@@ -1,0 +1,757 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>06 · RLVR — exploration under a verifier</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">gpt_mini / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">06 · rlvr</span>
+    <span class="step-pill">lesson 6 / 6</span>
+  </div>
+</header>
+
+<main>
+
+<h1>RLVR — exploration under a verifier <span class="tag">GRPO · DeepSeek-R1</span></h1>
+<p class="subtitle">The final stage. A programmatic checker replaces the human rater, fresh samples from the policy replace the static dataset, and a one-line group statistic replaces the value network.</p>
+
+<h2>Where DPO ran out of road</h2>
+
+<p>Lesson 5 left us with a model that has been pushed toward chosen responses and away from rejected ones under a frozen reference anchor. DPO is elegant — the reward model dissolves algebraically, the loss is closed-form — but it inherits the rigidity of any supervised method. Three concrete gaps:</p>
+
+<ol>
+  <li><strong>Static pair distribution.</strong> The training signal is bounded by what is in the pair file. DPO can re-rank within the support of <span class="math">(y<sub>w</sub>, y<sub>l</sub>)</span> seen at training time, but it cannot reward a response style it has never seen.</li>
+  <li><strong>No exploration.</strong> The model never produces samples during DPO training — every gradient comes from log-probabilities of pre-canned strings. There is no mechanism for <em>discovering</em> a new reasoning pattern that scores well; only for tilting probability toward what some human, or some prior model, has already written down.</li>
+  <li><strong>Wasteful for verifiable tasks.</strong> For arithmetic, code, puzzles, or anything with a programmatic correctness oracle, paying humans to compare responses is silly. The oracle <em>is</em> the reward. Spending preference labels on tasks with a ground truth is like hiring a panel of judges to score a stopwatch.</li>
+</ol>
+
+<p>RLVR — Reinforcement Learning with Verifiable Rewards — collapses all three problems at once: replace the static dataset with on-policy rollouts, replace the human rater with a verifier, and use a clean group statistic in place of any learned value function. The instantiation we will study is GRPO (Group-Relative Policy Optimization), the algorithm behind DeepSeek-R1 and the broader o1-style reasoning-model family.</p>
+
+<div class="callout">
+  <div class="label">One-sentence reading of the whole pipeline so far</div>
+  Pretrain learns <span class="math">P(text)</span>. SFT carves out <span class="math">P(response | prompt)</span>. CoT injects reasoning tokens to buy serial compute. DPO tilts <span class="math">P(response | prompt)</span> using pairwise preferences with a frozen KL anchor. RLVR draws fresh samples, scores them with a verifier, and pushes the policy uphill in expected reward — still under a KL anchor.
+</div>
+
+<h2>The setting in five symbols</h2>
+
+<p>Three of the symbols carry over verbatim from lesson 5; two are new.</p>
+
+<ul>
+  <li><span class="math">π<sub>θ</sub></span> — the <strong>policy</strong> we are training. Same MiniGPT, same parameters, same forward pass.</li>
+  <li><span class="math">π<sub>ref</sub></span> — the <strong>frozen reference</strong>. As in DPO, this is the SFT-warmed-up checkpoint at the moment RLVR starts. <code>requires_grad_(False)</code>. It anchors the KL term.</li>
+  <li><span class="math">x</span> — a <strong>prompt</strong>, here a chat-templated arithmetic problem such as <code>&lt;3+4+5&gt;</code>.</li>
+  <li><span class="math">y</span> — a <strong>response</strong> sampled from <span class="math">π<sub>θ</sub>(·|x)</span> token-by-token. New every step.</li>
+  <li><span class="math">R(x, y)</span> — the <strong>verifier</strong>. A function from <span class="math">(x, y)</span> to ℝ that returns 1 if the response decodes to the gold answer and 0 otherwise. No learning, no parameters, just code:</li>
+</ul>
+
+<pre><code>def verify(response_text: str, gold: int) -> float:
+    matches = _DIGITS_RE.findall(response_text)
+    if not matches:
+        return 0.0
+    return 1.0 if int(matches[-1]) == gold else 0.0
+</code></pre>
+
+<p>For math the verifier parses the last integer in the response and compares to the gold sum. For code it would run unit tests. For puzzles it would diff against a known solution. The defining property is that <em>the verifier is cheap, faithful, and noiseless</em> — it never gives partial credit it does not believe in, and it never disagrees with itself. That is what makes it a strictly better signal than a reward model trained on preferences.</p>
+
+<div class="callout ok">
+  <div class="label">Why a verifier dominates a reward model when you have one</div>
+  A reward model is a finite-capacity neural network trained on a finite preference dataset. It hallucinates. It is biased toward styles its raters preferred. It can be reward-hacked: the policy finds adversarial responses that score high under the model and low under any human. A verifier has none of these failure modes within its domain — it cannot be fooled by a response that does not actually parse to the gold answer. The cost of that strength is generality: a verifier only exists where correctness is programmatically checkable.
+</div>
+
+<h2>GRPO in six lines</h2>
+
+<p>Here is the entire algorithm. Walk through it once now; we will dissect each line below.</p>
+
+<pre><code>1. Sample a prompt    x  ~ D
+2. Roll out K samples y_1, …, y_K  ~  π_θ(·|x)
+3. Verify each        r_i  =  R(x, y_i)        ∈ ℝ
+4. Group advantage    A_i  =  (r_i − mean_j r_j) / (std_j r_j + ε)
+5. PG loss            L_PG =  − (1/K) Σ_i  A_i · log π_θ(y_i | x)
+6. KL anchor          L_KL =   β · (1/K) Σ_i  KL( π_θ ‖ π_ref )   over response tokens
+   Total              L    =  L_PG + L_KL
+</code></pre>
+
+<p>That is the whole loop. One optimizer step per group of <span class="math">K</span> rollouts. The toy implementation in <a href="../../../gpt_mini/04_rlvr.py"><code>04_rlvr.py</code></a> uses <span class="math">K=4</span> and <span class="math">β=0.05</span> for 800 steps; production recipes use <span class="math">K=16…64</span> and tens of thousands of steps.</p>
+
+<svg viewBox="0 0 760 260" class="diagram">
+  <defs>
+    <marker id="arr6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/>
+    </marker>
+  </defs>
+
+  <g><rect class="node-bg" x="20"  y="30" width="120" height="56" rx="8"/>
+     <text x="80"  y="55" text-anchor="middle" font-weight="600" font-size="13">1. rollout</text>
+     <text x="80"  y="72" text-anchor="middle" font-size="11" fill="var(--text-mute)">K samples y_i</text></g>
+
+  <g><rect class="node-bg" x="170" y="30" width="120" height="56" rx="8"/>
+     <text x="230" y="55" text-anchor="middle" font-weight="600" font-size="13">2. verify</text>
+     <text x="230" y="72" text-anchor="middle" font-size="11" fill="var(--text-mute)">r_i ∈ ℝ</text></g>
+
+  <g><rect class="node-bg" x="320" y="30" width="120" height="56" rx="8"/>
+     <text x="380" y="55" text-anchor="middle" font-weight="600" font-size="13">3. advantage</text>
+     <text x="380" y="72" text-anchor="middle" font-size="11" fill="var(--text-mute)">A_i = (r−μ)/σ</text></g>
+
+  <g><rect class="node-bg" x="470" y="30" width="120" height="56" rx="8"/>
+     <text x="530" y="55" text-anchor="middle" font-weight="600" font-size="13">4. loss</text>
+     <text x="530" y="72" text-anchor="middle" font-size="11" fill="var(--text-mute)">L_PG + βL_KL</text></g>
+
+  <g><rect class="node-bg" x="620" y="30" width="120" height="56" rx="8"/>
+     <text x="680" y="55" text-anchor="middle" font-weight="600" font-size="13">5. step</text>
+     <text x="680" y="72" text-anchor="middle" font-size="11" fill="var(--text-mute)">Adam</text></g>
+
+  <path class="edge" d="M140 58 L170 58" marker-end="url(#arr6)"/>
+  <path class="edge" d="M290 58 L320 58" marker-end="url(#arr6)"/>
+  <path class="edge" d="M440 58 L470 58" marker-end="url(#arr6)"/>
+  <path class="edge" d="M590 58 L620 58" marker-end="url(#arr6)"/>
+
+  <path class="edge" d="M680 86 C 680 160, 80 160, 80 86" marker-end="url(#arr6)"/>
+  <text class="edge-label" x="380" y="155" text-anchor="middle">6. repeat — new prompt, new rollouts (on-policy)</text>
+
+  <g><rect class="node-bg" x="170" y="190" width="420" height="50" rx="8" fill="var(--code-bg)"/>
+     <text x="380" y="213" text-anchor="middle" font-size="12" fill="var(--text-mute)">π_ref (frozen) participates only in the KL term inside step 4</text>
+     <text x="380" y="229" text-anchor="middle" font-size="11" fill="var(--text-dim)">no value head, no reward model, no off-policy buffer</text></g>
+</svg>
+
+<h2>Why group-relative — the disappearance of the value network</h2>
+
+<p>The score-function gradient is</p>
+
+<div class="math block">
+  ∇<sub>θ</sub> J(θ) &nbsp;=&nbsp; 𝔼<sub>y∼π<sub>θ</sub></sub> [ R(x, y) · ∇<sub>θ</sub> log π<sub>θ</sub>(y|x) ].
+</div>
+
+<p>This is the formula from lesson 1, lifted to sequences. Estimated naively (one sample), it has crushing variance: a single response touches hundreds of tokens, and a binary reward gives you one bit of signal scattered across all of them. The standard cure is a <strong>baseline</strong> <span class="math">b(x)</span>. Subtracting any function of <span class="math">x</span> alone from the reward leaves the gradient unbiased:</p>
+
+<div class="math block">
+  𝔼<sub>y∼π<sub>θ</sub></sub> [ b(x) · ∇<sub>θ</sub> log π<sub>θ</sub>(y|x) ] &nbsp;=&nbsp; b(x) · ∇<sub>θ</sub> 𝔼<sub>y</sub>[1] &nbsp;=&nbsp; b(x) · ∇<sub>θ</sub> 1 &nbsp;=&nbsp; 0,
+</div>
+
+<p>because the policy distribution integrates to one no matter <span class="math">θ</span>. So the centred gradient</p>
+
+<div class="math block">
+  ∇<sub>θ</sub> J &nbsp;=&nbsp; 𝔼<sub>y∼π<sub>θ</sub></sub> [ ( R(x, y) − b(x) ) · ∇<sub>θ</sub> log π<sub>θ</sub>(y|x) ]
+</div>
+
+<p>is unbiased for any <span class="math">b</span> that does not depend on <span class="math">y</span>. PPO-style RLHF realizes <span class="math">b(x)</span> as a learned value head — a second copy of the trunk with a scalar projection — trained by regressing returns. GRPO realizes <span class="math">b(x)</span> as the <em>sample mean of K rollouts for the same prompt</em>:</p>
+
+<div class="math block">
+  b̂(x) &nbsp;=&nbsp; (1/K) Σ<sub>j=1..K</sub> r<sub>j</sub>.
+</div>
+
+<p>This is a Monte-Carlo estimate of <span class="math">𝔼<sub>y∼π<sub>θ</sub></sub>[R(x,y)]</span>. It depends only on <span class="math">x</span> (the rollouts are i.i.d. given <span class="math">x</span>), so the baseline-zero-mean argument applies. It costs zero extra parameters, has zero warmup, and cannot go stale relative to the policy because it is computed from the policy itself, this step. The standard-deviation denominator</p>
+
+<div class="math block">
+  A<sub>i</sub> &nbsp;=&nbsp; ( r<sub>i</sub> − b̂(x) ) / ( σ̂(x) + ε )
+</div>
+
+<p>does not change unbiasedness — it is a rescaling — but it makes the loss invariant to reward shifts and to multiplicative reward rescaling. Switch your verifier from <code>{0,1}</code> to <code>{0,10}</code> and the optimizer behaves identically.</p>
+
+<p>The cost of going group-relative: <span class="math">K</span> forward passes per prompt instead of one. That is the basic GRPO-vs-PPO trade. PPO pays in <em>extra parameters and a value-target signal</em>; GRPO pays in <em>extra compute per prompt</em>. For verifiable tasks with sparse terminal reward — where the value head is hardest to train anyway — the GRPO trade is the better one.</p>
+
+<div class="callout warn">
+  <div class="label">A subtlety</div>
+  Strictly, <span class="math">A<sub>i</sub></span> uses <span class="math">r<sub>i</sub></span> in its own baseline through the group mean, so the estimator is biased at finite <span class="math">K</span>. The bias is <span class="math">O(1/K)</span> and vanishes asymptotically. In practice at <span class="math">K ≥ 4</span> the bias is much smaller than the variance you'd pay to remove it. The strictly-unbiased fix — using the mean of the other <span class="math">K−1</span> rollouts — is RLOO (Leave-One-Out), and it costs the same compute. The DeepSeek papers use the in-group mean and accept the bias.
+</div>
+
+<h2>A worked group, by hand</h2>
+
+<p>Suppose we draw <span class="math">K=4</span> rollouts for prompt <code>&lt;3+4+5&gt;</code> (gold = 12). The verifier returns:</p>
+
+<div class="token-row">
+  <span class="tok">r<sub>1</sub> = 1</span>
+  <span class="tok">r<sub>2</sub> = 1</span>
+  <span class="tok">r<sub>3</sub> = 0</span>
+  <span class="tok">r<sub>4</sub> = 0</span>
+</div>
+
+<p>Mean is 0.5. The population standard deviation is also 0.5. Advantages:</p>
+
+<div class="math block">
+  A &nbsp;=&nbsp; ( 1 − 0.5, 1 − 0.5, 0 − 0.5, 0 − 0.5 ) / ( 0.5 + ε ) &nbsp;≈&nbsp; ( +1, +1, −1, −1 ).
+</div>
+
+<svg viewBox="0 0 760 200" class="diagram">
+  <text class="edge-label" x="20" y="22">rewards r_i</text>
+  <text class="edge-label" x="20" y="118">advantages A_i (after centering and ÷ std)</text>
+
+  <rect class="node-bg" x="20"  y="30" width="170" height="50" rx="6"/>
+  <rect x="35" y="40" width="140" height="30" fill="var(--ok)" opacity="0.85"/>
+  <text x="105" y="60" text-anchor="middle" font-size="13" fill="#ffffff" font-weight="600">r_1 = 1</text>
+
+  <rect class="node-bg" x="200" y="30" width="170" height="50" rx="6"/>
+  <rect x="215" y="40" width="140" height="30" fill="var(--ok)" opacity="0.85"/>
+  <text x="285" y="60" text-anchor="middle" font-size="13" fill="#ffffff" font-weight="600">r_2 = 1</text>
+
+  <rect class="node-bg" x="380" y="30" width="170" height="50" rx="6"/>
+  <text x="465" y="60" text-anchor="middle" font-size="13" fill="var(--text-mute)">r_3 = 0</text>
+
+  <rect class="node-bg" x="560" y="30" width="170" height="50" rx="6"/>
+  <text x="645" y="60" text-anchor="middle" font-size="13" fill="var(--text-mute)">r_4 = 0</text>
+
+  <rect class="node-bg" x="20"  y="125" width="170" height="60" rx="6"/>
+  <rect x="105" y="155" width="70" height="20" fill="var(--ok)"/>
+  <text x="105" y="170" text-anchor="end" font-size="12" fill="var(--text-mute)" dx="-4">+1.0</text>
+
+  <rect class="node-bg" x="200" y="125" width="170" height="60" rx="6"/>
+  <rect x="285" y="155" width="70" height="20" fill="var(--ok)"/>
+  <text x="285" y="170" text-anchor="end" font-size="12" fill="var(--text-mute)" dx="-4">+1.0</text>
+
+  <rect class="node-bg" x="380" y="125" width="170" height="60" rx="6"/>
+  <rect x="395" y="155" width="70" height="20" fill="var(--bad)"/>
+  <text x="540" y="170" text-anchor="end" font-size="12" fill="var(--text-mute)">−1.0</text>
+
+  <rect class="node-bg" x="560" y="125" width="170" height="60" rx="6"/>
+  <rect x="575" y="155" width="70" height="20" fill="var(--bad)"/>
+  <text x="720" y="170" text-anchor="end" font-size="12" fill="var(--text-mute)">−1.0</text>
+
+  <line x1="105" y1="125" x2="105" y2="185" stroke="var(--border)" stroke-dasharray="2 2"/>
+  <line x1="285" y1="125" x2="285" y2="185" stroke="var(--border)" stroke-dasharray="2 2"/>
+  <line x1="540" y1="125" x2="540" y2="185" stroke="var(--border)" stroke-dasharray="2 2"/>
+  <line x1="720" y1="125" x2="720" y2="185" stroke="var(--border)" stroke-dasharray="2 2"/>
+</svg>
+
+<p>Half the group gets pushed up, half pushed down. The policy gradient is now centred: the optimizer will increase log-probability of <span class="math">y<sub>1</sub></span> and <span class="math">y<sub>2</sub></span>, decrease log-probability of <span class="math">y<sub>3</sub></span> and <span class="math">y<sub>4</sub></span>, by exactly the magnitude their advantage prescribes. This is the entire learning signal.</p>
+
+<h2>The KL anchor — why we keep <span class="math">π<sub>ref</sub></span> around</h2>
+
+<p>Without a KL penalty, the policy is free to walk wherever the reward gradient points. Sounds desirable. It is not. Verifiers have edge cases. The arithmetic verifier in our toy parses the <em>last</em> integer in the response — so a policy that learns to emit the string <code>"42#"</code> always, and ignores the prompt, will get reward 1 on every problem whose gold answer happens to be 42, and reward 0 elsewhere. Across a uniform-difficulty stream of two- and three-summand problems, this is a winning strategy compared to most random outputs. A pure reward-maximizing policy with no anchor will <em>find it</em>. We are then proudly training a model that thinks the universal answer is 42 and have lost everything SFT gave us.</p>
+
+<p>The KL term against the frozen <span class="math">π<sub>ref</sub></span> stops this. It says: at every token, your distribution over next tokens has to stay near the SFT model's. Local exploration is fine; a wholesale collapse onto a degenerate sequence is not.</p>
+
+<svg viewBox="0 0 760 220" class="diagram">
+  <text x="20" y="22" font-size="12" fill="var(--text-mute)">without KL: policy collapses onto a single token sequence</text>
+  <text x="400" y="22" font-size="12" fill="var(--text-mute)">with KL anchor: policy stays a healthy distribution</text>
+
+  <line x1="20" y1="170" x2="370" y2="170" stroke="var(--border)"/>
+  <line x1="400" y1="170" x2="740" y2="170" stroke="var(--border)"/>
+
+  <g>
+    <rect x="30"  y="160" width="20" height="10" fill="var(--text-dim)" opacity="0.5"/>
+    <rect x="55"  y="160" width="20" height="10" fill="var(--text-dim)" opacity="0.5"/>
+    <rect x="80"  y="160" width="20" height="10" fill="var(--text-dim)" opacity="0.5"/>
+    <rect x="105" y="160" width="20" height="10" fill="var(--text-dim)" opacity="0.5"/>
+    <text x="190" y="195" font-size="11" fill="var(--text-mute)" text-anchor="middle">π_ref (was spread)</text>
+  </g>
+
+  <g>
+    <rect x="180" y="50"  width="20" height="120" fill="var(--bad)"/>
+    <rect x="155" y="160" width="20" height="10"  fill="var(--text-dim)" opacity="0.3"/>
+    <rect x="205" y="160" width="20" height="10"  fill="var(--text-dim)" opacity="0.3"/>
+    <text x="190" y="40"  font-size="11" fill="var(--bad)" text-anchor="middle">"42"</text>
+  </g>
+
+  <g>
+    <rect x="410" y="160" width="20" height="10" fill="var(--text-dim)" opacity="0.5"/>
+    <rect x="435" y="160" width="20" height="10" fill="var(--text-dim)" opacity="0.5"/>
+    <rect x="460" y="160" width="20" height="10" fill="var(--text-dim)" opacity="0.5"/>
+    <rect x="485" y="160" width="20" height="10" fill="var(--text-dim)" opacity="0.5"/>
+    <text x="570" y="195" font-size="11" fill="var(--text-mute)" text-anchor="middle">π_ref</text>
+  </g>
+
+  <g>
+    <rect x="540" y="120" width="20" height="50" fill="var(--ok)"/>
+    <rect x="515" y="135" width="20" height="35" fill="var(--ok)" opacity="0.7"/>
+    <rect x="565" y="140" width="20" height="30" fill="var(--ok)" opacity="0.7"/>
+    <rect x="590" y="145" width="20" height="25" fill="var(--ok)" opacity="0.5"/>
+    <rect x="490" y="150" width="20" height="20" fill="var(--ok)" opacity="0.5"/>
+    <text x="570" y="110" font-size="11" fill="var(--ok)" text-anchor="middle">π_θ stays spread</text>
+  </g>
+</svg>
+
+<p>The KL is computed only over <em>response</em> tokens, not the prompt. The prompt is identical between <span class="math">π<sub>θ</sub></span> and <span class="math">π<sub>ref</sub></span> conditionally (same input), so its KL is the same loss contribution either way — masking it out is just bookkeeping. In the code:</p>
+
+<pre><code>target_mask = torch.zeros((K, T - 1), dtype=torch.float32, device=device)
+target_mask[:, P - 1 : P - 1 + resp_mask.size(1)] = resp_mask
+</code></pre>
+
+<p><span class="math">P</span> is the prompt length; the mask is 1 only at <em>target</em> positions corresponding to response tokens that are not past-EOS padding.</p>
+
+<h2>Schulman's k3 KL estimator</h2>
+
+<p>How do we actually compute the KL? We have access to per-token log-probabilities <span class="math">log π<sub>θ</sub>(y<sub>t</sub>|·)</span> and <span class="math">log π<sub>ref</sub>(y<sub>t</sub>|·)</span> from the two model forwards. The naive estimator is</p>
+
+<div class="math block">
+  KL̂<sub>naive</sub> &nbsp;=&nbsp; log π<sub>θ</sub> − log π<sub>ref</sub>,
+</div>
+
+<p>which is unbiased — its expectation under <span class="math">y ∼ π<sub>θ</sub></span> is exactly <span class="math">KL(π<sub>θ</sub> ‖ π<sub>ref</sub>)</span> — but signed and high-variance. Per token it can be negative, which is uncomfortable both interpretationally and as a loss term you might want to clip or log. Schulman's "k3" estimator fixes this. Let <span class="math">r = log π<sub>ref</sub> − log π<sub>θ</sub></span>. Then</p>
+
+<div class="math block">
+  KL̂<sub>k3</sub> &nbsp;=&nbsp; e<sup>r</sup> − r − 1.
+</div>
+
+<p>Two properties to verify:</p>
+
+<ol>
+  <li><strong>Nonnegativity per token.</strong> The function <span class="math">f(r) = e<sup>r</sup> − r − 1</span> has minimum 0 at <span class="math">r=0</span>, since <span class="math">f′(r) = e<sup>r</sup> − 1</span> vanishes there and <span class="math">f″(r) = e<sup>r</sup> &gt; 0</span> is positive everywhere. So <span class="math">f ≥ 0</span> for all real <span class="math">r</span>, with equality iff <span class="math">π<sub>θ</sub> = π<sub>ref</sub></span> at that token.</li>
+  <li><strong>Unbiased in expectation.</strong> Under <span class="math">y ∼ π<sub>θ</sub></span>, <span class="math">𝔼[e<sup>r</sup>] = Σ<sub>y</sub> π<sub>θ</sub>(y) · π<sub>ref</sub>(y)/π<sub>θ</sub>(y) = Σ<sub>y</sub> π<sub>ref</sub>(y) = 1</span>. So <span class="math">𝔼[KL̂<sub>k3</sub>] = 1 − 𝔼[r] − 1 = −𝔼[r] = 𝔼[log π<sub>θ</sub> − log π<sub>ref</sub>] = KL(π<sub>θ</sub> ‖ π<sub>ref</sub>)</span>. The expectations of the naive and k3 estimators agree exactly.</li>
+</ol>
+
+<p>So k3 trades <em>nothing in expectation</em> for <em>always-nonnegative samples</em>. That is a strict variance reduction for a strict expectation-preserving change. Free lunch.</p>
+
+<svg viewBox="0 0 760 240" class="diagram">
+  <line x1="60"  y1="200" x2="700" y2="200" stroke="var(--border)"/>
+  <line x1="380" y1="20"  x2="380" y2="220" stroke="var(--border)"/>
+  <text x="700" y="218" font-size="11" fill="var(--text-mute)">r</text>
+  <text x="384" y="20"  font-size="11" fill="var(--text-mute)">KL̂</text>
+
+  <text x="380" y="218" font-size="11" fill="var(--text-mute)" text-anchor="middle">0</text>
+  <text x="220" y="218" font-size="11" fill="var(--text-mute)" text-anchor="middle">−1</text>
+  <text x="540" y="218" font-size="11" fill="var(--text-mute)" text-anchor="middle">+1</text>
+  <text x="60"  y="218" font-size="11" fill="var(--text-mute)" text-anchor="middle">−2</text>
+  <text x="700" y="218" font-size="11" fill="var(--text-mute)" text-anchor="middle">+2</text>
+
+  <path d="M60,184 L100,176 L140,168 L180,158 L220,148 L260,138 L300,128 L340,118 L380,108 L420,98 L460,87 L500,75 L540,61 L580,46 L620,30 L660,12 L700,-8"
+        class="edge" stroke="var(--text-mute)" stroke-width="1.4" stroke-dasharray="4 3" fill="none"/>
+  <text x="100" y="170" font-size="11" fill="var(--text-mute)">naive (signed, unbounded below)</text>
+
+  <path d="M60,40 L100,68 L140,96 L180,124 L220,148 L260,168 L300,184 L340,194 L380,200 L420,196 L460,188 L500,176 L540,160 L580,138 L620,108 L660,68 L700,16"
+        class="edge active" fill="none"/>
+  <circle cx="380" cy="200" r="4" fill="var(--ok)"/>
+  <text x="395" y="195" font-size="11" fill="var(--ok)">k3 minimum = 0 at r=0</text>
+</svg>
+
+<p>The toy implementation is one Python line:</p>
+
+<pre><code>r = ref_logp - pol_logp
+kl_per_tok = torch.exp(r) - r - 1.0     # &gt;= 0 elementwise
+</code></pre>
+
+<div class="callout bad">
+  <div class="label">Debugging gotcha — sign of r matters</div>
+  We are computing <span class="math">KL(π<sub>θ</sub> ‖ π<sub>ref</sub>)</span> with samples from <span class="math">π<sub>θ</sub></span>. The unbiased k3 form uses <span class="math">r = log π<sub>ref</sub> − log π<sub>θ</sub></span>. Flip the sign by accident and you are estimating <span class="math">KL(π<sub>ref</sub> ‖ π<sub>θ</sub>)</span> with samples from the wrong distribution — biased — and the gradient pushes the policy <em>away</em> from <span class="math">π<sub>ref</sub></span>. Training looks fine for a few steps and then the policy explodes. The README of <code>gpt_mini</code> lists this as the canonical RLVR gotcha for a reason.
+</div>
+
+<h2>Why REINFORCE-style here — no PPO clipping</h2>
+
+<p>Real GRPO, as published, wraps the policy-gradient term in PPO-style importance-ratio clipping. The reason is off-policy reuse: in production, rollouts are produced by an inference engine on one set of GPUs while the trainer updates the policy on another set. Between the moment a rollout is sampled (using policy weights <span class="math">π<sub>old</sub></span>) and the moment it contributes to a gradient (using the current weights <span class="math">π<sub>θ</sub></span>), the policy has moved. The two distributions differ; the rollout is no longer on-policy. The PPO clip bounds the resulting update.</p>
+
+<p>Our toy in <a href="../../../gpt_mini/04_rlvr.py"><code>04_rlvr.py</code></a> sidesteps all of that. The loop is strictly synchronous: roll out → score → update → next prompt. The rollout policy <em>is</em> the current policy, so the importance ratio <span class="math">π<sub>θ</sub>(y|x) / π<sub>old</sub>(y|x) = 1</span> by construction and the clip is inactive. We skip the clip term for clarity; it would not change a single gradient. In a multi-epoch or asynchronous setting you'd insert one line:</p>
+
+<pre><code># where it would go, in the loss expression:
+ratio = (pol_logp - old_logp.detach()).exp()            # importance ratio
+clipped = torch.clamp(ratio, 1.0 - eps, 1.0 + eps)      # PPO-clip
+pg_loss = -torch.min(ratio * adv, clipped * adv).mean()
+</code></pre>
+
+<p>Everything else — group-relative advantage, KL anchor, k3 estimator, mask over response tokens — is unchanged.</p>
+
+<h2>Degenerate groups — when the step does nothing</h2>
+
+<p>If all <span class="math">K</span> rollouts in a group receive the same reward, then <span class="math">σ̂ = 0</span> and every <span class="math">r<sub>i</sub> − mean = 0</span>. The advantage vector is all zeros. The PG loss vanishes; only the KL term remains; the gradient is purely "stay close to <span class="math">π<sub>ref</sub></span>", which is uninformative. The toy file detects this and short-circuits:</p>
+
+<pre><code>if rewards.std().item() &lt; 1e-8:
+    return 0.0, rewards.mean().item(), 0.0      # skip the optimizer step
+adv = (rewards - rewards.mean()) / (rewards.std() + 1e-6)
+</code></pre>
+
+<p>Degenerate groups are not a bug — they are a fact of the training dynamics. They show up in two regimes:</p>
+
+<ul>
+  <li><strong>Early.</strong> A bad policy fails on most prompts. For an arithmetic problem with gold answer 14, all four rollouts say <code>"7#"</code>, <code>"3#"</code>, <code>"99#"</code>, <code>"5#"</code> — all wrong. Rewards are <code>(0,0,0,0)</code>. No signal.</li>
+  <li><strong>Late.</strong> A mastered policy succeeds on most prompts. All four rollouts say <code>"14#"</code>. Rewards are <code>(1,1,1,1)</code>. No signal — there is nothing to differentiate by.</li>
+</ul>
+
+<p>The interesting middle is where some rollouts succeed and some fail, and the centred advantage tells the policy <em>which sample style worked</em>. The dead-group rate is a useful real-time diagnostic: if it stays at 100% you have either a hopeless initial policy or a verifier that everyone passes; if it drops to zero you have either converged or run out of room to grow.</p>
+
+<h2>Interactive · a GRPO rollout group, step by step</h2>
+
+<p>The widget below simulates one full GRPO step at a time. The "policy correctness" parameter <span class="math">p</span> is a 1-D stand-in for the policy's competence: rollouts are sampled to be correct with probability <span class="math">p</span>. Hit <em>Resample</em> to draw a fresh group; hit <em>Step</em> to apply one fake gradient update — the step nudges <span class="math">p</span> up by an amount proportional to <span class="math">Σ A<sub>i</sub> · [correct<sub>i</sub>]</span> (the empirical group signal), tempered by the KL coefficient <span class="math">β</span> (larger <span class="math">β</span> means slower adaptation). The "mean reward EMA" line chart and the dead-group counter give you a feel for how RLVR actually unfolds.</p>
+
+<div class="widget" id="grpo-sim">
+  <div class="title">GRPO rollout group simulator · prompt = "&lt;3+4+5&gt;" · gold = 12</div>
+  <div class="hint">Each row is one of the K rollouts. Green chip = verifier returned 1. The advantages are computed live from the K rewards. Step takes a fake gradient step; over time the policy correctness parameter climbs and dead groups drop, then come back as the policy nears mastery.</div>
+
+  <div id="grpo-roll" style="margin: 10px 0 4px;"></div>
+
+  <div class="kpi-grid" style="margin-top: 10px;">
+    <div class="kpi"><div class="k">mean(r)</div><div class="v" id="grpo-mean">—</div></div>
+    <div class="kpi"><div class="k">std(r)</div><div class="v" id="grpo-std">—</div></div>
+    <div class="kpi"><div class="k">degenerate?</div><div class="v" id="grpo-deg">—</div></div>
+    <div class="kpi"><div class="k">policy p</div><div class="v" id="grpo-p">0.20</div></div>
+  </div>
+
+  <div class="controls" style="margin-top: 12px;">
+    <button class="primary" id="grpo-step">Step (resample + update)</button>
+    <button id="grpo-resample">Resample only</button>
+    <button id="grpo-x10">Step ×10</button>
+    <button id="grpo-reset">Reset</button>
+    <label class="inline">K: <input type="range" id="grpo-k" min="2" max="8" step="1" value="4"><span class="val" id="grpo-kv">4</span></label>
+    <label class="inline">β: <input type="range" id="grpo-beta" min="0" max="0.5" step="0.01" value="0.05"><span class="val" id="grpo-betav">0.05</span></label>
+  </div>
+
+  <canvas id="grpo-canvas" width="760" height="180" class="dist-canvas"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">steps</div><div class="v" id="grpo-steps">0</div></div>
+    <div class="kpi"><div class="k">mean reward EMA</div><div class="v" id="grpo-ema">0.00</div></div>
+    <div class="kpi"><div class="k">dead-group rate</div><div class="v" id="grpo-dead">0.0%</div></div>
+    <div class="kpi"><div class="k">KL / rollout</div><div class="v" id="grpo-kl">0.000</div></div>
+  </div>
+</div>
+
+<p>Play with three things and notice the dynamics:</p>
+
+<ul>
+  <li><strong>Hold <span class="math">β = 0</span> and step repeatedly.</strong> The policy correctness climbs fast — and you may notice it crosses 1.0 (impossible for a real policy) because there is nothing pulling it back. That is the collapse failure mode.</li>
+  <li><strong>Crank <span class="math">β</span> high.</strong> Each step barely moves the policy. The mean reward EMA grows linearly instead of accelerating. Strong anchor, slow learning.</li>
+  <li><strong>Reduce <span class="math">K</span> to 2.</strong> Dead-group rate spikes — half your steps do nothing. Increase to <span class="math">K=8</span> and the rate plummets at K× the compute.</li>
+</ul>
+
+<h2>What <span class="math">β</span> and <span class="math">K</span> actually control</h2>
+
+<table>
+  <thead><tr><th>Knob</th><th>Small</th><th>Large</th><th>Where it bites</th></tr></thead>
+  <tbody>
+    <tr><td><span class="math">β</span></td><td>weak anchor</td><td>strong anchor</td><td>Small → faster adaptation but risk of collapse onto a verifier exploit. Large → slow but stable. Typical: 0.01–0.1.</td></tr>
+    <tr><td><span class="math">K</span></td><td>high-variance advantage; many dead groups</td><td>low variance, K× compute</td><td>Small → step contributes nothing on dead groups, gradients noisy. Large → reliable advantage estimate. Papers use 16–64.</td></tr>
+    <tr><td>temperature</td><td>greedy, low entropy</td><td>diverse, exploratory</td><td>Too low collapses the group (every sample is the same response); too high makes everything garbage. Match to expected response length.</td></tr>
+    <tr><td>learning rate</td><td>safe</td><td>fast but unstable</td><td>RLVR LR is typically 10×–100× smaller than SFT LR — the gradient is already a high-variance Monte Carlo estimate; piling LR on top makes it worse. Toy uses 1e-5.</td></tr>
+  </tbody>
+</table>
+
+<h2>Warmup matters — the cold-start problem</h2>
+
+<p>RL needs a base that occasionally succeeds. A randomly initialized policy emits gibberish: for the toy task it would produce strings like <code>"+5_##"</code> that the verifier can't even parse. Every reward is 0. Every group is degenerate. Every gradient is zero. Training cannot start.</p>
+
+<p>That is why <a href="../../../gpt_mini/04_rlvr.py"><code>04_rlvr.py</code></a> runs a brief SFT warmup before the RLVR loop:</p>
+
+<pre><code>print("── SFT warmup (so the initial policy produces parseable output) ──")
+sft = train_warmup(tok, T_max=T_max, steps=600, B=64, device=device)
+policy = copy.deepcopy(sft)
+ref    = sft
+</code></pre>
+
+<p>After 600 steps of warmup the policy reliably emits digits + <code>#</code>. The verifier can now grade it. Some answers are right, some wrong — a productive split. The RLVR loop starts there. <span class="math">π<sub>ref</sub></span> is set to the same warmed-up model and frozen.</p>
+
+<p>This is a general lesson about RL post-training: <strong>you need a base that occasionally succeeds, otherwise the reward signal is too sparse to bootstrap</strong>. Real R1 starts from a strong base model. Our 4-layer toy starts from a tiny SFT. Same principle. The "Zero" variants (R1-Zero, etc.) demonstrate that with a sufficiently capable base and a verifier, you can skip explicit SFT entirely — but you can never skip the implicit prior that the base provides.</p>
+
+<div class="callout warn">
+  <div class="label">A pragmatic test</div>
+  Before you start an RLVR run, sample 50 rollouts from your base model on prompts from your training distribution and pass them through the verifier. If fewer than ~5% pass, you do not have enough signal to bootstrap — go back and SFT more. If more than ~95% pass, your verifier is too weak or your task is too easy and RLVR will not teach the model much. The productive band is 10%–80% pass rate.
+</div>
+
+<h2>DPO vs RLVR — same anchor, different oracle</h2>
+
+<p>DPO and RLVR share more than they differ. Both keep a frozen <span class="math">π<sub>ref</sub></span> as a KL anchor. Both train <span class="math">π<sub>θ</sub></span> via a weighted log-probability objective. Both inherit their initial weights from an SFT checkpoint. The difference is in the oracle they consult and the dataset shape that follows from it.</p>
+
+<table>
+  <thead><tr><th></th><th>DPO (Lesson 5)</th><th>RLVR (this lesson)</th></tr></thead>
+  <tbody>
+    <tr><td>Dataset shape</td><td>static <span class="math">(x, y<sub>w</sub>, y<sub>l</sub>)</span></td><td><span class="math">x</span> only; <span class="math">y</span>s sampled fresh from <span class="math">π<sub>θ</sub></span></td></tr>
+    <tr><td>Oracle</td><td>human (or model) preference</td><td>programmatic verifier</td></tr>
+    <tr><td>Number of samples per <span class="math">x</span></td><td>2 (the pair)</td><td>K (typically 16–64)</td></tr>
+    <tr><td>Exploration</td><td>none — re-ranks within pair distribution</td><td>yes — model generates novel responses</td></tr>
+    <tr><td>Gradient flavor</td><td>closed-form, supervised-like</td><td>Monte Carlo policy gradient</td></tr>
+    <tr><td>KL anchor</td><td>implicit (<span class="math">β·log(π<sub>θ</sub>/π<sub>ref</sub>)</span> margin)</td><td>explicit (KL term added to loss)</td></tr>
+    <tr><td>Failure mode</td><td>over-fits the pairs; can't go beyond them</td><td>reward hacking; KL collapse without anchor</td></tr>
+    <tr><td>Best for</td><td>general assistant tuning, style</td><td>math, code, puzzles, reasoning</td></tr>
+  </tbody>
+</table>
+
+<p>Modern recipes use both, often in sequence: DPO for assistant style, then RLVR for hard reasoning targets. The choice is not ideological; it is "do you have a verifier?". If yes, RLVR. If no, DPO (or RLHF with a learned reward model).</p>
+
+<h2>Trade-offs you have to think about</h2>
+
+<h3>Reward hacking</h3>
+
+<p>Any time you replace a goal ("be a good math solver") with a proxy ("pass this verifier"), you invite Goodhart's law. The arithmetic verifier in <a href="../../../gpt_mini/04_rlvr.py"><code>04_rlvr.py</code></a> parses the <em>last</em> integer. A policy could learn to emit <code>"5+7=12; the answer is 12"</code> for prompts whose gold is 12 — fine — but it could also learn to emit a long reasoning trace that ends with the wrong intermediate but the right final digit. The verifier cannot tell the difference. For code, a policy can write tests-passing code that fails on every input not in the tests. Mitigations include test-suite breadth, multiple verifiers, and the KL anchor itself — staying close to a sensible-looking reference makes exotic exploits less reachable.</p>
+
+<h3>Verifier strength</h3>
+
+<p>The verifier is the ceiling on what RLVR can teach. If the verifier accepts wrong-but-confident answers, the policy will learn to give them. If the verifier rejects right-but-unusual answers, the policy will learn to avoid them. For math, "compare to the gold integer" is rock-solid. For code, "pass these unit tests" is solid only if the tests cover edge cases. For reasoning, "agree with the answer key" works for short answers but breaks for open-ended outputs — which is why preferences (DPO, RLHF) still dominate for those.</p>
+
+<h3>KL coefficient tuning</h3>
+
+<p>Too small and the policy collapses; too large and it never moves. There is no principled value of <span class="math">β</span>; it depends on the geometry of the verifier landscape near <span class="math">π<sub>ref</sub></span>. A practical procedure: start at <span class="math">β=0.1</span>, monitor mean KL per rollout, and tune. If KL grows unboundedly, increase <span class="math">β</span>. If KL stays at zero and reward does not move, decrease <span class="math">β</span>. The toy uses <span class="math">β=0.05</span>, which is on the looser side appropriate for a small model with a forgiving task.</p>
+
+<h3>K vs steps</h3>
+
+<p>Compute budget says you can do <span class="math">N</span> total rollouts. Should you do <span class="math">N/4</span> steps with <span class="math">K=4</span>, or <span class="math">N/16</span> steps with <span class="math">K=16</span>? At <span class="math">K=4</span> you take more, noisier steps. At <span class="math">K=16</span> you take fewer, cleaner steps. Empirically the sweet spot is around <span class="math">K=16</span> in the original DeepSeek-Math paper. Smaller groups are wasted on dead-group rate; larger groups have diminishing returns from variance reduction.</p>
+
+<h3>On-policy vs off-policy</h3>
+
+<p>Strictly on-policy (each rollout consumed once, immediately) is the safest. It is also the slowest because rollouts cannot be reused. Production systems run several gradient updates per batch of rollouts; that is "off-policy" reuse and is where the PPO clip earns its keep. Our toy is strictly on-policy.</p>
+
+<h3>Temperature</h3>
+
+<p>Lower the sampling temperature and you get less group diversity — more degenerate groups. Raise it and you get more garbage rollouts. For verifiable tasks, temperature 0.7–1.0 is typical. The toy uses 1.0.</p>
+
+<h3>Length-bias of advantage normalization</h3>
+
+<p>Dividing by the group standard deviation amplifies signals from low-variance groups. The lowest-variance groups are the easy ones (everyone right) and the hardest ones (everyone wrong) — neither is the most informative. Dr.GRPO drops the std denominator to remove this bias; DAPO keeps it but adjusts elsewhere. The toy keeps it, in the interest of staying close to the canonical formulation. Detailed treatment lives in the sibling lesson <a href="../../RL/lessons/14_drgrpo.html">RL/lessons/14_drgrpo.html</a>.</p>
+
+<h2>What modern recipes do</h2>
+
+<p>State-of-the-art reasoning models — R1, R1-Zero, Qwen2.5-Math, the o-series sketch — share a recognizable backbone:</p>
+
+<ol>
+  <li><strong>Strong pretrain.</strong> A capable base model that already does some arithmetic and code.</li>
+  <li><strong>SFT warmup</strong> on reasoning-style demonstrations: chain-of-thought traces, code with explanations.</li>
+  <li><strong>RLVR with a verifier</strong> on math, code, puzzles. Often with curriculum: start on easy problems, raise difficulty as accuracy stabilizes.</li>
+  <li><strong>Optional DPO</strong> on the side, for general-assistant style and instruction-following niceties.</li>
+</ol>
+
+<p>The RLVR stage is where the largest reasoning-capability gains come from. R1-Zero famously skipped SFT entirely and went straight from base model to RLVR — a stress test for the cold-start argument. It worked because the base model was already strong enough to sometimes succeed; the verifier and the group-relative gradient did the rest.</p>
+
+<h2>Looking back at the whole pipeline</h2>
+
+<p>You've now seen all five stages. Re-read them as deltas:</p>
+
+<ul>
+  <li><strong>Pretrain.</strong> Loss is <span class="math">−Σ<sub>t</sub> log p<sub>θ</sub>(x<sub>t</sub>|x<sub>&lt;t</sub>)</span> over raw text. Output: a model of <span class="math">P(text)</span>.</li>
+  <li><strong>SFT.</strong> Same loss <em>shape</em>, but mask the prompt: <span class="math">−Σ<sub>t∈response</sub> log p<sub>θ</sub>(x<sub>t</sub>|x<sub>&lt;t</sub>)</span>. Output: <span class="math">P(response | prompt)</span>.</li>
+  <li><strong>CoT.</strong> Same loss again. Only the response shape changes — it now includes a reasoning trace before the answer. Output: a model that can spend more tokens on harder problems.</li>
+  <li><strong>DPO.</strong> Pairwise reformulation: <span class="math">−log σ(β·(logratio<sub>w</sub> − logratio<sub>l</sub>))</span>. Output: preferences embedded in the policy with a closed-form objective, no reward model.</li>
+  <li><strong>RLVR.</strong> Drop the static dataset; sample rollouts from <span class="math">π<sub>θ</sub></span>; score them with a verifier; weight log-probabilities by group-relative advantages; anchor with KL. Output: a model improved by exploration.</li>
+</ul>
+
+<p>One observation worth pausing on: every loss in the pipeline is, up to a sign and a weighting, <em>a sum of log-probabilities of tokens under the policy with the prompt masked out</em>. Pretraining sets the weights to 1 over all tokens. SFT sets them to 1 over response tokens, 0 elsewhere. CoT keeps the same scheme on richer response sequences. DPO sets them to <span class="math">+β</span> for winner-response tokens and <span class="math">−β</span> for loser-response tokens, with a sigmoid wrapping the difference. RLVR sets them to the per-rollout advantage <span class="math">A<sub>i</sub></span>, sampled fresh, plus a per-token KL term.</p>
+
+<p>That's the whole game. Five stages, one underlying machine. The architecture in <a href="../../../gpt_mini/model.py"><code>model.py</code></a> never knew about any of it.</p>
+
+<div class="callout ok">
+  <div class="label">Closing takeaway</div>
+  RLVR = rollouts + verifier + grouped advantages + KL anchor. No value network, no reward model, no human preferences — just an oracle that says correct or incorrect and K samples whose relative performance defines the signal. The policy improves through exploration under reward pressure, anchored to π_ref so it cannot run away from itself. Everything past this point in the literature — RLOO, DAPO, Dr.GRPO, off-policy variants, curriculum schedulers, length normalization — is a tweak to one of these four ingredients. The recipe is the lesson.
+</div>
+
+<footer class="lesson-nav">
+  <a href="05_dpo.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">05 · DPO — closed-form preferences</span>
+  </a>
+  <a class="next" href="index.html">
+    <span class="dir">↑ All lessons</span>
+    <span class="ttl">Pipeline complete — back to index</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  // ── GRPO rollout group simulator ─────────────────────────────────────────
+  // 1-D "policy" parameter p ∈ [0, 1] — probability that a rollout is correct.
+  // Each rollout: success ~ Bernoulli(p). Rewards are 0/1. Advantages computed
+  // group-relative. A fake gradient step nudges p by η · mean(A_i · [correct])
+  // — pulled back toward p_ref by β (KL anchor analog).
+
+  const POOL_CORRECT = [
+    "12#", "{3+4=7;7+5=12}12#", "{5+7=12}12#", "{4+5=9;9+3=12}12#",
+    "12 #", "{3+4+5=12}12#", "{3+5=8;8+4=12}12#"
+  ];
+  const POOL_WRONG = [
+    "11#", "13#", "{3+4=8}15#", "42#", "{3+4=7;7+5=10}10#",
+    "9#", "{5+5=10}10#", "{3+4=7}7#", "17#", "0#",
+    "{3+5=8;4+8=11}11#", "{4+5=9}9#"
+  ];
+
+  const P_REF = 0.20;          // policy correctness at the SFT anchor
+  const ETA   = 0.18;          // step size for the fake gradient
+  let p       = P_REF;         // current policy correctness
+  let K       = 4;
+  let beta    = 0.05;
+  let steps   = 0;
+  let deadCount = 0;
+  let emaR    = 0;
+  let emaInit = false;
+  let history = [];            // EMA reward history for canvas
+  let lastKL  = 0;
+  let lastRollout = [];        // array of { text, correct, adv }
+
+  const elRoll  = document.getElementById('grpo-roll');
+  const elMean  = document.getElementById('grpo-mean');
+  const elStd   = document.getElementById('grpo-std');
+  const elDeg   = document.getElementById('grpo-deg');
+  const elP     = document.getElementById('grpo-p');
+  const elKv    = document.getElementById('grpo-kv');
+  const elBv    = document.getElementById('grpo-betav');
+  const elSteps = document.getElementById('grpo-steps');
+  const elEma   = document.getElementById('grpo-ema');
+  const elDead  = document.getElementById('grpo-dead');
+  const elKL    = document.getElementById('grpo-kl');
+  const canvas  = document.getElementById('grpo-canvas');
+  const ctx     = canvas.getContext('2d');
+
+  function pick(arr){ return arr[Math.floor(Math.random() * arr.length)]; }
+
+  function sampleGroup() {
+    const out = [];
+    for (let i = 0; i < K; i++) {
+      const correct = Math.random() < p;
+      const text    = correct ? pick(POOL_CORRECT) : pick(POOL_WRONG);
+      out.push({ text, correct, reward: correct ? 1 : 0 });
+    }
+    return out;
+  }
+
+  function computeAdvantages(rs) {
+    const n = rs.length;
+    const mean = rs.reduce((a,b) => a + b, 0) / n;
+    const variance = rs.reduce((a,b) => a + (b - mean) ** 2, 0) / n;
+    const std = Math.sqrt(variance);
+    if (std < 1e-8) return { mean, std, adv: rs.map(() => 0), degenerate: true };
+    const adv = rs.map(r => (r - mean) / (std + 1e-6));
+    return { mean, std, adv, degenerate: false };
+  }
+
+  function renderRollouts() {
+    elRoll.innerHTML = '';
+    lastRollout.forEach((rollout, i) => {
+      const row = document.createElement('div');
+      row.className = 'trajectory';
+      row.innerHTML =
+        `<span class="label-l">y_${i+1}</span>` +
+        `<span class="text">${rollout.text}</span>` +
+        `<span class="tok ${rollout.correct ? 'reward' : ''}" style="min-width:46px; text-align:center;">r=${rollout.reward}</span>` +
+        `<span class="reward-l ${rollout.adv >= 0 ? '' : 'zero'}" style="color:${rollout.adv > 0 ? 'var(--ok)' : (rollout.adv < 0 ? 'var(--bad)' : 'var(--text-dim)')};">A=${rollout.adv.toFixed(2)}</span>`;
+      elRoll.appendChild(row);
+    });
+  }
+
+  function renderCanvas() {
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    // axes
+    const padX = 36, padY = 18;
+    ctx.strokeStyle = '#dde2ea';
+    ctx.beginPath();
+    ctx.moveTo(padX, H - padY);
+    ctx.lineTo(W - padX, H - padY);
+    ctx.moveTo(padX, padY);
+    ctx.lineTo(padX, H - padY);
+    ctx.stroke();
+
+    ctx.fillStyle = '#5b6573';
+    ctx.font = '11px monospace';
+    ctx.fillText('1.0', 6, padY + 4);
+    ctx.fillText('0.5', 6, (padY + H - padY) / 2 + 4);
+    ctx.fillText('0.0', 6, H - padY + 4);
+    ctx.fillText('reward EMA', padX + 4, padY - 4);
+
+    // line
+    if (history.length > 1) {
+      const n = history.length;
+      const xstep = (W - 2 * padX) / Math.max(1, n - 1);
+      ctx.strokeStyle = '#2563eb';
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      for (let i = 0; i < n; i++) {
+        const x = padX + i * xstep;
+        const y = H - padY - history[i] * (H - 2 * padY);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+
+    // current p line as dashed reference
+    const py = H - padY - p * (H - 2 * padY);
+    ctx.strokeStyle = '#16a34a';
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(padX, py);
+    ctx.lineTo(W - padX, py);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#16a34a';
+    ctx.fillText('p = ' + p.toFixed(2), W - padX - 60, py - 4);
+  }
+
+  function renderAll(group, stats) {
+    elMean.textContent = stats.mean.toFixed(2);
+    elStd.textContent  = stats.std.toFixed(2);
+    elDeg.textContent  = stats.degenerate ? 'yes (skip)' : 'no';
+    elDeg.style.color  = stats.degenerate ? 'var(--bad)' : 'var(--ok)';
+    elP.textContent    = p.toFixed(2);
+    elSteps.textContent = steps;
+    elEma.textContent   = emaR.toFixed(2);
+    elDead.textContent  = steps > 0 ? ((deadCount / steps) * 100).toFixed(1) + '%' : '0.0%';
+    elKL.textContent    = lastKL.toFixed(3);
+    renderRollouts();
+    renderCanvas();
+  }
+
+  function resample() {
+    const group = sampleGroup();
+    const stats = computeAdvantages(group.map(g => g.reward));
+    lastRollout = group.map((g, i) => ({ ...g, adv: stats.adv[i] }));
+    // estimate KL roughly proportional to (p - P_REF)^2 — toy stand-in for the
+    // actual per-token KL we'd compute against π_ref. Just a visualization.
+    lastKL = (p - P_REF) * (p - P_REF) * 10.0;
+    renderAll(group, stats);
+    return { group, stats };
+  }
+
+  function fakeStep() {
+    const { group, stats } = resample();
+    steps += 1;
+    if (stats.degenerate) {
+      deadCount += 1;
+    } else {
+      // empirical signal: mean over rollouts of A_i · [correct_i]
+      let signal = 0;
+      for (let i = 0; i < K; i++) {
+        signal += stats.adv[i] * (group[i].correct ? 1 : 0);
+      }
+      signal /= K;
+      // KL anchor pull: −β · (p − P_REF)
+      const anchor = -beta * (p - P_REF);
+      p = Math.max(0, Math.min(1, p + ETA * signal + ETA * anchor));
+    }
+    const r = stats.mean;
+    if (!emaInit) { emaR = r; emaInit = true; }
+    else          { emaR = 0.92 * emaR + 0.08 * r; }
+    history.push(emaR);
+    if (history.length > 200) history.shift();
+    // re-render KPIs with fresh emaR
+    elEma.textContent  = emaR.toFixed(2);
+    elDead.textContent = ((deadCount / steps) * 100).toFixed(1) + '%';
+    elSteps.textContent = steps;
+    elP.textContent    = p.toFixed(2);
+    renderCanvas();
+  }
+
+  function reset() {
+    p = P_REF; steps = 0; deadCount = 0; emaR = 0; emaInit = false;
+    history = []; lastKL = 0; lastRollout = [];
+    resample();
+  }
+
+  document.getElementById('grpo-step').addEventListener('click', fakeStep);
+  document.getElementById('grpo-x10').addEventListener('click', () => {
+    for (let i = 0; i < 10; i++) fakeStep();
+  });
+  document.getElementById('grpo-resample').addEventListener('click', resample);
+  document.getElementById('grpo-reset').addEventListener('click', reset);
+
+  const elK = document.getElementById('grpo-k');
+  elK.addEventListener('input', () => {
+    K = parseInt(elK.value, 10);
+    elKv.textContent = K;
+    resample();
+  });
+  const elB = document.getElementById('grpo-beta');
+  elB.addEventListener('input', () => {
+    beta = parseFloat(elB.value);
+    elBv.textContent = beta.toFixed(2);
+  });
+
+  window.addEventListener('resize', renderCanvas);
+  resample();
+})();
+</script>
+
+</body>
+</html>

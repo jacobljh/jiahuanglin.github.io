@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>24 · Performant PyTorch patterns &amp; synthesis</title><link rel="stylesheet" href="../RL/lessons/style.css"><style>main{overflow-wrap:break-word}table{table-layout:fixed}th,td{overflow-wrap:anywhere}input[type="range"]{max-width:min(200px,44vw)}label.inline{flex-wrap:wrap;max-width:100%}</style></head>
+<body><header class="topnav"><div class="inner"><a class="crumb-link" href="../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">gpu_kernel_serving</a><span class="crumb">/</span><span class="crumb">24 · performant pytorch</span><span class="step-pill">lesson 24 / 24</span></div></header><main>
+
+<h1>Performant PyTorch patterns &amp; synthesis</h1>
+<p class="subtitle">Compile, Triton, and profilers fix the kernels. This lesson fixes everything <em>around</em> the kernels: memory format, allocator pressure, async data movement, mixed precision, and the half-dozen tiny patterns that decide whether a healthy kernel actually runs healthy in your program.</p>
+
+<h2>The question this lesson answers</h2>
+<p>Your kernels are fast. The compiler is on. The profile says GPU utilization is 65 %. Where is the other 35 % going? Usually it's PyTorch-level: a host stall in the dataloader, an allocator hiccup, a needless <code>contiguous()</code>, an autograd graph held longer than it should be. This lesson is a checklist for the patterns that move that 35 %.</p>
+
+<div class="callout"><div class="label">Mental model for the whole track</div>Every performance fix in this track is exactly one of three things:
+<ul style="margin:6px 0">
+  <li><strong>Fewer bytes moved</strong> — fusion (19, 22, 23), prefix reuse (14), quantization (16), KV layout (13).</li>
+  <li><strong>More useful bytes on chip</strong> — tiling (05), tensor cores (09), better tile size, async copy.</li>
+  <li><strong>Less work between kernels</strong> — CUDA graphs (15), <code>torch.compile</code> (23), sync discipline (this lesson), allocator hygiene (this lesson).</li>
+</ul>
+The seven habits below are the third category, applied at the PyTorch layer.</div>
+
+<h2>The seven habits</h2>
+<svg viewBox="0 0 880 320" class="diagram" role="img" aria-label="Seven performance habits: device transfer overlap, allocator awareness, contiguous discipline, mixed precision, autograd hygiene, dataloader overlap, sync discipline">
+  <g font-size="11" fill="var(--text-mute)">
+    <rect class="node-bg" x="20"  y="40" width="200" height="60" rx="6"/><text x="120" y="64" text-anchor="middle" font-weight="700" fill="var(--text)">1 · async H2D / D2H</text><text x="120" y="82" text-anchor="middle">pin_memory + non_blocking</text>
+    <rect class="node-bg" x="240" y="40" width="200" height="60" rx="6"/><text x="340" y="64" text-anchor="middle" font-weight="700" fill="var(--text)">2 · allocator</text><text x="340" y="82" text-anchor="middle">caching, fragmentation, OOM</text>
+    <rect class="node-bg" x="460" y="40" width="200" height="60" rx="6"/><text x="560" y="64" text-anchor="middle" font-weight="700" fill="var(--text)">3 · contiguous discipline</text><text x="560" y="82" text-anchor="middle">view vs copy, strides</text>
+    <rect class="node-bg" x="680" y="40" width="180" height="60" rx="6"/><text x="770" y="64" text-anchor="middle" font-weight="700" fill="var(--text)">4 · mixed precision</text><text x="770" y="82" text-anchor="middle">bf16 / fp8, master copy</text>
+
+    <rect class="node-bg" x="20"  y="120" width="200" height="60" rx="6"/><text x="120" y="144" text-anchor="middle" font-weight="700" fill="var(--text)">5 · autograd hygiene</text><text x="120" y="162" text-anchor="middle">grad clears, retain_graph, hooks</text>
+    <rect class="node-bg" x="240" y="120" width="200" height="60" rx="6"/><text x="340" y="144" text-anchor="middle" font-weight="700" fill="var(--text)">6 · dataloader overlap</text><text x="340" y="162" text-anchor="middle">workers, prefetch, sharding</text>
+    <rect class="node-bg" x="460" y="120" width="200" height="60" rx="6"/><text x="560" y="144" text-anchor="middle" font-weight="700" fill="var(--text)">7 · sync discipline</text><text x="560" y="162" text-anchor="middle">.item(), print, logging</text>
+    <rect class="node-bg" x="680" y="120" width="180" height="60" rx="6"/><text x="770" y="144" text-anchor="middle" font-weight="700" fill="var(--text)">+ streams (advanced)</text><text x="770" y="162" text-anchor="middle">compute/comm overlap</text>
+  </g>
+  <rect x="20" y="208" width="840" height="80" rx="6" fill="var(--bg-soft)" stroke="var(--border)"/>
+  <text x="40" y="232" font-size="12" fill="var(--text)" font-weight="700">The bridge</text>
+  <text x="40" y="252" font-size="12" fill="var(--text-mute)">All seven are about keeping the GPU fed without surprising it. Lessons 18–23 made each kernel fast.</text>
+  <text x="40" y="270" font-size="12" fill="var(--text-mute)">This lesson keeps the spaces <em>between</em> kernels fast, so the timeline you saw in lesson 20 actually has no gaps.</text>
+</svg>
+
+<h2>1 · Async host↔device transfer</h2>
+<p>Copying a CPU tensor to GPU is two steps: pin it (so DMA can grab it without an extra copy), then issue an async transfer. Both have to be set up correctly or you get a sync.</p>
+<pre><code># dataloader side: pin host memory
+loader = DataLoader(dataset, batch_size=B, num_workers=4, pin_memory=True)
+
+# transfer side: non-blocking copy
+for batch in loader:
+    x = batch['x'].to('cuda', non_blocking=True)   # async
+    y = batch['y'].to('cuda', non_blocking=True)
+    # do GPU work concurrently with the next H2D
+    out = model(x)
+    loss = loss_fn(out, y)
+    loss.backward()</code></pre>
+<p>Without <code>pin_memory=True</code> the runtime makes a hidden synchronous copy through a pinned staging buffer. Without <code>non_blocking=True</code> the call waits for completion. The two together overlap H2D with compute.</p>
+
+<h2>2 · The caching allocator, and how to not anger it</h2>
+<p>PyTorch never returns memory to the driver between operations. It caches freed blocks and reuses them. Two failure modes:</p>
+<ul>
+  <li><strong>Fragmentation.</strong> Many small allocations of varied sizes leave gaps the allocator can't reuse for big requests → OOM at a memory utilization well below the GPU's capacity.</li>
+  <li><strong>Excess high-water.</strong> Once the allocator reserves N GB for a peak, it holds it until the process ends.</li>
+</ul>
+
+<table><thead><tr><th>Tool</th><th>What it tells you</th></tr></thead><tbody>
+<tr><td><code>torch.cuda.memory_allocated()</code></td><td>Bytes the program is using.</td></tr>
+<tr><td><code>torch.cuda.memory_reserved()</code></td><td>Bytes the allocator has from the driver. The "high-water."</td></tr>
+<tr><td><code>torch.cuda.memory_summary()</code></td><td>Per-pool stats, allocations, frees.</td></tr>
+<tr><td><code>torch.cuda.memory._record_memory_history()</code> + <code>_dump_snapshot()</code></td><td>Replayable timeline of every alloc/free with stack traces. Open in <a href="https://pytorch.org/memory_viz">pytorch.org/memory_viz</a>.</td></tr>
+<tr><td><code>PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True</code></td><td>Allocator strategy that defragments better for variable shapes.</td></tr>
+</tbody></table>
+
+<p>Practical rules: avoid creating long-lived <code>list</code>s of tensors you no longer need; <code>del</code> them or rebind. Use <code>torch.no_grad()</code> in inference paths so activations aren't held for backward. Beware giant model-init transients (some checkpoint loaders briefly hold 2× the model weight in memory).</p>
+
+<h2>3 · Contiguous discipline (view vs copy)</h2>
+<p>Many ops return <em>views</em>: a new tensor that points into the same storage with different strides. Free in compute, but downstream ops that demand contiguity (<code>conv</code>, <code>matmul</code> in some paths, <code>reshape</code> across non-contiguous strides) call <code>.contiguous()</code> which is a copy. The copy can be ~30 % of an op's time, silently.</p>
+<table><thead><tr><th>Op</th><th>Returns view?</th></tr></thead><tbody>
+<tr><td><code>x.reshape(...)</code></td><td>View if possible, else copy.</td></tr>
+<tr><td><code>x.view(...)</code></td><td>View; errors if strides don't allow it.</td></tr>
+<tr><td><code>x.transpose / permute</code></td><td>View (non-contiguous strides).</td></tr>
+<tr><td><code>x.contiguous()</code></td><td>Copy unless already contiguous.</td></tr>
+<tr><td><code>x.expand(...)</code></td><td>View (zero-stride). Free broadcasting.</td></tr>
+<tr><td><code>x.repeat(...)</code></td><td><strong>Copy.</strong> Often the wrong choice — use <code>expand</code> if you can.</td></tr>
+<tr><td>Indexing with a list/tensor</td><td>Copy (gather).</td></tr>
+<tr><td>Slicing with <code>:</code></td><td>View.</td></tr>
+</tbody></table>
+<p><strong>Channels-last</strong> is the same idea applied to convolution memory format. For 4D conv on Hopper, <code>x = x.to(memory_format=torch.channels_last)</code> on inputs + weights routes to faster cuDNN kernels. For LLM serving (no conv) this rarely matters.</p>
+
+<h2>4 · Mixed precision, done correctly</h2>
+<p>Two patterns coexist in modern training:</p>
+<ul>
+  <li><strong>AMP / autocast (bf16):</strong> matmuls and convolutions run in bf16; reductions and norms stay fp32. Cheap, robust, almost always a win.</li>
+  <li><strong>fp8 (e4m3/e5m2):</strong> tensor-core fp8 GEMM on Hopper. Needs scale management and per-tensor calibration. ~2× over bf16 in throughput when it works.</li>
+</ul>
+<pre><code>from torch.amp import autocast, GradScaler
+
+scaler = GradScaler('cuda')   # only needed for fp16, not bf16
+
+for x, y in loader:
+    with autocast('cuda', dtype=torch.bfloat16):
+        out = model(x)
+        loss = loss_fn(out, y)
+    loss.backward()           # GradScaler-free path; bf16 doesn't underflow like fp16
+    opt.step(); opt.zero_grad()</code></pre>
+<p>Three gotchas: (1) cast inputs <em>before</em> autocast for predictable behavior; (2) loss functions that include large reductions stay fp32 automatically — don't fight it; (3) save weights as fp32 master copies; the autocast layer downcasts at compute time.</p>
+
+<h2>5 · Autograd hygiene</h2>
+<ul>
+  <li><strong><code>opt.zero_grad(set_to_none=True)</code></strong> — sets <code>.grad</code> to <code>None</code> instead of zero-tensoring. Saves an entire elementwise op per parameter per step. Default in modern PyTorch.</li>
+  <li><strong>Don't <code>retain_graph=True</code> unless you need it.</strong> Holds onto activations and turns one step into many.</li>
+  <li><strong>Hooks (forward/backward) leak.</strong> Returning a closure from a <code>register_forward_hook</code> can hold the entire module. Use weak refs or remove the hook explicitly.</li>
+  <li><strong><code>torch.no_grad()</code> on eval paths</strong> — turns off graph tape, halves activation memory.</li>
+  <li><strong><code>checkpoint(...)</code></strong> trades recomputation for activation memory. Useful at long context lengths.</li>
+</ul>
+
+<h2>6 · Dataloader overlap</h2>
+<p>If your GPU has idle gaps at the start of each iteration, you're dataloader-bound, not model-bound. Three settings dominate:</p>
+<ul>
+  <li><strong><code>num_workers</code></strong> — usually <code>2 × number of GPUs</code> or <code>min(8, cpu_count // num_gpus)</code>. More workers ≠ better; each one is a CPU process.</li>
+  <li><strong><code>prefetch_factor</code></strong> (default 2) — batches per worker to keep queued.</li>
+  <li><strong><code>persistent_workers=True</code></strong> — avoids re-forking workers each epoch, saving seconds at small-epoch training.</li>
+</ul>
+<p>Diagnostics: in nsys, look at the CPU row at the start of each iteration. If it's busy and the GPU is idle, the loader is the bottleneck.</p>
+
+<h2>7 · Sync discipline (the silent killer)</h2>
+<p>Re-stating from lesson 18 because it appears in every "why is my training slow" thread:</p>
+<table><thead><tr><th>Code</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>print(loss)</code></td><td>Implicit <code>.cpu()</code>. Sync.</td></tr>
+<tr><td><code>logger.info(f"loss={loss}")</code></td><td>Same. f-string formats the tensor → <code>.item()</code>.</td></tr>
+<tr><td><code>writer.add_scalar('loss', loss.item(), step)</code></td><td><code>.item()</code> → sync. Aggregate &amp; log every N steps.</td></tr>
+<tr><td><code>if loss &gt; threshold:</code></td><td>Sync to evaluate the branch.</td></tr>
+<tr><td><code>tensor.numpy()</code></td><td>Sync.</td></tr>
+<tr><td><code>torch.cuda.synchronize()</code></td><td>Explicit. Use in benchmarks, not in hot loops.</td></tr>
+</tbody></table>
+<p>Pattern: keep all logging tensors on GPU until end of step, then batch-sync. A single <code>torch.cuda.synchronize()</code> at the iteration boundary is fine; ten throughout the body is not.</p>
+
+<h2>Advanced · streams for compute/comm overlap</h2>
+<p>By default every op goes on the default CUDA stream. For overlap (e.g., next layer's compute while previous layer's all-reduce is in flight), use multiple streams:</p>
+<pre><code>comp_stream = torch.cuda.Stream()
+comm_stream = torch.cuda.Stream()
+
+# IMPORTANT: comm_stream must wait for grad to be produced on the default stream
+# before starting the all_reduce. Without this, the all_reduce reads garbage.
+comm_stream.wait_stream(torch.cuda.current_stream())
+
+with torch.cuda.stream(comm_stream):
+    work = dist.all_reduce(grad, async_op=True)   # comm on its own stream
+
+with torch.cuda.stream(comp_stream):
+    next_layer_forward(...)                        # compute concurrently
+
+# at sync barriers, the current stream waits for both producers
+torch.cuda.current_stream().wait_stream(comp_stream)
+torch.cuda.current_stream().wait_stream(comm_stream)
+work.wait()</code></pre>
+<p>This is the foundation of "comm/compute overlap" in distributed training. Most users get it via framework features (FSDP's <code>backward_prefetch</code>, DDP's bucket overlap) rather than writing it directly — but knowing it exists explains why DDP wires things the way it does.</p>
+
+<h2>The synthesis: one decision flow</h2>
+<svg viewBox="0 0 880 360" class="diagram" role="img" aria-label="Decision flow: profile → identify symptom → fix at appropriate layer; covers all lessons 18-24">
+  <defs><marker id="sy24" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <g font-size="11" fill="var(--text-mute)">
+    <rect class="node-bg" x="340" y="20" width="200" height="50" rx="6"/><text x="440" y="42" text-anchor="middle" font-weight="700" fill="var(--text)">profile (20)</text><text x="440" y="60" text-anchor="middle">torch.profiler / nsys / ncu</text>
+
+    <rect class="node-bg" x="20"  y="120" width="200" height="60" rx="6"/><text x="120" y="144" text-anchor="middle" font-weight="700" fill="var(--text)">CPU gaps?</text><text x="120" y="162" text-anchor="middle">dispatch · sync · dataloader</text>
+    <rect class="node-bg" x="240" y="120" width="200" height="60" rx="6"/><text x="340" y="144" text-anchor="middle" font-weight="700" fill="var(--text)">launches dominate?</text><text x="340" y="162" text-anchor="middle">small kernels + many launches</text>
+    <rect class="node-bg" x="460" y="120" width="200" height="60" rx="6"/><text x="560" y="144" text-anchor="middle" font-weight="700" fill="var(--text)">specific kernel slow?</text><text x="560" y="162" text-anchor="middle">below its roofline</text>
+    <rect class="node-bg" x="680" y="120" width="180" height="60" rx="6"/><text x="770" y="144" text-anchor="middle" font-weight="700" fill="var(--text)">memory pressure?</text><text x="770" y="162" text-anchor="middle">OOM / fragmentation</text>
+
+    <rect class="node-bg" x="20"  y="220" width="200" height="60" rx="6"/><text x="120" y="244" text-anchor="middle" font-weight="700" fill="var(--text)">fix at PyTorch layer (24)</text><text x="120" y="262" text-anchor="middle">sync discipline · dataloader · streams</text>
+    <rect class="node-bg" x="240" y="220" width="200" height="60" rx="6"/><text x="340" y="244" text-anchor="middle" font-weight="700" fill="var(--text)">compile / graph (23, 15)</text><text x="340" y="262" text-anchor="middle">fuse + CUDA graph</text>
+    <rect class="node-bg" x="460" y="220" width="200" height="60" rx="6"/><text x="560" y="244" text-anchor="middle" font-weight="700" fill="var(--text)">kernel work (22, 21)</text><text x="560" y="262" text-anchor="middle">Triton / library / read ncu</text>
+    <rect class="node-bg" x="680" y="220" width="180" height="60" rx="6"/><text x="770" y="244" text-anchor="middle" font-weight="700" fill="var(--text)">allocator / quant (24, 16)</text><text x="770" y="262" text-anchor="middle">expandable_segments · bf16/fp8</text>
+
+    <path class="edge" d="M400 70 L150 120" marker-end="url(#sy24)"/>
+    <path class="edge" d="M430 70 L340 120" marker-end="url(#sy24)"/>
+    <path class="edge" d="M460 70 L560 120" marker-end="url(#sy24)"/>
+    <path class="edge" d="M510 70 L770 120" marker-end="url(#sy24)"/>
+    <path class="edge" d="M120 180 L120 220" marker-end="url(#sy24)"/>
+    <path class="edge" d="M340 180 L340 220" marker-end="url(#sy24)"/>
+    <path class="edge" d="M560 180 L560 220" marker-end="url(#sy24)"/>
+    <path class="edge" d="M770 180 L770 220" marker-end="url(#sy24)"/>
+  </g>
+  <text x="440" y="320" text-anchor="middle" font-size="12" fill="var(--text-mute)">Every fix in this track maps to one of these four boxes. Profile first; never guess.</text>
+</svg>
+
+<h2>Top-10 checklist for "make my PyTorch model faster"</h2>
+<ol>
+  <li>Wrap <code>model = torch.compile(model)</code>. Re-measure after warmup.</li>
+  <li>Confirm <code>num_workers</code> &gt; 0 and <code>pin_memory=True</code>, <code>non_blocking=True</code> on H2D copies.</li>
+  <li>Remove debug prints / <code>.item()</code> from the hot loop. Log every N steps if needed.</li>
+  <li>Use <code>autocast(dtype=bfloat16)</code> for the forward; keep optimizer in fp32.</li>
+  <li>Replace <code>x.repeat(...)</code> with <code>x.expand(...)</code> where possible.</li>
+  <li>Set <code>PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True</code> for variable shapes.</li>
+  <li>Profile with <code>torch.profiler</code> — sort by CUDA time, look at top 5.</li>
+  <li>If decode-step launch-bound, add <code>mode="reduce-overhead"</code> to <code>torch.compile</code>.</li>
+  <li>If a specific kernel is slow, take it to ncu (lesson 21) before rewriting.</li>
+  <li>Benchmark median of 50 steps after a warmup of 10. Don't trust single runs.</li>
+</ol>
+
+<h2>Interactive · end-to-end "what should I try first?"</h2>
+<p>Describe your current bottleneck profile. The widget points you to the lesson and the lever.</p>
+
+<div class="widget"><div class="title">Synthesis: where to spend the next hour</div><p class="hint">Move the sliders to match what your profile says. The output names the top action — pulled from the right lesson.</p><div class="controls">
+<label class="inline">GPU utilization % <input id="sy-gpu" type="range" min="0" max="100" value="55"><span class="val" id="sy-gpu-v">55</span></label>
+<label class="inline">CPU gap per step ms <input id="sy-gap" type="range" min="0" max="50" value="6"><span class="val" id="sy-gap-v">6</span></label>
+<label class="inline">memory pressure (0=plenty, 100=OOM-soon) <input id="sy-mem" type="range" min="0" max="100" value="20"><span class="val" id="sy-mem-v">20</span></label>
+<label class="inline">specific kernel below roofline? <input id="sy-kern" type="range" min="0" max="100" value="0"><span class="val" id="sy-kern-v">0</span></label>
+</div><canvas id="sy-canvas" class="dist-canvas" height="220"></canvas><p class="hint" id="sy-note"></p></div>
+
+<h2>Closing the track</h2>
+<p>Twenty-four lessons. From "what is a thread" to "what to try first when my model is slow." One unifying object runs through all of them: <em>the roofline from lesson 01</em>. Every other concept is a way of moving a kernel toward, along, or off its roof.</p>
+
+<p>The arc, retraced:</p>
+<ul>
+  <li><strong>Part I (01–09)</strong> built the hardware vocabulary — threads, warps, SMs, memory tiers, tensor cores. Each lesson named one resource and showed how kernels can saturate or waste it.</li>
+  <li><strong>Part II (10–17)</strong> applied those primitives to the specific question of LLM serving. PagedAttention is "tile + indirection." FlashAttention is "tile + online reduction." Continuous batching is "make warps eligible." Cache-aware routing is "amortize HBM across requests." Every serving abstraction reduces to a hardware lever from Part I.</li>
+  <li><strong>Part III (18–24)</strong> gave you the loop — translate a PyTorch line to the kernels it launches, profile, classify the bottleneck on the roofline, fix at the right layer, re-measure. Triton when you need a new kernel, <code>torch.compile</code> when you need many, PyTorch patterns when the gap is between kernels.</li>
+</ul>
+
+<div class="callout ok"><div class="label">Final mental model</div>Every performance fix is one of three things: <em>fewer bytes</em> moved (fusion, quantization, KV reuse), <em>more useful bytes</em> on chip (tile size, occupancy, async copy), or <em>less work between kernels</em> (compile, graphs, sync discipline). When you encounter "X is slow," name which of the three it is — that names the lesson, which names the lever.</div>
+
+<p>If you remember nothing else: <strong>profile before guessing</strong>, <strong>count bytes before naming a kernel</strong>, and <strong>place the bar on the roofline</strong>. The rest is variations on those three habits.</p>
+
+<script>
+(function(){
+  const ids=['gpu','gap','mem','kern'];
+  const e=Object.fromEntries(ids.map(k=>[k,document.getElementById('sy-'+k)]));
+  const c=document.getElementById('sy-canvas'),ctx=c.getContext('2d'),note=document.getElementById('sy-note');
+  function draw(){
+    ids.forEach(k=>document.getElementById('sy-'+k+'-v').textContent=e[k].value);
+    c.width=c.clientWidth*devicePixelRatio;c.height=220*devicePixelRatio;ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.clearRect(0,0,c.clientWidth,220);
+    const gpu=+e.gpu.value, gap=+e.gap.value, mem=+e.mem.value, kern=+e.kern.value;
+    const options = [
+      ['PyTorch layer (sync, dataloader, allocator) — lessons 24/18', (100-gpu)*0.4 + gap*5],
+      ['torch.compile + CUDA graphs — lesson 23/15', (100-gpu)*0.3 + gap*3 + (kern<30?15:0)],
+      ['Triton custom kernel — lesson 22', kern*0.6 + (gap<2?5:0)],
+      ['Memory / quantization — lessons 16/24', mem*0.7 + (gpu>80?5:0)],
+      ['Profile more — lesson 20', (gpu>85 && gap<2 && kern<20)?60:5]
+    ];
+    const max = Math.max(...options.map(x=>x[1]),1);
+    const cols = ['#dc2626','#d97706','#2563eb','#16a34a','#7c3aed'];
+    options.forEach(([n,v],i)=>{
+      const y=20+i*40, w=(c.clientWidth-360)*Math.max(0,v)/max;
+      ctx.fillStyle='#eef1f5';ctx.fillRect(300,y,c.clientWidth-360,28);
+      ctx.fillStyle=cols[i];ctx.fillRect(300,y,w,28);
+      ctx.fillStyle='#1f2430';ctx.font='12px sans-serif';
+      ctx.fillText(n,28,y+19);
+    });
+    const top = options.slice().sort((a,b)=>b[1]-a[1])[0][0];
+    note.textContent = 'Top action: '+top+'. Always re-profile after any change — the bottleneck moves.';
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+<footer class="lesson-nav"><a href="23_torch_compile.html"><span class="dir">Previous</span><span class="ttl">23 · torch.compile</span></a><a class="next" href="index.html"><span class="dir">Done</span><span class="ttl">Track index</span></a></footer>
+</main></body></html>

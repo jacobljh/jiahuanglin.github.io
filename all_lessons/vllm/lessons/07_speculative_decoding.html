@@ -1,0 +1,830 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>07 · Speculative decoding</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">vllm_lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">07 · speculative decoding</span>
+    <span class="step-pill">lesson 7 / 12</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Speculative decoding</h1>
+<p class="subtitle">Draft K cheap tokens, verify them in one parallel target forward, keep the prefix that survives a ratio test. Same output distribution as plain decode, ~2× faster.</p>
+
+<h2>The asymmetry that makes it work</h2>
+
+<p>Lesson 01, Consequence B: decode is memory-bound. Each step the target model reads its whole KV cache once and does one token's worth of matmul. The compute is tiny relative to the bytes moved.</p>
+
+<p>That has an underappreciated corollary. A <em>K-token parallel</em> forward through the target model takes essentially the same wall-clock time as a 1-token forward:</p>
+
+<div class="math block">
+  t<sub>target</sub>(K parallel tokens) ≈ t<sub>target</sub>(1 token)
+</div>
+
+<p>Why? Both forwards move the KV cache the same amount of bytes (one pass over the full cache). The compute scales with K but compute was never the bottleneck. So <strong>a K-token parallel verify is essentially free.</strong></p>
+
+<p>Speculative decoding exploits exactly this: instead of generating 1 token per target step, generate K cheap guesses with a small model, then verify them all in one expensive-but-not-K×-expensive target step.</p>
+
+<h2>The algorithm</h2>
+
+<p>From <a href="https://arxiv.org/abs/2211.17192">Leviathan et al. 2023</a> (and concurrently Chen et al. at DeepMind). Given target M<sub>T</sub>, draft M<sub>D</sub>, speculative length K.</p>
+
+<p>One round:</p>
+
+<ol>
+  <li><strong>Draft K tokens sequentially</strong> from the small model:
+    <div class="math block">
+      for i = 1..K:  q<sub>i</sub> = p<sub>D</sub>(· | ctx + x<sub>1..i-1</sub>);  x<sub>i</sub> ~ q<sub>i</sub>
+    </div>
+  </li>
+  <li><strong>Target verifies in ONE parallel forward</strong> over K+1 positions:
+    <div class="math block">
+      p<sub>T</sub><sup>i</sup>(·) = p<sub>T</sub>(· | ctx + x<sub>1..i-1</sub>)   for i = 1..K+1
+    </div>
+  </li>
+  <li><strong>Accept-reject by the ratio test.</strong> For each i = 1..K, sample r ~ U(0,1):
+    <div class="math block">
+      accept x<sub>i</sub>  iff  r &lt; min(1, p<sub>T</sub><sup>i</sup>(x<sub>i</sub>) / q<sub>i</sub>(x<sub>i</sub>))
+    </div>
+  </li>
+  <li><strong>On first rejection at position j</strong>, resample from the residual:
+    <div class="math block">
+      p̃(x) = max(0, p<sub>T</sub><sup>j</sup>(x) − q<sub>j</sub>(x)) / Z,&nbsp;&nbsp;Z = Σ<sub>x</sub> max(0, p<sub>T</sub><sup>j</sup>(x) − q<sub>j</sub>(x))
+    </div>
+    Append this corrected token; discard the rest of the draft.
+  </li>
+  <li><strong>If all K accepted</strong>, sample one bonus token from p<sub>T</sub><sup>K+1</sup>. Round yields K+1 tokens.</li>
+</ol>
+
+<div class="callout warn">
+  <div class="label">The non-obvious bit</div>
+  Step 4's residual is exactly what makes the whole thing an exact sampler of p<sub>T</sub>. Skip the proof below and you'll either disbelieve the unbiasedness or implement the rejection step wrong.
+</div>
+
+<h2>Unbiasedness — why this is exact, not approximate</h2>
+
+<p>Claim: per round, the distribution of the <em>first</em> emitted token equals p<sub>T</sub> exactly. (The argument iterates: condition on context and apply the same logic to position 2, and so on for accepted positions.)</p>
+
+<p>For any token x, the round emits x at position 1 via one of two disjoint events:</p>
+
+<div class="math block">
+  P(x emitted) = P(x proposed &amp; accepted) + P(some y proposed, rejected, x resampled)
+</div>
+
+<p>The first term is direct from the rule:</p>
+
+<div class="math block">
+  P(x proposed &amp; accepted) = q(x) · min(1, p<sub>T</sub>(x) / q(x)) = min(q(x), p<sub>T</sub>(x))
+</div>
+
+<p>For the second, total rejection mass is</p>
+
+<div class="math block">
+  P(any rejection) = Σ<sub>y</sub> q(y) · (1 − min(1, p<sub>T</sub>(y)/q(y))) = Σ<sub>y</sub> max(0, q(y) − p<sub>T</sub>(y)) = Z
+</div>
+
+<p>(Equivalently, Z = 1 − Σ<sub>y</sub> min(q(y), p<sub>T</sub>(y)) — the two forms agree because min + max-of-the-difference partitions the probability mass.) Conditional on rejection we resample from p̃(x) = max(0, p<sub>T</sub>(x) − q(x)) / Z, so</p>
+
+<div class="math block">
+  P(rejection &amp; x resampled) = Z · max(0, p<sub>T</sub>(x) − q(x)) / Z = max(0, p<sub>T</sub>(x) − q(x))
+</div>
+
+<p>Adding the two terms:</p>
+
+<div class="math block">
+  P(x emitted) = min(q(x), p<sub>T</sub>(x)) + max(0, p<sub>T</sub>(x) − q(x))
+</div>
+
+<p>Case split:</p>
+
+<table>
+  <thead><tr><th>case</th><th>min term</th><th>max term</th><th>sum</th></tr></thead>
+  <tbody>
+    <tr><td>p<sub>T</sub>(x) ≥ q(x)</td><td>q(x)</td><td>p<sub>T</sub>(x) − q(x)</td><td><strong>p<sub>T</sub>(x)</strong></td></tr>
+    <tr><td>p<sub>T</sub>(x) &lt; q(x)</td><td>p<sub>T</sub>(x)</td><td>0</td><td><strong>p<sub>T</sub>(x)</strong></td></tr>
+  </tbody>
+</table>
+
+<p>Both cases give p<sub>T</sub>(x). The marginal of the emitted token is exactly the target distribution. ∎</p>
+
+<div class="callout ok">
+  <div class="label">Quality is preserved</div>
+  Speculative decoding is <em>not</em> a "draft model approximates the target" heuristic. Sample-by-sample, the output stream is statistically indistinguishable from running M<sub>T</sub> alone. The draft only affects <em>how many target steps you needed</em>, never <em>what you got out</em>.
+</div>
+
+<h2>Interactive · how the residual fills the gap, per token</h2>
+
+<p>The widget below shows two paths emitting the same target distribution. For each token <em>x</em>:</p>
+
+<ul>
+  <li>The <strong>p<sub>T</sub></strong> bar is split into <span style="color:#16a34a">green</span> (mass arriving via accept — equal to <span class="math">min(p<sub>T</sub>, q<sub>D</sub>)</span>) and <span style="color:#d97706">yellow</span> (mass arriving via residual resample — equal to <span class="math">max(0, p<sub>T</sub> − q<sub>D</sub>)</span>).</li>
+  <li>The <strong>q<sub>D</sub></strong> bar is split into <span style="color:#16a34a">green</span> (proposals that will be accepted — same height as the green on p<sub>T</sub>) and <span style="color:#dc2626">red</span> (proposals that will be rejected — equal to <span class="math">max(0, q<sub>D</sub> − p<sub>T</sub>)</span>).</li>
+  <li>The <strong>empirical</strong> bar is what the algorithm has actually emitted. Click <em>step</em> repeatedly — green grows from accept events, yellow grows from rejection-then-resample events. Their <em>sum per token</em> tracks p<sub>T</sub>(x).</li>
+</ul>
+
+<p>The whole red mass on the q<sub>D</sub> side has nowhere to go on the accept path — that's the rejection probability <strong>Z</strong>. The residual <span class="math">max(0, p<sub>T</sub> − q<sub>D</sub>) / Z</span> exactly redistributes those rejections so the totals match. <em>Watch the yellow on empirical refill what the red rejected.</em></p>
+
+<div class="widget" id="resid-widget">
+  <div class="title">Residual resampling · live decomposition (vocab size = 8)</div>
+  <div class="hint">Triple bars per token: p_T (target) │ q_D (draft) │ empirical. Hit step a few times, then run 1000.</div>
+
+  <div class="controls">
+    <button id="rd-step" class="primary">step ×1</button>
+    <button id="rd-run">run ×1000</button>
+    <button id="rd-auto">▶ auto</button>
+    <button id="rd-reset">reset</button>
+    <span style="color: var(--text-mute); font-size: 12px; margin-left: 8px;" id="rd-event">—</span>
+  </div>
+
+  <canvas id="rd-canvas" width="760" height="320" style="width:100%; height:320px; background: var(--code-bg); border:1px solid var(--border); border-radius:8px; display:block;"></canvas>
+
+  <div class="kpi-grid" style="margin-top: 12px;">
+    <div class="kpi"><div class="k">rejection mass Z</div><div class="v" id="rd-Z">—</div></div>
+    <div class="kpi"><div class="k">samples drawn</div><div class="v" id="rd-n">0</div></div>
+    <div class="kpi"><div class="k">accept rate α</div><div class="v" id="rd-alpha">—</div></div>
+    <div class="kpi"><div class="k">L1(empirical, p<sub>T</sub>)</div><div class="v" id="rd-l1">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">show the per-token identity this widget illustrates</summary>
+<pre><code>// For any vocab item x:
+accept_mass(x)   = min(p_T(x), q_D(x))         // emitted via accept path
+residual_mass(x) = max(0, p_T(x) - q_D(x))     // emitted via reject→resample path
+
+// Algebraic identity (proof above):
+accept_mass(x) + residual_mass(x) = p_T(x)     for every x
+
+// And by complementary symmetry on q_D:
+accept_mass(x) + reject_mass(x)   = q_D(x)     where reject_mass(x) = max(0, q_D(x) - p_T(x))
+Z = sum(reject_mass) = sum(residual_mass)      // the algorithm's rejection probability</code></pre>
+  </details>
+</div>
+
+<h2>Speedup math</h2>
+
+<p>Let α be the per-position acceptance probability, assumed iid across the K positions in a round (a reasonable working assumption — empirical α drifts only weakly with depth). Then the number of accepted prefix tokens is geometric-truncated:</p>
+
+<div class="math block">
+  E[accepted prefix length] = Σ<sub>i=0..K-1</sub> α<sup>i</sup> = (1 − α<sup>K</sup>) / (1 − α)
+</div>
+
+<p>Every round we additionally emit one extra token — either the residual-resampled correction on first reject, or the bonus sample on a full-accept. So:</p>
+
+<div class="math block">
+  E[tokens / round] = (1 − α<sup>K</sup>) / (1 − α) + 1
+</div>
+
+<p>The cost of a round, measured in target-forward equivalents, where c = t<sub>draft</sub> / t<sub>target</sub>:</p>
+
+<div class="math block">
+  cost / round = 1 + K · c        <em>(one target verify + K sequential draft steps)</em>
+</div>
+
+<p>Speedup over plain decode (which emits 1 token per target step):</p>
+
+<div class="math block">
+  <strong>speedup(α, K, c) = [(1 − α<sup>K</sup>) / (1 − α) + 1] / (1 + K · c)</strong>
+</div>
+
+<h3>Worked example</h3>
+
+<p>α = 0.7, K = 5, c = 0.2 (draft is 5× cheaper than target):</p>
+
+<pre><code>E[tokens/round] = (1 − 0.7^5) / (1 − 0.7) + 1
+                = (1 − 0.16807) / 0.3 + 1
+                = 2.7731 + 1
+                = 3.7731
+
+cost/round      = 1 + 5 · 0.2 = 2.0
+
+speedup         = 3.7731 / 2.0 ≈ 1.89×</code></pre>
+
+<p>That's right in the middle of reported production numbers (1.5-3×). Greedy decoding at temperature 0 gives the highest α and so the best speedup — the draft and target agree more often when both pick argmax.</p>
+
+<h2>Variants worth knowing</h2>
+
+<table>
+  <thead><tr><th>variant</th><th>idea</th><th>tradeoff</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>Medusa</strong> (Cai et al. 2024)</td>
+      <td>Add K small "decoding heads" to the target itself; each predicts (pos+1), (pos+2), …</td>
+      <td>No separate draft model, no separate KV cache. Trains the heads on top of the frozen target.</td>
+    </tr>
+    <tr>
+      <td><strong>EAGLE</strong> (Li et al. 2024)</td>
+      <td>Draft model takes the target's <em>penultimate-layer features</em> as input, not raw token IDs.</td>
+      <td>Higher α — features carry more predictive info than the discrete sampled token.</td>
+    </tr>
+    <tr>
+      <td><strong>Lookahead</strong> (Fu et al. 2024)</td>
+      <td>No draft model. Jacobi fixed-point iteration on the target's own K-step conditional.</td>
+      <td>Trades draft cost for extra target FLOPs; useful when no good small model exists.</td>
+    </tr>
+    <tr>
+      <td><strong>Tree spec</strong> (Sequoia, Medusa-tree)</td>
+      <td>Draft a <em>tree</em> of branches, not a single line. Verify all branches in one target pass; take the longest accepted path.</td>
+      <td>Higher expected accepted length per round at fixed K; needs a kernel that supports custom tree attention masks.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>When speculative decoding does <em>not</em> help</h2>
+
+<div class="callout bad">
+  <div class="label">Three regimes where you lose</div>
+  <ul>
+    <li><strong>Compute-saturated.</strong> Large-batch serving where the target is already near peak FLOPs — the K-token parallel forward is no longer ~free. The +K·c draft cost is just pure overhead.</li>
+    <li><strong>Low α with expensive draft.</strong> Low acceptance erodes the gain, and only pushes below 1× when α is very small <em>and</em> draft cost is high. Plug in α=0.2, K=4, c=0.5: E[tokens/round] = (1 − 0.2<sup>4</sup>) / 0.8 + 1 ≈ 2.248; cost = 1 + 4·0.5 = 3.0; speedup ≈ 0.75×. At c=0.2 you'd still win modestly even at α=0.4 (≈1.32×) — the K·c overhead only dominates when both knobs go bad.</li>
+    <li><strong>Tight KV budget.</strong> Verifying K+1 positions at once needs that much extra KV scratch. Under preemption pressure (lesson 11) spec decoding can push you into eviction.</li>
+  </ul>
+</div>
+
+<h2>Interactive · the speedup landscape</h2>
+
+<p>The speedup formula has three knobs. Slide them and watch the surface. The heatmap below plots speedup(α, K) for the c you set. Sweet spots and dead zones are immediately visible.</p>
+
+<p>Things to find:</p>
+<ul>
+  <li>Set c = 0.2. Trace the speedup ridge as α rises — it bends toward larger K. At α ≥ 0.9, K = 8-10 dominates. At α = 0.5, the ridge stops at K ≈ 3-4: more guesses are just wasted draft work.</li>
+  <li>Set c = 0.5 (slow draft). Most of the heatmap goes cold; only high-α / low-K regions stay green. This is the "no good small model" regime where Lookahead beats classical spec.</li>
+  <li>Drop α to 0.3. Almost the whole grid is &lt; 1.0 — you've made the system slower.</li>
+</ul>
+
+<div class="widget" id="spec-widget">
+  <div class="title">Speedup landscape, speedup(α, K) for fixed c</div>
+  <div class="hint">Green = speedup &gt; 1, blue = &lt; 1. White dot = your current (α, K). The colored stripe to the right reads off your exact value.</div>
+
+  <div class="controls">
+    <label class="inline">α (accept rate): <input type="range" id="sp-alpha" min="0" max="1" step="0.01" value="0.7"> <span class="val" id="sp-alpha-val">0.70</span></label>
+    <label class="inline">K (draft len): <input type="range" id="sp-k" min="1" max="10" step="1" value="5"> <span class="val" id="sp-k-val">5</span></label>
+    <label class="inline">c = t_draft/t_target: <input type="range" id="sp-c" min="0.05" max="1" step="0.05" value="0.2"> <span class="val" id="sp-c-val">0.20</span></label>
+  </div>
+
+  <canvas class="dist-canvas" id="sp-canvas" width="760" height="320" style="height: 320px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">E[tokens/round]</div><div class="v" id="sp-tok">—</div></div>
+    <div class="kpi"><div class="k">cost/round</div><div class="v" id="sp-cost">—</div></div>
+    <div class="kpi"><div class="k">speedup</div><div class="v" id="sp-speedup">—</div></div>
+    <div class="kpi"><div class="k">optimal K @ this α,c</div><div class="v" id="sp-optk">—</div></div>
+  </div>
+
+  <h3 style="margin-top: 22px;">Empirical unbiasedness check</h3>
+  <p style="color: var(--text-mute); font-size: 14px;">Run 5000 rounds of speculative decoding on a synthetic (target, draft) pair and compare the empirical distribution of the first emitted token against the true p<sub>T</sub>. L1 should converge to 0.</p>
+
+  <div class="controls">
+    <button id="sp-verify" class="primary">Run 5000 rounds</button>
+    <span id="sp-verify-status" style="color: var(--text-mute); font-size: 13px;"></span>
+  </div>
+  <canvas class="dist-canvas" id="sp-verify-canvas" width="760" height="160" style="height: 160px;"></canvas>
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">L1(empirical, p_T)</div><div class="v" id="sp-l1">—</div></div>
+    <div class="kpi"><div class="k">rounds run</div><div class="v" id="sp-rounds">—</div></div>
+    <div class="kpi"><div class="k">mean accepted</div><div class="v" id="sp-meanacc">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">show the formula being plotted</summary>
+<pre><code>// expected tokens per round (geometric-truncated + 1 bonus/correction):
+const Etok = (a === 1) ? K + 1 : (1 - Math.pow(a, K)) / (1 - a) + 1;
+// cost per round in target-step-equivalents:
+const cost = 1 + K * c;
+// speedup vs plain decode:
+const speedup = Etok / cost;</code></pre>
+  </details>
+</div>
+
+<footer class="lesson-nav">
+  <a href="06_serving_architecture.html">
+    <span class="dir">← Prev</span>
+    <span class="ttl">06 · Serving architecture</span>
+  </a>
+  <a class="next" href="08_pd_disaggregation.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">08 · P/D disaggregation</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  // ── speedup-landscape widget ────────────────────────────────────────────────
+  const canvas = document.getElementById('sp-canvas');
+  const ctx = canvas.getContext('2d');
+  const aEl = document.getElementById('sp-alpha');
+  const kEl = document.getElementById('sp-k');
+  const cEl = document.getElementById('sp-c');
+
+  function speedup(a, K, c) {
+    const Etok = (a >= 0.9999) ? (K + 1) : (1 - Math.pow(a, K)) / (1 - a) + 1;
+    return { Etok, cost: 1 + K * c, speedup: Etok / (1 + K * c) };
+  }
+
+  // Lerp between several anchor colors based on value vs 1.0.
+  function colorRamp(v) {
+    // v in roughly 0..3
+    // < 0.5: deep red; 0.5-1: orange; 1: dim; 1-2: green; > 2: bright green
+    if (v < 0.5) {
+      const t = v / 0.5;
+      return mix([60, 18, 30], [120, 40, 50], t);
+    } else if (v < 1.0) {
+      const t = (v - 0.5) / 0.5;
+      return mix([120, 40, 50], [60, 60, 70], t);
+    } else if (v < 2.0) {
+      const t = (v - 1.0) / 1.0;
+      return mix([60, 70, 70], [30, 150, 90], t);
+    } else {
+      const t = Math.min(1, (v - 2.0) / 1.5);
+      return mix([30, 150, 90], [110, 220, 140], t);
+    }
+  }
+  function mix(a, b, t) {
+    return `rgb(${Math.round(a[0] + (b[0]-a[0])*t)}, ${Math.round(a[1] + (b[1]-a[1])*t)}, ${Math.round(a[2] + (b[2]-a[2])*t)})`;
+  }
+
+  function render() {
+    const a = parseFloat(aEl.value), K = parseInt(kEl.value, 10), c = parseFloat(cEl.value);
+    document.getElementById('sp-alpha-val').textContent = a.toFixed(2);
+    document.getElementById('sp-k-val').textContent     = String(K);
+    document.getElementById('sp-c-val').textContent     = c.toFixed(2);
+
+    const s = speedup(a, K, c);
+    document.getElementById('sp-tok').textContent     = s.Etok.toFixed(2);
+    document.getElementById('sp-cost').textContent    = s.cost.toFixed(2);
+    document.getElementById('sp-speedup').textContent = s.speedup.toFixed(2) + '×';
+
+    // optimal K for current α and c
+    let bestK = 1, bestS = 0;
+    for (let k = 1; k <= 20; k++) {
+      const sk = speedup(a, k, c).speedup;
+      if (sk > bestS) { bestS = sk; bestK = k; }
+    }
+    document.getElementById('sp-optk').textContent = `K=${bestK} (${bestS.toFixed(2)}×)`;
+
+    // draw heatmap
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    const padL = 56, padR = 110, padT = 18, padB = 38;
+    const plotW = W - padL - padR;
+    const plotH = H - padT - padB;
+    const NA = 50, NK = 10;
+
+    // Cells
+    for (let i = 0; i < NA; i++) {
+      for (let j = 0; j < NK; j++) {
+        const ai = (i + 0.5) / NA;          // α in (0,1)
+        const kj = j + 1;
+        const v = speedup(ai, kj, c).speedup;
+        const x = padL + (i / NA) * plotW;
+        const w = plotW / NA + 1;
+        const y = padT + plotH - ((j + 1) / NK) * plotH;
+        const h = plotH / NK + 1;
+        ctx.fillStyle = colorRamp(v);
+        ctx.fillRect(x, y, w, h);
+      }
+    }
+
+    // Iso-line at speedup = 1.0 (approximate, scan per K).
+    ctx.strokeStyle = '#d97706';
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    let started = false;
+    for (let j = 0; j < NK; j++) {
+      const kj = j + 1;
+      // find α s.t. speedup ≈ 1
+      let prev = speedup(0.01, kj, c).speedup;
+      for (let i = 1; i <= 100; i++) {
+        const ai = i / 100;
+        const cur = speedup(ai, kj, c).speedup;
+        if (prev < 1 && cur >= 1) {
+          const t = (1 - prev) / (cur - prev);
+          const aIso = (i - 1 + t) / 100;
+          const x = padL + aIso * plotW;
+          const y = padT + plotH - ((j + 0.5) / NK) * plotH;
+          if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+          break;
+        }
+        prev = cur;
+      }
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Axes
+    ctx.fillStyle = '#5b6573';
+    ctx.font = '11px monospace';
+    // x labels (α)
+    for (let i = 0; i <= 5; i++) {
+      const aTick = i / 5;
+      const x = padL + aTick * plotW;
+      ctx.fillText(aTick.toFixed(1), x - 8, padT + plotH + 14);
+    }
+    // y labels (K)
+    for (let j = 0; j < NK; j++) {
+      const kj = j + 1;
+      const y = padT + plotH - ((j + 0.5) / NK) * plotH + 4;
+      ctx.fillText('K=' + kj, 10, y);
+    }
+    // axis titles
+    ctx.fillStyle = '#1f2430';
+    ctx.fillText('α  (per-position acceptance prob.)', padL + plotW/2 - 80, padT + plotH + 30);
+
+    // Current (α, K) marker
+    const mx = padL + a * plotW;
+    const my = padT + plotH - ((K - 0.5) / NK) * plotH;
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(mx, my, 5, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(mx, my, 5, 0, Math.PI * 2); ctx.stroke();
+    ctx.lineWidth = 1;
+    ctx.fillStyle = '#fff';
+    ctx.font = '11px monospace';
+    ctx.fillText(s.speedup.toFixed(2) + '×', mx + 8, my - 6);
+
+    // Right-side colorbar
+    const cbX = padL + plotW + 24, cbW = 18, cbY = padT, cbH = plotH;
+    const NB = 80;
+    for (let i = 0; i < NB; i++) {
+      const v = (i / (NB - 1)) * 3.0;  // 0..3×
+      ctx.fillStyle = colorRamp(v);
+      ctx.fillRect(cbX, cbY + cbH - (i + 1) * (cbH / NB), cbW, cbH / NB + 1);
+    }
+    ctx.strokeStyle = '#dde2ea';
+    ctx.strokeRect(cbX, cbY, cbW, cbH);
+    ctx.fillStyle = '#5b6573';
+    ctx.font = '10px monospace';
+    [0, 1, 2, 3].forEach(v => {
+      const y = cbY + cbH - (v / 3) * cbH;
+      ctx.fillText(v.toFixed(0) + '×', cbX + cbW + 4, y + 3);
+      ctx.strokeStyle = '#94a3b8';
+      ctx.beginPath(); ctx.moveTo(cbX + cbW, y); ctx.lineTo(cbX + cbW + 3, y); ctx.stroke();
+    });
+    // 1× tick highlight
+    const y1 = cbY + cbH - (1 / 3) * cbH;
+    ctx.strokeStyle = '#d97706';
+    ctx.setLineDash([3, 2]);
+    ctx.beginPath(); ctx.moveTo(cbX - 2, y1); ctx.lineTo(cbX + cbW + 2, y1); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  [aEl, kEl, cEl].forEach(el => el.addEventListener('input', render));
+  render();
+
+  // ── unbiasedness verifier ───────────────────────────────────────────────────
+  // Tiny vocab. Synthetic p_T and p_D = mix(p_T, uniform); α controlled implicitly.
+  const VOCAB = 16;
+  function makeDist(seed) {
+    // Sharpened random distribution, deterministic per seed.
+    let s = seed;
+    function r() { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }
+    const xs = Array.from({length: VOCAB}, () => Math.pow(r(), 2.0));
+    const sum = xs.reduce((a, b) => a + b, 0);
+    return xs.map(x => x / sum);
+  }
+  function sample(d, rng) {
+    const u = rng();
+    let acc = 0;
+    for (let i = 0; i < d.length; i++) { acc += d[i]; if (u < acc) return i; }
+    return d.length - 1;
+  }
+  function mixDist(p, mixUniform) {
+    const u = 1 / p.length;
+    return p.map(pi => mixUniform * u + (1 - mixUniform) * pi);
+  }
+
+  function specRound(pT, pD, rng) {
+    // Single round, K=4, just position 1 token (which is what we measure).
+    // For unbiasedness we only need the marginal of the FIRST emitted token.
+    const q = pD;
+    const x = sample(q, rng);
+    const ratio = pT[x] / q[x];
+    if (rng() < Math.min(1, ratio)) return { tok: x, accepted: 1 };
+    // residual
+    const resid = pT.map((p, i) => Math.max(0, p - q[i]));
+    const Z = resid.reduce((a, b) => a + b, 0);
+    if (Z <= 0) return { tok: sample(pT, rng), accepted: 0 };
+    const r = resid.map(v => v / Z);
+    return { tok: sample(r, rng), accepted: 0 };
+  }
+
+  const vCanvas = document.getElementById('sp-verify-canvas');
+  const vCtx = vCanvas.getContext('2d');
+
+  function drawVerify(empirical, target, n) {
+    const dpr = window.devicePixelRatio || 1;
+    const W = vCanvas.clientWidth, H = vCanvas.clientHeight;
+    if (vCanvas.width !== W * dpr) { vCanvas.width = W * dpr; vCanvas.height = H * dpr; }
+    vCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    vCtx.clearRect(0, 0, W, H);
+    const padX = 20, padY = 20;
+    const plotW = W - 2 * padX, plotH = H - 2 * padY;
+    const barW = plotW / VOCAB;
+    const maxP = Math.max(...target, ...empirical);
+    // target bars (light)
+    for (let i = 0; i < VOCAB; i++) {
+      const x = padX + i * barW;
+      const ht = (target[i] / maxP) * plotH;
+      vCtx.fillStyle = 'rgba(106, 169, 255, 0.35)';
+      vCtx.fillRect(x + 2, padY + plotH - ht, barW * 0.45, ht);
+    }
+    // empirical bars
+    for (let i = 0; i < VOCAB; i++) {
+      const x = padX + i * barW;
+      const he = (empirical[i] / maxP) * plotH;
+      vCtx.fillStyle = '#16a34a';
+      vCtx.fillRect(x + 2 + barW * 0.5, padY + plotH - he, barW * 0.45, he);
+    }
+    // legend
+    vCtx.font = '11px monospace'; vCtx.fillStyle = '#5b6573';
+    vCtx.fillRect(padX, padY - 12, 10, 10); vCtx.fillStyle = 'rgba(106, 169, 255, 0.7)';
+    vCtx.fillRect(padX, padY - 12, 10, 10); vCtx.fillStyle = '#5b6573';
+    vCtx.fillText('target p_T', padX + 14, padY - 4);
+    vCtx.fillStyle = '#16a34a'; vCtx.fillRect(padX + 100, padY - 12, 10, 10);
+    vCtx.fillStyle = '#5b6573'; vCtx.fillText('empirical (n=' + n + ')', padX + 114, padY - 4);
+  }
+
+  document.getElementById('sp-verify').addEventListener('click', () => {
+    const pT = makeDist(7);
+    const pD = mixDist(pT, 0.4);            // moderate agreement
+    let seed = 31337;
+    const rng = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+    const counts = new Array(VOCAB).fill(0);
+    const N = 5000;
+    let acc = 0;
+    const statusEl = document.getElementById('sp-verify-status');
+    statusEl.textContent = 'running…';
+    // Run in chunks so the canvas can repaint.
+    let i = 0;
+    function chunk() {
+      const end = Math.min(N, i + 500);
+      for (; i < end; i++) {
+        const { tok, accepted } = specRound(pT, pD, rng);
+        counts[tok]++;
+        acc += accepted;
+      }
+      const empirical = counts.map(c => c / Math.max(1, i));
+      const L1 = empirical.reduce((s, v, k) => s + Math.abs(v - pT[k]), 0);
+      drawVerify(empirical, pT, i);
+      document.getElementById('sp-l1').textContent = L1.toFixed(4);
+      document.getElementById('sp-rounds').textContent = String(i);
+      document.getElementById('sp-meanacc').textContent = (acc / i).toFixed(2);
+      if (i < N) { requestAnimationFrame(chunk); }
+      else { statusEl.textContent = 'done. L1 → 0 confirms unbiasedness.'; }
+    }
+    chunk();
+  });
+})();
+</script>
+
+<script>
+/* ── Lesson 07 · residual resampling per-token decomposition ─────────────── */
+(function(){
+  const V = 8;
+  const LABELS = ['A','B','C','D','E','F','G','H'];
+
+  // Distributions chosen so every "case" appears:
+  //   - p > q  (D, F, G):    yellow residual contribution
+  //   - p < q  (A, E, H):    red rejection mass
+  //   - p ≈ q  (B, C):       mostly green
+  const pT = [0.05, 0.20, 0.20, 0.18, 0.04, 0.16, 0.12, 0.05];
+  const qD = [0.14, 0.18, 0.18, 0.06, 0.13, 0.06, 0.04, 0.21];
+  // sanity: each sums to 1.0
+  const accept_mass   = pT.map((p,i) => Math.min(p, qD[i]));            // green
+  const residual_mass = pT.map((p,i) => Math.max(0, p - qD[i]));        // yellow on p_T side
+  const reject_mass   = qD.map((q,i) => Math.max(0, q - pT[i]));        // red on q_D side
+  const Z             = reject_mass.reduce((a,b) => a+b, 0);            // = sum(residual_mass)
+  const residual_pdf  = (Z > 0) ? residual_mass.map(r => r/Z) : residual_mass.slice();
+
+  // ── Sampling state
+  let countsAccept = new Array(V).fill(0);
+  let countsResid  = new Array(V).fill(0);
+  let n = 0;
+  let lastEvent = null;       // {tok, path:'accept'|'reject_resample', proposed?}
+
+  function rand() { return Math.random(); }
+  function sampleFrom(d) {
+    const u = rand();
+    let acc = 0;
+    for (let i = 0; i < V; i++) { acc += d[i]; if (u < acc) return i; }
+    return V - 1;
+  }
+  function stepOnce() {
+    const x = sampleFrom(qD);
+    const r = rand();
+    const ratio = pT[x] / qD[x];
+    if (r < Math.min(1, ratio)) {
+      countsAccept[x]++; n++;
+      lastEvent = {tok: x, path: 'accept', proposed: x};
+    } else {
+      const y = sampleFrom(residual_pdf);
+      countsResid[y]++; n++;
+      lastEvent = {tok: y, path: 'reject_resample', proposed: x};
+    }
+  }
+  function reset() {
+    countsAccept.fill(0); countsResid.fill(0); n = 0; lastEvent = null;
+  }
+
+  // ── DOM
+  const canvas = document.getElementById('rd-canvas');
+  const ctx = canvas.getContext('2d');
+  const btnStep  = document.getElementById('rd-step');
+  const btnRun   = document.getElementById('rd-run');
+  const btnAuto  = document.getElementById('rd-auto');
+  const btnReset = document.getElementById('rd-reset');
+  const evEl     = document.getElementById('rd-event');
+
+  let autoTimer = null;
+  function stopAuto() {
+    if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+    btnAuto.textContent = '▶ auto';
+  }
+  function startAuto() {
+    btnAuto.textContent = '⏸ pause';
+    autoTimer = setInterval(() => { stepOnce(); render(); }, 90);
+  }
+  btnStep .addEventListener('click', () => { stopAuto(); stepOnce(); render(); });
+  btnRun  .addEventListener('click', () => { stopAuto(); for (let k=0;k<1000;k++) stepOnce(); render(); });
+  btnReset.addEventListener('click', () => { stopAuto(); reset(); render(); });
+  btnAuto .addEventListener('click', () => autoTimer ? stopAuto() : startAuto());
+
+  function render() {
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    const padL = 22, padR = 22, padT = 38, padB = 36;
+    const plotW = W - padL - padR;
+    const plotH = H - padT - padB;
+    const colW = plotW / V;
+    const triW = colW * 0.85;
+    const barW = triW / 3 - 2;
+    const gap  = 2;
+
+    // Y-scale based on max bar value across panels
+    const empCur = new Array(V).fill(0).map((_,i) => (countsAccept[i] + countsResid[i]) / Math.max(1, n));
+    const yMax = Math.max(0.32, ...pT, ...qD, ...empCur) * 1.05;
+
+    // Y axis gridlines
+    ctx.strokeStyle = '#222a38';
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '10px var(--mono), monospace';
+    for (let g = 0; g <= 4; g++) {
+      const v = (g / 4) * yMax;
+      const y = padT + plotH - (v / yMax) * plotH;
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + plotW, y); ctx.stroke();
+      ctx.textAlign = 'right';
+      ctx.fillText(v.toFixed(2), padL - 4, y + 3);
+    }
+
+    // Section header
+    ctx.fillStyle = '#1f2430';
+    ctx.font = '11px var(--mono), monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText('per token, left→right: p_T  │  q_D  │  empirical', padL, 8);
+
+    function barRect(x, value, color, baselineY) {
+      const h = (value / yMax) * plotH;
+      ctx.fillStyle = color;
+      ctx.fillRect(x, baselineY - h, barW, h);
+      return h;
+    }
+
+    for (let i = 0; i < V; i++) {
+      const colX = padL + i * colW + (colW - triW) / 2;
+      const baselineY = padT + plotH;
+
+      const xPT  = colX;
+      const xQD  = colX + barW + gap;
+      const xEMP = colX + 2 * (barW + gap);
+
+      // p_T bar: green min + yellow residual
+      const accY = baselineY - (accept_mass[i] / yMax) * plotH;
+      barRect(xPT, accept_mass[i],    '#16a34a', baselineY);
+      ctx.fillStyle = '#d97706';
+      ctx.fillRect(xPT, accY - (residual_mass[i] / yMax) * plotH, barW,
+                       (residual_mass[i] / yMax) * plotH);
+
+      // q_D bar: green min + red reject
+      const accY2 = baselineY - (accept_mass[i] / yMax) * plotH;
+      barRect(xQD, accept_mass[i],    '#16a34a', baselineY);
+      ctx.fillStyle = '#dc2626';
+      ctx.fillRect(xQD, accY2 - (reject_mass[i] / yMax) * plotH, barW,
+                       (reject_mass[i] / yMax) * plotH);
+
+      // empirical bar: green accept counts + yellow residual counts
+      const accFrac  = countsAccept[i] / Math.max(1, n);
+      const residFrac= countsResid[i]  / Math.max(1, n);
+      const accH     = (accFrac / yMax) * plotH;
+      const residH   = (residFrac / yMax) * plotH;
+      ctx.fillStyle = '#16a34a';
+      ctx.fillRect(xEMP, baselineY - accH, barW, accH);
+      ctx.fillStyle = '#d97706';
+      ctx.fillRect(xEMP, baselineY - accH - residH, barW, residH);
+
+      // outline empirical bar with target dashed silhouette
+      ctx.strokeStyle = '#2563eb';
+      ctx.setLineDash([2, 2]);
+      const tgtH = (pT[i] / yMax) * plotH;
+      ctx.strokeRect(xEMP - 1, baselineY - tgtH, barW + 2, tgtH);
+      ctx.setLineDash([]);
+
+      // Highlight last-event tok
+      if (lastEvent && lastEvent.tok === i) {
+        ctx.strokeStyle = (lastEvent.path === 'accept') ? '#16a34a' : '#d97706';
+        ctx.lineWidth = 2;
+        const hh = (lastEvent.path === 'accept') ? accH : (accH + residH);
+        ctx.strokeRect(xEMP - 1.5, baselineY - hh - 1.5, barW + 3, hh + 3);
+        ctx.lineWidth = 1;
+      }
+
+      // Token label
+      ctx.fillStyle = '#5b6573';
+      ctx.font = '11px var(--mono), monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillText(LABELS[i], colX + triW / 2, baselineY + 6);
+
+      // Small captions under each triple
+      ctx.fillStyle = '#3f4858';
+      ctx.font = '8px var(--mono), monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('p', xPT + barW/2,  baselineY + 22);
+      ctx.fillText('q', xQD + barW/2,  baselineY + 22);
+      ctx.fillText('emp', xEMP + barW/2, baselineY + 22);
+    }
+
+    // Legend in upper-right
+    const ly = 8;
+    const legendItems = [
+      ['#16a34a', 'min(p,q)  · accept'],
+      ['#d97706', 'max(0,p−q) · residual'],
+      ['#dc2626', 'max(0,q−p) · rejected'],
+    ];
+    let lx = W - padR;
+    ctx.font = '10px var(--mono), monospace';
+    ctx.textBaseline = 'top';
+    for (let i = legendItems.length - 1; i >= 0; i--) {
+      const [c, t] = legendItems[i];
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#5b6573';
+      ctx.fillText(t, lx - 14, ly);
+      lx -= ctx.measureText(t).width + 4;
+      ctx.fillStyle = c;
+      ctx.fillRect(lx - 10, ly + 1, 10, 10);
+      lx -= 22;
+    }
+
+    // KPIs
+    const empSum = empCur;
+    const L1 = pT.reduce((s,v,i) => s + Math.abs(v - empSum[i]), 0);
+    const acc = countsAccept.reduce((a,b) => a+b, 0);
+    document.getElementById('rd-Z').textContent     = Z.toFixed(3);
+    document.getElementById('rd-n').textContent     = String(n);
+    document.getElementById('rd-alpha').textContent = (n === 0) ? '—' : (acc / n).toFixed(3);
+    document.getElementById('rd-l1').textContent    = (n === 0) ? '—' : L1.toFixed(3);
+
+    // last-event narration
+    if (lastEvent) {
+      const x = lastEvent.proposed, y = lastEvent.tok;
+      if (lastEvent.path === 'accept') {
+        evEl.textContent = `proposed ${LABELS[x]}  ·  accepted  ·  emitted ${LABELS[x]}  (green)`;
+        evEl.style.color = '#16a34a';
+      } else {
+        evEl.textContent = `proposed ${LABELS[x]}  ·  rejected  ·  resampled from residual → emitted ${LABELS[y]}  (yellow)`;
+        evEl.style.color = '#d97706';
+      }
+    } else {
+      evEl.textContent = '—';
+      evEl.style.color = 'var(--text-mute)';
+    }
+  }
+
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>22 · Writing Triton kernels</title><link rel="stylesheet" href="../RL/lessons/style.css"><style>main{overflow-wrap:break-word}table{table-layout:fixed}th,td{overflow-wrap:anywhere}input[type="range"]{max-width:min(200px,44vw)}label.inline{flex-wrap:wrap;max-width:100%}</style></head>
+<body><header class="topnav"><div class="inner"><a class="crumb-link" href="../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">gpu_kernel_serving</a><span class="crumb">/</span><span class="crumb">22 · writing triton</span><span class="step-pill">lesson 22 / 24</span></div></header><main>
+
+<h1>Writing Triton kernels</h1>
+<p class="subtitle"><strong>Triton trades CUDA's thread-level control for a per-program tile language with an autotuner.</strong> You give up some last-mile control over mma scheduling and warp specialization in exchange for far less code, automatic shape tuning, and easier maintenance. For 95 % of "I need a fused kernel" cases, that trade is the right one.</p>
+
+<h2>The question this lesson answers</h2>
+<p>You profiled (lesson 20), located a bandwidth-bound chain of small ops (lesson 21), and decided fusion is the lever. Now what? You could write CUDA, but you don't need 100 % of peak — you need a fused kernel today that's within 80–90 % of optimal, autotunable across shapes, easy to maintain. That's exactly what Triton is for.</p>
+
+<h2>Triton's programming model in one diagram</h2>
+<svg viewBox="0 0 880 320" class="diagram" role="img" aria-label="Triton model: programs are tiles, vector ops operate within a tile, autotune chooses tile sizes per shape">
+  <defs><marker id="t22" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <g font-size="11" fill="var(--text-mute)">
+    <rect class="node-bg" x="20"  y="40" width="200" height="80" rx="6"/><text x="120" y="64" text-anchor="middle" font-weight="700" fill="var(--text)">Triton "program"</text><text x="120" y="84" text-anchor="middle">1D / 2D / 3D grid id</text><text x="120" y="100" text-anchor="middle">handles one tile of work</text>
+    <rect class="node-bg" x="240" y="40" width="200" height="80" rx="6"/><text x="340" y="64" text-anchor="middle" font-weight="700" fill="var(--text)">tile</text><text x="340" y="84" text-anchor="middle">BLOCK_M × BLOCK_N etc.</text><text x="340" y="100" text-anchor="middle">vectorized loads/stores</text>
+    <rect class="node-bg" x="460" y="40" width="200" height="80" rx="6"/><text x="560" y="64" text-anchor="middle" font-weight="700" fill="var(--text)">on-chip math</text><text x="560" y="84" text-anchor="middle">tl.dot, tl.sum, tl.exp</text><text x="560" y="100" text-anchor="middle">no explicit warps</text>
+    <rect class="node-bg" x="680" y="40" width="180" height="80" rx="6"/><text x="770" y="64" text-anchor="middle" font-weight="700" fill="var(--text)">autotune</text><text x="770" y="84" text-anchor="middle">configs per shape key</text><text x="770" y="100" text-anchor="middle">cached compiled binaries</text>
+
+    <path class="edge" d="M220 80 L240 80" marker-end="url(#t22)"/>
+    <path class="edge" d="M440 80 L460 80" marker-end="url(#t22)"/>
+    <path class="edge" d="M660 80 L680 80" marker-end="url(#t22)"/>
+  </g>
+  <rect x="20" y="160" width="840" height="60" rx="6" fill="var(--bg-soft)" stroke="var(--border)"/>
+  <text x="40" y="182" font-size="12" fill="var(--text)" font-weight="700">vs CUDA</text>
+  <text x="40" y="202" font-size="12" fill="var(--text-mute)">Triton hides threads and warps. You write tile-level code; the compiler maps it. You give up some last-mile control (mma scheduling, warp specialization) for far less code and an autotuner.</text>
+  <rect x="20" y="232" width="840" height="60" rx="6" fill="var(--bg-soft)" stroke="var(--border)"/>
+  <text x="40" y="254" font-size="12" fill="var(--text)" font-weight="700">when Triton wins</text>
+  <text x="40" y="274" font-size="12" fill="var(--text-mute)">Custom fusions, novel reductions, kernels that need to track new layouts. cuBLAS/CUTLASS will still beat hand-Triton for vanilla bf16 matmul because they hand-tune mma sequences and async copies.</text>
+</svg>
+
+<h2>The Triton DSL, just the parts you need</h2>
+<table><thead><tr><th>Primitive</th><th>Purpose</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>@triton.jit</code></td><td>JIT-compile this Python function as a kernel.</td><td>The function is staged — runs at compile time, emits PTX.</td></tr>
+<tr><td><code>tl.program_id(axis)</code></td><td>Which tile is this program.</td><td>Up to 3 axes. Map your problem decomposition here.</td></tr>
+<tr><td><code>tl.arange(0, BLOCK)</code></td><td>Vector of compile-time-known length.</td><td>The "thread vector." Operations on it are SIMD.</td></tr>
+<tr><td><code>tl.load(ptr, mask, other)</code></td><td>Coalesced load with predicate.</td><td>Out-of-bounds lanes get <code>other</code>. Always pass a mask for the boundary tile.</td></tr>
+<tr><td><code>tl.store(ptr, val, mask)</code></td><td>Coalesced store with predicate.</td><td>Same boundary contract.</td></tr>
+<tr><td><code>tl.dot(a, b)</code></td><td>Tile matmul. Hits tensor cores when shapes allow.</td><td>The right primitive for GEMM-shaped inner loops.</td></tr>
+<tr><td><code>tl.sum / tl.max / tl.min / tl.cumsum</code></td><td>Reductions across a tile axis.</td><td>Compiles to warp shuffles + SMEM.</td></tr>
+<tr><td><code>tl.exp / tl.log / tl.rsqrt</code></td><td>Math intrinsics (fast hardware versions).</td><td>Lower precision than std libm but usually fine.</td></tr>
+<tr><td><code>tl.constexpr</code></td><td>Marks an argument as compile-time.</td><td>Tile sizes, dtypes. Anything that affects code generation.</td></tr>
+<tr><td><code>@triton.autotune(configs, key=...)</code></td><td>Compile several configs; pick the fastest on first call per key.</td><td>The autotuner is your friend. Use it.</td></tr>
+<tr><td><code>num_warps</code>, <code>num_stages</code> (config knobs)</td><td><code>num_warps</code>: warps per program (occupancy vs work-per-warp). <code>num_stages</code>: depth of the software pipeline Triton emits for overlapping memory loads with compute.</td><td>Both are config-level, not per-instruction. The autotuner sweeps them.</td></tr>
+</tbody></table>
+
+<h2>A complete fused kernel: GELU + linear bias</h2>
+<p>Suppose downstream we want <code>y = gelu(x @ w + b)</code>. With eager PyTorch that is 3 launches (matmul → add → gelu). A Triton kernel folds the bias and activation into the GEMM's epilogue.</p>
+<pre><code>import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BM': 128, 'BN': 128, 'BK': 32}, num_warps=4, num_stages=3),
+        triton.Config({'BM': 128, 'BN': 256, 'BK': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BM': 64,  'BN': 64,  'BK': 64}, num_warps=4, num_stages=4),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def gelu_linear(
+    x_ptr, w_ptr, b_ptr, y_ptr,
+    M, N, K,
+    sxm, sxk, swk, swn, sym, syn,         # strides
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+
+    # outer-product K-loop with on-chip accumulation
+    for k in range(0, K, BK):
+        a = tl.load(x_ptr + offs_m[:, None]*sxm + (k+offs_k)[None, :]*sxk,
+                    mask=(offs_m[:, None] < M) & ((k+offs_k)[None, :] < K),
+                    other=0.).to(tl.bfloat16)
+        bw = tl.load(w_ptr + (k+offs_k)[:, None]*swk + offs_n[None, :]*swn,
+                     mask=((k+offs_k)[:, None] < K) & (offs_n[None, :] < N),
+                     other=0.).to(tl.bfloat16)
+        acc += tl.dot(a, bw)             # tensor-core matmul on tile
+
+    # fused epilogue: bias + GELU
+    bias = tl.load(b_ptr + offs_n, mask=offs_n < N, other=0.).to(tl.float32)
+    z = acc + bias[None, :]
+    # gelu approx: 0.5 * z * (1 + tanh(sqrt(2/pi) * (z + 0.044715 * z^3)))
+    c = 0.7978845608    # sqrt(2/pi)
+    y = 0.5 * z * (1.0 + tl.tanh(c * (z + 0.044715 * z*z*z)))
+
+    tl.store(y_ptr + offs_m[:, None]*sym + offs_n[None, :]*syn,
+             y.to(tl.bfloat16),
+             mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))</code></pre>
+
+<h2>The wrapper that makes it a PyTorch op</h2>
+<pre><code>def gelu_linear_fn(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    M, K = x.shape
+    K2, N = w.shape
+    assert K == K2
+    y = torch.empty(M, N, device=x.device, dtype=x.dtype)
+    grid = lambda meta: (triton.cdiv(M, meta['BM']), triton.cdiv(N, meta['BN']))
+    gelu_linear[grid](
+        x, w, b, y,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        w.stride(0), w.stride(1),
+        y.stride(0), y.stride(1),
+    )
+    return y</code></pre>
+
+<p>For backward, register a <code>torch.autograd.Function</code> with explicit <code>forward</code> and <code>backward</code> Triton kernels — or write a single forward and let <code>torch.compile</code> (lesson 23) handle the backward by tracing through your op.</p>
+
+<h2>The design loop</h2>
+<svg viewBox="0 0 820 220" class="diagram" role="img" aria-label="Triton design loop: hypothesis from profile, sketch kernel, run benchmark, ncu profile, refine">
+  <defs><marker id="tl22" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <g font-size="11" fill="var(--text-mute)">
+    <rect class="node-bg" x="20"  y="60" width="150" height="60" rx="6"/><text x="95"  y="84" text-anchor="middle" font-weight="700" fill="var(--text)">1 · hypothesis</text><text x="95"  y="102" text-anchor="middle">"fusion will help"</text>
+    <rect class="node-bg" x="190" y="60" width="150" height="60" rx="6"/><text x="265" y="84" text-anchor="middle" font-weight="700" fill="var(--text)">2 · sketch kernel</text><text x="265" y="102" text-anchor="middle">prologue/load/math/epilogue</text>
+    <rect class="node-bg" x="360" y="60" width="150" height="60" rx="6"/><text x="435" y="84" text-anchor="middle" font-weight="700" fill="var(--text)">3 · correctness</text><text x="435" y="102" text-anchor="middle">vs PyTorch reference</text>
+    <rect class="node-bg" x="530" y="60" width="150" height="60" rx="6"/><text x="605" y="84" text-anchor="middle" font-weight="700" fill="var(--text)">4 · benchmark</text><text x="605" y="102" text-anchor="middle">do_bench / autotune</text>
+    <rect class="node-bg" x="700" y="60" width="100" height="60" rx="6"/><text x="750" y="84" text-anchor="middle" font-weight="700" fill="var(--text)">5 · ncu</text><text x="750" y="102" text-anchor="middle">why slow?</text>
+    <path class="edge" d="M170 90 L190 90" marker-end="url(#tl22)"/>
+    <path class="edge" d="M340 90 L360 90" marker-end="url(#tl22)"/>
+    <path class="edge" d="M510 90 L530 90" marker-end="url(#tl22)"/>
+    <path class="edge" d="M680 90 L700 90" marker-end="url(#tl22)"/>
+    <path class="edge" d="M750 120 C740 170 200 170 200 120" marker-end="url(#tl22)"/>
+    <text x="475" y="170" text-anchor="middle" font-size="11">refine tiles, autotune configs, fix register spill, etc.</text>
+  </g>
+</svg>
+
+<h2>What autotune actually does</h2>
+<p>The autotuner stores a dict keyed by your <code>key=[...]</code> values. For each new key, it compiles every config, runs each one a few times, picks the fastest, and caches the choice. Subsequent calls with the same key skip the search. Two practical consequences:</p>
+<ul>
+  <li><strong>The first call per shape is slow</strong> — sometimes hundreds of ms. Run a warmup pass before timing.</li>
+  <li><strong>Pick the <code>key</code> carefully.</strong> If you key only on <code>M</code> but performance also depends on <code>N</code>, you'll cache a suboptimal config. Conversely, if you key on too many fields, every new shape is a fresh search.</li>
+</ul>
+
+<pre><code># benchmark a single config
+ms = triton.testing.do_bench(lambda: gelu_linear_fn(x, w, b), warmup=25, rep=100)
+print(f"{ms:.3f} ms")</code></pre>
+
+<h2>Common pitfalls and how to spot them</h2>
+<table><thead><tr><th>Pitfall</th><th>Symptom</th><th>Fix</th></tr></thead><tbody>
+<tr><td>No boundary mask</td><td>Out-of-bounds reads → segfault or wrong outputs at irregular shapes.</td><td>Always pass <code>mask=</code> and <code>other=</code> for non-multiples of BLOCK.</td></tr>
+<tr><td>Wrong stride argument order</td><td>Garbled output for non-contiguous tensors.</td><td>Pass <code>x.stride(0), x.stride(1)</code> in the same order the kernel multiplies.</td></tr>
+<tr><td>Accumulating in bf16</td><td>Loss drift; large-K matmuls go visibly wrong.</td><td>Always accumulate in fp32 (<code>tl.zeros(..., dtype=tl.float32)</code>).</td></tr>
+<tr><td>Forgot <code>tl.constexpr</code></td><td>Tile sizes become runtime values; compiler can't vectorize.</td><td>Mark <code>BM</code>, <code>BN</code>, <code>BK</code>, dtypes as <code>tl.constexpr</code>.</td></tr>
+<tr><td>Register spill</td><td>Achieved occupancy &lt;25 %; ncu shows "No Eligible" stalls.</td><td>Smaller tile, fewer accumulators, or set <code>maxnreg</code>.</td></tr>
+<tr><td>SMEM bank conflicts (non-dot patterns)</td><td>SM throughput much lower than peak in reductions or custom SMEM scratchpad usage.</td><td>Triton's layout planner picks swizzle patterns to avoid bank conflicts in <code>tl.dot</code> automatically. If you see conflicts, they are almost always in custom reductions; pad strides or restructure the access pattern.</td></tr>
+<tr><td>Autotune never re-runs</td><td>Cached config is stale after you change the kernel.</td><td>Clear <code>~/.triton/cache</code> or bump a constant in the function.</td></tr>
+<tr><td>Reduction across blocks</td><td>You wrote <code>tl.atomic_add</code> across many programs and lost determinism.</td><td>Use a two-pass scheme: per-block partial → second kernel to combine.</td></tr>
+</tbody></table>
+
+<h2>When NOT to write Triton</h2>
+<ul>
+  <li><strong>Vanilla GEMM:</strong> cuBLAS / cuBLASLt and CUTLASS are usually 5–15 % faster. Use them via <code>torch.matmul</code> or <code>torch._scaled_mm</code>.</li>
+  <li><strong>Attention:</strong> FlashAttention v3 + FlashInfer have hand-tuned producer-consumer kernels with TMA. Don't reinvent unless you're targeting a feature they don't support.</li>
+  <li><strong>Communication kernels:</strong> NCCL is the answer. Triton doesn't talk to NVLink primitives directly.</li>
+  <li><strong>The kernel is going to be 1 % of the step:</strong> not worth the maintenance cost.</li>
+</ul>
+<p>Use Triton when (a) no library covers the operation, (b) the operation is bandwidth-bound and fusion saves bytes, or (c) you need autotuning across many shapes and don't have time to hand-tune CUDA per shape.</p>
+
+<h2>Interactive · is Triton the right tool?</h2>
+<p>Set how much of the step the candidate region takes, how unique the op is, and how irregular the shapes are. The widget recommends Triton, a library call, or "don't bother."</p>
+
+<div class="widget"><div class="title">Triton vs library vs no-op</div><p class="hint">Triton's sweet spot: novel fusion, bandwidth-bound, multiple shapes. Outside that, prefer a library or skip.</p><div class="controls">
+<label class="inline">% of step time <input id="tt-share" type="range" min="0" max="100" value="20"><span class="val" id="tt-share-v">20</span></label>
+<label class="inline">op novelty (0=library has it, 100=custom) <input id="tt-nov" type="range" min="0" max="100" value="60"><span class="val" id="tt-nov-v">60</span></label>
+<label class="inline">memory-bound score 0..100 <input id="tt-mem" type="range" min="0" max="100" value="70"><span class="val" id="tt-mem-v">70</span></label>
+<label class="inline">shapes seen (1=fixed, 50=very dynamic) <input id="tt-shapes" type="range" min="1" max="50" value="5"><span class="val" id="tt-shapes-v">5</span></label>
+</div><canvas id="tt-canvas" class="dist-canvas" height="220"></canvas><p class="hint" id="tt-note"></p></div>
+
+<h2>What this gives you for the next lesson</h2>
+<p>You can write a fused kernel by hand. Lesson 23 covers the lazy alternative: let <code>torch.compile</code> generate Triton for you. That's right far more often than people think — and when it's not, you have the skills from this lesson to step in.</p>
+
+<script>
+(function(){
+  const ids=['share','nov','mem','shapes'];
+  const e=Object.fromEntries(ids.map(k=>[k,document.getElementById('tt-'+k)]));
+  const c=document.getElementById('tt-canvas'),ctx=c.getContext('2d'),note=document.getElementById('tt-note');
+  function draw(){
+    ids.forEach(k=>document.getElementById('tt-'+k+'-v').textContent=e[k].value);
+    c.width=c.clientWidth*devicePixelRatio;c.height=220*devicePixelRatio;ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.clearRect(0,0,c.clientWidth,220);
+    const share=+e.share.value, nov=+e.nov.value, mem=+e.mem.value, shapes=+e.shapes.value;
+    const triton_score = share*0.6 + nov*0.5 + mem*0.4 + Math.log2(shapes+1)*8;
+    const lib_score = share*0.4 + (100-nov)*0.7 - mem*0.1 + (50-Math.log2(shapes+1)*8);
+    const skip_score = (100 - share)*0.8 + (100-mem)*0.2;
+    const items = [['Triton',triton_score,'#2563eb'], ['library (cuBLAS/CUTLASS/FA)',lib_score,'#d97706'], ['don\'t bother',skip_score,'#16a34a']];
+    const max=Math.max(...items.map(x=>x[1]),1);
+    items.forEach(([n,v,col],i)=>{
+      const y=40+i*52, w=(c.clientWidth-280)*Math.max(0,v)/max;
+      ctx.fillStyle='#eef1f5';ctx.fillRect(220,y,c.clientWidth-280,30);
+      ctx.fillStyle=col;ctx.fillRect(220,y,w,30);
+      ctx.fillStyle='#1f2430';ctx.font='13px sans-serif';
+      ctx.fillText(n,30,y+20);
+      ctx.fillText(v.toFixed(0),226+w+6,y+20);
+    });
+    const top = items.slice().sort((a,b)=>b[1]-a[1])[0][0];
+    const advice = {
+      'Triton':'Custom fusion across multiple shapes — Triton + autotune is the right call.',
+      'library (cuBLAS/CUTLASS/FA)':'A tuned library probably exists. Try torch._scaled_mm, FlashInfer, or CUTLASS before writing code.',
+      'don\'t bother':'Cost/benefit is poor. Skip and find a larger lever (lessons 18, 20).'
+    };
+    note.textContent = 'Pick: '+top+'. '+advice[top];
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+<footer class="lesson-nav"><a href="21_reading_profile_roofline.html"><span class="dir">Previous</span><span class="ttl">21 · Reading profiles</span></a><a class="next" href="23_torch_compile.html"><span class="dir">Next</span><span class="ttl">23 · torch.compile</span></a></footer>
+</main></body></html>

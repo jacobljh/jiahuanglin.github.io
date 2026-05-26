@@ -1,0 +1,519 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>08 · Prefill/decode disaggregation</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">vllm_lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">08 · P/D disaggregation</span>
+    <span class="step-pill">lesson 8 / 12</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Prefill/decode disaggregation</h1>
+<p class="subtitle">Two phases with opposite bottlenecks share one GPU. The fix: don't. Run them on different hardware pools and pay one KV transfer for the privilege.</p>
+
+<h2>The asymmetry, one more time</h2>
+
+<p>Lesson 01 established it; here it drives the architecture. The same model, the same kernels, two phases:</p>
+
+<table>
+  <thead><tr><th></th><th>prefill</th><th>decode</th></tr></thead>
+  <tbody>
+    <tr><td>shape</td><td>T tokens in parallel, one forward</td><td>1 token per forward, T forwards over the response</td></tr>
+    <tr><td>attention</td><td>O(T²) — full QK<sup>T</sup> matrix</td><td>O(T) — one query against T keys/values</td></tr>
+    <tr><td>matmul shape</td><td>matrix × matrix (high arithmetic intensity)</td><td>matrix × vector (low arithmetic intensity)</td></tr>
+    <tr><td>bottleneck</td><td><strong>compute-bound</strong>: latency ≈ FLOPs / GPU FLOP rate</td><td><strong>memory-bound</strong>: latency ≈ KV bytes / HBM bandwidth</td></tr>
+    <tr><td>what scales it</td><td>better TFLOPs (H100, MI300X)</td><td>more HBM, faster HBM</td></tr>
+  </tbody>
+</table>
+
+<p>One run, opposite bottlenecks. That's the architectural smell. The two phases want different hardware, and forcing them to share a stream costs you on both ends.</p>
+
+<h2>The co-located failure mode</h2>
+
+<p>Default vLLM does both phases on the same GPU, same stream. A long prefill blocks the queue for as long as it takes — hundreds of milliseconds for a 4k-token prompt — and every decode in flight waits.</p>
+
+<pre class="ascii">CO-LOCATED, ONE GPU, ONE STREAM
+
+t=0     t=80    t=120    t=320         t=400
+├─decode─┤├arr.─┤├──── prefill ────────┤├─decode─
+   r0,r1     r2       r2 (4000 tok)        r0,r1,r2
+                ↑                       ↑
+                r0, r1 stalled here     TTFT(r2) = ~280 ms
+                TTFT(r1) ← punished     TTFT(r0,r1) ← also punished</pre>
+
+<p>The cost lands on tail latency. p50 looks fine; p99 is awful because <em>every</em> request unlucky enough to arrive behind a long prefill picks up the prefill's full duration as queuing delay.</p>
+
+<p>Chunked prefill (lesson 10) softens this — chunk the prompt into 512-token slices and pack each slice with one decode step in the same forward. But each chunk still steals compute from decode. The interference is reduced, not removed.</p>
+
+<h2>The disaggregated architecture</h2>
+
+<p>Run the two phases on two distinct GPU pools. Route based on phase, not on request.</p>
+
+<pre class="ascii">                   ┌───────────────┐
+                   │  router / LB  │  (short-prompts can skip pool A)
+                   └───────┬───────┘
+                           │
+              ┌────────────┴────────────┐
+              ▼                         ▼
+        ┌───────────┐             ┌───────────┐
+        │ PREFILL   │             │  DECODE   │
+        │ pool A    │             │  pool B   │
+        │           │             │           │
+        │  few GPUs │             │ many GPUs │
+        │ big FLOPs │  KV xfer    │ lots HBM  │
+        │           │ ──────────► │           │
+        │ batched   │             │ small per │
+        │ long-ctx  │             │ step batch│
+        │ prefill   │             │ many seqs │
+        └───────────┘             └───────────┘
+            ↑                          │
+            └──── request arrives      └──► streams tokens to client</pre>
+
+<p>Key property: a long prefill on pool A does <em>not</em> block any decode on pool B. The two queues are independent. Tail latency on the decode side decouples from prompt-length distribution on the prefill side.</p>
+
+<p>The flow per request:</p>
+<ol>
+  <li>Router admits to prefill pool A.</li>
+  <li>Pool A runs the prompt through the model, producing one full KV cache.</li>
+  <li>KV cache transfers to a GPU on pool B.</li>
+  <li>Pool B owns the request; runs decode steps; streams tokens to the client.</li>
+</ol>
+
+<h2>The cost: KV transfer</h2>
+
+<p>You've now added a network hop. The KV cache for a T-token prompt is exactly what lesson 01 quantified:</p>
+
+<div class="math block">
+  KV bytes = T · 2 · L · h<sub>kv</sub> · d<sub>head</sub> · bytes_per_dtype
+</div>
+
+<p>For a 7B fp16 (32 layers, 32 kv heads, d_head 128): ~500 KB/tok (or ~60 KB/tok on a GQA model with fp8 KV — see lesson 09; this 8× reduction is what makes cross-node disagg practical at scale). A 4096-token prompt is <strong>2 GB</strong>. Transfer time depends entirely on the fabric:</p>
+
+<table>
+  <thead><tr><th>fabric</th><th>peak BW</th><th>time for 2 GB</th><th>verdict</th></tr></thead>
+  <tbody>
+    <tr><td>NVLink (intra-node)</td><td>~800 GB/s</td><td>~2.5 ms</td><td>negligible</td></tr>
+    <tr><td>PCIe 4 (x16)</td><td>~30 GB/s</td><td>~65 ms</td><td>tolerable</td></tr>
+    <tr><td>RDMA / InfiniBand</td><td>~25–50 GB/s</td><td>~40–80 ms</td><td>non-trivial</td></tr>
+    <tr><td>regular ethernet (10 GbE)</td><td>~1 GB/s</td><td>~2000 ms</td><td>do not attempt</td></tr>
+  </tbody>
+</table>
+
+<p>This is the central tradeoff. On NVLink the transfer is free; disagg almost always wins. Over RDMA the transfer competes with the interference it's meant to save — so disagg only wins on workloads with enough long prefills.</p>
+
+<h2>Optimizations that make disagg practical</h2>
+
+<div class="callout">
+  <div class="label">1. Layer-wise streaming</div>
+  Don't wait for the whole prefill to finish before transferring KV. As layer L's KV is written, start sending it while layer L+1 is computing. If transfer BW per layer ≥ compute time per layer, the transfer hides entirely in the prefill — added TTFT cost ≈ <em>one layer's</em> overhead, not the full transfer.
+</div>
+
+<div class="callout">
+  <div class="label">2. Block-aligned transfer</div>
+  Paged KV blocks (lesson 02) are fixed-size, contiguous in physical memory. They're the natural transfer unit. The DMA engine moves one block at a time; the receiving end registers the same block in its own block manager. No serialization, no copy on either end.
+</div>
+
+<div class="callout">
+  <div class="label">3. Shared prefix cache</div>
+  If the prompt's prefix hits the prefill pool's APC (lesson 05), don't prefill — just transfer the cached KV. Chat system prompts hit 50-90% on production traffic, so most "prefills" become network-only operations.
+</div>
+
+<div class="callout">
+  <div class="label">4. Mixed (1-phase) routing</div>
+  For prompts under ~128 tokens, the prefill is cheap enough that transfer + prefill > "just do it on the decode pool". The router has a length threshold; short prompts skip the two-phase path entirely.
+</div>
+
+<div class="callout">
+  <div class="label">5. SLO-aware priority</div>
+  Once the two phases are decoupled, you can reorder either queue independently. High-priority requests jump the prefill queue; bulk requests fill the gaps. Co-location made this nearly impossible — reordering interferes with both phases at once.
+</div>
+
+<h2>The systems</h2>
+
+<table>
+  <thead><tr><th>system</th><th>contribution</th></tr></thead>
+  <tbody>
+    <tr><td><strong>DistServe</strong> (OSDI 2024)</td><td>First formal analysis. Defines <em>goodput-under-SLO</em>: requests served per second that meet both TTFT and per-token-latency targets. Shows when disagg beats co-location analytically — a function of prompt-length distribution and fabric BW.</td></tr>
+    <tr><td><strong>Mooncake</strong> (Moonshot AI)</td><td>Production. Tiered KV cache: HBM → DRAM → SSD. Decode pool fetches KV from whichever tier holds it. Massive prefix-cache hit rates from chat-style workloads.</td></tr>
+    <tr><td><strong>vLLM disagg</strong> (2026)</td><td>Experimental as of this writing. Inherits the DistServe + Mooncake ideas; ships with NCCL-based KV transport and the layer-wise streaming optimization.</td></tr>
+  </tbody>
+</table>
+
+<h2>Interactive · bimodal-workload timeline</h2>
+
+<p>Below: a sequence of requests arrives on a Poisson-ish schedule, with prompts drawn from a bimodal distribution — most short (50-200 tokens), some long (2000-4000 tokens). Compare two architectures on the same workload:</p>
+
+<ul>
+  <li><strong>Top timeline.</strong> Co-located: one GPU, serial. Prefills (orange) block decodes (blue).</li>
+  <li><strong>Bottom timeline.</strong> Disaggregated: prefill pool runs to the left of the slash, decode pool to the right. The two pools are independent.</li>
+</ul>
+
+<p>Things to try:</p>
+<ul>
+  <li>Default settings, NVLink. Disagg wins on p99 TTFT cleanly — the long prompts don't poison the queue for everyone else.</li>
+  <li>Same settings on PCIe. p99 still improves, mean E2E gets slightly worse — the transfer fee shows up.</li>
+  <li>Drop long-prompt % to 0. Now disagg adds the transfer cost without saving any interference. Co-location is faster.</li>
+  <li>Crank long-prompt % to 60%. p99 TTFT on the co-located timeline becomes unusable. Disagg flattens to within a factor of ~2 of the mean.</li>
+</ul>
+
+<div class="widget" id="pd-widget">
+  <div class="title">Co-located vs disaggregated, bimodal prompt mix</div>
+  <div class="hint">Each request is one colored band. Orange = prefill, blue = decode. Total request count and long-prompt % control the workload; the fabric controls the per-token transfer time.</div>
+
+  <div class="controls">
+    <label class="inline">requests: <input type="range" id="pd-n" min="10" max="80" step="2" value="40"> <span class="val" id="pd-n-val">40</span></label>
+    <label class="inline">long-prompt %: <input type="range" id="pd-pct" min="0" max="60" step="5" value="20"> <span class="val" id="pd-pct-val">20</span>%</label>
+    <label class="inline">fabric:
+      <select id="pd-fab">
+        <option value="nvlink" selected>NVLink (~800 GB/s)</option>
+        <option value="pcie">PCIe 4 (~30 GB/s)</option>
+        <option value="rdma">RDMA / IB (~25 GB/s)</option>
+      </select>
+    </label>
+    <button id="pd-run" class="primary">Simulate</button>
+  </div>
+
+  <canvas class="dist-canvas" id="pd-canvas" width="760" height="380" style="height: 380px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">mean TTFT (co)</div><div class="v" id="pd-mttft-co">—</div></div>
+    <div class="kpi"><div class="k">p99 TTFT (co)</div><div class="v" id="pd-p99-co">—</div></div>
+    <div class="kpi"><div class="k">mean TTFT (disagg)</div><div class="v" id="pd-mttft-pd">—</div></div>
+    <div class="kpi"><div class="k">p99 TTFT (disagg)</div><div class="v" id="pd-p99-pd">—</div></div>
+    <div class="kpi"><div class="k">mean E2E (co)</div><div class="v" id="pd-e2e-co">—</div></div>
+    <div class="kpi"><div class="k">mean E2E (disagg)</div><div class="v" id="pd-e2e-pd">—</div></div>
+    <div class="kpi"><div class="k">TTFT &gt; 500 ms (co)</div><div class="v" id="pd-sla-co">—</div></div>
+    <div class="kpi"><div class="k">TTFT &gt; 500 ms (disagg)</div><div class="v" id="pd-sla-pd">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">show the timing model</summary>
+<pre><code>// Per-token costs (ms):
+const PREFILL_PER_TOK = 0.5;            // compute-bound, batch-of-1
+const DECODE_STEP_MS  = 10;             // one decode step over the active set
+const XFER_PER_TOK = {                  // KV transfer bandwidth → per-token cost
+  nvlink: 0.005,
+  pcie:   0.10,
+  rdma:   0.12,
+};
+// Co-located: prefill and decode share one stream, serialized.
+// Disagg: prefill pool FIFO + decode pool independent loop; KV transfer adds latency
+//         before the request is eligible for decode.</code></pre>
+  </details>
+</div>
+
+<h2>Takeaways</h2>
+
+<div class="callout ok">
+  <div class="label">What to keep</div>
+  <ul>
+    <li>Prefill and decode have opposite bottlenecks. Co-location forces them to share a stream they don't want to share.</li>
+    <li>Long prefills under co-location punish <em>every</em> queued request's TTFT. p99 is where it shows.</li>
+    <li>Disagg trades that interference for a KV transfer. NVLink makes it free; PCIe is tolerable; RDMA depends on workload mix.</li>
+    <li>Layer-wise streaming hides most of the transfer in the prefill itself.</li>
+    <li>The architecture only wins when long-prompt mass × interference cost &gt; transfer overhead. Below that, just co-locate.</li>
+  </ul>
+</div>
+
+<footer class="lesson-nav">
+  <a href="07_speculative_decoding.html">
+    <span class="dir">← Prev</span>
+    <span class="ttl">07 · Speculative decoding</span>
+  </a>
+  <a class="next" href="09_gqa_mqa.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">09 · GQA / MQA</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const canvas = document.getElementById('pd-canvas');
+  const ctx = canvas.getContext('2d');
+
+  const nEl   = document.getElementById('pd-n');
+  const pctEl = document.getElementById('pd-pct');
+  const fabEl = document.getElementById('pd-fab');
+  const nLab   = document.getElementById('pd-n-val');
+  const pctLab = document.getElementById('pd-pct-val');
+  [nEl, pctEl].forEach(el => el.addEventListener('input', () => {
+    nLab.textContent   = nEl.value;
+    pctLab.textContent = pctEl.value;
+  }));
+
+  // Timing model
+  const PREFILL_PER_TOK = 0.5;     // ms/tok, compute-bound
+  const DECODE_STEP_MS  = 10;      // ms per decode tick over active set
+  const XFER_PER_TOK = { nvlink: 0.005, pcie: 0.10, rdma: 0.12 };
+
+  function genWorkload(n, longPct, seed) {
+    let s = seed;
+    function r() { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }
+    const reqs = [];
+    let t = 0;
+    for (let i = 0; i < n; i++) {
+      // Mean inter-arrival ~30 ms (one request every 30 ms ≈ 33 req/s).
+      t += -Math.log(1 - r()) * 30;
+      const isLong = r() * 100 < longPct;
+      const prompt = isLong ? (2000 + Math.floor(r() * 2000)) : (50 + Math.floor(r() * 150));
+      const out    = 20 + Math.floor(r() * 60);
+      reqs.push({ id: i, arrive: t, prompt, out, isLong });
+    }
+    return reqs;
+  }
+
+  // Co-located: one GPU. Prefill atomic. Decode step over active set.
+  function simulateColo(reqs) {
+    const evs = reqs.slice().sort((a, b) => a.arrive - b.arrive);
+    let t = 0, i = 0;
+    const pending = []; const active = [];
+    const spans = []; // {req, type, x0, x1}
+    while (i < evs.length || pending.length || active.length) {
+      while (i < evs.length && evs[i].arrive <= t) { pending.push(evs[i]); i++; }
+      if (pending.length) {
+        const r = pending.shift();
+        const dur = r.prompt * PREFILL_PER_TOK;
+        spans.push({ req: r, type: 'prefill', x0: t, x1: t + dur });
+        t += dur;
+        r.firstTok = t;
+        r.tokens = 0;
+        active.push(r);
+      } else if (active.length) {
+        const x0 = t;
+        t += DECODE_STEP_MS;
+        for (const r of active) {
+          r.tokens++;
+          if (r.tokens >= r.out) r.finish = t;
+        }
+        spans.push({ req: null, type: 'decode-step', x0, x1: t, n: active.length });
+        for (let k = active.length - 1; k >= 0; k--) {
+          if (active[k].tokens >= active[k].out) active.splice(k, 1);
+        }
+      } else if (i < evs.length) {
+        t = evs[i].arrive;
+      } else break;
+    }
+    return spans;
+  }
+
+  // Disaggregated. Prefill pool FIFO. Then KV transfer. Then admit to decode pool.
+  function simulateDisagg(reqs, fabric) {
+    const xferPT = XFER_PER_TOK[fabric];
+    const sorted = reqs.slice().sort((a, b) => a.arrive - b.arrive);
+    let pfFree = 0;
+    const readyEvents = [];
+    const spans = [];
+    for (const r of sorted) {
+      const start = Math.max(r.arrive, pfFree);
+      const pfEnd = start + r.prompt * PREFILL_PER_TOK;
+      const xfEnd = pfEnd + r.prompt * xferPT;
+      spans.push({ req: r, type: 'prefill', x0: start, x1: pfEnd, pool: 'A' });
+      spans.push({ req: r, type: 'xfer',    x0: pfEnd, x1: xfEnd, pool: 'A' });
+      pfFree = pfEnd;
+      r._ready = xfEnd;
+      readyEvents.push(r);
+    }
+    readyEvents.sort((a, b) => a._ready - b._ready);
+    let t = 0, ri = 0;
+    const active = [];
+    while (ri < readyEvents.length || active.length) {
+      while (ri < readyEvents.length && readyEvents[ri]._ready <= t) {
+        const r = readyEvents[ri]; r.tokens = 0;
+        active.push(r); ri++;
+      }
+      if (!active.length) {
+        if (ri < readyEvents.length) { t = readyEvents[ri]._ready; continue; }
+        else break;
+      }
+      const x0 = t;
+      t += DECODE_STEP_MS;
+      for (const r of active) {
+        r.tokens++;
+        if (r.firstTok === undefined) r.firstTok = t;
+        if (r.tokens >= r.out) r.finish = t;
+      }
+      spans.push({ req: null, type: 'decode-step', x0, x1: t, n: active.length, pool: 'B' });
+      for (let k = active.length - 1; k >= 0; k--) {
+        if (active[k].tokens >= active[k].out) active.splice(k, 1);
+      }
+    }
+    return spans;
+  }
+
+  function statsFrom(reqs) {
+    const done = reqs.filter(r => r.finish !== undefined);
+    if (!done.length) return null;
+    const ttfts = done.map(r => r.firstTok - r.arrive).sort((a, b) => a - b);
+    const e2es  = done.map(r => r.finish   - r.arrive);
+    return {
+      mttft: ttfts.reduce((a, b) => a + b, 0) / ttfts.length,
+      p99:   ttfts[Math.max(0, Math.floor(0.99 * ttfts.length) - 1)],
+      e2e:   e2es.reduce((a, b) => a + b, 0)  / e2es.length,
+      slo:   ttfts.filter(x => x > 500).length / ttfts.length,
+    };
+  }
+
+  function colorFor(r) {
+    return r.isLong ? '#d97706' : '#2563eb';
+  }
+
+  function drawTimelines(spansCo, spansPd, reqsCo, reqsPd, maxT) {
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    const padL = 70, padR = 16;
+    const plotW = W - padL - padR;
+    const tToX = t => padL + (t / maxT) * plotW;
+
+    // top label
+    ctx.font = '12px ' + getComputedStyle(document.body).fontFamily;
+    ctx.fillStyle = '#1f2430';
+    ctx.fillText('co-located (one pool)', padL, 14);
+    ctx.fillText('disaggregated (pool A = prefill | pool B = decode)', padL, 178);
+
+    // lanes
+    const coY = 22, coH = 130;
+    const pdY = 186, pdH = 170;
+    [[coY, coH], [pdY, pdH]].forEach(([y, h]) => {
+      ctx.fillStyle = '#f1f3f7';
+      ctx.fillRect(padL, y, plotW, h);
+      ctx.strokeStyle = '#dde2ea';
+      ctx.strokeRect(padL, y, plotW, h);
+    });
+
+    // Co-located: stack requests by id (with wrap to avoid overflow).
+    const coRows = 10;
+    function drawCoSpan(sp) {
+      if (sp.type === 'decode-step') {
+        // light shade for decode steps
+        ctx.fillStyle = 'rgba(106, 169, 255, 0.10)';
+        ctx.fillRect(tToX(sp.x0), coY + 1, Math.max(0.5, tToX(sp.x1) - tToX(sp.x0)), coH - 2);
+      } else {
+        const row = sp.req.id % coRows;
+        const yy = coY + 4 + row * ((coH - 8) / coRows);
+        const hh = (coH - 8) / coRows - 1;
+        ctx.fillStyle = colorFor(sp.req);
+        ctx.fillRect(tToX(sp.x0), yy, Math.max(1.5, tToX(sp.x1) - tToX(sp.x0)), hh);
+      }
+    }
+    for (const sp of spansCo) drawCoSpan(sp);
+
+    // Disaggregated: split top of lane = pool A (prefill+xfer), bottom = pool B (decode active set)
+    const pdSplit = pdY + 80;
+    ctx.strokeStyle = '#dde2ea';
+    ctx.setLineDash([2, 3]);
+    ctx.beginPath(); ctx.moveTo(padL, pdSplit); ctx.lineTo(padL + plotW, pdSplit); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+    ctx.fillText('pool A (prefill + xfer)', padL + 4, pdY + 14);
+    ctx.fillText('pool B (decode)',         padL + 4, pdSplit + 14);
+
+    const aRows = 6;
+    const bRows = 8;
+    for (const sp of spansPd) {
+      if (sp.type === 'prefill' || sp.type === 'xfer') {
+        const row = sp.req.id % aRows;
+        const yy = pdY + 20 + row * ((pdSplit - pdY - 24) / aRows);
+        const hh = (pdSplit - pdY - 24) / aRows - 1;
+        ctx.fillStyle = sp.type === 'prefill' ? colorFor(sp.req) : '#7c3aed';
+        ctx.fillRect(tToX(sp.x0), yy, Math.max(1.0, tToX(sp.x1) - tToX(sp.x0)), hh);
+      } else if (sp.type === 'decode-step') {
+        ctx.fillStyle = 'rgba(106, 169, 255, 0.10)';
+        ctx.fillRect(tToX(sp.x0), pdSplit + 18, Math.max(0.5, tToX(sp.x1) - tToX(sp.x0)), pdY + pdH - pdSplit - 22);
+      }
+    }
+    // Disagg decode: also draw per-request stripes in pool B
+    for (const r of reqsPd) {
+      if (r.firstTok === undefined || r.finish === undefined) continue;
+      const row = r.id % bRows;
+      const yy = pdSplit + 20 + row * ((pdY + pdH - pdSplit - 24) / bRows);
+      const hh = (pdY + pdH - pdSplit - 24) / bRows - 1;
+      ctx.fillStyle = '#2563eb';
+      ctx.fillRect(tToX(r.firstTok), yy, Math.max(1.0, tToX(r.finish) - tToX(r.firstTok)), hh);
+    }
+
+    // time axis
+    ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+    const stepT = maxT > 5000 ? 1000 : 500;
+    for (let tt = 0; tt <= maxT; tt += stepT) {
+      const x = tToX(tt);
+      ctx.strokeStyle = '#dde2ea';
+      ctx.beginPath(); ctx.moveTo(x, pdY + pdH); ctx.lineTo(x, pdY + pdH + 4); ctx.stroke();
+      ctx.fillText((tt / 1000).toFixed(1) + 's', x - 12, pdY + pdH + 16);
+    }
+
+    // legend
+    ctx.font = '11px monospace';
+    const ly = pdY + pdH + 30;
+    let lx = padL;
+    const legend = [
+      ['#2563eb', 'short req'],
+      ['#d97706', 'long req (prefill in orange)'],
+      ['#7c3aed', 'KV xfer'],
+    ];
+    for (const [c, t] of legend) {
+      ctx.fillStyle = c; ctx.fillRect(lx, ly - 8, 10, 10);
+      ctx.fillStyle = '#5b6573'; ctx.fillText(t, lx + 14, ly);
+      lx += ctx.measureText(t).width + 38;
+    }
+  }
+
+  function run() {
+    const n   = parseInt(nEl.value, 10);
+    const pct = parseInt(pctEl.value, 10);
+    const fab = fabEl.value;
+
+    const reqsCo = genWorkload(n, pct, 1);
+    const reqsPd = genWorkload(n, pct, 1);   // same seed → same workload
+    const spansCo = simulateColo(reqsCo);
+    const spansPd = simulateDisagg(reqsPd, fab);
+
+    const sCo = statsFrom(reqsCo);
+    const sPd = statsFrom(reqsPd);
+
+    const maxT = Math.max(
+      spansCo.length ? spansCo[spansCo.length - 1].x1 : 0,
+      spansPd.length ? spansPd[spansPd.length - 1].x1 : 0,
+      ...reqsCo.map(r => r.finish || 0),
+      ...reqsPd.map(r => r.finish || 0)
+    ) * 1.02 + 50;
+
+    drawTimelines(spansCo, spansPd, reqsCo, reqsPd, maxT);
+
+    if (sCo) {
+      document.getElementById('pd-mttft-co').textContent = sCo.mttft.toFixed(0) + ' ms';
+      document.getElementById('pd-p99-co').textContent   = sCo.p99.toFixed(0) + ' ms';
+      document.getElementById('pd-e2e-co').textContent   = sCo.e2e.toFixed(0) + ' ms';
+      document.getElementById('pd-sla-co').textContent   = (sCo.slo * 100).toFixed(0) + '%';
+    }
+    if (sPd) {
+      document.getElementById('pd-mttft-pd').textContent = sPd.mttft.toFixed(0) + ' ms';
+      document.getElementById('pd-p99-pd').textContent   = sPd.p99.toFixed(0) + ' ms';
+      document.getElementById('pd-e2e-pd').textContent   = sPd.e2e.toFixed(0) + ' ms';
+      document.getElementById('pd-sla-pd').textContent   = (sPd.slo * 100).toFixed(0) + '%';
+    }
+  }
+
+  document.getElementById('pd-run').addEventListener('click', run);
+  window.addEventListener('load', run);
+})();
+</script>
+
+</body>
+</html>

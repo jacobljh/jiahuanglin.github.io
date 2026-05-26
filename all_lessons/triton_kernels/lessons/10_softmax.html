@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>10 · Softmax — the online reduction</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">Triton kernels / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">10 · softmax</span>
+    <span class="step-pill">lesson 10 / 14</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Softmax — the online reduction</h1>
+<p class="subtitle">Three implementations side by side: <strong>naive 3-pass</strong> (overflows), <strong>2-pass numerically stable</strong> (works but reads twice), <strong>1-pass online</strong> (the Milakov–Gimelshein recurrence, the trick that makes Flash Attention possible). The third one is the one you'll reuse for the rest of your Triton career.</p>
+
+<h2>The three implementations in code</h2>
+
+<h3>1 · Naive 3-pass (broken)</h3>
+
+<pre><code># pass 1: compute exp
+e = tl.exp(x)
+# pass 2: sum
+s = tl.sum(e, axis=0)
+# pass 3: divide
+y = e / s</code></pre>
+
+<p>Overflows for any moderately large <em>x</em>. <code>tl.exp(20)</code> is fp32-OK; <code>tl.exp(100)</code> is +inf. Don't use this.</p>
+
+<h3>2 · Numerically stable 2-pass</h3>
+
+<pre><code># pass 1: max
+m = tl.max(x, axis=0)
+# pass 2: sum of shifted exponentials
+e = tl.exp(x - m)
+s = tl.sum(e, axis=0)
+# pass 3: divide
+y = e / s</code></pre>
+
+<p>This works. It's what you write when the whole row fits in one tile. The cost: two reductions over the row, each a warp-shuffle + SMEM round-trip. For row lengths up to ~4K this is fine.</p>
+
+<h3>3 · Online 1-pass (the Milakov–Gimelshein recurrence)</h3>
+
+<p>Stream the row in chunks. Carry forward only the running max <em>m</em> and the running sum-of-exp ℓ. Update both together:</p>
+
+<pre><code># initial state
+m = -float('inf')
+l = 0.0
+
+for chunk in chunks_of(row):
+    cm = tl.max(chunk, axis=0)               # max of this chunk
+    new_m = tl.maximum(m, cm)
+    # rescale old ℓ to the new max, add chunk's ℓ
+    l = l * tl.exp(m - new_m) + tl.sum(tl.exp(chunk - new_m), axis=0)
+    m = new_m
+
+# final pass — recompute each chunk and divide by ℓ
+# (or stash partial e values during the first pass and divide them here)</code></pre>
+
+<p>The magic is the rescale: <code>l = l * exp(m - new_m) + chunk_l_at_new_m</code>. When the max grows, the old ℓ (which was computed against the old max) is rescaled by <code>exp(old_m − new_m)</code> — a number ≤ 1 — to "correct" for the change.</p>
+
+<div class="callout">
+  <div class="label">Why this matters</div>
+  In a 2-pass softmax you have to load the row twice — once for max, once for sum. In an online 1-pass softmax you load it once. For attention, the "row" is the row of attention scores S<sub>ij</sub> = Q<sub>i</sub> · K<sub>j</sub>, which is N²-shaped. The 1-pass version is what makes Flash Attention's "never materialise the full attention matrix" possible.
+</div>
+
+<h2>The Triton kernel — row-per-program, 2-pass version</h2>
+
+<p>For typical sequence lengths the 2-pass version is the right one to write. The 1-pass online recurrence we'll save for Flash Attention (lesson 12).</p>
+
+<pre><code>@triton.jit
+def softmax_kernel(x_ptr, y_ptr, stride_x_row, stride_y_row, N, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs &lt; N
+
+    # row pointers
+    x_row = x_ptr + row * stride_x_row
+    y_row = y_ptr + row * stride_y_row
+
+    # load (one row per program); use -inf so masked lanes lose the max
+    x = tl.load(x_row + offs, mask=mask, other=-float('inf'))
+
+    # 2-pass softmax in registers
+    m = tl.max(x, axis=0)
+    e = tl.exp(x - m)
+    s = tl.sum(e, axis=0)
+    y = e / s
+
+    tl.store(y_row + offs, y, mask=mask)</code></pre>
+
+<p>The <code>other=-float('inf')</code> on the load is the lesson-04 boundary rule: lanes past N must not win the max. Sub them out with the identity of max, which is −∞.</p>
+
+<h2>The wrapper</h2>
+
+<pre><code>def softmax(x: torch.Tensor) -&gt; torch.Tensor:
+    M, N = x.shape                            # M rows, each of length N
+    y = torch.empty_like(x)
+    # one program per row; tile width = nearest power-of-two ≥ N
+    BLOCK = triton.next_power_of_2(N)
+    num_warps = 4
+    if BLOCK &gt;= 2048: num_warps = 8
+    if BLOCK &gt;= 4096: num_warps = 16
+    softmax_kernel[(M,)](
+        x, y, x.stride(0), y.stride(0), N,
+        BLOCK=BLOCK, num_warps=num_warps,
+    )
+    return y</code></pre>
+
+<p>Two things to call out:</p>
+
+<ul>
+  <li><strong><code>next_power_of_2(N)</code></strong>: tile sizes must be compile-time powers of two. Round up; the boundary mask handles the slack.</li>
+  <li><strong><code>num_warps</code> scales with BLOCK</strong>: more warps let the reductions parallelise over more lanes. The autotuner can pick this, but for softmax a simple staircase is fine.</li>
+</ul>
+
+<h2>What happens when N exceeds BLOCK</h2>
+
+<p>If the row is longer than the max tile (~8192), the one-program-per-row approach breaks. You can't materialise more than ~8K elements in registers. Options:</p>
+
+<ol>
+  <li><strong>Multiple programs per row, online merge.</strong> Each program processes a chunk, writes its (m, ℓ) pair to a small auxiliary buffer; a second kernel merges them and rescales. The full online recurrence.</li>
+  <li><strong>Per-program streaming loop.</strong> One program walks its row in BK-wide chunks, applying the online recurrence in registers. The kernel touches the row twice (once for the recurrence, once for the final divide), but everything stays per-program and you avoid the auxiliary buffer.</li>
+</ol>
+
+<p>Both are variants of the same idea. Lesson 12 uses option 2 inside Flash Attention.</p>
+
+<h2>The recurrence, derived from scratch</h2>
+
+<p>Suppose you've processed elements <code>x[0..i]</code> and have <em>m</em> = max(x[0..i]) and ℓ = Σ<sub>j ≤ i</sub> e<sup>x<sub>j</sub> − m</sup>. The next chunk has max <em>m</em><sub>c</sub> and ℓ<sub>c</sub> = Σ<sub>chunk</sub> e<sup>x<sub>j</sub> − m<sub>c</sub></sup>.</p>
+
+<p>The new combined max is <em>m</em>' = max(<em>m</em>, <em>m</em><sub>c</sub>). The new combined ℓ should be Σ<sub>j ≤ new end</sub> e<sup>x<sub>j</sub> − m'</sup>. Split the sum at the chunk boundary:</p>
+
+<pre class="math block">ℓ' = Σ<sub>j ≤ i</sub> e<sup>x<sub>j</sub> − m'</sup> + Σ<sub>chunk</sub> e<sup>x<sub>j</sub> − m'</sup></pre>
+
+<p>Multiply numerator and denominator of each term by 1 in the form <em>e<sup>−m_x + m_x</sup></em>:</p>
+
+<pre class="math block">ℓ' = e<sup>m − m'</sup> · Σ<sub>j ≤ i</sub> e<sup>x<sub>j</sub> − m</sup> + e<sup>m<sub>c</sub> − m'</sup> · Σ<sub>chunk</sub> e<sup>x<sub>j</sub> − m<sub>c</sub></sup></pre>
+
+<p>The two sums are just ℓ and ℓ<sub>c</sub>. So:</p>
+
+<pre class="math block">ℓ' = e<sup>m − m'</sup> · ℓ + e<sup>m<sub>c</sub> − m'</sup> · ℓ<sub>c</sub></pre>
+
+<p>That's the recurrence in three lines of algebra. The first term <em>rescales</em> the old ℓ for the change in max; the second contributes the chunk's ℓ rescaled to the same max. Both factors are ≤ 1, so there's no overflow.</p>
+
+<h2>Reading the kernel like an interviewer would</h2>
+
+<p>A common interview question on Triton: <em>"What's the difference between the 2-pass softmax and Flash Attention's softmax?"</em> Answer in one breath:</p>
+
+<ul>
+  <li>The 2-pass version assumes the whole row fits in registers (or, on a tile, in one program).</li>
+  <li>Flash Attention's softmax is the online recurrence above, applied inside the K-loop of attention. It produces (m, ℓ) one chunk of attention scores at a time, never materialising the full N×N matrix in HBM.</li>
+</ul>
+
+<p>You will be expected to write the recurrence on a whiteboard. It's three lines. Memorise them.</p>
+
+<h2>Interactive · which softmax is right for this row length?</h2>
+<p>Drag the row length. See which variant fits in a tile, what BLOCK and num_warps Triton would pick, and when you need to fall back to the online recurrence.</p>
+
+<div class="widget"><div class="title">Softmax variant picker</div><p class="hint">The hard cliff is at the max tile size (~8192 elements). Past that, you can't materialise the row in registers and must stream.</p><div class="controls">
+<label class="inline">row length N <input id="t10-N" type="range" min="64" max="32768" step="64" value="4096"><span class="val" id="t10-N-v">4096</span></label>
+</div><div id="t10-out" class="kpi-grid"></div><p class="hint" id="t10-note"></p></div>
+
+<h2>What's next</h2>
+
+<p>Softmax fuses a max reduction with a sum reduction with a divide. Lesson 11 fuses a different pair: a mean (or RMS) reduction with a scale. The kernel is half as long but the pattern — stream once, fuse the stat with the scaling — is identical.</p>
+
+<footer class="lesson-nav">
+  <a href="09_tiled_matmul.html"><span class="dir">Previous</span><span class="ttl">09 · Tiled matmul</span></a>
+  <a class="next" href="11_rmsnorm.html"><span class="dir">Next</span><span class="ttl">11 · RMSNorm</span></a>
+</footer>
+
+<script>
+(function(){
+  const e={N:document.getElementById('t10-N')};
+  const out=document.getElementById('t10-out'),note=document.getElementById('t10-note');
+  function nextPow2(n){return 1 &lt;&lt; Math.ceil(Math.log2(n));}
+  function draw(){
+    document.getElementById('t10-N-v').textContent=e.N.value;
+    const N=+e.N.value;
+    const BLOCK = nextPow2(N);
+    const fits = BLOCK <= 8192;
+    let warps = 4; if (BLOCK >= 2048) warps=8; if (BLOCK >= 4096) warps=16;
+    out.innerHTML='';
+    function kpi(k,v,col){const d=document.createElement('div');d.className='kpi';d.innerHTML='<div class="k">'+k+'</div><div class="v" style="color:'+(col||'#1f2430')+'">'+v+'</div>';out.appendChild(d);}
+    kpi('BLOCK (next pow2)', BLOCK.toLocaleString(), '#1f2430');
+    kpi('fits in tile?', fits ? 'YES' : 'NO', fits ? '#16a34a':'#dc2626');
+    kpi('num_warps', warps, '#1f2430');
+    kpi('passes over row', fits ? '2' : '2 (streaming online)', '#1f2430');
+    note.textContent = fits
+      ? 'Row fits in one tile. 2-pass kernel (max + sum + divide) is the right call. ~12 lines of Triton.'
+      : '⚠ Row exceeds max tile. Use the online recurrence — one program walks the row in chunks, keeps (m, ℓ) in registers. This is exactly the pattern Flash Attention uses (lesson 12).';
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

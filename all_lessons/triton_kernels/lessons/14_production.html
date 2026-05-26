@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>14 · Production — backward, profile, when NOT</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">Triton kernels / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">14 · production</span>
+    <span class="step-pill">lesson 14 / 14</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Production — backward, profile, when NOT</h1>
+<p class="subtitle">The kernel works on a unit test. Now it has to ship: <strong>have a backward</strong>, <strong>be observable in a profile</strong>, and you <strong>know when to use it</strong>. This lesson is the production-readiness checklist plus the decision tree for when Triton is the wrong tool.</p>
+
+<h2>Wrapping a Triton kernel as a PyTorch op</h2>
+
+<p>For inference-only kernels, the function wrapper from earlier lessons is enough. For training, you need both directions, registered with autograd:</p>
+
+<pre><code>import torch, triton, triton.language as tl
+
+# forward kernel
+@triton.jit
+def rmsnorm_fwd_kernel(...): ...
+
+# backward kernel (also Triton)
+@triton.jit
+def rmsnorm_bwd_kernel(...): ...
+
+class RMSNormFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, w, eps):
+        y, rstd = rmsnorm_forward(x, w, eps)        # calls the fwd kernel
+        ctx.save_for_backward(x, w, rstd)
+        ctx.eps = eps
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        x, w, rstd = ctx.saved_tensors
+        dx, dw = rmsnorm_backward(dy, x, w, rstd)    # calls the bwd kernel
+        return dx, dw, None                           # one None per non-tensor input
+
+rmsnorm = RMSNormFn.apply        # use this in your nn.Module</code></pre>
+
+<p>Three rules:</p>
+
+<ol>
+  <li><strong>Save what you need.</strong> The forward usually keeps tensors that the backward will reuse (rstd in this example) to avoid recomputing them.</li>
+  <li><strong>Return one <code>None</code> per non-tensor input.</strong> <code>backward</code> must return gradients for every <code>forward</code> arg, in order. Non-differentiable args (like <code>eps</code>) return <code>None</code>.</li>
+  <li><strong>Don't capture the kernel itself in the graph.</strong> The autograd graph sees one node (RMSNormFn). The two Triton kernels under it are opaque.</li>
+</ol>
+
+<h2>Backward kernels are not symmetric to forward</h2>
+
+<p>Forward RMSNorm: one row reduction. Backward RMSNorm: two row reductions (one over <em>dy·w</em>, one over <em>dy·w·x</em>) plus a fused multiply, plus a column reduction for <em>dw</em>. The backward is usually ~1.5–2× the cost of forward — that's normal.</p>
+
+<p>For matmul-style ops, the backward is two more matmuls (<em>dA</em> and <em>dB</em>). For attention, the backward has its own paper (Flash Attention v2 recomputes <em>S</em> on the fly during the backward pass to avoid storing the full attention matrix). When you implement backward, expect it to be the harder kernel.</p>
+
+<h2>Verifying the backward — gradcheck</h2>
+
+<p>The single most important test for a Triton-backed autograd function:</p>
+
+<pre><code>x = torch.randn(4, 128, device='cuda', dtype=torch.float64, requires_grad=True)
+w = torch.randn(128, device='cuda', dtype=torch.float64, requires_grad=True)
+
+torch.autograd.gradcheck(rmsnorm, (x, w, 1e-6), eps=1e-6, atol=1e-4)</code></pre>
+
+<p>This finite-differences your backward against the forward. Two notes:</p>
+
+<ul>
+  <li>Use <code>fp64</code> for gradcheck — bf16/fp16 are too imprecise for finite-diff to converge.</li>
+  <li>If gradcheck fails, the wall-clock test won't catch it either. Don't skip this step.</li>
+</ul>
+
+<h2>Profiling — three views you actually need</h2>
+
+<table>
+  <thead><tr><th>Tool</th><th>What it tells you</th><th>When to use</th></tr></thead>
+  <tbody>
+    <tr><td><code>triton.testing.do_bench</code></td><td>Single-kernel wall-clock with proper warmup &amp; noise floor.</td><td>Iterating on tile sizes.</td></tr>
+    <tr><td><code>torch.profiler</code></td><td>The whole training step: which Triton kernels were called, in what order, with stack traces.</td><td>"Is my kernel even running, and how often?"</td></tr>
+    <tr><td><code>ncu</code> (Nsight Compute)</td><td>SM utilisation, memory throughput, register spill, occupancy. Per-kernel deep dive.</td><td>"Why is this kernel slow?"</td></tr>
+  </tbody>
+</table>
+
+<p>The workflow:</p>
+
+<ol>
+  <li><code>do_bench</code> says it's slow.</li>
+  <li><code>torch.profiler</code> confirms it's the kernel you think (and not, say, an extra copy).</li>
+  <li><code>ncu</code> tells you whether you're SM-bound, memory-bound, or stall-bound.</li>
+</ol>
+
+<h2>Reading the IR to confirm tensor cores are firing</h2>
+
+<p>If you suspect <code>tl.dot</code> isn't lowering to tensor cores, dump the IR:</p>
+
+<pre><code>import os
+os.environ['MLIR_ENABLE_DUMP'] = '1'      # before importing triton
+# run your kernel once
+# then grep the dump:
+#   grep -E 'mma|wgmma' /tmp/triton_dump_*.ttgir | head</code></pre>
+
+<p>If you see <code>mma.sync</code> (Ampere/Ada) or <code>wgmma</code> (Hopper), tensor cores are firing. If you see <code>llvm.fma</code> instead, you're on the vector ALU — go back to lesson 05 and check tile dims.</p>
+
+<h2>The decision tree — when NOT to write Triton</h2>
+
+<svg viewBox="0 0 760 380" class="diagram" role="img" aria-label="Decision tree: Triton vs library vs torch.compile vs CUDA vs skip">
+  <g font-size="11" fill="var(--text-mute)">
+    <g transform="translate(280,20)">
+      <rect width="200" height="36" fill="#dbeafe" stroke="#bfdbfe"/>
+      <text x="100" y="22" text-anchor="middle" font-weight="700" fill="var(--text)">found a hot region in the profile?</text>
+    </g>
+    <line x1="380" x2="200" y1="76" y2="100" stroke="#94a3b8"/>
+    <text x="280" y="92" text-anchor="middle" font-family="var(--mono)" fill="var(--bad)">no</text>
+    <line x1="380" x2="560" y1="76" y2="100" stroke="#94a3b8"/>
+    <text x="480" y="92" text-anchor="middle" font-family="var(--mono)" fill="var(--ok)">yes</text>
+
+    <g transform="translate(100,100)">
+      <rect width="200" height="36" fill="#fee2e2" stroke="#fecaca"/>
+      <text x="100" y="22" text-anchor="middle" font-weight="700" fill="var(--text)">skip — find a real lever first</text>
+    </g>
+
+    <g transform="translate(460,100)">
+      <rect width="200" height="36" fill="#dbeafe" stroke="#bfdbfe"/>
+      <text x="100" y="22" text-anchor="middle" font-weight="700" fill="var(--text)">does a library cover it?</text>
+    </g>
+    <line x1="560" x2="380" y1="156" y2="180" stroke="#94a3b8"/>
+    <text x="460" y="172" text-anchor="middle" font-family="var(--mono)" fill="var(--bad)">no</text>
+    <line x1="560" x2="700" y1="156" y2="180" stroke="#94a3b8"/>
+    <text x="640" y="172" text-anchor="middle" font-family="var(--mono)" fill="var(--ok)">yes</text>
+
+    <g transform="translate(640,180)">
+      <rect width="120" height="36" fill="#dcfce7" stroke="#86efac"/>
+      <text x="60" y="22" text-anchor="middle" font-weight="700" fill="var(--text)">use the library</text>
+    </g>
+
+    <g transform="translate(260,180)">
+      <rect width="240" height="36" fill="#dbeafe" stroke="#bfdbfe"/>
+      <text x="120" y="22" text-anchor="middle" font-weight="700" fill="var(--text)">elementwise chain after a matmul?</text>
+    </g>
+    <line x1="380" x2="200" y1="236" y2="260" stroke="#94a3b8"/>
+    <text x="280" y="252" text-anchor="middle" font-family="var(--mono)" fill="var(--bad)">no</text>
+    <line x1="380" x2="560" y1="236" y2="260" stroke="#94a3b8"/>
+    <text x="480" y="252" text-anchor="middle" font-family="var(--mono)" fill="var(--ok)">yes</text>
+
+    <g transform="translate(460,260)">
+      <rect width="240" height="36" fill="#fef3c7" stroke="#fcd34d"/>
+      <text x="120" y="22" text-anchor="middle" font-weight="700" fill="var(--text)">try torch.compile first; Triton if it fails</text>
+    </g>
+
+    <g transform="translate(80,260)">
+      <rect width="280" height="36" fill="#dbeafe" stroke="#bfdbfe"/>
+      <text x="140" y="22" text-anchor="middle" font-weight="700" fill="var(--text)">need warp specialisation or async TMA?</text>
+    </g>
+    <line x1="220" x2="100" y1="316" y2="340" stroke="#94a3b8"/>
+    <text x="160" y="332" text-anchor="middle" font-family="var(--mono)" fill="var(--bad)">no</text>
+    <line x1="220" x2="340" y1="316" y2="340" stroke="#94a3b8"/>
+    <text x="280" y="332" text-anchor="middle" font-family="var(--mono)" fill="var(--ok)">yes</text>
+
+    <g transform="translate(280,340)">
+      <rect width="160" height="36" fill="#fee2e2" stroke="#fecaca"/>
+      <text x="80" y="22" text-anchor="middle" font-weight="700" fill="var(--text)">CUDA / CUTLASS</text>
+    </g>
+
+    <g transform="translate(20,340)">
+      <rect width="160" height="36" fill="#dcfce7" stroke="#86efac"/>
+      <text x="80" y="22" text-anchor="middle" font-weight="700" fill="var(--text)">write Triton</text>
+    </g>
+  </g>
+</svg>
+
+<h2>Concrete examples of "not Triton"</h2>
+
+<ul>
+  <li><strong>Vanilla bf16 matmul.</strong> Call <code>torch.matmul</code>. cuBLAS is 5–15% faster than hand-Triton, and you save a week.</li>
+  <li><strong>Attention.</strong> Call FlashAttention v3 or FlashInfer. Their Hopper-tuned versions beat Triton by 20–40%.</li>
+  <li><strong>NCCL collectives.</strong> Triton doesn't talk to NVLink primitives.</li>
+  <li><strong>A 100-line elementwise chain after a matmul.</strong> Try <code>torch.compile</code> first; in 2026 it fuses most of these correctly.</li>
+  <li><strong>An op that's 0.5% of the step.</strong> The lever is too small. Find a bigger one.</li>
+</ul>
+
+<h2>Concrete examples of "yes, Triton"</h2>
+
+<ul>
+  <li><strong>A novel fused epilogue.</strong> e.g. matmul → bias → silu → dropout → residual add (lesson 08).</li>
+  <li><strong>Quantised GEMM</strong> with a dequant-on-load that no library covers.</li>
+  <li><strong>Custom attention variants.</strong> ALiBi + sliding window + learned bias, or MLA's compressed KV path.</li>
+  <li><strong>Backward of a fused forward.</strong> Whatever you fused on the way in needs a matching kernel on the way out.</li>
+  <li><strong>Sparse / block-sparse patterns</strong> not covered by cuSPARSE.</li>
+</ul>
+
+<h2>Maintenance — what you sign up for</h2>
+
+<p>Triton kernels are easier than CUDA, but not free. The ongoing costs:</p>
+
+<ol>
+  <li><strong>Triton releases.</strong> Each release can change perf characteristics. Re-benchmark on every upgrade.</li>
+  <li><strong>New hardware.</strong> Hopper → Blackwell will require autotune sweeps; existing configs may not transfer.</li>
+  <li><strong>Backward parity.</strong> Forward and backward need to stay in sync as the model evolves.</li>
+  <li><strong>Numerical drift.</strong> If a new model uses a different activation or eps, you may need to re-derive the kernel.</li>
+</ol>
+
+<h2>Interactive · production-readiness checklist</h2>
+<p>Click each box as your kernel passes it. The bottom counter is your "is this safe to ship?" score.</p>
+
+<div class="widget"><div class="title">Production readiness</div><p class="hint">A kernel that ticks all 10 boxes is one you can hand off to someone else without dread.</p>
+<div id="t14-list"></div>
+<div id="t14-out" class="kpi-grid"></div>
+</div>
+
+<h2>What this gives you</h2>
+
+<p>You've followed the whole arc:</p>
+
+<ol>
+  <li><strong>Lessons 01–03:</strong> the abstraction (tiles, not threads), the pipeline (Python → PTX), the why.</li>
+  <li><strong>Lessons 04–06:</strong> the DSL — loads/masks, tl.dot, reductions.</li>
+  <li><strong>Lessons 07–11:</strong> five canonical kernels, each one a one-step elaboration on the previous.</li>
+  <li><strong>Lesson 12:</strong> Flash Attention as the synthesis.</li>
+  <li><strong>Lessons 13–14:</strong> performance and shipping.</li>
+</ol>
+
+<p>You can write a fused kernel, derive its bandwidth model, autotune across shapes, write the backward, gradcheck it, profile it, decide if Triton is the right tool, and ship it. That's the full skillset for kernels in 2026.</p>
+
+<div class="callout ok">
+  <div class="label">Where to go from here</div>
+  Read the Triton tutorials for the kernels we skipped (dropout, group conv, sparse). Read FlashAttention v3 and FlashInfer source to see what production attention looks like. Read CUTLASS for the CUDA side. And when you next see a profile with a fat elementwise chain after a matmul — fuse it.
+</div>
+
+<footer class="lesson-nav">
+  <a href="13_autotune_pipeline.html"><span class="dir">Previous</span><span class="ttl">13 · Autotune + pipeline</span></a>
+  <a class="next" href="index.html"><span class="dir">↑ Series index</span><span class="ttl">All lessons</span></a>
+</footer>
+
+<script>
+(function(){
+  const items = [
+    'Forward kernel correctness verified vs PyTorch reference (atol per dtype).',
+    'Tested at irregular sizes (non-power-of-two, batch=1, very small N, very large N).',
+    'Backward kernel passes gradcheck in fp64.',
+    'Autotune key chosen — covers shapes you actually see in production.',
+    'No register spill — ncu shows ≥ 50% achieved occupancy.',
+    'fp32 accumulator for any matmul or reduction.',
+    'do_bench number is within 90% of the roofline ceiling for the regime.',
+    'PyTorch wrapper handles non-contiguous inputs (or asserts contiguous).',
+    'Profiled in torch.profiler — appears as expected, no surprise launches.',
+    'CI: re-run benchmarks on every Triton upgrade; alert on >10% regression.',
+  ];
+  const list = document.getElementById('t14-list');
+  const out  = document.getElementById('t14-out');
+  items.forEach((t, i) => {
+    const row = document.createElement('label');
+    row.style.display='flex'; row.style.gap='8px'; row.style.alignItems='flex-start'; row.style.padding='6px 4px';
+    row.innerHTML = '<input type="checkbox" data-i="'+i+'"> <span>'+(i+1)+' · '+t+'</span>';
+    list.appendChild(row);
+  });
+  function draw(){
+    const checks = list.querySelectorAll('input');
+    let n=0; checks.forEach(c => { if (c.checked) n++; });
+    out.innerHTML='';
+    function kpi(k,v,col){const d=document.createElement('div');d.className='kpi';d.innerHTML='<div class="k">'+k+'</div><div class="v" style="color:'+(col||'#1f2430')+'">'+v+'</div>';out.appendChild(d);}
+    kpi('checked', n+' / '+items.length, '#1f2430');
+    const status = n < 5 ? 'do not ship' : (n < 8 ? 'risky' : (n === items.length ? 'ship' : 'almost'));
+    const col = n < 5 ? '#dc2626' : (n < 8 ? '#d97706' : '#16a34a');
+    kpi('verdict', status, col);
+  }
+  list.addEventListener('change', draw);
+  draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

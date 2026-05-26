@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>06 · Scheduling and graph capture</title><link rel="stylesheet" href="../RL/lessons/style.css"><style>main{overflow-wrap:break-word}table{table-layout:fixed}th,td{overflow-wrap:anywhere}input[type="range"]{max-width:min(200px,44vw)}label.inline{flex-wrap:wrap;max-width:100%}</style></head>
+<body><header class="topnav"><div class="inner"><a class="crumb-link" href="../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">gpu_kernel_serving</a><span class="crumb">/</span><span class="crumb">15 · scheduling &amp; graphs</span><span class="step-pill">lesson 15 / 17</span></div></header><main>
+
+<h1>Scheduling and graph capture</h1>
+<p class="subtitle">Lessons 03–05 made each kernel cheaper. This lesson makes the gaps between kernels cheaper. Continuous batching folds new requests in without restarting; chunked prefill keeps a long prompt from freezing decoders; CUDA graphs erase the per-launch CPU dispatch cost.</p>
+
+<h2>The question this lesson answers</h2>
+<p>If kernels are now efficient, why does decode-step latency on small batches plateau around a few hundred microseconds — well above the roofline lower bound from lesson 02? Because the work between launches stops being free. The scheduler must build a batch every step, Python dispatches each kernel, the driver enqueues commands, and the GPU waits between blocks. At small batch each of those costs is comparable to the actual math. This lesson is about hiding them.</p>
+
+<h2>Static batching is the wrong baseline</h2>
+<p>Naive batched inference says: collect N requests, prefill them all, decode them all in lockstep, return when the slowest finishes. Three things go wrong:</p>
+<ol>
+  <li>A short response sits idle waiting for a long response → wasted GPU.</li>
+  <li>New requests can't join until the next batch boundary → high time-to-first-token under bursty traffic.</li>
+  <li>Variable lengths force padding to the max → wasted compute and memory.</li>
+</ol>
+
+<h2>Continuous batching</h2>
+<p>The fix is to dissolve the "batch" boundary. At every decode step the scheduler:</p>
+<ol>
+  <li>Examines the running batch and removes any sequence that finished (hit EOS, stop sequence, or max-tokens).</li>
+  <li>Pulls eligible waiting requests from a queue and admits as many as fit in the KV pool and the per-step token budget.</li>
+  <li>Combines admitted prefill tokens and existing decode tokens into one mixed batch.</li>
+  <li>Launches one forward pass that handles the mix.</li>
+</ol>
+
+<svg viewBox="0 0 820 280" class="diagram" role="img" aria-label="Static batching vs continuous batching timeline: continuous batching folds in new requests at every step without idle gaps">
+  <text x="20" y="30" font-weight="700">static batching</text>
+  <g font-size="11" fill="var(--text-mute)">
+    <rect x="20" y="40" width="180" height="22" fill="#2563eb88"/><text x="22" y="56" fill="var(--text)">req A · 9 tokens</text>
+    <rect x="20" y="66" width="80" height="22" fill="#d9770688"/><text x="22" y="82" fill="var(--text)">req B · 4 tok</text>
+    <rect x="100" y="66" width="100" height="22" fill="#eef1f5" stroke="var(--border)" stroke-dasharray="2,2"/><text x="104" y="82" fill="var(--text-dim)">idle (B done, waits for A)</text>
+    <rect x="20" y="92" width="160" height="22" fill="#16a34a88"/><text x="22" y="108" fill="var(--text)">req C · 8 tok</text>
+    <rect x="180" y="92" width="20" height="22" fill="#eef1f5" stroke="var(--border)" stroke-dasharray="2,2"/>
+    <rect x="220" y="40" width="160" height="78" fill="#eef1f5" stroke="var(--border)" stroke-dasharray="2,2"/>
+    <text x="226" y="80" font-size="11" fill="var(--text-dim)">queue: D, E, F wait for next batch</text>
+  </g>
+  <text x="20" y="148" font-weight="700">continuous batching</text>
+  <g font-size="11" fill="var(--text-mute)">
+    <rect x="20" y="158" width="180" height="22" fill="#2563eb88"/><text x="22" y="174" fill="var(--text)">req A · 9 tokens</text>
+    <rect x="20" y="184" width="80" height="22" fill="#d9770688"/><text x="22" y="200" fill="var(--text)">req B · 4 tok</text>
+    <rect x="100" y="184" width="240" height="22" fill="#7c3aed88"/><text x="104" y="200" fill="var(--text)">req D joins immediately when B finishes</text>
+    <rect x="20" y="210" width="160" height="22" fill="#16a34a88"/><text x="22" y="226" fill="var(--text)">req C · 8 tok</text>
+    <rect x="180" y="210" width="160" height="22" fill="#a0d6ff88"/><text x="184" y="226" fill="var(--text)">req E joins when C finishes</text>
+  </g>
+  <text x="20" y="262" font-size="11" fill="var(--text-mute)">x-axis is decode steps. Each step is one forward pass containing whoever is currently active. No idle bubbles.</text>
+</svg>
+
+<h2>Chunked prefill</h2>
+<p>Continuous batching has a residual problem: a request with an 8K prompt processes all 8K tokens in one step. That step is dominated by a giant prefill GEMM, which can take 50–200 ms. Every decoding sequence in the batch waits for it. Time-to-first-token of the new request improves; latency of every other request gets worse.</p>
+<p>Chunked prefill splits the prompt across <em>several</em> scheduling steps. Step k processes a chunk of N_prefill tokens of the long prompt, plus N_decode tokens from other sequences, all in one mixed kernel call.</p>
+
+<svg viewBox="0 0 820 260" class="diagram" role="img" aria-label="Chunked prefill: a long prompt is split into multiple steps while other decoders continue">
+  <g font-size="11" fill="var(--text-mute)">
+    <text x="20" y="32" font-weight="700" fill="var(--text)">unchunked: one giant prefill step blocks decoders</text>
+    <rect x="20" y="42" width="480" height="22" fill="#dc262688"/><text x="22" y="58" fill="var(--text)">prefill A · 8K tokens (one step, ~100 ms)</text>
+    <rect x="20" y="68" width="480" height="22" fill="#eef1f5" stroke="var(--border)" stroke-dasharray="2,2"/><text x="22" y="84" fill="var(--text-dim)">decoders B, C, D stalled the entire time</text>
+    <rect x="500" y="42" width="40" height="22" fill="#2563eb88"/>
+    <rect x="540" y="42" width="40" height="22" fill="#2563eb88"/>
+    <rect x="580" y="42" width="40" height="22" fill="#2563eb88"/>
+    <text x="620" y="58" fill="var(--text-mute)">then everyone decodes again</text>
+  </g>
+  <g font-size="11" fill="var(--text-mute)">
+    <text x="20" y="132" font-weight="700" fill="var(--text)">chunked: prefill split into 8 chunks, decoders continue every step</text>
+    <g>
+      <rect x="20"  y="142" width="60" height="22" fill="#dc262688"/>
+      <rect x="80"  y="142" width="60" height="22" fill="#dc262688"/>
+      <rect x="140" y="142" width="60" height="22" fill="#dc262688"/>
+      <rect x="200" y="142" width="60" height="22" fill="#dc262688"/>
+      <rect x="260" y="142" width="60" height="22" fill="#dc262688"/>
+      <rect x="320" y="142" width="60" height="22" fill="#dc262688"/>
+      <rect x="380" y="142" width="60" height="22" fill="#dc262688"/>
+      <rect x="440" y="142" width="60" height="22" fill="#dc262688"/>
+    </g>
+    <text x="510" y="158" fill="var(--text)">prefill A chunks (1K each)</text>
+    <g>
+      <rect x="20"  y="168" width="60" height="22" fill="#2563eb88"/>
+      <rect x="80"  y="168" width="60" height="22" fill="#2563eb88"/>
+      <rect x="140" y="168" width="60" height="22" fill="#2563eb88"/>
+      <rect x="200" y="168" width="60" height="22" fill="#2563eb88"/>
+      <rect x="260" y="168" width="60" height="22" fill="#2563eb88"/>
+      <rect x="320" y="168" width="60" height="22" fill="#2563eb88"/>
+      <rect x="380" y="168" width="60" height="22" fill="#2563eb88"/>
+      <rect x="440" y="168" width="60" height="22" fill="#2563eb88"/>
+    </g>
+    <text x="510" y="184" fill="var(--text)">decoders B, C, D — one token per step</text>
+  </g>
+  <text x="20" y="222" font-size="11" fill="var(--text-mute)">Each step has a fixed <em>token budget</em> = chunk_tokens + decode_tokens. Larger budget → fewer steps but bigger per-step latency. Smaller → more steps, more launch overhead.</text>
+</svg>
+
+<p>The scheduler runs a token-budget allocator. Typical defaults pick a budget like 2048 or 4096 tokens per step; that is split between active decoders (one token each) and one or more in-flight prefill chunks. Each engine has knobs:</p>
+<ul>
+  <li><code>--max-num-batched-tokens</code> (vLLM): step token budget.</li>
+  <li><code>--long-prefill-token-threshold</code> / <code>--enable-chunked-prefill</code> (vLLM): when chunking kicks in.</li>
+  <li><code>--chunked-prefill-size</code> (SGLang): per-step prefill cap.</li>
+</ul>
+
+<div class="callout"><div class="label">Variant you'll hear about: PD disaggregation</div>The extreme version of avoiding prefill–decode interference is to run them on separate GPUs entirely: a prefill pool produces KV for a request, transfers it to a decode pool, and only the decode pool serves tokens. Trade-off: the KV transfer becomes a system path (NVLink or network). It pays off mainly for very-long-prompt, short-output workloads. Lesson 08 returns to this as a serving-architecture decision.</div>
+
+<h2>CUDA graphs: erasing dispatch overhead</h2>
+<p>Even after the scheduler is perfect, the per-step Python dispatch is real. For Llama-3-70B decode at batch 32, one step is around 80–200 small kernel launches. At ~5 µs each that is 0.4–1.0 ms of pure CPU-side dispatch — comparable to the actual GPU math.</p>
+<p>CUDA graphs solve this by <em>capturing</em> a stream of kernel launches once and replaying it many times with a single command. The CPU goes from "launch 200 kernels" to "replay graph." The GPU runs the same kernels in the same order; only the dispatch is bypassed.</p>
+
+<svg viewBox="0 0 820 260" class="diagram" role="img" aria-label="Eager dispatch vs CUDA graph replay timeline">
+  <text x="20" y="30" font-weight="700">eager dispatch (CPU is busy every kernel)</text>
+  <g>
+    <rect x="20" y="42" width="780" height="22" fill="var(--bg-soft)" stroke="var(--border)"/>
+    <g>
+      <rect x="20"  y="42" width="20" height="22" fill="#dc262688"/>
+      <rect x="40"  y="42" width="60" height="22" fill="#2563eb88"/>
+      <rect x="100" y="42" width="20" height="22" fill="#dc262688"/>
+      <rect x="120" y="42" width="60" height="22" fill="#2563eb88"/>
+      <rect x="180" y="42" width="20" height="22" fill="#dc262688"/>
+      <rect x="200" y="42" width="60" height="22" fill="#2563eb88"/>
+      <rect x="260" y="42" width="20" height="22" fill="#dc262688"/>
+      <rect x="280" y="42" width="60" height="22" fill="#2563eb88"/>
+      <rect x="340" y="42" width="20" height="22" fill="#dc262688"/>
+      <rect x="360" y="42" width="60" height="22" fill="#2563eb88"/>
+      <rect x="420" y="42" width="20" height="22" fill="#dc262688"/>
+      <rect x="440" y="42" width="60" height="22" fill="#2563eb88"/>
+      <rect x="500" y="42" width="20" height="22" fill="#dc262688"/>
+      <rect x="520" y="42" width="60" height="22" fill="#2563eb88"/>
+      <rect x="580" y="42" width="20" height="22" fill="#dc262688"/>
+      <rect x="600" y="42" width="60" height="22" fill="#2563eb88"/>
+    </g>
+  </g>
+  <text x="20" y="86" font-size="11" fill="var(--text-mute)">red = CPU launch overhead; blue = actual GPU kernel time. At small batch the red blocks dominate.</text>
+
+  <text x="20" y="130" font-weight="700">graph replay (one launch, no per-kernel CPU)</text>
+  <g>
+    <rect x="20" y="142" width="780" height="22" fill="var(--bg-soft)" stroke="var(--border)"/>
+    <rect x="20" y="142" width="24" height="22" fill="#dc262688"/>
+    <g>
+      <rect x="44"  y="142" width="60" height="22" fill="#2563eb88"/>
+      <rect x="104" y="142" width="60" height="22" fill="#2563eb88"/>
+      <rect x="164" y="142" width="60" height="22" fill="#2563eb88"/>
+      <rect x="224" y="142" width="60" height="22" fill="#2563eb88"/>
+      <rect x="284" y="142" width="60" height="22" fill="#2563eb88"/>
+      <rect x="344" y="142" width="60" height="22" fill="#2563eb88"/>
+      <rect x="404" y="142" width="60" height="22" fill="#2563eb88"/>
+      <rect x="464" y="142" width="60" height="22" fill="#2563eb88"/>
+    </g>
+  </g>
+  <text x="20" y="186" font-size="11" fill="var(--text-mute)">one red block at launch; all kernels run back-to-back. The CPU thread is free to schedule the next step concurrently.</text>
+
+  <text x="20" y="220" font-size="11" fill="var(--text-mute)">savings ≈ (n_kernels − 1) × launch_overhead. At 100 kernels × 5 µs that is ~0.5 ms per token — large at small batch, less relevant at large batch where kernels are long.</text>
+</svg>
+
+<p>The catch is that the captured graph runs <em>exactly</em> what it captured. If shapes change (different batch size, different sequence length, different number of pending sequences), you cannot use that graph. Production engines therefore capture <em>multiple</em> graphs at preset batch sizes (e.g., 1, 2, 4, 8, 16, 32, 64, 128, 256), and pad up to the nearest captured size when running.</p>
+
+<h2>Graph capture costs and constraints</h2>
+<table><thead><tr><th>Constraint</th><th>Why it exists</th><th>Workaround</th></tr></thead><tbody>
+<tr><td>Fixed shapes</td><td>Each kernel was launched with specific dims.</td><td>Pad batch and KV table sizes to nearest captured shape.</td></tr>
+<tr><td>Fixed memory addresses</td><td>Captured pointers must still be valid at replay.</td><td>Persistent buffers; never reallocate between captures.</td></tr>
+<tr><td>No CPU-dependent control flow</td><td>Branches cannot depend on host state.</td><td>Express everything as masked tensor ops or use conditional graph nodes.</td></tr>
+<tr><td>Capture is slow (~seconds)</td><td>Driver compiles a launch plan.</td><td>Capture during warmup, never on the request path.</td></tr>
+<tr><td>Replay still costs VRAM</td><td>Captured graphs hold buffers.</td><td>Don't capture every conceivable shape; pick a handful and pad.</td></tr>
+</tbody></table>
+
+<div class="callout warn"><div class="label">Coupling scheduler and kernel</div>This is where scheduling and kernel design become coupled. The scheduler must hit shapes the graph supports, so it pads/truncates batches; the kernel author has to make sure the captured shape is the fast shape. A "fast kernel that isn't capturable" can lose to a "slower kernel that runs in a graph."</div>
+
+<h2>Interactive · token budget &amp; graph capture</h2>
+<p>Set per-step token budget (split between prefill chunks and decoders) and the number of small kernel launches per step. The widget shows the eager vs graph-replay latency and tells you when graph capture is worth the constraints.</p>
+
+<div class="widget"><div class="title">When CUDA graphs matter</div><p class="hint">Eager: <code>n × (launch + work)</code>. Graph: <code>1 × launch + n × work</code>. At small batch and many launches, graph capture is the difference between bandwidth-bound and launch-bound.</p><div class="controls">
+<label class="inline">kernels per step <input id="cg-k" type="range" min="20" max="400" value="120"><span class="val" id="cg-k-v">120</span></label>
+<label class="inline">launch overhead µs <input id="cg-l" type="range" min="1" max="20" value="5"><span class="val" id="cg-l-v">5</span></label>
+<label class="inline">avg kernel work µs <input id="cg-w" type="range" min="2" max="200" value="40"><span class="val" id="cg-w-v">40</span></label>
+<label class="inline">batch size <input id="cg-b" type="range" min="1" max="256" value="16"><span class="val" id="cg-b-v">16</span></label>
+</div><canvas id="cg-canvas" class="dist-canvas" height="220"></canvas><p class="hint" id="cg-note"></p></div>
+
+<div class="callout"><div class="label">Variant you'll hear about: speculative decoding</div>A draft model proposes k tokens; the target model verifies them in parallel. The verify step has k+1 Q rows per sequence instead of one, moving the step slightly toward prefill on the arithmetic-intensity axis. That makes the same kernels and graphs more efficient. The scheduler must accept that some steps reject every draft and revert to ordinary decode.</div>
+
+<h2>What this gives you for the rest of the track</h2>
+<p>With scheduling installed, the GPU is rarely idle and the CPU rarely waits. The remaining ground for improvement is inside the non-attention kernels: weight matrices, MoE routing, sampling, communication. That is lesson 07. Then lesson 08 stitches everything into the framework that turns HTTP requests into the structured batches we now know how to run.</p>
+
+<script>
+(function(){
+  const ids=['k','l','w','b'];
+  const e=Object.fromEntries(ids.map(k=>[k,document.getElementById('cg-'+k)]));
+  const c=document.getElementById('cg-canvas'),ctx=c.getContext('2d'),note=document.getElementById('cg-note');
+  function draw(){
+    ids.forEach(k=>document.getElementById('cg-'+k+'-v').textContent=e[k].value);
+    c.width=c.clientWidth*devicePixelRatio;c.height=220*devicePixelRatio;ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.clearRect(0,0,c.clientWidth,220);
+    const K=+e.k.value,L=+e.l.value,W=+e.w.value,B=+e.b.value;
+    // kernel work scales weakly with batch (capped — most are launch-bound or memory-bound)
+    const w_eff = W * (0.5 + 0.5 * Math.log2(B+1)/Math.log2(257));
+    const eager = K*(L + w_eff);
+    const graph = L*2 + K*w_eff;
+    const max=eager;
+    const items=[['eager dispatch',eager,'#dc2626'],['graph replay',graph,'#16a34a']];
+    items.forEach(([n,v,col],i)=>{
+      const y=46+i*52,w=(c.clientWidth-220)*v/max;
+      ctx.fillStyle='#eef1f5';ctx.fillRect(170,y,c.clientWidth-220,30);
+      ctx.fillStyle=col;ctx.fillRect(170,y,w,30);
+      ctx.fillStyle='#1f2430';ctx.font='13px sans-serif';
+      ctx.fillText(n,30,y+20);
+      ctx.fillText((v/1000).toFixed(2)+' ms',176+w+6,y+20);
+    });
+    const speedup = eager/graph;
+    ctx.fillStyle='#5b6573';ctx.font='12px sans-serif';
+    ctx.fillText('speedup from capture: '+speedup.toFixed(2)+'×    ·    launch share of eager: '+(100*K*L/eager).toFixed(0)+'%',30,168);
+    note.textContent = speedup>1.4 ? 'Launch overhead dominates — graph capture pays off. Make sure your shapes are stable enough to capture a few sizes and pad to them.' : 'Kernel work dominates — graph capture is a small win. Spend effort on bandwidth and quantization instead.';
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+<footer class="lesson-nav"><a href="14_layouts_paged_radix.html"><span class="dir">Previous</span><span class="ttl">14 · Prefix reuse</span></a><a class="next" href="16_debug_kernel_system_design.html"><span class="dir">Next</span><span class="ttl">16 · Beyond attention</span></a></footer>
+</main></body></html>

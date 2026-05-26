@@ -1,0 +1,1022 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>01 · Why distributed at all?</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">01 · why distributed?</span>
+    <span class="step-pill">lesson 1 / 19</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Why distributed at all?</h1>
+<p class="subtitle">Three failure modes — memory, compute, throughput — each with its own response. Most of the complexity in this series exists to address one of them.</p>
+
+<h2>The honest framing</h2>
+
+<p>"Distributed" is not an architectural goal; it is a tax you pay because something doesn't fit. Whenever a teammate says "let's go distributed", three questions should fire before any code is touched:</p>
+
+<ol>
+  <li><strong>Does the training state fit in one GPU's HBM?</strong> Weights + gradients + optimizer state + activations. If no — you have a <em>memory wall</em>, and your response is to shard those things (FSDP / ZeRO, lesson 05).</li>
+  <li><strong>If it fits, can one GPU finish training in tolerable wall-clock time?</strong> If no — you have a <em>throughput wall</em>, and your response is to replicate the model and split the data across workers (DDP / FSDP, lesson 04).</li>
+  <li><strong>For inference: can one replica meet the QPS / latency target?</strong> If no — you have a <em>serving wall</em>, and your response is replication plus, sometimes, intra-replica sharding (lesson 11).</li>
+</ol>
+
+<p>A model that fits, trains in reasonable time, and serves at moderate QPS doesn't need any of this. Distributed engineering is genuinely expensive — NCCL deadlocks, opaque hangs, version skew, straggling ranks, silent data corruption at scale. Pay only for one of the three reasons above.</p>
+
+<h2>Walking the first wall — the bytes per parameter</h2>
+
+<p>The memory wall is the cleanest one to reason about, because we can count bytes. For a parameter <span class="math">θ</span> stored in <span class="math">bf16</span> (2 bytes), under Adam, in the standard mixed-precision recipe:</p>
+
+<div class="math block">
+  bytes_per_param &nbsp;=&nbsp; 2 &nbsp;(bf16 weight) &nbsp;+&nbsp; 2 &nbsp;(bf16 grad) &nbsp;+&nbsp; 4 &nbsp;(fp32 master weight) &nbsp;+&nbsp; 8 &nbsp;(fp32 Adam m + v) &nbsp;=&nbsp; 16
+</div>
+
+<p>Sixteen bytes is the headline number. For a 70B-parameter model that's <strong>1.12 TB</strong> of training state — before we count activations, before we count the KV-cache-like intermediates that backward needs. On an 80 GB H100, that's <span class="math">14×</span> too big to fit anywhere on the device.</p>
+
+<div class="callout warn">
+  <div class="label">Where the 16 comes from, exactly</div>
+  Mixed-precision training (Micikevicius 2017) keeps a master copy of every parameter in fp32 because Adam's update is numerically unstable in bf16. The forward and backward use bf16 copies for speed, but the optimizer step happens in fp32. So you pay for <em>both</em>: 2 bytes of bf16 weight + 4 bytes of fp32 master + 8 bytes of Adam state per param. Without the master copy you'd lose the small updates (a 1e-4 LR update to a 1.0 bf16 weight rounds to zero). Trade that off and you save 4 bytes per param at the cost of training stability.
+</div>
+
+<p>Activations are the other axis, and they scale with sequence length and batch, not just with parameters. For a transformer with hidden size <span class="math">d</span>, sequence length <span class="math">T</span>, batch <span class="math">B</span>, and <span class="math">L</span> layers, the activations checkpoint-able for backward are roughly:</p>
+
+<div class="math block">
+  activation_bytes &nbsp;≈&nbsp; B · T · L · d · 2 · k
+</div>
+
+<p>where <span class="math">k</span> is some small multiplier (typically 12–20 for a vanilla layer; activation checkpointing cuts it dramatically at the cost of recomputing forward during backward). For Llama-70B-ish numbers (<span class="math">d=8192</span>, <span class="math">L=80</span>) and a single sequence at <span class="math">T=8192</span>: roughly <span class="math">~130–200 GB</span> per sequence without checkpointing, dropping to <span class="math">~20 GB</span> with aggressive activation checkpointing — on top of the 1.1 TB of state. The point is not the exact number but its <em>shape</em>: activations grow with batch, state grows with model size, and they grow <em>independently</em>.</p>
+
+<h2>Animated · the 16-byte stack vs the HBM ceiling</h2>
+
+<p>The bytes-per-param stack literally stacks: bf16 weight + bf16 grad + fp32 master + Adam m + Adam v. Multiply by parameter count and the column grows. Slide it past the H100 ceiling, then the H200, then the B200. Watch the column turn red the moment it overshoots — that's the memory wall as a height. The animation phase shows each byte-category appearing in sequence so you can see <em>which</em> 4 bytes you'd save with Adafactor, or with mixed-precision tricks.</p>
+
+<div class="widget" id="bpp-widget">
+  <div class="title">Bytes-per-param column · grows with model size, capped by HBM</div>
+  <div class="hint">Each colored slab is one byte-category, scaled by P. Horizontal dashed lines are HBM ceilings for current GPUs. ▶ to animate the stack assembling; the column turns red when it pierces your selected ceiling.</div>
+
+  <div class="controls">
+    <button id="bpp-play">▶ animate stack</button>
+    <button id="bpp-reset">⟲ reset</button>
+    <label class="inline">params (B): <input type="range" id="bpp-P" min="1" max="200" step="1" value="70"> <span class="val" id="bpp-P-v">70</span></label>
+    <label class="inline">ceiling:
+      <select id="bpp-gpu" style="background:var(--code-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px;font-family:var(--mono);font-size:12px;">
+        <option value="80">H100 (80 GB)</option>
+        <option value="141">H200 (141 GB)</option>
+        <option value="192" selected>B200 (192 GB)</option>
+        <option value="40">A100 (40 GB)</option>
+      </select>
+    </label>
+  </div>
+
+  <canvas id="bpp-canvas" width="760" height="340" style="width:100%; height:340px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">column height</div><div class="v" id="bpp-h">—</div></div>
+    <div class="kpi"><div class="k">vs ceiling</div><div class="v" id="bpp-r">—</div></div>
+    <div class="kpi"><div class="k">fits on 1 GPU?</div><div class="v" id="bpp-fit" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">min GPUs needed</div><div class="v" id="bpp-min">—</div></div>
+  </div>
+</div>
+
+<h2>Walking the second wall — the time per step</h2>
+
+<p>Even if the model fit in one GPU's HBM, training a 70B model on 15 trillion tokens at single-GPU speed is infeasible. The arithmetic is brutal but useful to keep in your head:</p>
+
+<div class="math block">
+  total_FLOPs &nbsp;≈&nbsp; 6 · params · tokens
+</div>
+
+<p>The factor of <span class="math">6</span> comes from the standard scaling-laws accounting (Kaplan et al. 2020; also used in Chinchilla / Hoffmann et al. 2022): 2 FLOPs per parameter per token for the forward pass, plus 4 for the backward pass — split as 2 for the input-gradient pass and 2 for the weight-gradient pass. For 70B × 15T tokens, that's <span class="math">6.3 × 10²⁴</span> FLOPs. An H100 SXM does about <span class="math">1 × 10¹⁵</span> bf16 FLOPs/s peak; in practice you achieve ~40% of that (MFU, "model FLOP utilization") because of bandwidth-bound layers and overhead. One GPU at 0.4 PFLOPS:</p>
+
+<div class="math block">
+  time &nbsp;=&nbsp; 6.3 × 10²⁴ / (4 × 10¹⁴) &nbsp;=&nbsp; 1.6 × 10¹⁰ seconds &nbsp;≈&nbsp; <strong>500 years</strong>
+</div>
+
+<p>500 years. Even if memory were free, time isn't. The whole point of data parallel (lesson 04) is to drop this number by a factor of <span class="math">N</span> by running <span class="math">N</span> forward passes simultaneously on different data — the elapsed time falls to <span class="math">~6 months</span> at 1024 GPUs. The cost is one AllReduce of all gradients per step. We will spend lesson 02 making sure that AllReduce is essentially free.</p>
+
+<h2>2D · three walls in one picture</h2>
+
+<p>The three walls — memory, compute, throughput — are three different scaling lines that each get hit at different model sizes. Pick a model size with the slider; the three bars on the left show <em>how full</em> each budget is. The animated "ball" on each track shows the linear scaling. When a bar fills past 100%, that wall is hit and turns red.</p>
+
+<div class="widget" id="walls-widget">
+  <div class="title">Three walls, three budgets · scroll model size and watch them fill</div>
+  <div class="hint">Memory wall: training-state bytes vs one GPU's HBM. Compute wall: per-step FLOPs vs one GPU's per-second budget at a target step time. Throughput wall: total training FLOPs vs a deadline. Each bar fills linearly; whichever fills first is the binding constraint.</div>
+
+  <div class="controls">
+    <label class="inline">model (B params): <input type="range" id="ww-P" min="1" max="400" step="1" value="70"> <span class="val" id="ww-P-v">70</span></label>
+    <label class="inline">deadline (days): <input type="range" id="ww-D" min="1" max="180" step="1" value="60"> <span class="val" id="ww-D-v">60</span></label>
+    <label class="inline">tokens (T): <input type="range" id="ww-T" min="1" max="30" step="1" value="15"> <span class="val" id="ww-T-v">15</span></label>
+  </div>
+
+  <canvas id="ww-canvas" width="760" height="280" style="width:100%; height:280px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">memory wall</div><div class="v" id="ww-m" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">compute wall (step)</div><div class="v" id="ww-c" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">throughput wall (deadline)</div><div class="v" id="ww-t" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">first wall hit</div><div class="v" id="ww-first" style="font-size:14px;">—</div></div>
+  </div>
+</div>
+
+<h2>The roofline — the one diagram for "what's bound by what"</h2>
+
+<p>Every kernel on a GPU is bound by one of two things: how fast you can stream bytes from HBM, or how fast the tensor cores can do FLOPs on bytes already in SRAM. The roofline plot makes the choice visible:</p>
+
+<svg viewBox="0 0 720 320" class="diagram">
+  <!-- axes -->
+  <line x1="60" y1="280" x2="700" y2="280" stroke="var(--text-dim)" stroke-width="1"/>
+  <line x1="60" y1="40"  x2="60"  y2="280" stroke="var(--text-dim)" stroke-width="1"/>
+  <text x="380" y="306" text-anchor="middle" font-size="11" fill="var(--text-mute)" font-family="monospace">arithmetic intensity (FLOPs / byte)</text>
+  <text x="20"  y="160" text-anchor="middle" font-size="11" fill="var(--text-mute)" font-family="monospace" transform="rotate(-90 20 160)">throughput (FLOPs/s)</text>
+
+  <!-- two slopes -->
+  <line x1="60" y1="280" x2="280" y2="60" stroke="var(--accent-2)" stroke-width="2"/>
+  <line x1="280" y1="60" x2="700" y2="60" stroke="#16a34a" stroke-width="2"/>
+
+  <!-- ridge -->
+  <circle cx="280" cy="60" r="4" fill="var(--accent)"/>
+  <text x="288" y="56" font-size="11" font-family="monospace" fill="var(--accent)">ridge point ≈ peak / BW</text>
+
+  <!-- labels -->
+  <text x="120" y="200" font-size="11" font-family="monospace" fill="var(--accent-2)">memory-bound</text>
+  <text x="124" y="216" font-size="10" font-family="monospace" fill="var(--text-mute)">throughput = BW × intensity</text>
+  <text x="450" y="50" font-size="11" font-family="monospace" fill="#16a34a">compute-bound</text>
+  <text x="450" y="36" font-size="10" font-family="monospace" fill="var(--text-mute)">throughput = peak FLOPs/s</text>
+
+  <!-- workload dots -->
+  <circle cx="130" cy="252" r="5" fill="var(--accent-2)"/>
+  <text x="138" y="248" font-size="11" font-family="monospace" fill="var(--text)">decode step (batch=1)</text>
+  <text x="138" y="260" font-size="10" fill="var(--text-mute)" font-family="monospace">~1 FLOP/byte</text>
+
+  <circle cx="220" cy="100" r="5" fill="var(--accent-2)"/>
+  <text x="228" y="96" font-size="11" font-family="monospace" fill="var(--text)">attention (FlashAttn, long T)</text>
+
+  <circle cx="430" cy="60" r="5" fill="#16a34a"/>
+  <text x="438" y="56" font-size="11" font-family="monospace" fill="var(--text)">training MLP / prefill</text>
+  <text x="438" y="68" font-size="10" fill="var(--text-mute)" font-family="monospace">~200+ FLOP/byte</text>
+</svg>
+
+<p>Two of the most important distributed-systems consequences fall out of this picture:</p>
+
+<ul>
+  <li><strong>Decode is memory-bound, prefill is compute-bound.</strong> Per-token decode reads the entire weight matrix from HBM and does one matmul-vector. Arithmetic intensity is roughly <span class="math">batch · 1</span>. So a per-replica batch size of 1 lives far down the orange slope — far below peak. Bigger batches climb the slope; eventually you hit the ridge and become compute-bound. This single fact drives PD-disaggregation, continuous batching, speculative decoding, and almost every inference optimization. (Lesson 12, lesson 11.)</li>
+  <li><strong>Training prefers high arithmetic intensity, so big batches win — until the AllReduce stops scaling.</strong> Training a transformer layer at batch 1024 on a long sequence comfortably sits above the ridge. Distributed training keeps that batch large by adding ranks: each rank takes <span class="math">B/N</span> of a batch, the per-rank work stays comfortably compute-bound, and the only added cost is gradient sync. This is why DDP works at all.</li>
+</ul>
+
+<h2>The accounting habit</h2>
+
+<p>The most important skill in this series is doing back-of-envelope estimates of bytes and FLOPs <em>before</em> writing any code. Practising it on a few benchmark numbers:</p>
+
+<table>
+  <thead><tr><th>Quantity</th><th>Symbol / formula</th><th>70B model (B=1, T=8k)</th></tr></thead>
+  <tbody>
+    <tr><td>Param state (mixed-prec Adam)</td><td>16 · params</td><td>1.12 TB</td></tr>
+    <tr><td>Forward activations (no checkpointing)</td><td>~B · T · L · d · 14 bytes</td><td>~150 GB</td></tr>
+    <tr><td>Forward activations (checkpointed)</td><td>~B · T · L · 2 bytes</td><td>~2.6 GB</td></tr>
+    <tr><td>One step FLOPs</td><td>6 · params · B · T</td><td>~3.4 × 10¹⁵</td></tr>
+    <tr><td>One step time at 1 PFLOPS @ 40% MFU</td><td>FLOPs / (0.4 · peak)</td><td>~8.4 ms (per GPU, fictionally)</td></tr>
+    <tr><td>Grad AllReduce volume per step</td><td>~2 · 2 · params</td><td>280 GB / rank, ring-asymptotic</td></tr>
+    <tr><td>Grad AllReduce time at 100 GB/s ring BW</td><td>vol / BW</td><td>2.8 s if not overlapped</td></tr>
+  </tbody>
+</table>
+
+<p>That last line is the punchline: a 2.8s AllReduce against an 8ms step is <span class="math">~350×</span> too slow. So the AllReduce has to be either small (FSDP cuts it; lesson 05), local (intra-node NVLink; lesson 03), or hidden behind the compute (overlap; lesson 04). All three are real strategies, and all three are tested in the lessons ahead.</p>
+
+<h2>3D · the regime cube</h2>
+
+<p>Plot a model in (memory, compute, bandwidth) space. Each axis is "how much of that resource does one rank need". Models cluster into regimes: small models live near the origin (any GPU), 7B models press against the memory axis, frontier 405B models pin all three. The dot color tells you which axis is the binding wall. Rotate the cube to read off the depth.</p>
+
+<div class="widget" id="cube-widget">
+  <div class="title">Models in resource space · isometric cube</div>
+  <div class="hint">Each colored dot is a model; axis-aligned dropped lines show its (mem, compute, BW) coordinates. Color = binding axis (blue = memory, orange = compute, green = bandwidth). Click a dot to see its numbers.</div>
+
+  <div class="controls">
+    <label class="inline">rotation: <input type="range" id="cb-rot" min="-40" max="40" step="1" value="0"> <span class="val" id="cb-rot-v">0°</span></label>
+    <label class="inline">tilt: <input type="range" id="cb-tilt" min="10" max="50" step="1" value="28"> <span class="val" id="cb-tilt-v">28°</span></label>
+    <label class="inline">GPU HBM:
+      <select id="cb-gpu" style="background:var(--code-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px;font-family:var(--mono);font-size:12px;">
+        <option value="80">H100 80GB</option>
+        <option value="141">H200 141GB</option>
+        <option value="192" selected>B200 192GB</option>
+      </select>
+    </label>
+  </div>
+
+  <canvas id="cb-canvas" width="760" height="380" style="width:100%; height:380px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">selected model</div><div class="v" id="cb-sel" style="font-size:14px;">— click a dot —</div></div>
+    <div class="kpi"><div class="k">memory load</div><div class="v" id="cb-m" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">compute load</div><div class="v" id="cb-c" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">BW load</div><div class="v" id="cb-b" style="font-size:14px;">—</div></div>
+  </div>
+</div>
+
+<h2>Interactive · feel the memory wall</h2>
+
+<p>Slide the model size, the precision, the optimizer, and the batch around. Watch the bar chart show which buckets fit on which GPU. The dotted line is your chosen GPU's HBM budget. The lesson is in <em>which slider hits the wall first</em> — and that wall is what each subsequent lesson is going to dismantle.</p>
+
+<div class="widget" id="mem-widget">
+  <div class="title">Training-state budget on one GPU</div>
+  <div class="hint">Per-rank memory required to start a single forward+backward. Bars exceed the dashed budget? That's the memory wall. Note: activations here assume <em>no</em> checkpointing; flipping the checkpoint toggle is one of FSDP's main competitor strategies (lesson 05 explains why we usually want <em>both</em>).</div>
+
+  <div class="controls">
+    <label class="inline">params (B): <input type="range" id="m-p" min="1" max="200" step="1" value="70"> <span class="val" id="m-p-v">70</span></label>
+    <label class="inline">batch × seq: <input type="range" id="m-bt" min="1" max="64" step="1" value="8"> <span class="val" id="m-bt-v">8</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline">layers: <input type="range" id="m-l" min="16" max="128" step="4" value="80"> <span class="val" id="m-l-v">80</span></label>
+    <label class="inline">hidden d: <input type="range" id="m-d" min="2048" max="16384" step="512" value="8192"> <span class="val" id="m-d-v">8192</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline">optimizer:
+      <select id="m-opt">
+        <option value="adam">Adam (16 B/p)</option>
+        <option value="adafactor">Adafactor (8 B/p)</option>
+        <option value="sgdm">SGD+m (10 B/p)</option>
+        <option value="adam8bit">Adam-8bit (8 B/p)</option>
+      </select>
+    </label>
+    <label class="inline">GPU:
+      <select id="m-gpu">
+        <option value="80">H100 80GB</option>
+        <option value="40">A100 40GB</option>
+        <option value="141">H200 141GB</option>
+        <option value="192">B200 192GB</option>
+      </select>
+    </label>
+    <label class="inline">activation checkpointing
+      <input type="checkbox" id="m-ck">
+    </label>
+  </div>
+
+  <canvas class="dist-canvas" id="m-canvas" width="760" height="220" style="height: 220px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">total state</div><div class="v" id="m-tot">—</div></div>
+    <div class="kpi"><div class="k">vs one GPU</div><div class="v" id="m-ratio">—</div></div>
+    <div class="kpi"><div class="k">min ranks (FSDP, perfect shard)</div><div class="v" id="m-n">—</div></div>
+    <div class="kpi"><div class="k">first slider that hit it</div><div class="v" id="m-first">—</div></div>
+  </div>
+</div>
+
+<h2>Where each wall sends you</h2>
+
+<table>
+  <thead><tr><th>Wall</th><th>Symptom</th><th>First response</th><th>Lessons</th></tr></thead>
+  <tbody>
+    <tr><td>Memory (state)</td><td>OOM at step 0</td><td>FSDP / ZeRO-3 → activation checkpointing → TP</td><td>05, then 06</td></tr>
+    <tr><td>Memory (activations)</td><td>OOM at longer sequence</td><td>Activation checkpointing → SP → CP</td><td>05, 08</td></tr>
+    <tr><td>Memory (KV cache)</td><td>OOM serving long context</td><td>GQA → KV quantization → paged KV</td><td>see vLLM/09, vLLM/02</td></tr>
+    <tr><td>Time (training)</td><td>One-step time × steps &gt; deadline</td><td>DP → FSDP-HSDP → 3D parallelism</td><td>04, 05, 10</td></tr>
+    <tr><td>Latency (inference)</td><td>TTFT or ITL miss target</td><td>TP per replica → speculative decode → PD-disagg</td><td>11, 12</td></tr>
+    <tr><td>Throughput (inference)</td><td>QPS shortfall</td><td>Replicate → continuous batching → APC</td><td>11, see vLLM/04</td></tr>
+  </tbody>
+</table>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Distributed is a response to a constraint, not a goal. Diagnose which wall you're hitting (memory? time? throughput?) before reaching for a hammer. The lessons in Part II are each a different hammer; reading them in order is reading the hammers from cheapest to most expensive.
+</div>
+
+<footer class="lesson-nav">
+  <a href="index.html">
+    <span class="dir">← Index</span>
+    <span class="ttl">All lessons</span>
+  </a>
+  <a class="next" href="02_collectives.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">02 · Collectives</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const els = {
+    p: document.getElementById('m-p'), pv: document.getElementById('m-p-v'),
+    bt: document.getElementById('m-bt'), btv: document.getElementById('m-bt-v'),
+    l: document.getElementById('m-l'), lv: document.getElementById('m-l-v'),
+    d: document.getElementById('m-d'), dv: document.getElementById('m-d-v'),
+    opt: document.getElementById('m-opt'),
+    gpu: document.getElementById('m-gpu'),
+    ck: document.getElementById('m-ck'),
+    canvas: document.getElementById('m-canvas'),
+    tot: document.getElementById('m-tot'),
+    ratio: document.getElementById('m-ratio'),
+    n: document.getElementById('m-n'),
+    first: document.getElementById('m-first'),
+  };
+  const ctx = els.canvas.getContext('2d');
+
+  function bytesPerParam(opt){
+    switch(opt){
+      case 'adam':     return 2 + 2 + 4 + 8;
+      case 'adafactor':return 2 + 2 + 4 + 0;
+      case 'sgdm':     return 2 + 2 + 4 + 2;
+      case 'adam8bit': return 2 + 2 + 4 + 0;
+    }
+    return 16;
+  }
+
+  function fmtGB(b){
+    if (b < 1) return (b * 1024).toFixed(1) + ' MB';
+    if (b < 1024) return b.toFixed(1) + ' GB';
+    return (b / 1024).toFixed(2) + ' TB';
+  }
+
+  function compute(){
+    const P_B = parseInt(els.p.value);
+    const BT  = parseInt(els.bt.value);
+    const L   = parseInt(els.l.value);
+    const d   = parseInt(els.d.value);
+    const opt = els.opt.value;
+    const gpu = parseInt(els.gpu.value);
+    const ck  = els.ck.checked;
+
+    const params = P_B * 1e9;
+    const bpp = bytesPerParam(opt);
+
+    const w_b      = params * 2;
+    const g_b      = params * 2;
+    const masterOpt_b = params * (bpp - 4);
+    const master_b = params * 4;
+
+    const tokens = BT * 1024;
+    const act_b = ck
+      ? tokens * L * d * 2
+      : tokens * L * d * 14;
+
+    const buckets = [
+      { name: 'weight (bf16)',           v: w_b,         c: '#2563eb' },
+      { name: 'gradient (bf16)',         v: g_b,         c: '#3b82f6' },
+      { name: 'fp32 master',             v: master_b,    c: '#a8c8ff' },
+      { name: 'optimizer state',         v: masterOpt_b, c: '#d97706' },
+      { name: 'activations' + (ck?' (ck)':' (no ck)'), v: act_b, c: '#16a34a' },
+    ];
+    const total_b = buckets.reduce((s,b) => s + b.v, 0);
+    const total_gb = total_b / 1e9;
+    const gpu_gb = gpu;
+
+    let dom = buckets.reduce((a,b) => a.v > b.v ? a : b);
+    els.first.textContent = dom.name;
+    els.tot.textContent = fmtGB(total_gb);
+    els.ratio.textContent = (total_gb / gpu_gb).toFixed(2) + '× HBM';
+    els.n.textContent = Math.max(1, Math.ceil(total_gb / gpu_gb));
+
+    els.pv.textContent = P_B + 'B';
+    els.btv.textContent = BT + 'k';
+    els.lv.textContent = L;
+    els.dv.textContent = d;
+
+    return { buckets, total_gb, gpu_gb };
+  }
+
+  function render(){
+    const { buckets, total_gb, gpu_gb } = compute();
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = els.canvas.clientWidth, H = els.canvas.clientHeight;
+    if (els.canvas.width !== Math.round(W * dpr)){
+      els.canvas.width = Math.round(W * dpr);
+      els.canvas.height = Math.round(H * dpr);
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    const xMax = Math.max(total_gb * 1.1, gpu_gb * 1.4);
+    const padL = 130, padR = 20, padT = 20, padB = 28;
+    const innerW = W - padL - padR;
+
+    const xBudget = padL + (gpu_gb / xMax) * innerW;
+    ctx.strokeStyle = '#dc2626';
+    ctx.setLineDash([4, 4]);
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(xBudget, padT - 6);
+    ctx.lineTo(xBudget, H - padB);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#dc2626';
+    ctx.font = '11px monospace';
+    ctx.fillText('one GPU = ' + gpu_gb + ' GB', xBudget + 4, padT - 8);
+
+    const barY = padT + 30;
+    const barH = 28;
+    let cumGB = 0;
+    for (const b of buckets){
+      const gb = b.v / 1e9;
+      const x0 = padL + (cumGB / xMax) * innerW;
+      const w  = (gb / xMax) * innerW;
+      ctx.fillStyle = b.c;
+      ctx.fillRect(x0, barY, Math.max(1, w), barH);
+      cumGB += gb;
+    }
+
+    let ly = barY + barH + 18;
+    ctx.font = '11px monospace';
+    for (const b of buckets){
+      ctx.fillStyle = b.c;
+      ctx.fillRect(padL, ly - 9, 10, 10);
+      ctx.fillStyle = '#1f2430';
+      ctx.fillText(b.name + '  ' + (b.v / 1e9).toFixed(1) + ' GB', padL + 16, ly);
+      ly += 16;
+    }
+
+    ctx.fillStyle = '#1f2430';
+    ctx.font = '12px monospace';
+    ctx.fillText('total = ' + total_gb.toFixed(1) + ' GB', padL, barY - 8);
+  }
+
+  ['input', 'change'].forEach(ev => {
+    [els.p, els.bt, els.l, els.d, els.opt, els.gpu, els.ck].forEach(el => el.addEventListener(ev, render));
+  });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: bytes-per-param column animation ───
+ * Stacked column of 5 byte-slabs (2/2/4/4/4). Animate them building up.
+ * Compare to selected GPU HBM ceiling; flag overflow.
+ */
+(function(){
+  const C  = document.getElementById('bpp-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    play:$('bpp-play'), reset:$('bpp-reset'),
+    P:$('bpp-P'), Pv:$('bpp-P-v'),
+    gpu:$('bpp-gpu'),
+    h:$('bpp-h'), r:$('bpp-r'), fit:$('bpp-fit'), min:$('bpp-min'),
+  };
+
+  // The 5 slabs (bf16 weight, bf16 grad, fp32 master, Adam m, Adam v)
+  const SLABS = [
+    { name:'bf16 weight', bytes:2, color:'#2563eb' },
+    { name:'bf16 grad',   bytes:2, color:'#3b82f6' },
+    { name:'fp32 master', bytes:4, color:'#7c3aed' },
+    { name:'Adam m',      bytes:4, color:'#d97706' },
+    { name:'Adam v',      bytes:4, color:'#ff9d5a' },
+  ];
+
+  // Animation: revealed slab count grows from 0 to 5
+  let revealed = 5;       // animation progress: number of slabs visible
+  let animProg = 1.0;     // 0..1 within the currently-growing slab
+  let playing = false;
+  let lastTs = 0;
+
+  // Reference GPU ceilings to also draw as horizontal dashed lines
+  const CEILINGS = [
+    { name:'A100 40',  gb:40,  color:'#94a3b8' },
+    { name:'H100 80',  gb:80,  color:'#94a3b8' },
+    { name:'H200 141', gb:141, color:'#94a3b8' },
+    { name:'B200 192', gb:192, color:'#94a3b8' },
+  ];
+
+  function render(){
+    const P_B = parseInt(els.P.value);
+    const gpu_gb = parseInt(els.gpu.value);
+    els.Pv.textContent = P_B + 'B';
+    const P = P_B * 1e9;
+
+    // Total bytes
+    const total_b = SLABS.reduce((s,x)=>s+x.bytes,0) * P;
+    const total_gb = total_b / 1e9;
+    const ratio = total_gb / gpu_gb;
+    const overflows = total_gb > gpu_gb;
+
+    els.h.textContent = total_gb.toFixed(1) + ' GB';
+    els.r.textContent = ratio.toFixed(2) + '× HBM';
+    els.fit.textContent = overflows ? 'no — overflows' : 'yes';
+    els.fit.style.color = overflows ? '#dc2626' : '#16a34a';
+    els.min.textContent = Math.max(1, Math.ceil(ratio));
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 60, padR = 230, padT = 20, padB = 30;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+
+    // y-axis maximum: at least the largest ceiling, or the actual column height +20%
+    const maxScale = Math.max(...CEILINGS.map(c=>c.gb), total_gb) * 1.15;
+
+    // Draw axis
+    ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT+innerH); ctx.lineTo(padL+innerW, padT+innerH); ctx.stroke();
+
+    // y-axis labels (GB)
+    ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+    const ticks = 6;
+    for (let i=0; i<=ticks; i++){
+      const gb = (maxScale * i / ticks);
+      const y = padT + innerH - (gb / maxScale) * innerH;
+      ctx.fillText(gb.toFixed(0)+' GB', 6, y+3);
+      ctx.strokeStyle = '#eef1f5'; ctx.beginPath();
+      ctx.moveTo(padL, y); ctx.lineTo(padL+innerW, y); ctx.stroke();
+    }
+
+    // Draw GPU ceilings (dashed horizontal)
+    CEILINGS.forEach(c => {
+      const y = padT + innerH - (c.gb / maxScale) * innerH;
+      const isSelected = c.gb === gpu_gb;
+      ctx.strokeStyle = isSelected ? '#dc2626' : '#cbd5e1';
+      ctx.setLineDash(isSelected ? [4,3] : [2,4]);
+      ctx.lineWidth = isSelected ? 1.5 : 1;
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL+innerW, y); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = isSelected ? '#dc2626' : '#94a3b8';
+      ctx.font = isSelected ? 'bold 11px monospace' : '10px monospace';
+      ctx.fillText(c.name + ' GB', padL+innerW+6, y+3);
+    });
+
+    // Column geometry
+    const colW = Math.min(120, innerW * 0.35);
+    const colX = padL + innerW/2 - colW/2;
+
+    // Draw slabs from bottom to top
+    let cumBytes = 0;
+    const colTopY = padT + innerH;
+    SLABS.forEach((slab, i) => {
+      const slabBytes = slab.bytes * P;
+      const slabGb = slabBytes / 1e9;
+      // Animation: if i > revealed, skip; if i == revealed-1, fractional
+      if (i >= revealed) return;
+      let frac = 1;
+      if (i === revealed - 1 && animProg < 1) frac = animProg;
+
+      const showGb = slabGb * frac;
+      const y0 = colTopY - (cumBytes/1e9 / maxScale) * innerH;
+      const y1 = colTopY - ((cumBytes + slabBytes*frac)/1e9 / maxScale) * innerH;
+      ctx.fillStyle = slab.color;
+      // tint red when over ceiling
+      const isOver = (cumBytes + slabBytes*frac)/1e9 > gpu_gb;
+      ctx.globalAlpha = 1;
+      ctx.fillRect(colX, y1, colW, y0 - y1);
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1;
+      ctx.strokeRect(colX, y1, colW, y0 - y1);
+
+      // slab label on the right
+      const midY = (y0 + y1) / 2;
+      ctx.fillStyle = slab.color; ctx.font = '11px monospace';
+      ctx.fillText(slab.name, padL+innerW+6, midY-4);
+      ctx.fillStyle = '#5b6573'; ctx.font = '10px monospace';
+      ctx.fillText(slab.bytes + ' B/p · ' + slabGb.toFixed(1) + ' GB', padL+innerW+6, midY+9);
+
+      cumBytes += slabBytes * frac;
+    });
+
+    // If the column overshoots, draw a red top cap with a "!" symbol
+    if (overflows && revealed >= SLABS.length){
+      const yTop = colTopY - (total_gb / maxScale) * innerH;
+      ctx.strokeStyle = '#dc2626'; ctx.lineWidth = 2;
+      ctx.strokeRect(colX-2, yTop-2, colW+4, (total_gb/maxScale)*innerH+4);
+      ctx.fillStyle = '#dc2626'; ctx.font = 'bold 14px monospace';
+      ctx.fillText('!  doesn\'t fit', colX + colW + 8, yTop + 8);
+    }
+
+    // Title above column
+    ctx.fillStyle = '#1f2430'; ctx.font = 'bold 12px monospace';
+    ctx.fillText('total = ' + total_gb.toFixed(1) + ' GB  ('+ratio.toFixed(2)+'× HBM)', colX, padT - 4);
+
+    // x-axis label below
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('column = ' + P_B + 'B params × 16 B/param', colX-20, H - 10);
+  }
+
+  function tick(ts){
+    if (!playing) return;
+    const dt = ts - lastTs; lastTs = ts;
+    animProg += dt / 250;
+    if (animProg >= 1){
+      animProg = 0;
+      revealed += 1;
+      if (revealed > SLABS.length){
+        revealed = SLABS.length; animProg = 1; playing = false;
+        els.play.textContent = '▶ animate stack';
+      }
+    }
+    render();
+    if (playing) requestAnimationFrame(tick);
+  }
+
+  els.play.addEventListener('click', ()=>{
+    if (revealed >= SLABS.length){ revealed = 0; animProg = 0; }
+    playing = !playing;
+    els.play.textContent = playing ? '❚❚ pause' : '▶ animate stack';
+    if (playing){ lastTs = performance.now(); requestAnimationFrame(tick); }
+  });
+  els.reset.addEventListener('click', ()=>{
+    revealed = SLABS.length; animProg = 1; playing = false;
+    els.play.textContent = '▶ animate stack'; render();
+  });
+  [els.P, els.gpu].forEach(e => e.addEventListener('input', render));
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: three walls bars ───
+ * Memory, compute, throughput. Each scales with model size P; slider drags P.
+ * Bars fill up as load fraction (0..>1). >1 turns red.
+ */
+(function(){
+  const C  = document.getElementById('ww-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    P:$('ww-P'), Pv:$('ww-P-v'),
+    D:$('ww-D'), Dv:$('ww-D-v'),
+    T:$('ww-T'), Tv:$('ww-T-v'),
+    m:$('ww-m'), c:$('ww-c'), t:$('ww-t'), first:$('ww-first')
+  };
+
+  // assumptions
+  const GPU_HBM_GB    = 80;            // H100
+  const PEAK_FLOPS    = 1e15;          // 1 PFLOP/s peak
+  const MFU           = 0.40;
+  const EFF_FLOPS     = PEAK_FLOPS * MFU;
+  const STEP_BUDGET_MS = 100;
+  const BATCH_SEQ_TOK = 8 * 8192;      // B=8, T=8k typical
+  const BYTES_PER_PARAM_STATE = 16;
+
+  function compute(){
+    const P_B = parseInt(els.P.value);
+    const D   = parseInt(els.D.value);
+    const Ttr = parseInt(els.T.value);
+    els.Pv.textContent = P_B + 'B';
+    els.Dv.textContent = D;
+    els.Tv.textContent = Ttr + 'T';
+    const P = P_B * 1e9;
+
+    // Memory: state bytes / one GPU HBM
+    const memGB = P * BYTES_PER_PARAM_STATE / 1e9;
+    const memLoad = memGB / GPU_HBM_GB;
+
+    // Compute (per-step): 6*P*BATCH_SEQ_TOK FLOPs vs (EFF_FLOPS * STEP_BUDGET)
+    const stepFLOPs = 6 * P * BATCH_SEQ_TOK;
+    const stepBudgetFLOPs = EFF_FLOPS * (STEP_BUDGET_MS / 1000);
+    const computeLoad = stepFLOPs / stepBudgetFLOPs;
+
+    // Throughput (total): 6*P*tokens vs (1 GPU × deadline)
+    const tokens = Ttr * 1e12;
+    const totalFLOPs = 6 * P * tokens;
+    const deadlineFLOPs = EFF_FLOPS * D * 86400;
+    const throughputLoad = totalFLOPs / deadlineFLOPs;
+
+    return {
+      memLoad, computeLoad, throughputLoad,
+      memGB, stepFLOPs, totalFLOPs, P_B, D, Ttr,
+      stepBudgetFLOPs, deadlineFLOPs
+    };
+  }
+
+  function fmtE(x){
+    if (x < 1e6) return x.toFixed(0);
+    if (x < 1e9)  return (x/1e6).toFixed(1)+'M';
+    if (x < 1e12) return (x/1e9).toFixed(1)+'G';
+    if (x < 1e15) return (x/1e12).toFixed(1)+'T';
+    if (x < 1e18) return (x/1e15).toFixed(1)+'P';
+    if (x < 1e21) return (x/1e18).toFixed(1)+'E';
+    return (x/1e21).toFixed(1)+'Z';
+  }
+
+  function render(){
+    const r = compute();
+
+    els.m.textContent = r.memGB.toFixed(0)+' GB · '+(r.memLoad*100).toFixed(0)+'%';
+    els.c.textContent = fmtE(r.stepFLOPs)+'F · '+(r.computeLoad*100).toFixed(0)+'%';
+    els.t.textContent = fmtE(r.totalFLOPs)+'F · '+(r.throughputLoad*100).toFixed(1)+'×';
+
+    // find first wall hit by smallest ratio above 1 (i.e. ratio = load)
+    const loads = [
+      { name:'memory', v:r.memLoad },
+      { name:'compute', v:r.computeLoad },
+      { name:'throughput', v:r.throughputLoad },
+    ];
+    const overflowed = loads.filter(x=>x.v>=1).sort((a,b)=>b.v-a.v);
+    els.first.textContent = overflowed.length? overflowed[0].name+' ('+overflowed[0].v.toFixed(1)+'×)' : 'none';
+    els.first.style.color = overflowed.length ? '#dc2626' : '#16a34a';
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 18, padR = 20, padT = 26, padB = 18;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+    const colW = innerW / 3 - 12;
+
+    const walls = [
+      { name:'MEMORY WALL', load:r.memLoad, color:'#2563eb',
+        units:r.memGB.toFixed(0)+' GB',
+        cap: GPU_HBM_GB + ' GB HBM',
+        sub:'state = 16 · P bytes' },
+      { name:'COMPUTE WALL', load:r.computeLoad, color:'#d97706',
+        units:fmtE(r.stepFLOPs)+'F',
+        cap:fmtE(r.stepBudgetFLOPs)+'F / step',
+        sub:'per-step FLOPs at 100ms budget' },
+      { name:'THROUGHPUT WALL', load:r.throughputLoad, color:'#16a34a',
+        units:fmtE(r.totalFLOPs)+'F',
+        cap:fmtE(r.deadlineFLOPs)+'F (1 GPU)',
+        sub:'total FLOPs vs '+r.D+'-day deadline' },
+    ];
+
+    walls.forEach((w,i)=>{
+      const x0 = padL + i*(colW + 12);
+      // header
+      ctx.fillStyle = '#5b6573'; ctx.font = 'bold 11px monospace';
+      ctx.fillText(w.name, x0, padT - 10);
+      // outer "budget" frame
+      ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+      ctx.strokeRect(x0, padT, colW, innerH);
+      // capped bar fill
+      const loadCap = Math.min(1, w.load);
+      const filledH = loadCap * innerH;
+      ctx.fillStyle = w.color;
+      ctx.fillRect(x0, padT + innerH - filledH, colW, filledH);
+      // overflow above
+      if (w.load > 1){
+        const overFrac = Math.min(1, w.load - 1);
+        const overH = overFrac * innerH * 0.4;
+        ctx.fillStyle = '#dc2626';
+        ctx.fillRect(x0-2, padT - overH - 2, colW+4, overH);
+        // hashed pattern
+        ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1;
+        for (let k=0; k<overH; k+=4){
+          ctx.beginPath(); ctx.moveTo(x0, padT - k); ctx.lineTo(x0+colW, padT - k - 6); ctx.stroke();
+        }
+      }
+      // ceiling line on top of frame
+      ctx.strokeStyle = '#dc2626'; ctx.setLineDash([3,3]); ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(x0-4, padT); ctx.lineTo(x0+colW+4, padT); ctx.stroke();
+      ctx.setLineDash([]);
+      // load value inside
+      ctx.fillStyle = w.load > 1 ? '#fff' : '#ffffff';
+      ctx.font = 'bold 18px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText((w.load*100).toFixed(0)+'%', x0 + colW/2, padT + innerH/2);
+      ctx.font = '11px monospace';
+      ctx.fillStyle = w.load > 1 ? '#fff' : '#eef1f5';
+      ctx.fillText(w.units, x0 + colW/2, padT + innerH/2 + 18);
+      ctx.textAlign = 'left';
+
+      // footer labels
+      ctx.fillStyle = '#5b6573'; ctx.font = '10px monospace';
+      ctx.fillText('cap: '+w.cap, x0, padT + innerH + 12);
+      ctx.fillStyle = '#94a3b8';
+      ctx.fillText(w.sub, x0, padT + innerH + 24);
+    });
+  }
+
+  [els.P, els.D, els.T].forEach(e => e.addEventListener('input', render));
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: 3D regime cube (isometric) ───
+ * Plot models as points in (memory, compute, BW) space.
+ * Click to select. Rotate via slider.
+ */
+(function(){
+  const C  = document.getElementById('cb-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  let rotDeg = 0, tiltDeg = 28, selectedIdx = -1;
+
+  const els = {
+    rot:$('cb-rot'), rotv:$('cb-rot-v'),
+    tilt:$('cb-tilt'), tiltv:$('cb-tilt-v'),
+    gpu:$('cb-gpu'),
+    sel:$('cb-sel'), m:$('cb-m'), c:$('cb-c'), b:$('cb-b'),
+  };
+
+  // (mem_GB_per_rank_unsharded, per_step_PFLOP, per_step_GB_grad_AR)
+  // Normalized later by GPU capacity.
+  const MODELS = [
+    { name:'GPT-2 (1.5B)',   P:1.5,  bind:'none'  },
+    { name:'LLaMA-7B',       P:7,    bind:'memory'},
+    { name:'Mistral-7B',     P:7,    bind:'memory'},
+    { name:'LLaMA-70B',      P:70,   bind:'memory'},
+    { name:'Mixtral-8x22B',  P:141,  bind:'memory'},
+    { name:'LLaMA-405B',     P:405,  bind:'all'   },
+    { name:'GPT-3 (175B)',   P:175,  bind:'memory'},
+    { name:'GPT-NeoX 20B',   P:20,   bind:'memory'},
+  ];
+
+  els.rot.addEventListener('input', ()=>{ rotDeg = +els.rot.value; els.rotv.textContent = rotDeg+'°'; render(); });
+  els.tilt.addEventListener('input', ()=>{ tiltDeg = +els.tilt.value; els.tiltv.textContent = tiltDeg+'°'; render(); });
+  els.gpu.addEventListener('change', render);
+
+  // Iso projection
+  function proj(x, y, z, cx, cy, scale){
+    const ar = rotDeg * Math.PI / 180;
+    // x along axis1, y along axis2 (depth), z along axis3 (vertical)
+    // Apply rotation about z (yaw)
+    const xr =  x * Math.cos(ar) - y * Math.sin(ar);
+    const yr =  x * Math.sin(ar) + y * Math.cos(ar);
+    const t  = tiltDeg * Math.PI / 180;
+    const sx = (xr - yr) * Math.cos(t) * scale;
+    const sy = ((xr + yr) * Math.sin(t) - z) * scale;
+    return [cx + sx, cy + sy];
+  }
+
+  function modelCoords(m, gpu_gb){
+    const memLoad = (m.P*1e9*16/1e9) / gpu_gb;
+    const stepPF  = 6 * m.P*1e9 * 8 * 8192 / 1e15;
+    const computeLoad = stepPF / (0.4 * 1.0 * 0.1);
+    const gradGB = m.P*1e9*2/1e9;
+    const bwLoad = gradGB / (50);
+    // clamp 0..1 for display in [0,1] cube
+    const mc = Math.min(1, memLoad / 30);
+    const cc = Math.min(1, computeLoad / 30);
+    const bc = Math.min(1, bwLoad / 30);
+    return { memLoad, computeLoad, bwLoad, mc, cc, bc };
+  }
+
+  function bindColor(memL, comL, bwL){
+    const v = Math.max(memL, comL, bwL);
+    if (v < 1) return '#16a34a';
+    // find binding
+    if (memL >= comL && memL >= bwL) return '#2563eb';
+    if (comL >= bwL) return '#d97706';
+    return '#7c3aed';
+  }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const gpu_gb = parseInt(els.gpu.value);
+    const cx = W / 2, cy = H / 2 + 60;
+    const scale = Math.min(W, H) * 0.42;
+
+    // Draw the wireframe cube in (x:mem, y:compute, z:bw)
+    const verts = [
+      [0,0,0],[1,0,0],[1,1,0],[0,1,0],
+      [0,0,1],[1,0,1],[1,1,1],[0,1,1]
+    ];
+    const projV = verts.map(v => proj(v[0]-0.5, v[1]-0.5, v[2]-0.5, cx, cy, scale));
+    const edges = [
+      [0,1],[1,2],[2,3],[3,0],
+      [4,5],[5,6],[6,7],[7,4],
+      [0,4],[1,5],[2,6],[3,7]
+    ];
+    // bottom (z=0) and floor cells, drawn first
+    ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+    // grid on floor
+    for (let i=1; i<4; i++){
+      const t = i/4;
+      // along x at y=t, z=0
+      const a = proj(0-0.5, t-0.5, -0.5, cx, cy, scale);
+      const b = proj(1-0.5, t-0.5, -0.5, cx, cy, scale);
+      ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+      const a2 = proj(t-0.5, 0-0.5, -0.5, cx, cy, scale);
+      const b2 = proj(t-0.5, 1-0.5, -0.5, cx, cy, scale);
+      ctx.beginPath(); ctx.moveTo(a2[0], a2[1]); ctx.lineTo(b2[0], b2[1]); ctx.stroke();
+    }
+
+    // edges (full cube)
+    edges.forEach(([a,b]) => {
+      ctx.strokeStyle = (a < 4 && b < 4) ? '#cbd5e1' : '#dde2ea';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(projV[a][0], projV[a][1]); ctx.lineTo(projV[b][0], projV[b][1]); ctx.stroke();
+    });
+
+    // axis labels (extending from origin corner)
+    const O = proj(-0.5, -0.5, -0.5, cx, cy, scale);
+    const Xaxis = proj(0.7, -0.5, -0.5, cx, cy, scale);
+    const Yaxis = proj(-0.5, 0.7, -0.5, cx, cy, scale);
+    const Zaxis = proj(-0.5, -0.5, 0.7, cx, cy, scale);
+    ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(O[0],O[1]); ctx.lineTo(Xaxis[0],Xaxis[1]); ctx.stroke();
+    ctx.strokeStyle = '#d97706';
+    ctx.beginPath(); ctx.moveTo(O[0],O[1]); ctx.lineTo(Yaxis[0],Yaxis[1]); ctx.stroke();
+    ctx.strokeStyle = '#7c3aed';
+    ctx.beginPath(); ctx.moveTo(O[0],O[1]); ctx.lineTo(Zaxis[0],Zaxis[1]); ctx.stroke();
+    ctx.fillStyle = '#2563eb'; ctx.font='11px monospace';
+    ctx.fillText('mem (load × HBM)', Xaxis[0]+4, Xaxis[1]+4);
+    ctx.fillStyle = '#d97706';
+    ctx.fillText('compute (per-step)', Yaxis[0]+4, Yaxis[1]+12);
+    ctx.fillStyle = '#7c3aed';
+    ctx.fillText('BW (grad AllReduce)', Zaxis[0]+4, Zaxis[1]-4);
+
+    // For each model, project center, draw dropped lines + dot
+    const points = MODELS.map((m,i) => {
+      const c = modelCoords(m, gpu_gb);
+      const p3 = [c.mc - 0.5, c.cc - 0.5, c.bc - 0.5];
+      const p = proj(p3[0], p3[1], p3[2], cx, cy, scale);
+      const pfloor = proj(p3[0], p3[1], -0.5, cx, cy, scale);
+      return { i, m, c, p, pfloor };
+    });
+
+    // sort by depth (back to front) for proper occlusion
+    points.sort((a,b) => (a.p[1]) - (b.p[1]));
+
+    // dropped lines first
+    points.forEach(pt => {
+      ctx.strokeStyle = '#cbd5e1'; ctx.setLineDash([2,3]); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(pt.p[0], pt.p[1]); ctx.lineTo(pt.pfloor[0], pt.pfloor[1]); ctx.stroke();
+      ctx.setLineDash([]);
+      // small footprint marker
+      ctx.fillStyle = '#cbd5e1';
+      ctx.beginPath(); ctx.arc(pt.pfloor[0], pt.pfloor[1], 2, 0, Math.PI*2); ctx.fill();
+    });
+
+    // dots
+    points.forEach((pt) => {
+      const color = bindColor(pt.c.memLoad, pt.c.computeLoad, pt.c.bwLoad);
+      const isSel = (selectedIdx === pt.i);
+      ctx.beginPath();
+      ctx.arc(pt.p[0], pt.p[1], isSel ? 8 : 5.5, 0, Math.PI*2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.lineWidth = isSel ? 2 : 1;
+      ctx.strokeStyle = isSel ? '#fff' : '#ffffff';
+      ctx.stroke();
+      // label
+      ctx.fillStyle = isSel ? '#fff' : '#5b6573';
+      ctx.font = isSel ? 'bold 11px monospace' : '10px monospace';
+      ctx.fillText(pt.m.name, pt.p[0]+10, pt.p[1]+3);
+    });
+
+    // legend
+    const lx = 14, ly = 18;
+    const legend = [
+      ['#2563eb','memory bound'],
+      ['#d97706','compute bound'],
+      ['#7c3aed','BW bound'],
+      ['#16a34a','fits comfortably'],
+    ];
+    legend.forEach((l,i)=>{
+      ctx.fillStyle = l[0];
+      ctx.fillRect(lx, ly + i*14, 9, 9);
+      ctx.fillStyle = '#5b6573'; ctx.font='10px monospace';
+      ctx.fillText(l[1], lx + 14, ly + i*14 + 8);
+    });
+
+    // selection KPIs
+    if (selectedIdx >= 0){
+      const m = MODELS[selectedIdx];
+      const c = modelCoords(m, gpu_gb);
+      els.sel.textContent = m.name + ' (' + m.P + 'B)';
+      els.m.textContent = c.memLoad.toFixed(2)+'× HBM';
+      els.c.textContent = c.computeLoad.toFixed(1)+'× / 100ms step';
+      els.b.textContent = c.bwLoad.toFixed(2)+'× / 1s IB';
+    } else {
+      els.sel.textContent = '— click a dot —';
+      els.m.textContent = '—'; els.c.textContent = '—'; els.b.textContent = '—';
+    }
+  }
+
+  C.addEventListener('click', e => {
+    const rect = C.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    const gpu_gb = parseInt(els.gpu.value);
+    const W = C.clientWidth, H = C.clientHeight;
+    const cx = W / 2, cy = H / 2 + 60;
+    const scale = Math.min(W, H) * 0.42;
+    let best = -1, bestD = 14;
+    MODELS.forEach((m,i)=>{
+      const c = modelCoords(m, gpu_gb);
+      const p = proj(c.mc - 0.5, c.cc - 0.5, c.bc - 0.5, cx, cy, scale);
+      const d = Math.hypot(p[0]-x, p[1]-y);
+      if (d < bestD){ bestD = d; best = i; }
+    });
+    if (best >= 0){
+      selectedIdx = (selectedIdx === best) ? -1 : best;
+      render();
+    }
+  });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

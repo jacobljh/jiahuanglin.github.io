@@ -1,0 +1,932 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>09 · Expert parallel (MoE)</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">09 · expert parallel</span>
+    <span class="step-pill">lesson 9 / 19</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Expert parallel — MoE and AllToAll</h1>
+<p class="subtitle">Mixture-of-Experts replaces a single dense MLP with <span class="math">E</span> experts and a router that picks <span class="math">k</span> of them per token. Sharding the experts across ranks means tokens have to travel, twice per layer, and the dominant cost stops being matmul.</p>
+
+<h2>What an MoE layer is</h2>
+
+<p>In a dense transformer, every token passes through the same MLP weights. In an MoE layer, the MLP is replaced by:</p>
+
+<ul>
+  <li><strong>A router</strong>: a tiny linear that maps the token's hidden state to a score per expert.</li>
+  <li><strong>E expert MLPs</strong>, each typically the same size as the original dense MLP.</li>
+  <li><strong>A top-k selection</strong>: for each token, pick the top <span class="math">k</span> experts by router score and route the token only to those. <span class="math">k</span> is usually 1 (Switch Transformer) or 2 (Mixtral); larger models often pick more (DeepSeek-V3 uses k=8 routed experts plus shared experts).</li>
+</ul>
+
+<p>Total parameters: <span class="math">E ×</span> larger than a dense model of the same MLP shape. <strong>Total FLOPs per token: unchanged</strong> — each token still touches only <span class="math">k</span> experts' worth of MLP weights. So you get a model with much more "capacity" (more learnable parameters) at the same inference cost per token. This is the whole reason MoE is on the trajectory of every frontier lab: it lets capacity grow without FLOPs growing.</p>
+
+<h2>How sharding expert weights forces communication</h2>
+
+<p>The experts are huge — collectively, the MLP layer is now <span class="math">E ×</span> the size. Holding all <span class="math">E</span> experts on every rank is impossible. So we shard them: rank <span class="math">i</span> holds expert <span class="math">i</span> (or a small group of experts), the parameters for which never leave its HBM.</p>
+
+<p>But each rank's <em>input tokens</em> are distributed differently: every rank started with its own micro-batch (DP) or sequence shard (CP). Each token's router output says "go to expert 3". Expert 3 lives on rank 3. So the token has to <strong>travel</strong> from its origin rank to the rank holding its assigned expert.</p>
+
+<p>This is the <strong>dispatch AllToAll</strong>. Rank <span class="math">i</span> packages up: "here's the chunk of tokens I have that need to go to rank 0, here's the chunk for rank 1, here's mine, …". After AllToAll, every rank holds the tokens routed <em>to</em> its expert from every origin rank. It runs the local expert MLP on those tokens. Then the <strong>combine AllToAll</strong> sends each token's output back to its origin rank so it can re-enter the residual stream.</p>
+
+<svg viewBox="0 0 720 260" class="diagram">
+  <text x="40" y="20" font-size="12" font-family="monospace" fill="var(--text-mute)">expert parallel · two AllToAlls per forward pass</text>
+
+  <rect class="node-bg" x="40"  y="40" width="200" height="50" rx="8"/>
+  <text x="140" y="62" text-anchor="middle" font-size="13">tokens on each rank</text>
+  <text x="140" y="80" text-anchor="middle" font-size="10" fill="var(--text-mute)">router assigns expert IDs</text>
+
+  <rect class="node-bg" x="280" y="40" width="160" height="50" rx="8"/>
+  <text x="360" y="62" text-anchor="middle" font-size="13" fill="var(--accent-2)">DISPATCH AllToAll</text>
+  <text x="360" y="80" text-anchor="middle" font-size="10" fill="var(--text-mute)">tokens travel to experts</text>
+
+  <rect class="node-bg" x="480" y="40" width="200" height="50" rx="8"/>
+  <text x="580" y="62" text-anchor="middle" font-size="13">expert MLPs run locally</text>
+  <text x="580" y="80" text-anchor="middle" font-size="10" fill="var(--text-mute)">each rank's E_i sees its tokens</text>
+
+  <rect class="node-bg" x="280" y="160" width="160" height="50" rx="8"/>
+  <text x="360" y="182" text-anchor="middle" font-size="13" fill="var(--accent-2)">COMBINE AllToAll</text>
+  <text x="360" y="200" text-anchor="middle" font-size="10" fill="var(--text-mute)">outputs return to origins</text>
+
+  <rect class="node-bg" x="40"  y="160" width="200" height="50" rx="8"/>
+  <text x="140" y="182" text-anchor="middle" font-size="13">tokens, transformed</text>
+
+  <rect class="node-bg" x="480" y="160" width="200" height="50" rx="8"/>
+  <text x="580" y="182" text-anchor="middle" font-size="13">outputs per expert</text>
+
+  <path class="edge" d="M240 65 L280 65" marker-end="url(#arrow)"/>
+  <path class="edge" d="M440 65 L480 65" marker-end="url(#arrow)"/>
+  <path class="edge" d="M580 90 L580 160" marker-end="url(#arrow)"/>
+  <path class="edge" d="M480 185 L440 185" marker-end="url(#arrow)"/>
+  <path class="edge" d="M280 185 L240 185" marker-end="url(#arrow)"/>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/>
+    </marker>
+  </defs>
+</svg>
+
+<p><strong>Two AllToAlls per MoE layer per forward pass. Two more in backward.</strong> Four per layer per step. Compare with TP (also four AllReduces per layer per step) — they are roughly the same frequency. But the collective is different.</p>
+
+<h2>Animated · the two AllToAlls, token by token</h2>
+
+<p>Below: <span class="math">N = 8</span> ranks (= 8 experts, one per rank). Every rank starts with its own batch of tokens, each token's router has already chosen <span class="math">k = 2</span> experts. Watch the dispatch AllToAll fly tokens from origin rank to expert-host rank, then the expert MLPs run, then the combine AllToAll flies the results back. The tokens are colored by <em>origin</em> rank, so you can see which rank they came from after the dispatch.</p>
+
+<div class="widget" id="ep-anim">
+  <div class="title">Expert parallel · scrub the dispatch / compute / combine</div>
+  <div class="hint">5 phases: <em>router scores</em> → <em>dispatch AllToAll</em> → <em>expert FFN compute</em> → <em>combine AllToAll</em> → <em>tokens back home</em>. Color = origin rank. Position of token = where it currently lives.</div>
+
+  <div class="controls">
+    <button id="ep-play">▶ play</button>
+    <button id="ep-step">step ▷</button>
+    <button id="ep-reset">⟲ reset</button>
+    <label class="inline">phase: <input type="range" id="ep-t" min="0" max="4" step="1" value="0" style="width:280px"> <span class="val" id="ep-t-v">0/4</span></label>
+    <label class="inline">tokens/rank: <input type="range" id="ep-tk" min="2" max="8" step="1" value="4"> <span class="val" id="ep-tk-v">4</span></label>
+    <label class="inline">speed: <input type="range" id="ep-spd" min="1" max="10" step="1" value="3"> <span class="val" id="ep-spd-v">3×</span></label>
+  </div>
+
+  <canvas id="ep-canvas" width="760" height="380" style="width:100%; height:380px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">phase</div><div class="v" id="ep-phase" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">collective</div><div class="v" id="ep-coll" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">tokens in transit</div><div class="v" id="ep-in">—</div></div>
+    <div class="kpi"><div class="k">bytes / direction</div><div class="v" id="ep-by" style="font-size:13px;">—</div></div>
+  </div>
+</div>
+
+<h2>2D · routing matrix (tokens × experts)</h2>
+
+<p>Below is the heatmap that turns up when you log the router output during training. Rows = individual tokens, columns = experts. The intensity is the routing probability after top-k; only <span class="math">k</span> cells per row are nonzero. The vertical red line per column is the capacity cap — anything above it gets dropped. Increase the capacity factor to relax the cap, increase the skew to see the bottleneck rank fill up first.</p>
+
+<div class="widget" id="ep-route">
+  <div class="title">Routing matrix · which tokens go where</div>
+  <div class="hint">Each tiny tile = router probability for one (token, expert) pair. Red triangle in each column = capacity overflow.</div>
+
+  <div class="controls">
+    <label class="inline">tokens: <input type="range" id="er-T" min="32" max="256" step="16" value="64"> <span class="val" id="er-T-v">64</span></label>
+    <label class="inline">experts E: <input type="range" id="er-E" min="4" max="16" step="1" value="8"> <span class="val" id="er-E-v">8</span></label>
+    <label class="inline">top-k: <input type="range" id="er-k" min="1" max="4" step="1" value="2"> <span class="val" id="er-k-v">2</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline">skew: <input type="range" id="er-sk" min="0" max="100" step="5" value="30"> <span class="val" id="er-sk-v">30</span></label>
+    <label class="inline">capacity: <input type="range" id="er-cf" min="100" max="250" step="10" value="125"> <span class="val" id="er-cf-v">1.25</span></label>
+  </div>
+
+  <canvas id="er-canvas" width="760" height="320" style="width:100%; height:320px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">tokens dropped</div><div class="v" id="er-dr">—</div></div>
+    <div class="kpi"><div class="k">heaviest expert</div><div class="v" id="er-hv">—</div></div>
+    <div class="kpi"><div class="k">capacity</div><div class="v" id="er-cap">—</div></div>
+    <div class="kpi"><div class="k">imbalance</div><div class="v" id="er-im">—</div></div>
+  </div>
+</div>
+
+<h2>3D · experts as shards across ranks (isometric)</h2>
+
+<p>Each rank is a cube; on top sit its hosted experts (small flat slabs). The gold arrows show the dispatch AllToAll; the blue arrows show the combine AllToAll. The load bar under each rank is its expert's load relative to capacity — overflowing bars are clipped at the red line. Click a rank to highlight its hosted expert(s) and the routing arrows in and out.</p>
+
+<div class="widget" id="ep-3d">
+  <div class="title">Expert layout · click a rank to trace AllToAll</div>
+  <div class="hint">Top slabs on each cube = experts hosted by that rank (E_per = experts/rank). Bottom red bars = current per-expert load.</div>
+
+  <div class="controls">
+    <label class="inline">ranks N: <input type="range" id="e3-N" min="4" max="8" step="1" value="8"> <span class="val" id="e3-N-v">8</span></label>
+    <label class="inline">experts E: <input type="range" id="e3-E" min="4" max="16" step="1" value="8"> <span class="val" id="e3-E-v">8</span></label>
+    <label class="inline">rotation: <input type="range" id="e3-r" min="-30" max="30" step="1" value="0"> <span class="val" id="e3-r-v">0°</span></label>
+    <label class="inline">arrows:
+      <select id="e3-a" style="background:var(--code-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px;font-family:var(--mono);font-size:12px;">
+        <option value="both">both AllToAlls</option>
+        <option value="disp">dispatch only</option>
+        <option value="comb">combine only</option>
+        <option value="none">none</option>
+      </select>
+    </label>
+  </div>
+
+  <canvas id="e3-canvas" width="760" height="380" style="width:100%; height:380px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">selected rank</div><div class="v" id="e3-sel" style="font-size:14px;">— click one —</div></div>
+    <div class="kpi"><div class="k">experts hosted</div><div class="v" id="e3-eh">—</div></div>
+    <div class="kpi"><div class="k">load balance</div><div class="v" id="e3-lb" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">A2As / layer</div><div class="v" id="e3-a2a">2 fwd + 2 bwd</div></div>
+  </div>
+</div>
+
+<h2>Why AllToAll is the painful one</h2>
+
+<p>AllReduce is bandwidth-bound; for large messages it asymptotes to a constant cost. AllToAll is <em>latency-bound</em>: each rank sends <span class="math">N - 1</span> distinct messages, one per other rank, each carrying a different chunk. The per-message overhead (α in lesson 02) is paid <span class="math">N - 1</span> times per rank per call.</p>
+
+<p>Worse: the chunk sizes are unequal because the router is unpredictable. If 80% of tokens this batch chose expert 3, rank 3 receives 4× the workload of average. The slowest rank determines the AllToAll completion time. This is the <strong>load imbalance</strong> problem and it has its own machinery (below).</p>
+
+<p>Bandwidth math: each token of size <span class="math">d</span> bytes × 2 (bf16) gets sent <em>twice</em> per layer (dispatch + combine, ignoring backward). For <span class="math">B · T = 16384</span> tokens, <span class="math">d = 4096</span>, that's <span class="math">~134 MB</span> per AllToAll. Twice per layer × 32 layers = ~8.5 GB of AllToAll traffic per forward, on top of the inter-rank routing latency. On NVLink: ~10 ms. On IB: ~170 ms. <strong>EP is intra-node, with rare exceptions.</strong></p>
+
+<h2>Load balancing — a loss term, not a flag</h2>
+
+<p>If the router learns to send 90% of tokens to one expert (a common failure mode early in training), that one rank is bottleneck while the others sit idle. Two mechanisms keep things balanced:</p>
+
+<ol>
+  <li><strong>Auxiliary loss.</strong> Add a term to the training loss that penalises imbalanced routing. The standard form (Shazeer et al. 2017, Fedus et al. 2021): for each expert <span class="math">e</span>, let <span class="math">f_e</span> = fraction of tokens routed to <span class="math">e</span>, and <span class="math">p_e</span> = mean router probability assigned to <span class="math">e</span>. The aux loss is <span class="math">α · E · Σ f_e · p_e</span>. Minimised at uniform routing.</li>
+  <li><strong>Expert capacity.</strong> Cap each expert at <span class="math">C</span> tokens per batch. Overflow tokens are <em>dropped</em> from the expert and processed by the residual only. <span class="math">C = (B · T · k / E) · capacity_factor</span> where <span class="math">capacity_factor ∈ [1.0, 2.0]</span>. Higher capacity factor means fewer drops but more wasted FLOPs (since most experts won't fill their slot).</li>
+</ol>
+
+<p>Tradeoff: capacity factor 1.0 → tight pipelines, max drop rate (some loss in quality). 1.25–1.5 typical. Mixtral and most earlier MoEs use the standard aux-loss recipe; DeepSeek-V3 introduced an <em>auxiliary-loss-free</em> approach (per-expert bias terms that adjust during training) — a modern variant that avoids the aux-loss term's mild quality drag.</p>
+
+<h2>Composing EP with the rest</h2>
+
+<p>EP shards the experts' parameters; nothing forces it to also shard the per-token compute. In a typical layout EP is the dimension <em>around</em> the experts, like TP. Common compositions:</p>
+
+<ul>
+  <li><strong>EP = N_experts</strong> (one expert per rank). Pure expert parallel. AllToAlls span all ranks.</li>
+  <li><strong>EP × DP</strong>. Replicate the (EP, experts) group across DP replicas; each replica has its own AllToAll cluster. Standard.</li>
+  <li><strong>EP × TP</strong>. Inside an expert, also shard along feature dim. Useful when each expert is itself huge. Adds an AllReduce <em>inside</em> the expert MLP, on top of the AllToAlls.</li>
+</ul>
+
+<p>EP is bandwidth-hungry like TP — pin it to NVLink. If you have 8 experts and an 8-GPU node, EP fits naturally on one node.</p>
+
+<h2>The serving cost (because this is also an inference question)</h2>
+
+<p>At serve time, an MoE model has <span class="math">E ×</span> the weights to hold in HBM (every expert must be loaded even though only <span class="math">k</span> are used per token). For DeepSeek-V3 (671B total params, 37B active per token), serving requires holding all 671B in HBM somewhere — which means multiple replicas of a many-GPU shard. The "effective compute" per token is small (37B active), but the HBM cost is large. Inference for MoE wants:</p>
+
+<ul>
+  <li><strong>EP at serving time</strong> too, to spread the HBM cost across GPUs.</li>
+  <li><strong>Token batching across all experts</strong> so each expert's matmul has enough work to be compute-bound.</li>
+  <li><strong>Expert-aware scheduling</strong>: try to keep batches' expert routing diverse, so all ranks have work each forward.</li>
+</ul>
+
+<h2>Interactive · routing imbalance and capacity</h2>
+
+<p>Set <span class="math">E</span>, <span class="math">k</span>, capacity factor, and a "routing skew" parameter (0 = uniform, 1 = all tokens to one expert). Watch the per-expert load bars and the drop rate. The takeaway: even modest skew makes the slowest rank the bottleneck, and the capacity-factor / aux-loss tradeoff is visible.</p>
+
+<div class="widget" id="moe-widget">
+  <div class="title">MoE routing · per-expert load and drops</div>
+  <div class="hint">Each bar is the token count routed to one expert. Red overlay = tokens dropped (over capacity). Slowest bar's height sets the AllToAll completion time.</div>
+
+  <div class="controls">
+    <label class="inline">tokens (B·T): <input type="range" id="m-bt" min="1024" max="65536" step="1024" value="16384"> <span class="val" id="m-bt-v">16384</span></label>
+    <label class="inline">experts E: <input type="range" id="m-e" min="2" max="32" step="1" value="8"> <span class="val" id="m-e-v">8</span></label>
+    <label class="inline">top-k: <input type="range" id="m-k" min="1" max="4" step="1" value="2"> <span class="val" id="m-k-v">2</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline">routing skew: <input type="range" id="m-sk" min="0" max="100" step="5" value="20"> <span class="val" id="m-sk-v">20</span></label>
+    <label class="inline">capacity factor: <input type="range" id="m-cf" min="100" max="300" step="10" value="125"> <span class="val" id="m-cf-v">1.25</span></label>
+  </div>
+
+  <canvas class="dist-canvas" id="m-canvas" width="760" height="220" style="height: 220px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">drop rate</div><div class="v" id="m-dr">—</div></div>
+    <div class="kpi"><div class="k">slowest expert load</div><div class="v" id="m-sl">—</div></div>
+    <div class="kpi"><div class="k">imbalance factor</div><div class="v" id="m-im">—</div></div>
+    <div class="kpi"><div class="k">A2A bottleneck cost</div><div class="v" id="m-cost">—</div></div>
+  </div>
+</div>
+
+<div class="callout warn">
+  <div class="label">Practical caveat — MoE is bandwidth-hungry but not always feasible</div>
+  AllToAll cost scales with <span class="math">N - 1</span> messages per call, so doubling EP doubles the latency floor. Past EP = 16 or so, the latency tax is large enough that the gains from spreading experts are eaten by communication. Frontier MoE training uses EP = 8 or 16, never EP = thousands.
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  MoE moves the parallelism cost from "shard weights" to "shard <em>tokens</em>": every layer, every token has to find its expert (dispatch) and come back (combine). Cost is dominated by AllToAll latency, not bandwidth — so EP wants the lowest-latency interconnect (NVLink), and load imbalance is a real correctness problem solved at the loss-function level, not the schedule level.
+</div>
+
+<footer class="lesson-nav">
+  <a href="08_sequence_context_parallel.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">08 · Sequence / context parallel</span>
+  </a>
+  <a class="next" href="10_3d_parallelism.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">10 · 3D parallelism</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const get = id => document.getElementById(id);
+  const els = {
+    bt:get('m-bt'),btv:get('m-bt-v'),e:get('m-e'),ev:get('m-e-v'),k:get('m-k'),kv:get('m-k-v'),
+    sk:get('m-sk'),skv:get('m-sk-v'),cf:get('m-cf'),cfv:get('m-cf-v'),
+    canvas:get('m-canvas'),
+    dr:get('m-dr'),sl:get('m-sl'),im:get('m-im'),cost:get('m-cost')
+  };
+  const ctx = els.canvas.getContext('2d');
+
+  function compute(){
+    const BT = parseInt(els.bt.value), E = parseInt(els.e.value), k = parseInt(els.k.value);
+    const sk = parseInt(els.sk.value) / 100;
+    const cf = parseInt(els.cf.value) / 100;
+    els.btv.textContent = BT; els.ev.textContent = E; els.kv.textContent = k;
+    els.skv.textContent = parseInt(els.sk.value); els.cfv.textContent = cf.toFixed(2);
+
+    const total = BT * k;
+    const dist = new Array(E).fill(0);
+    for (let e = 0; e < E; e++){
+      const uni = total / E;
+      const conc = (e < k) ? total / k : 0;
+      dist[e] = (1 - sk) * uni + sk * conc;
+    }
+
+    const capacity = (BT * k / E) * cf;
+    let dropped = 0;
+    const actual = new Array(E).fill(0);
+    for (let e = 0; e < E; e++){
+      actual[e] = Math.min(dist[e], capacity);
+      dropped += Math.max(0, dist[e] - capacity);
+    }
+
+    const slowest = Math.max(...actual);
+    const mean = actual.reduce((a,b)=>a+b,0) / E;
+    const imbalance = slowest / mean;
+    const drop_rate = dropped / total;
+
+    return { dist, actual, capacity, slowest, mean, imbalance, drop_rate, BT, E, k };
+  }
+
+  function render(){
+    const { dist, actual, capacity, slowest, mean, imbalance, drop_rate, BT, E, k } = compute();
+
+    els.dr.textContent = (drop_rate*100).toFixed(1) + '%';
+    els.sl.textContent = Math.round(slowest);
+    els.im.textContent = imbalance.toFixed(2) + '×';
+    els.cost.textContent = imbalance > 1.5 ? 'imbalance-bound' : 'balanced';
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = els.canvas.clientWidth, H = els.canvas.clientHeight;
+    if (els.canvas.width !== Math.round(W*dpr)){
+      els.canvas.width = Math.round(W*dpr); els.canvas.height = Math.round(H*dpr);
+    }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 30, padR = 14, padT = 30, padB = 28;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+    const barW = innerW / E - 2;
+    const maxVal = Math.max(...dist, capacity) * 1.05;
+
+    const yCap = padT + innerH - (capacity / maxVal) * innerH;
+    ctx.strokeStyle = '#dc2626'; ctx.setLineDash([4,4]); ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(padL, yCap); ctx.lineTo(padL + innerW, yCap); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#dc2626'; ctx.font = '11px monospace';
+    ctx.fillText('capacity = ' + Math.round(capacity), padL + 4, yCap - 4);
+
+    for (let e = 0; e < E; e++){
+      const x = padL + e * (barW + 2);
+      const hReq = (dist[e] / maxVal) * innerH;
+      const hAct = (actual[e] / maxVal) * innerH;
+      ctx.fillStyle = '#cbd5e1';
+      ctx.fillRect(x, padT + innerH - hReq, barW, hReq);
+      ctx.fillStyle = '#2563eb';
+      ctx.fillRect(x, padT + innerH - hAct, barW, hAct);
+      if (dist[e] > capacity){
+        const hDrop = ((dist[e] - capacity) / maxVal) * innerH;
+        ctx.fillStyle = 'rgba(255,122,144,0.6)';
+        ctx.fillRect(x, padT + innerH - hReq, barW, hDrop);
+      }
+      ctx.fillStyle = '#5b6573'; ctx.font = '10px monospace';
+      ctx.fillText('E' + e, x + barW/2 - 8, H - 8);
+    }
+
+    ctx.fillStyle = '#2563eb'; ctx.fillRect(padL, padT - 18, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+    ctx.fillText('processed', padL + 14, padT - 9);
+    ctx.fillStyle = '#cbd5e1'; ctx.fillRect(padL + 90, padT - 18, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('requested', padL + 104, padT - 9);
+    ctx.fillStyle = 'rgba(255,122,144,0.6)'; ctx.fillRect(padL + 180, padT - 18, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('dropped (overflow)', padL + 194, padT - 9);
+  }
+
+  ['input','change'].forEach(ev=>{
+    [els.bt,els.e,els.k,els.sk,els.cf].forEach(el=>el.addEventListener(ev,render));
+  });
+  window.addEventListener('resize',render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: animated AllToAll routing ─── */
+(function(){
+  const C = document.getElementById('ep-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const COLORS = ['#2563eb','#d97706','#16a34a','#7c3aed','#dc2626','#3b82f6','#f59e0b','#16a34a'];
+
+  const N = 8; // 8 ranks
+  const k = 2;
+  let tokensPerRank = 4;
+  let phase = 0;
+  let playing = false, lastT = 0;
+
+  const els = {
+    play:$('ep-play'), step:$('ep-step'), reset:$('ep-reset'),
+    t:$('ep-t'), tv:$('ep-t-v'),
+    tk:$('ep-tk'), tkv:$('ep-tk-v'),
+    spd:$('ep-spd'), spdv:$('ep-spd-v'),
+    phase:$('ep-phase'), coll:$('ep-coll'),
+    inflight:$('ep-in'), bytes:$('ep-by')
+  };
+
+  // deterministic random
+  function mulberry32(a){ return function(){ let t = a += 0x6D2B79F5; t = Math.imul(t ^ t >>> 15, t | 1); t ^= t + Math.imul(t ^ t >>> 7, t | 61); return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+  function buildTokens(){
+    const rng = mulberry32(13);
+    const tokens = [];
+    for (let r=0; r<N; r++){
+      for (let i=0; i<tokensPerRank; i++){
+        // route to 2 distinct experts (0..N-1)
+        const e1 = Math.floor(rng()*N);
+        let e2 = Math.floor(rng()*N);
+        while (e2 === e1) e2 = Math.floor(rng()*N);
+        tokens.push({ origin:r, idx:i, experts:[e1, e2] });
+      }
+    }
+    return tokens;
+  }
+  let TOKENS = buildTokens();
+
+  function rankPos(W, H, r){
+    // top row of N rank columns
+    const padL = 40, padR = 40;
+    const colW = (W - padL - padR) / N;
+    return { x: padL + r*colW + colW/2, colW };
+  }
+
+  function render(){
+    phase = +els.t.value;
+    els.tv.textContent = phase + '/4';
+    els.spdv.textContent = els.spd.value + '×';
+    els.tkv.textContent = tokensPerRank;
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width = Math.round(W*dpr); C.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    // Layout: rank boxes top and bottom (origin row vs expert row)
+    const topY = 40, topH = 100;
+    const botY = H - 140, botH = 100;
+
+    // Draw origin row (top)
+    for (let r=0; r<N; r++){
+      const { x, colW } = rankPos(W, H, r);
+      ctx.fillStyle = '#f1f3f7';
+      ctx.fillRect(x - colW/2 + 4, topY, colW - 8, topH);
+      ctx.strokeStyle = '#dde2ea';
+      ctx.strokeRect(x - colW/2 + 4, topY, colW - 8, topH);
+      ctx.fillStyle = COLORS[r];
+      ctx.globalAlpha = 0.18;
+      ctx.fillRect(x - colW/2 + 4, topY, colW - 8, 18);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+      ctx.fillText('rank '+r, x - 18, topY + 13);
+    }
+    // Draw expert row (bottom): one expert per rank
+    for (let r=0; r<N; r++){
+      const { x, colW } = rankPos(W, H, r);
+      ctx.fillStyle = '#f1f3f7';
+      ctx.fillRect(x - colW/2 + 4, botY, colW - 8, botH);
+      ctx.strokeStyle = '#dde2ea';
+      ctx.strokeRect(x - colW/2 + 4, botY, colW - 8, botH);
+      ctx.fillStyle = '#cbd5e1';
+      ctx.fillRect(x - colW/2 + 4, botY, colW - 8, 18);
+      ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+      ctx.fillText('E'+r, x - 8, botY + 13);
+    }
+
+    // Section labels
+    ctx.fillStyle = '#5b6573'; ctx.font = '12px monospace';
+    ctx.fillText('origin ranks — tokens start here', 12, 24);
+    ctx.fillText('expert hosts — experts live here', 12, botY - 8);
+
+    // Token rendering depends on phase
+    // Each token has 2 destinations (k=2), draw two dots (or just one dot moving to its first expert for animation simplicity)
+    const tokDot = (x, y, color, label) => {
+      ctx.fillStyle = color;
+      ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI*2); ctx.fill();
+      if (label){
+        ctx.fillStyle = '#1f2430'; ctx.font = '9px monospace';
+        ctx.fillText(label, x + 7, y + 3);
+      }
+    };
+
+    let inflight = 0;
+
+    for (const tok of TOKENS){
+      const orig = rankPos(W, H, tok.origin);
+      // each of the two routes is rendered separately
+      for (let ki=0; ki<2; ki++){
+        const e = tok.experts[ki];
+        const dst = rankPos(W, H, e);
+        // small offset by token index + ki so they don't overlap
+        const offX = (tok.idx - (tokensPerRank-1)/2) * 7 + (ki - 0.5) * 4;
+        const offY = ki * 8;
+        const xOrigin = orig.x + offX;
+        const yOrigin = topY + 50 + offY;
+        const xDest = dst.x + offX;
+        const yDest = botY + 50 + offY;
+        let x, y;
+        if (phase === 0){
+          // router scores at origin
+          x = xOrigin; y = yOrigin;
+          // draw routing arrows toward expert columns
+          if (ki === 0){
+            ctx.strokeStyle = COLORS[tok.origin]; ctx.globalAlpha = 0.15; ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(xOrigin, yOrigin);
+            ctx.lineTo(dst.x, botY + 4);
+            ctx.stroke();
+            ctx.globalAlpha = 1;
+          }
+        } else if (phase === 1){
+          // dispatch AllToAll: interpolate orig -> dest
+          const a = 0.55;
+          x = xOrigin*(1-a) + xDest*a;
+          y = yOrigin*(1-a) + yDest*a;
+          inflight++;
+          // draw motion trail
+          ctx.strokeStyle = COLORS[tok.origin]; ctx.globalAlpha = 0.3; ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(xOrigin, yOrigin); ctx.lineTo(x, y); ctx.stroke();
+          ctx.globalAlpha = 1;
+        } else if (phase === 2){
+          // expert compute: tokens at destination
+          x = xDest; y = yDest;
+          if (ki === 0){
+            // small pulse on expert
+            ctx.strokeStyle = '#16a34a'; ctx.lineWidth = 2; ctx.globalAlpha = 0.5;
+            ctx.strokeRect(dst.x - dst.colW/2 + 6, botY + 22, dst.colW - 12, botH - 28);
+            ctx.globalAlpha = 1;
+          }
+        } else if (phase === 3){
+          // combine AllToAll: interpolate dest -> orig
+          const a = 0.45;
+          x = xDest*(1-a) + xOrigin*a;
+          y = yDest*(1-a) + yOrigin*a;
+          inflight++;
+          ctx.strokeStyle = '#3b82f6'; ctx.globalAlpha = 0.3; ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(xDest, yDest); ctx.lineTo(x, y); ctx.stroke();
+          ctx.globalAlpha = 1;
+        } else {
+          // back at origin, transformed
+          x = xOrigin; y = yOrigin;
+        }
+        tokDot(x, y, COLORS[tok.origin], '');
+      }
+    }
+
+    // Phase + KPIs
+    const PHASES = ['router assigns experts (k=2 per token)', 'DISPATCH AllToAll', 'expert FFN compute (local)', 'COMBINE AllToAll', 'tokens back home (transformed)'];
+    const COLLS = ['—', 'AllToAll', '—', 'AllToAll', '—'];
+    els.phase.textContent = PHASES[phase];
+    els.coll.textContent = COLLS[phase];
+    els.inflight.textContent = inflight;
+    const totalTokens = TOKENS.length * k;
+    const bytesEst = totalTokens * 4096 * 2 / N; // per rank
+    els.bytes.textContent = (bytesEst / 1e6).toFixed(1) + ' MB/rank';
+
+    // Footer phase strip
+    const padL = 12, fy = H - 20;
+    for (let i=0; i<5; i++){
+      ctx.fillStyle = i === phase ? '#2563eb' : '#dde2ea';
+      ctx.fillRect(padL + i*(W-24)/5, fy, (W-24)/5 - 4, 8);
+    }
+  }
+
+  function step(){
+    let v = +els.t.value; v = (v + 1) % 5; els.t.value = v; render();
+  }
+  function tick(ts){
+    if (!playing) return;
+    const spd = +els.spd.value;
+    if (ts - lastT > 900/spd){ step(); lastT = ts; }
+    requestAnimationFrame(tick);
+  }
+  els.play.addEventListener('click', ()=>{
+    playing = !playing;
+    els.play.textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastT = performance.now(); requestAnimationFrame(tick); }
+  });
+  els.step.addEventListener('click', step);
+  els.reset.addEventListener('click', ()=>{ els.t.value=0; playing=false; els.play.textContent='▶ play'; render(); });
+  els.t.addEventListener('input', render);
+  els.tk.addEventListener('input', ()=>{ tokensPerRank = +els.tk.value; els.tkv.textContent = tokensPerRank; TOKENS = buildTokens(); render(); });
+  els.spd.addEventListener('input', ()=>{ els.spdv.textContent = els.spd.value+'×'; });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: routing matrix heatmap ─── */
+(function(){
+  const C = document.getElementById('er-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    T:$('er-T'), Tv:$('er-T-v'),
+    E:$('er-E'), Ev:$('er-E-v'),
+    k:$('er-k'), kv:$('er-k-v'),
+    sk:$('er-sk'), skv:$('er-sk-v'),
+    cf:$('er-cf'), cfv:$('er-cf-v'),
+    dr:$('er-dr'), hv:$('er-hv'), cap:$('er-cap'), im:$('er-im')
+  };
+  function mulberry32(a){ return function(){ let t = a += 0x6D2B79F5; t = Math.imul(t ^ t >>> 15, t | 1); t ^= t + Math.imul(t ^ t >>> 7, t | 61); return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+  function render(){
+    const T = +els.T.value, E = +els.E.value, k = Math.min(+els.k.value, E);
+    const sk = +els.sk.value / 100, cf = +els.cf.value / 100;
+    els.Tv.textContent = T; els.Ev.textContent = E; els.kv.textContent = k;
+    els.skv.textContent = +els.sk.value; els.cfv.textContent = cf.toFixed(2);
+
+    // Generate routing probabilities
+    const rng = mulberry32(7);
+    const route = []; // [token][expert] = prob (only top-k nonzero)
+    const counts = new Array(E).fill(0);
+    for (let i=0; i<T; i++){
+      // Base scores: skewed toward first few experts based on `sk`
+      const scores = new Array(E);
+      for (let e=0; e<E; e++){
+        const skewedBias = sk * (1 - e/(E-1)); // higher for low-index
+        scores[e] = rng()*0.3 + skewedBias + rng()*(1-sk)*0.5;
+      }
+      // softmax
+      const m = Math.max(...scores);
+      const exps = scores.map(s => Math.exp((s - m)*3));
+      const sum = exps.reduce((a,b)=>a+b);
+      const probs = exps.map(x => x/sum);
+      // top-k
+      const idx = [...probs.keys()].sort((a,b) => probs[b] - probs[a]).slice(0, k);
+      const row = new Array(E).fill(0);
+      for (const e of idx){ row[e] = probs[e]; counts[e]++; }
+      route.push(row);
+    }
+
+    const capacity = (T * k / E) * cf;
+    let dropped = 0;
+    for (let e=0; e<E; e++){
+      if (counts[e] > capacity) dropped += counts[e] - capacity;
+    }
+    const heaviest = Math.max(...counts);
+    const mean = counts.reduce((a,b)=>a+b)/E;
+    const imbalance = heaviest / Math.max(1, mean);
+
+    els.dr.textContent = (dropped / (T*k) * 100).toFixed(1) + '%';
+    els.hv.textContent = Math.round(heaviest);
+    els.cap.textContent = Math.round(capacity);
+    els.im.textContent = imbalance.toFixed(2) + '×';
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width = Math.round(W*dpr); C.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    // Top section: heatmap
+    const padL = 50, padT = 24, padR = 16, padB = 80;
+    const hmW = W - padL - padR;
+    const hmH = H - padT - padB;
+    const cellW = hmW / E, cellH = hmH / T;
+
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('experts →', padL, padT - 6);
+    ctx.save(); ctx.translate(12, padT + hmH/2); ctx.rotate(-Math.PI/2);
+    ctx.fillText('tokens →', 0, 0); ctx.restore();
+
+    for (let i=0; i<T; i++){
+      for (let e=0; e<E; e++){
+        const p = route[i][e];
+        if (p > 0){
+          // overflow check: if this assignment is past the per-expert capacity, draw red
+          const positionInExpert = route.slice(0, i+1).reduce((s, r) => s + (r[e] > 0 ? 1 : 0), 0);
+          const isOverflow = positionInExpert > capacity;
+          ctx.fillStyle = isOverflow ? 'rgba(255,122,144,0.85)' : '#2563eb';
+          ctx.globalAlpha = 0.4 + p * 1.2;
+          ctx.fillRect(padL + e*cellW, padT + i*cellH, Math.max(1, cellW - 0.5), Math.max(1, cellH - 0.3));
+          ctx.globalAlpha = 1;
+        }
+      }
+    }
+    // Expert column borders
+    ctx.strokeStyle = '#dde2ea';
+    for (let e=0; e<=E; e++){
+      const x = padL + e*cellW;
+      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + hmH); ctx.stroke();
+    }
+
+    // Bottom: column-bar of per-expert load
+    const barY = padT + hmH + 14;
+    const barH = 36;
+    const maxLoad = Math.max(...counts, capacity);
+    for (let e=0; e<E; e++){
+      const x = padL + e*cellW;
+      const lh = (counts[e] / maxLoad) * barH;
+      const overflow = Math.max(0, counts[e] - capacity);
+      // useful portion
+      ctx.fillStyle = '#2563eb';
+      ctx.fillRect(x + 1, barY + barH - lh + (overflow / maxLoad) * barH, cellW - 2, lh - (overflow / maxLoad) * barH);
+      // overflow
+      if (overflow > 0){
+        ctx.fillStyle = 'rgba(255,122,144,0.85)';
+        ctx.fillRect(x + 1, barY + barH - lh, cellW - 2, (overflow / maxLoad) * barH);
+      }
+      ctx.fillStyle = '#5b6573'; ctx.font = '9px monospace';
+      ctx.fillText('E'+e, x + cellW/2 - 7, barY + barH + 12);
+    }
+    // capacity line
+    const yCap = barY + barH - (capacity / maxLoad) * barH;
+    ctx.strokeStyle = '#dc2626'; ctx.setLineDash([4,3]); ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(padL, yCap); ctx.lineTo(padL + hmW, yCap); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#dc2626'; ctx.font = '10px monospace';
+    ctx.fillText('capacity', padL + hmW - 50, yCap - 2);
+  }
+
+  ['input','change'].forEach(ev=>{
+    [els.T, els.E, els.k, els.sk, els.cf].forEach(s => s.addEventListener(ev, render));
+  });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: 3D experts as shards isometric ─── */
+(function(){
+  const C = document.getElementById('e3-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const COLORS = ['#2563eb','#d97706','#16a34a','#7c3aed','#dc2626','#3b82f6','#f59e0b','#16a34a'];
+
+  let N = 8, E = 8, rot = 0, arrows = 'both', selected = null;
+  const sN = $('e3-N'), sE = $('e3-E'), sR = $('e3-r'), sA = $('e3-a');
+  const sNv = $('e3-N-v'), sEv = $('e3-E-v'), sRv = $('e3-r-v');
+  sN.addEventListener('input', ()=>{ N = +sN.value; sNv.textContent = N; render(); });
+  sE.addEventListener('input', ()=>{ E = +sE.value; sEv.textContent = E; render(); });
+  sR.addEventListener('input', ()=>{ rot = +sR.value; sRv.textContent = rot+'°'; render(); });
+  sA.addEventListener('change', ()=>{ arrows = sA.value; render(); });
+
+  function proj(x, y, z, cx, cy){
+    const rad = rot*Math.PI/180;
+    const a = Math.PI/6 + rad;
+    const sx = (x - y)*Math.cos(a);
+    const sy = (x + y)*Math.sin(a) - z;
+    return [cx + sx, cy + sy];
+  }
+  function shade(c, f){
+    const m = c.replace('#','');
+    const r = parseInt(m.substr(0,2),16), g = parseInt(m.substr(2,2),16), b = parseInt(m.substr(4,2),16);
+    return 'rgb('+Math.round(r*f)+','+Math.round(g*f)+','+Math.round(b*f)+')';
+  }
+
+  function mulberry32(a){ return function(){ let t = a += 0x6D2B79F5; t = Math.imul(t ^ t >>> 15, t | 1); t ^= t + Math.imul(t ^ t >>> 7, t | 61); return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width = Math.round(W*dpr); C.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    // Layout: N ranks in a row
+    const colSpacing = 70;
+    const totalW = N * colSpacing;
+    const cx = (W - totalW * Math.cos(Math.PI/6)) / 2 + 50;
+    const cy = H/2 + 20;
+
+    // Synthetic per-expert load
+    const rng = mulberry32(11);
+    const load = new Array(E).fill(0).map(() => 0.4 + rng()*1.2);
+    // bias one
+    load[0] = Math.max(load[0], 1.5);
+    const capacity = 1.0;
+
+    // Hits for click
+    const hits = [];
+
+    // Order rank-cubes back to front
+    const order = [];
+    for (let r=0; r<N; r++) order.push(r);
+    order.sort((a, b)=> a - b); // simple left-to-right ordering
+
+    // Determine experts per rank
+    const ePerRank = Math.max(1, Math.ceil(E / N));
+
+    for (const r of order){
+      const ox = r * colSpacing, oy = 0;
+      const isSel = selected === r;
+      const dim = !isSel && selected != null;
+
+      ctx.globalAlpha = dim ? 0.3 : 1;
+
+      // Rank cube (host)
+      const cs = 48, ch = 36;
+      const p000 = proj(ox, oy, 0, cx, cy);
+      const p100 = proj(ox+cs, oy, 0, cx, cy);
+      const p110 = proj(ox+cs, oy+cs, 0, cx, cy);
+      const p010 = proj(ox, oy+cs, 0, cx, cy);
+      const p001 = proj(ox, oy, ch, cx, cy);
+      const p101 = proj(ox+cs, oy, ch, cx, cy);
+      const p111 = proj(ox+cs, oy+cs, ch, cx, cy);
+      const p011 = proj(ox, oy+cs, ch, cx, cy);
+
+      const baseColor = '#cbd5e1';
+      ctx.fillStyle = shade(baseColor, 1.0);
+      ctx.beginPath(); ctx.moveTo(p001[0],p001[1]); ctx.lineTo(p101[0],p101[1]); ctx.lineTo(p111[0],p111[1]); ctx.lineTo(p011[0],p011[1]); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = shade(baseColor, 0.55);
+      ctx.beginPath(); ctx.moveTo(p001[0],p001[1]); ctx.lineTo(p011[0],p011[1]); ctx.lineTo(p010[0],p010[1]); ctx.lineTo(p000[0],p000[1]); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = shade(baseColor, 0.78);
+      ctx.beginPath(); ctx.moveTo(p011[0],p011[1]); ctx.lineTo(p111[0],p111[1]); ctx.lineTo(p110[0],p110[1]); ctx.lineTo(p010[0],p010[1]); ctx.closePath(); ctx.fill();
+
+      // Rank label
+      const lp = proj(ox + cs/2, -10, 0, cx, cy);
+      ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+      ctx.fillText('r'+r, lp[0]-6, lp[1]);
+
+      // Experts on top (small slabs)
+      for (let ei=0; ei<ePerRank; ei++){
+        const eIdx = r * ePerRank + ei;
+        if (eIdx >= E) break;
+        const slabH = 12;
+        const slabZ = ch + 4 + ei*(slabH+3);
+        const color = COLORS[eIdx % COLORS.length];
+
+        const q000 = proj(ox + 4, oy + 4, slabZ, cx, cy);
+        const q100 = proj(ox + cs - 4, oy + 4, slabZ, cx, cy);
+        const q110 = proj(ox + cs - 4, oy + cs - 4, slabZ, cx, cy);
+        const q010 = proj(ox + 4, oy + cs - 4, slabZ, cx, cy);
+        const q001 = proj(ox + 4, oy + 4, slabZ + slabH, cx, cy);
+        const q101 = proj(ox + cs - 4, oy + 4, slabZ + slabH, cx, cy);
+        const q111 = proj(ox + cs - 4, oy + cs - 4, slabZ + slabH, cx, cy);
+        const q011 = proj(ox + 4, oy + cs - 4, slabZ + slabH, cx, cy);
+
+        ctx.fillStyle = shade(color, 1.0);
+        ctx.beginPath(); ctx.moveTo(q001[0],q001[1]); ctx.lineTo(q101[0],q101[1]); ctx.lineTo(q111[0],q111[1]); ctx.lineTo(q011[0],q011[1]); ctx.closePath(); ctx.fill();
+        ctx.fillStyle = shade(color, 0.55);
+        ctx.beginPath(); ctx.moveTo(q001[0],q001[1]); ctx.lineTo(q011[0],q011[1]); ctx.lineTo(q010[0],q010[1]); ctx.lineTo(q000[0],q000[1]); ctx.closePath(); ctx.fill();
+        ctx.fillStyle = shade(color, 0.78);
+        ctx.beginPath(); ctx.moveTo(q011[0],q011[1]); ctx.lineTo(q111[0],q111[1]); ctx.lineTo(q110[0],q110[1]); ctx.lineTo(q010[0],q010[1]); ctx.closePath(); ctx.fill();
+
+        // Tiny label
+        ctx.fillStyle = '#ffffff'; ctx.font = 'bold 10px monospace';
+        ctx.fillText('E'+eIdx, q001[0]+4, q001[1]+10);
+      }
+
+      // Load bar in front of rank cube
+      const eIdx = r * ePerRank;
+      const ld = load[eIdx % E];
+      const lbX = proj(ox + cs/2 - 18, oy + cs + 12, 0, cx, cy);
+      const lbW = 36;
+      ctx.fillStyle = '#f1f3f7';
+      ctx.fillRect(lbX[0], lbX[1] - 6, lbW, 6);
+      ctx.strokeStyle = '#dde2ea';
+      ctx.strokeRect(lbX[0], lbX[1] - 6, lbW, 6);
+      const overflow = ld > capacity;
+      ctx.fillStyle = overflow ? '#dc2626' : '#16a34a';
+      ctx.fillRect(lbX[0]+1, lbX[1] - 5, Math.min(lbW-2, lbW * ld/2), 4);
+      // capacity tick
+      const capX = lbX[0] + lbW * capacity/2;
+      ctx.strokeStyle = '#dc2626';
+      ctx.beginPath(); ctx.moveTo(capX, lbX[1]-7); ctx.lineTo(capX, lbX[1]+1); ctx.stroke();
+
+      ctx.globalAlpha = 1;
+
+      const hp = proj(ox+cs/2, oy+cs/2, ch+10, cx, cy);
+      hits.push({r, x:hp[0], y:hp[1]});
+    }
+
+    // Arrows: dispatch (gold) and combine (blue) — across all ranks ring style
+    if (arrows !== 'none'){
+      for (let r=0; r<N-1; r++){
+        const a = r * colSpacing + 24;
+        const b = (r+1) * colSpacing + 24;
+        const ya = proj(a, 24, 100, cx, cy);
+        const yb = proj(b, 24, 100, cx, cy);
+        if (arrows === 'both' || arrows === 'disp'){
+          ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2; ctx.globalAlpha = 0.6;
+          ctx.beginPath(); ctx.moveTo(ya[0], ya[1]-6); ctx.lineTo(yb[0], yb[1]-6); ctx.stroke();
+          ctx.fillStyle = '#f59e0b';
+          ctx.beginPath(); ctx.moveTo(yb[0], yb[1]-6); ctx.lineTo(yb[0]-6, yb[1]-9); ctx.lineTo(yb[0]-6, yb[1]-3); ctx.closePath(); ctx.fill();
+          ctx.globalAlpha = 1;
+        }
+        if (arrows === 'both' || arrows === 'comb'){
+          ctx.strokeStyle = '#3b82f6'; ctx.lineWidth = 2; ctx.globalAlpha = 0.6; ctx.setLineDash([5,3]);
+          ctx.beginPath(); ctx.moveTo(yb[0], yb[1]+6); ctx.lineTo(ya[0], ya[1]+6); ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = '#3b82f6';
+          ctx.beginPath(); ctx.moveTo(ya[0], ya[1]+6); ctx.lineTo(ya[0]+6, ya[1]+3); ctx.lineTo(ya[0]+6, ya[1]+9); ctx.closePath(); ctx.fill();
+          ctx.globalAlpha = 1;
+        }
+      }
+    }
+
+    // Legend
+    ctx.fillStyle = '#f59e0b'; ctx.fillRect(12, H-22, 10, 2);
+    ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace'; ctx.fillText('dispatch AllToAll', 28, H-16);
+    ctx.fillStyle = '#3b82f6'; ctx.fillRect(160, H-22, 10, 2);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('combine AllToAll', 176, H-16);
+    ctx.fillStyle = '#16a34a'; ctx.fillRect(310, H-22, 8, 8);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('load (under capacity)', 322, H-14);
+    ctx.fillStyle = '#dc2626'; ctx.fillRect(470, H-22, 8, 8);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('overflow', 482, H-14);
+
+    // KPIs
+    if (selected != null){
+      const eIdx = selected * ePerRank;
+      const numE = Math.min(ePerRank, E - eIdx);
+      $('e3-sel').textContent = 'rank ' + selected;
+      $('e3-eh').textContent = 'E' + eIdx + (numE > 1 ? '..E'+(eIdx+numE-1) : '');
+      $('e3-lb').textContent = load[eIdx % E] > capacity ? 'OVERFLOW' : 'OK · ' + (load[eIdx % E]/capacity * 100).toFixed(0) + '% capacity';
+    } else {
+      $('e3-sel').textContent = '— click one —';
+      $('e3-eh').textContent = '—';
+      $('e3-lb').textContent = '—';
+    }
+    C._hits = hits;
+  }
+
+  C.addEventListener('click', e => {
+    const rect = C.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    const hits = C._hits || [];
+    let best = null, bestD = 1e9;
+    for (const h of hits){
+      const d = Math.hypot(h.x - x, h.y - y);
+      if (d < bestD){ bestD = d; best = h.r; }
+    }
+    if (best != null && bestD < 36){
+      selected = (selected === best) ? null : best;
+      render();
+    }
+  });
+
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

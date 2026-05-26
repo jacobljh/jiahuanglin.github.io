@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>12 · Multi-LoRA serving</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">vllm_lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">12 · multi-LoRA serving</span>
+    <span class="step-pill">lesson 12 / 12</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Multi-LoRA serving</h1>
+<p class="subtitle">One base model, N customer adapters. Serving them on one process without merging — and without one kernel launch per row.</p>
+
+<h2>The business problem</h2>
+
+<p>You have one base model — say LLaMA-3 70B at ~140 GB in fp16 — and N customers, each with their own LoRA fine-tune. The naive approach is N model loads: N × 140 GB. With even ten customers you've exceeded any single node. Untenable.</p>
+
+<p>The fix is structural, not a serving trick: LoRA's mathematical form makes shared serving possible. This lesson is the path from that form to a kernel that batches a heterogeneous-adapter request mix at near-base throughput.</p>
+
+<h2>LoRA, the smallest possible recap</h2>
+
+<p>You freeze a pretrained weight <span class="math">W ∈ ℝ<sup>d<sub>out</sub> × d<sub>in</sub></sup></span> and learn a <em>low-rank</em> update:</p>
+
+<div class="math block">
+  W' &nbsp;=&nbsp; W &nbsp;+&nbsp; B · A, &nbsp;&nbsp;&nbsp; B ∈ ℝ<sup>d<sub>out</sub> × r</sup>, &nbsp;&nbsp; A ∈ ℝ<sup>r × d<sub>in</sub></sup>, &nbsp;&nbsp; r ∈ {4, 8, 16, 32}
+</div>
+
+<p>Storage per adapter is <span class="math">2 · r · d</span> per attention projection, per layer. Concretely, 50–160 MB per adapter (r=16, fp16, attention-only) depending on model size; roughly double those with MLP LoRA. For r=16 on LLaMA-3 70B (attention Q/K/V/O only, 80 layers, d=8192): ~160 MB per adapter. One base model + 1000 adapters = 140 GB + 160 GB ≈ fits on a 4-H100 node with room to spare.</p>
+
+<h2>Why merging fails for multi-tenant</h2>
+
+<p>The textbook formula <span class="math">y = x · W'</span> with <span class="math">W' = W + BA</span> suggests "for each request, materialize <span class="math">W'</span> and run the matmul." This is fine for single-tenant. For multi-tenant it's a disaster:</p>
+
+<ul>
+  <li><strong>Per-request weight rewrites in HBM.</strong> A 140 GB write between every request. Throughput goes to zero.</li>
+  <li><strong>Kills prefix caching.</strong> Two requests with the same system prompt now use <em>different</em> weights — their KV caches aren't sharable.</li>
+  <li><strong>Kills batching.</strong> A batch can only run one adapter at a time; you can't mix customers.</li>
+</ul>
+
+<p>The right move is to never merge. Keep <span class="math">W</span> as the shared frozen tensor and run two matmuls:</p>
+
+<div class="math block">
+  y &nbsp;=&nbsp; x · W &nbsp;+&nbsp; x · B · A
+</div>
+
+<p>First term: a normal batched GEMM, one big shared matmul across <em>every</em> row in the batch regardless of adapter. Second term: per-request — the per-row adapter delta. The question is how to compute that second term cheaply when the batch is heterogeneous.</p>
+
+<h2>The shape math</h2>
+
+<p>Let batch size be <span class="math">B</span> tokens, hidden size <span class="math">d</span>, rank <span class="math">r</span>. Per row <span class="math">i</span> with adapter index <span class="math">a<sub>i</sub></span>:</p>
+
+<div class="math block">
+  y<sub>i</sub> &nbsp;=&nbsp; x<sub>i</sub> · W &nbsp;+&nbsp; x<sub>i</sub> · B<sub>a<sub>i</sub></sub> · A<sub>a<sub>i</sub></sub>
+</div>
+
+<p>Shapes:</p>
+
+<pre><code>X     : (B, d)
+W     : (d, d)                        — shared
+B_i   : (d, r), A_i : (r, d)          — per-row, varies by adapter_id[i]
+
+Y_base   = X @ W                      → (B, d)   one shared GEMM
+Y_delta  = stack_i( x_i @ B_i @ A_i ) → (B, d)   grouped per-row
+Y        = Y_base + Y_delta</code></pre>
+
+<p>The base GEMM is <em>cheap</em> relative to the delta gather only if we don't pay one CUDA launch per row. A naive Python loop with B = 64 rows means 64 launches × ~5 µs each = 320 µs of pure overhead for what should be a few microseconds of math. That's the throughput killer.</p>
+
+<h2>The two S-LoRA / Punica contributions</h2>
+
+<h3>1 · Unified adapter memory</h3>
+
+<p>Put every adapter's <span class="math">B</span> and <span class="math">A</span> matrices in one contiguous HBM pool, indexed by adapter ID:</p>
+
+<pre><code>B_pool: (N_adapters, d_out, r)
+A_pool: (N_adapters, r, d_in)</code></pre>
+
+<p>No per-adapter tensor allocation. Adapters live or die based on usage: warm in HBM, cold in CPU DRAM, LRU eviction on miss. Same exact playbook as paged KV from lesson 02 — the unit of allocation is fixed, the index is the resource.</p>
+
+<h3>2 · BGMV / SGMV grouped-matmul kernel</h3>
+
+<p>One CUDA kernel that, given <code>X (B, d)</code>, the two pools, and <code>adapter_ids (B,)</code>, computes <span class="math">y<sub>i</sub> = x<sub>i</sub> · B<sub>a<sub>i</sub></sub> · A<sub>a<sub>i</sub></sub></span> in a single fused launch.</p>
+
+<p>BGMV = "batched grouped matrix-vector". One CUDA block per row. Inside the block:</p>
+
+<ol>
+  <li>Read this row's <code>adapter_id</code>.</li>
+  <li>Load slices <code>B_pool[adapter_id]</code> and <code>A_pool[adapter_id]</code> through normal global-memory loads into SRAM.</li>
+  <li>Do the (d, r) @ (r, d) matmul for this row's x.</li>
+  <li>Write the d-dim result to <code>Y[i]</code>.</li>
+</ol>
+
+<p>Parallelism is over rows, not adapters. One launch, regardless of how many distinct adapters appear in the batch.</p>
+
+<h3>SGMV — segmented variant for when adapters repeat</h3>
+
+<p>If multiple rows in the batch share an adapter, we can do better than gathering (B, A) once per row. Sort the batch by <code>adapter_id</code> so all rows sharing an adapter sit contiguously, then assign one "segment" to each adapter group. Inside a segment, load (B, A) into SRAM <em>once</em> and reuse across every row in the segment — the same tile-reuse pattern FlashAttention (<a href="03_flash_attention.html">lesson 03</a>) uses for K, V across query positions.</p>
+
+<p>The math is exactly the same; the SRAM reuse pattern is the difference. When the batch has <em>k</em> distinct adapters across <em>B</em> rows, the (B, A) loads from HBM drop from <span class="math">B</span> to <span class="math">k</span>. For a typical request mix (B=64, k=4–8 distinct adapters), that's an 8–16× reduction in adapter-pool HBM traffic.</p>
+
+<h2>Memory budget</h2>
+
+<p>Per-adapter size, attention only (Q/K/V/O projections):</p>
+
+<div class="math block">
+  size_per_adapter &nbsp;=&nbsp; 4 · 2 · d · r · dtype_bytes · n_layers
+</div>
+
+<table>
+  <thead><tr><th>model</th><th>n_layers</th><th>d</th><th>r</th><th>MB / adapter (fp16, attn only)</th><th>warm in 30 GB</th></tr></thead>
+  <tbody>
+    <tr><td>LLaMA-1 7B</td>   <td>32</td><td>4096</td><td>16</td><td>33 MB</td><td>~930 adapters</td></tr>
+    <tr><td>Mistral 7B</td>   <td>32</td><td>4096</td><td>8</td> <td>17 MB</td><td>~1830 adapters</td></tr>
+    <tr><td>LLaMA-2 70B</td>  <td>80</td><td>8192</td><td>16</td><td>160 MB</td><td>~190 adapters</td></tr>
+  </tbody>
+</table>
+
+<p>Numbers in the table are attention-only (Q/K/V/O). Add MLP adapters (up + down projections) and they roughly double. The pattern that matters: one base + hundreds of warm adapters in a fraction of the HBM the base itself occupies.</p>
+
+<h2>Throughput caveats</h2>
+
+<ul>
+  <li><strong>Best case:</strong> mostly distinct adapters, all warm. BGMV scales linearly with rows; latency overhead vs base-only is a few percent.</li>
+  <li><strong>Best+ case:</strong> grouped batch (sort by adapter). SGMV unlocks tile reuse; (B, A) loads drop k×. Better than the "best case" if k &lt; B.</li>
+  <li><strong>Worst case:</strong> cold-miss heavy batch. A miss costs ~100 ms DRAM → HBM. If half the batch misses, latency tanks. Mitigation: predict adapter affinity at the load balancer and route warm traffic to warm replicas.</li>
+</ul>
+
+<h2>Interactive · heterogeneous-batch visualizer</h2>
+
+<p>The batch is a row of tokens colored by adapter ID. Below it is a per-token timeline showing the cost of <em>gathering</em> the adapter's (B, A) into SRAM plus the per-row matmul. In <strong>per-row</strong> mode each row pays the full gather cost. In <strong>SGMV grouped</strong> mode rows are sorted by adapter, and adjacent same-color rows share the gather cost (load once, reuse the tile). The KPI reports the difference.</p>
+
+<div class="widget" id="lora-widget">
+  <div class="title">Heterogeneous-adapter batch</div>
+  <div class="hint">Sort the batch by adapter_id (grouped mode) and the (B, A) gather happens once per segment, not once per row. Same SRAM-reuse idea as FlashAttention's tile loop.</div>
+
+  <div class="controls">
+    <label class="inline">batch size: <input type="range" id="lo-bs" min="4" max="32" step="1" value="16"> <span class="val" id="lo-bs-val">16</span></label>
+    <label class="inline">distinct adapters: <input type="range" id="lo-na" min="1" max="8" step="1" value="4"> <span class="val" id="lo-na-val">4</span></label>
+  </div>
+
+  <div class="controls">
+    <label class="inline">mode:
+      <select id="lo-mode">
+        <option value="naive">naive (Python loop, random order)</option>
+        <option value="grouped" selected>BGMV / SGMV (grouped GEMM, sort by adapter)</option>
+      </select>
+    </label>
+    <button id="lo-shuffle">reshuffle</button>
+  </div>
+
+  <canvas class="dist-canvas" id="lo-canvas" width="760" height="240" style="height: 240px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">kernel launches</div><div class="v" id="lo-launches">—</div></div>
+    <div class="kpi"><div class="k">(B,A) HBM loads</div><div class="v" id="lo-loads">—</div></div>
+    <div class="kpi"><div class="k">gather bandwidth used</div><div class="v" id="lo-bw">—</div></div>
+    <div class="kpi"><div class="k">throughput (rows/μs)</div><div class="v" id="lo-tput">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">show the cost model</summary>
+<pre><code>// Per row:
+//   gather cost (HBM load of (d, r) + (r, d) for B_i, A_i): ~G µs
+//   matmul cost (one row × adapter matrices):              ~M µs
+//
+// per-row mode    : B rows × (G + M)
+// grouped mode    : k segments × G  +  B rows × M
+//                    where k = number of distinct adapters
+//                    in the batch (when sorted, each segment
+//                    loads (B, A) once into SRAM).</code></pre>
+  </details>
+</div>
+
+<h2>Putting it together</h2>
+
+<table>
+  <thead><tr><th>approach</th><th>HBM rewrites/req</th><th>kernel launches</th><th>(B,A) loads</th><th>scales to N adapters</th></tr></thead>
+  <tbody>
+    <tr><td>merge per request</td><td>140 GB</td><td>1</td><td>—</td><td>no</td></tr>
+    <tr><td>naive loop (no fusion)</td><td>0</td><td>B</td><td>B</td><td>throughput-limited</td></tr>
+    <tr><td>BGMV (per-row fused)</td><td>0</td><td>1</td><td>B</td><td>yes</td></tr>
+    <tr><td>SGMV (segmented)</td><td>0</td><td>1</td><td>k (distinct adapters)</td><td>yes, optimally</td></tr>
+  </tbody>
+</table>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Don't merge. Compute <span class="math">y = x · W + x · B · A</span> with one shared GEMM for the base and one BGMV/SGMV kernel for the delta. The shared adapter pool turns "N adapters cost N model loads" into "N adapters cost N · ~100–160 MB of HBM" (attention-only, fp16, r=16; roughly double with MLP LoRA). The fused kernel turns "B rows cost B launches" into "1 launch with row-level parallelism". Throughput within a few percent of base, hundreds of customers per process.
+</div>
+
+<footer class="lesson-nav">
+  <a href="11_preemption_swap.html">
+    <span class="dir">← Prev</span>
+    <span class="ttl">11 · Preemption and swap</span>
+  </a>
+  <a class="next" href="index.html">
+    <span class="dir">Back to →</span>
+    <span class="ttl">All lessons</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const canvas = document.getElementById('lo-canvas');
+  const ctx = canvas.getContext('2d');
+  const rBS = document.getElementById('lo-bs');
+  const rNA = document.getElementById('lo-na');
+  const sMode = document.getElementById('lo-mode');
+  const btnShuf = document.getElementById('lo-shuffle');
+  const vBS = document.getElementById('lo-bs-val');
+  const vNA = document.getElementById('lo-na-val');
+
+  // Cost-model constants (µs per row).
+  const GATHER_US = 4.0;   // (B, A) load from HBM into SRAM, per row
+  const MATMUL_US = 1.5;   // per-row matmul over (d, r) @ (r, d)
+
+  let seed = 1;
+  function mulberry32(a) {
+    return function() {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      let t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+
+  function makeBatch() {
+    const B = parseInt(rBS.value);
+    const N = parseInt(rNA.value);
+    const rng = mulberry32(seed * 4099);
+    const ids = [];
+    for (let i = 0; i < B; i++) ids.push(Math.floor(rng() * N));
+    return ids;
+  }
+
+  function colorFor(aid, total) {
+    const hue = Math.floor(360 * aid / Math.max(1, total));
+    return `hsl(${hue} 70% 60%)`;
+  }
+
+  function render() {
+    vBS.textContent = rBS.value;
+    vNA.textContent = rNA.value;
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    let ids = makeBatch();
+    const N_adapters = parseInt(rNA.value);
+    const mode = sMode.value;
+
+    if (mode === 'grouped') {
+      ids = ids.slice().sort((a, b) => a - b);
+    }
+
+    const B = ids.length;
+    const padX = 30, topY = 24;
+    const cellW = Math.max(8, Math.min(40, (W - 2*padX) / B - 2));
+    const rowH = 26;
+    const startX = padX + ((W - 2*padX) - B*(cellW + 2)) / 2;
+
+    // Header
+    ctx.font = '11px monospace';
+    ctx.fillStyle = '#5b6573';
+    ctx.fillText("batch (" + (mode === 'grouped' ? "sorted by adapter_id" : "random adapter_ids") + ")", padX, topY - 6);
+
+    // Token row.
+    for (let i = 0; i < B; i++) {
+      ctx.fillStyle = colorFor(ids[i], N_adapters);
+      ctx.fillRect(startX + i*(cellW + 2), topY, cellW, rowH);
+      if (cellW >= 18) {
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 10px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText("a" + ids[i], startX + i*(cellW + 2) + cellW/2, topY + 17);
+        ctx.textAlign = 'left';
+      }
+    }
+
+    // Identify segments (runs of same adapter id).
+    const segments = [];
+    let cur = { aid: ids[0], start: 0, len: 1 };
+    for (let i = 1; i < B; i++) {
+      if (ids[i] === cur.aid) cur.len++;
+      else { segments.push(cur); cur = { aid: ids[i], start: i, len: 1 }; }
+    }
+    segments.push(cur);
+
+    // Timeline: per row, show gather + matmul.
+    const timeY = topY + rowH + 24;
+    const timelineH = 22;
+    ctx.fillStyle = '#5b6573';
+    ctx.font = '11px monospace';
+    ctx.fillText("per-row time (gather (B,A) + matmul)", padX, timeY - 6);
+
+    // Scale: max possible per-row time is (gather + matmul).
+    const maxUs = GATHER_US + MATMUL_US + 1;
+    const tWidth = cellW;   // each row's timeline is cellW wide
+
+    for (let i = 0; i < B; i++) {
+      const x = startX + i*(cellW + 2);
+      const aid = ids[i];
+
+      // Find which segment this row is in.
+      let inSegmentIdx = 0;
+      for (const seg of segments) {
+        if (i >= seg.start && i < seg.start + seg.len) {
+          inSegmentIdx = i - seg.start;
+          break;
+        }
+      }
+
+      // In per-row mode, every row gathers.
+      // In grouped mode, only the FIRST row of each segment pays the gather.
+      const paysGather = (mode === 'naive') ? true : (inSegmentIdx === 0);
+
+      // Background slot
+      ctx.fillStyle = '#f1f3f7';
+      ctx.fillRect(x, timeY, tWidth, timelineH);
+      ctx.strokeStyle = '#dde2ea';
+      ctx.strokeRect(x, timeY, tWidth, timelineH);
+
+      // Gather (orange) — drawn first part
+      let cx = x;
+      if (paysGather) {
+        const gw = tWidth * (GATHER_US / maxUs);
+        ctx.fillStyle = '#d97706';
+        ctx.fillRect(cx, timeY, gw, timelineH);
+        cx += gw;
+      } else {
+        // Show a tiny "reuse" indicator.
+        ctx.fillStyle = '#dde2ea';
+        ctx.fillRect(cx, timeY, tWidth * (GATHER_US / maxUs), timelineH);
+      }
+
+      // Matmul (green)
+      const mw = tWidth * (MATMUL_US / maxUs);
+      ctx.fillStyle = '#16a34a';
+      ctx.fillRect(cx, timeY, mw, timelineH);
+    }
+
+    // Segment brackets in grouped mode (visual aid)
+    if (mode === 'grouped') {
+      ctx.strokeStyle = '#2563eb';
+      ctx.lineWidth = 1.5;
+      for (const seg of segments) {
+        const x0 = startX + seg.start * (cellW + 2) - 1;
+        const x1 = x0 + seg.len * (cellW + 2) - 2;
+        const y0 = timeY + timelineH + 4;
+        ctx.beginPath();
+        ctx.moveTo(x0, y0); ctx.lineTo(x0, y0 + 5);
+        ctx.lineTo(x1, y0 + 5); ctx.lineTo(x1, y0);
+        ctx.stroke();
+      }
+      ctx.fillStyle = '#5b6573';
+      ctx.font = '10px monospace';
+      ctx.fillText(segments.length + " segments → " + segments.length + " gather(s) total", padX, timeY + timelineH + 22);
+    }
+
+    // Legend
+    const ly = H - 24;
+    ctx.font = '11px monospace';
+    ctx.fillStyle = '#d97706'; ctx.fillRect(padX, ly - 9, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.fillText("gather (B,A)", padX + 14, ly);
+    ctx.fillStyle = '#16a34a'; ctx.fillRect(padX + 130, ly - 9, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.fillText("matmul", padX + 144, ly);
+    ctx.fillStyle = '#dde2ea'; ctx.fillRect(padX + 220, ly - 9, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.fillText("reuse (SRAM hit)", padX + 234, ly);
+
+    // KPIs
+    const distinct = new Set(ids).size;
+    const gathers = (mode === 'naive') ? B : segments.length;
+    const totalUs = gathers * GATHER_US + B * MATMUL_US;
+    const launches = 1;  // both modes are one fused launch — that's the BGMV/SGMV point
+    const naiveTotalUs = B * (GATHER_US + MATMUL_US);
+    document.getElementById('lo-launches').textContent = launches + "  (vs " + B + " naive-loop)";
+    document.getElementById('lo-loads').textContent = gathers + "  (B,A) loads";
+    document.getElementById('lo-bw').textContent = (gathers / B * 100).toFixed(0) + "% of naive";
+    document.getElementById('lo-tput').textContent = (B / totalUs).toFixed(2);
+  }
+
+  [rBS, rNA, sMode].forEach(el => el.addEventListener('input', render));
+  btnShuf.addEventListener('click', () => { seed++; render(); });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

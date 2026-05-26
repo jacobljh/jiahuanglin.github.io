@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>07 · Beyond attention: GEMM, quant, MoE, sampling</title><link rel="stylesheet" href="../RL/lessons/style.css"><style>main{overflow-wrap:break-word}table{table-layout:fixed}th,td{overflow-wrap:anywhere}input[type="range"]{max-width:min(200px,44vw)}label.inline{flex-wrap:wrap;max-width:100%}</style></head>
+<body><header class="topnav"><div class="inner"><a class="crumb-link" href="../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">gpu_kernel_serving</a><span class="crumb">/</span><span class="crumb">16 · beyond attention</span><span class="step-pill">lesson 16 / 17</span></div></header><main>
+
+<h1>Beyond attention: GEMM, quantization, MoE, sampling</h1>
+<p class="subtitle">Once attention is well-tuned and the scheduler keeps the GPU busy, the bottleneck moves elsewhere in the decode chain. This lesson walks the rest: weight GEMMs and quantization, MoE routing, communication, and the small launches around sampling.</p>
+
+<h2>The question this lesson answers</h2>
+<p>From lesson 02, decode HBM traffic split into "KV" (handled by paged KV + prefix reuse) and "weights." For Llama-3-70B at small batch the weight share dominates: ~34 GB read per layer-summed forward pass. Halving that — by reading 4-bit instead of bf16 — would roughly halve decode latency, but only if a kernel exists that can do the math on the new layout. This lesson is about that kind of move: each remaining win is a "layout × kernel × scheduler" agreement, not just a faster math primitive.</p>
+
+<h2>The decode chain, ranked by where time actually goes</h2>
+<p>For Llama-3-70B at B=32, T=4K on H100 (rough, illustrative):</p>
+<svg viewBox="0 0 820 220" class="diagram" role="img" aria-label="Decode step time breakdown: weight GEMMs largest then KV attention then everything else">
+  <g font-size="12">
+    <rect x="20" y="40" width="780" height="32" fill="var(--bg-soft)" stroke="var(--border)"/>
+    <rect x="20"  y="40" width="480" height="32" fill="#2563eb88"/>
+    <rect x="500" y="40" width="200" height="32" fill="#d9770688"/>
+    <rect x="700" y="40" width="60"  height="32" fill="#16a34a88"/>
+    <rect x="760" y="40" width="40"  height="32" fill="#dc262688"/>
+    <text x="260" y="60" text-anchor="middle" fill="var(--text)">Linear GEMMs (QKV, Out, MLP up/gate/down) ≈ 60%</text>
+    <text x="600" y="60" text-anchor="middle" fill="var(--text)">Attention (KV read + softmax) ≈ 25%</text>
+    <text x="730" y="60" text-anchor="middle" fill="var(--text)" font-size="11">norm 8%</text>
+    <text x="780" y="60" text-anchor="middle" fill="var(--text)" font-size="11">samp</text>
+  </g>
+  <text x="20" y="100" font-size="11" fill="var(--text-mute)">Dense-model decode (Llama-3-70B at B=32, T=4K): the linear layers dominate, attention comes next, the rest is "small but adds up."</text>
+  <text x="20" y="120" font-size="11" fill="var(--text-mute)">For MoE models the MLP slot is replaced by routing + grouped GEMM + all-to-all — usually wider than the dense MLP it replaces.</text>
+
+  <text x="20" y="160" font-weight="700">Implication</text>
+  <text x="20" y="180" font-size="12" fill="var(--text-mute)">Once attention and scheduling are tight, the next dollar of effort goes into the linear GEMMs.</text>
+  <text x="20" y="198" font-size="12" fill="var(--text-mute)">For dense models that means quantization; for MoE that also means routing &amp; expert-parallel comms.</text>
+</svg>
+
+<h2>Quantization as a layout decision</h2>
+<p>"Quantize the weights" really means two things at once:</p>
+<ol>
+  <li>Store each weight in fewer bits (e.g., 4 instead of 16) → less HBM read per token.</li>
+  <li>Compute the matmul using those compressed weights → requires a kernel that can dequantize on-the-fly into tensor-core math.</li>
+</ol>
+<p>The bytes-saved part is the easy half. The kernel part is where 90% of the engineering goes. A 4-bit weight isn't a number a tensor core can multiply directly; the kernel must read packed nibbles, apply per-group scales (and sometimes zero-points), produce bf16/fp16 operands, and feed them to mma instructions. Done well, dequant happens in registers and the throughput is bandwidth-bound on packed bytes; done badly, dequant overhead exceeds the savings.</p>
+
+<p><strong>The quant landscape in one paragraph.</strong> <em>GPTQ</em> and <em>AWQ</em> are calibration algorithms that produce 4-bit weight checkpoints with per-group scales. <em>SmoothQuant</em> rescales weights and activations so both can be 8-bit. <em>Marlin</em> and <em>Machete</em> are NVIDIA-tuned int4×bf16 GEMM kernels for those checkpoint formats. <em>cuBLAS</em> and <em>CUTLASS</em> are NVIDIA's reference GEMM libraries (FP16/BF16/FP8). <em>Triton</em> is a kernel-authoring DSL with its own GEMM implementations. The checkpoint format and the kernel have to agree on packing, group size, and scale layout.</p>
+<table><thead><tr><th>Format</th><th>Weight bytes / param</th><th>Kernel families that actually run fast</th><th>Notes</th></tr></thead><tbody>
+<tr><td>bf16 / fp16</td><td>2 B</td><td>cuBLAS, CUTLASS, Triton</td><td>Reference; no quirks.</td></tr>
+<tr><td>fp8 (e4m3 / e5m2)</td><td>1 B</td><td>CUTLASS fp8 GEMM, cuBLAS, Hopper+</td><td>Activation also fp8; needs scale management.</td></tr>
+<tr><td>int8 W8A8</td><td>1 B</td><td>SmoothQuant kernels, CUTLASS i8</td><td>Activation also int8; per-channel scales.</td></tr>
+<tr><td>int8 W8A16</td><td>1 B</td><td>Marlin (W8A16), CUTLASS</td><td>bf16 activation, int8 weight; per-group scales.</td></tr>
+<tr><td>int4 W4A16 (GPTQ, AWQ)</td><td>0.5 B</td><td>Marlin, Machete, AWQ kernels</td><td>Group size (often 128) must match kernel; activation stays bf16/fp16.</td></tr>
+<tr><td>2-bit / mixed</td><td>0.25 B + outliers</td><td>Specialized; gains diminish</td><td>Tail of distribution often needs higher precision.</td></tr>
+</tbody></table>
+
+<div class="callout warn"><div class="label">When quantization regresses</div>The kernel's packed-bytes pipeline can become compute-bound on dequant if group size is too small, scale handling is too expensive, or the kernel was tuned for an older arch. Always benchmark against a tuned bf16 baseline; "we quantized to 4-bit" is not by itself a win.</div>
+
+<h2>The MoE detour</h2>
+<p>Mixture-of-experts replaces the dense MLP with K experts and a router that picks the top-r per token. From the kernel side this introduces five new pieces, in order:</p>
+<ol>
+  <li><strong>Routing kernel:</strong> compute gating scores, top-r selection, and per-expert token counts.</li>
+  <li><strong>Token permutation:</strong> reorder tokens so each expert gets a contiguous slab.</li>
+  <li><strong>Dispatch all-to-all:</strong> if experts are sharded across GPUs (expert parallel), each token's hidden state is sent to the rank holding its chosen experts.</li>
+  <li><strong>Grouped GEMM:</strong> one launch that computes K small GEMMs of different shapes, one per expert, on the local slab.</li>
+  <li><strong>Combine all-to-all + unpermutation:</strong> outputs travel back and are restored to original token order.</li>
+</ol>
+<p>The all-to-all pair is a serving system problem, not just a kernel one. It saturates NVLink/InfiniBand bandwidth and is the typical bottleneck of MoE decode. Throughput depends on routing balance: skewed routes leave some experts idle while others overflow.</p>
+
+<svg viewBox="0 0 820 240" class="diagram" role="img" aria-label="MoE token path: router, permute, dispatch all-to-all, grouped GEMM, combine all-to-all, unpermute">
+  <defs><marker id="moe" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <g font-size="11" fill="var(--text-mute)">
+    <rect class="node-bg" x="6"   y="60" width="88" height="58" rx="6"/><text x="50"  y="84" text-anchor="middle" fill="var(--text)" font-weight="700">router</text><text x="50" y="104" text-anchor="middle">top-r/token</text>
+    <rect class="node-bg" x="106" y="60" width="98" height="58" rx="6"/><text x="155" y="84" text-anchor="middle" fill="var(--text)" font-weight="700">permute</text><text x="155" y="104" text-anchor="middle">group by expert</text>
+    <rect class="node-bg" x="216" y="60" width="130" height="58" rx="6"/><text x="281" y="84" text-anchor="middle" fill="var(--text)" font-weight="700">a2a (dispatch)</text><text x="281" y="104" text-anchor="middle">to expert's rank</text>
+    <rect class="node-bg" x="358" y="60" width="140" height="58" rx="6"/><text x="428" y="84" text-anchor="middle" fill="var(--text)" font-weight="700">grouped GEMM</text><text x="428" y="104" text-anchor="middle">K shapes, one launch</text>
+    <rect class="node-bg" x="510" y="60" width="130" height="58" rx="6"/><text x="575" y="84" text-anchor="middle" fill="var(--text)" font-weight="700">a2a (combine)</text><text x="575" y="104" text-anchor="middle">back to origin rank</text>
+    <rect class="node-bg" x="652" y="60" width="100" height="58" rx="6"/><text x="702" y="84" text-anchor="middle" fill="var(--text)" font-weight="700">unpermute</text><text x="702" y="104" text-anchor="middle">restore order</text>
+    <path class="edge" d="M94 89 L106 89" marker-end="url(#moe)"/>
+    <path class="edge" d="M204 89 L216 89" marker-end="url(#moe)"/>
+    <path class="edge" d="M346 89 L358 89" marker-end="url(#moe)"/>
+    <path class="edge" d="M498 89 L510 89" marker-end="url(#moe)"/>
+    <path class="edge" d="M640 89 L652 89" marker-end="url(#moe)"/>
+  </g>
+  <text x="20" y="160" font-size="11" fill="var(--text-mute)">FlashInfer-style libraries fuse router, permute/unpermute, and grouped GEMM. The two all-to-alls pull in NCCL or a custom EP transport — that's the part that scales with GPU count.</text>
+  <text x="20" y="184" font-size="11" fill="var(--text-mute)">Balanced routing (~1.0× imbalance) decodes near dense-MoE throughput. At 2× imbalance the slowest rank sets the rate.</text>
+  <text x="20" y="208" font-size="11" fill="var(--text-mute)">Practical knobs: expert capacity factor (overflow handling), drop policy, expert-parallel topology.</text>
+</svg>
+
+<h2>Sampling: many tiny kernels in a hot loop</h2>
+<p>Once logits exist, the engine applies (some subset of): temperature scaling, presence/frequency penalties, repetition penalty, top-k, top-p (nucleus), min-p, banned tokens, grammar constraints, random sampling. Each is a kernel; some need a sort or partial-sort; some require RNG state.</p>
+<p>The naive implementation launches a dozen small ops per step and pays the launch overhead from lesson 06. Production engines fuse the chain: a single kernel applies temperature, penalties, masks, and top-k/p selection, then a single random sample. vLLM and FlashInfer both expose batched sampling kernels along these lines.</p>
+
+<table><thead><tr><th>Stage</th><th>What it does</th><th>Naive cost</th><th>Fused cost</th></tr></thead><tbody>
+<tr><td>Temperature</td><td>Divide logits by T.</td><td>1 kernel</td><td>folded into the next op</td></tr>
+<tr><td>Penalties</td><td>Subtract by token-frequency vectors.</td><td>1–2 kernels, gather over history</td><td>same op, fused with the mask</td></tr>
+<tr><td>Top-k</td><td>Keep top-k logits; mask others.</td><td>radix-select or sort kernel</td><td>warp-level select, no extra launch</td></tr>
+<tr><td>Top-p</td><td>Keep smallest set summing to ≥ p.</td><td>sort + cumsum</td><td>fused within the same pass</td></tr>
+<tr><td>Sample</td><td>Random draw from filtered distribution.</td><td>RNG + categorical</td><td>one CUDA-side RNG, no host trip</td></tr>
+</tbody></table>
+
+<p>Why this matters: sampling is small per token, but it runs <em>every</em> token. A 200 µs sampling chain at 100 tok/s/replica × 1000 replicas is a meaningful chunk of fleet GPU time.</p>
+
+<h2>Communication kernels</h2>
+<p>Tensor parallelism splits each weight matrix across GPUs. Every all-reduce between layers is a kernel — usually NCCL ring or tree. Two practical knobs:</p>
+<ul>
+  <li><strong>Overlap:</strong> launch the next layer's GEMM while the previous layer's all-reduce is in flight.</li>
+  <li><strong>Reduce-scatter + all-gather pairs:</strong> split a single all-reduce into two halves so different parts of the model can pipeline more aggressively.</li>
+</ul>
+<p>For MoE, the all-to-all dominates communication; production engines fuse the routing+permute step with the all-to-all so a single kernel does dispatch instead of multiple round trips.</p>
+
+<h2>The backend dispatcher, demystified</h2>
+<p>Every engine ends up with a small matrix: "for op X with model feature set Y on hardware Z, run backend B." This is what the docs call <em>attention backend selection</em>, <em>quantization scheme</em>, or <em>communication backend</em>. The matrix exists because: head dim, KV dtype, page size, sliding-window-ness, MLA-vs-MHA, and GPU generation all constrain which kernel is correct. A "fast but invalid" kernel is not an optimization; it is a bug.</p>
+
+<div class="callout"><div class="label">How to read backend docs</div>The columns are constraints, not preferences. If a backend's row says "fp8 KV: no," that means it would silently produce garbage; the engine refuses to use it for fp8 KV. Pick the row that fits all your features, then sort by speed.</div>
+
+<h2>Interactive · quantization payoff accountant</h2>
+<p>Set weight precision, dequant overhead, and dense decode time. The widget shows the bandwidth savings vs compute cost, and warns if dequant eats the win.</p>
+
+<div class="widget"><div class="title">Quantization: bandwidth saved vs dequant cost</div><p class="hint">A 4-bit weight reads 4× less HBM than bf16. If your kernel's dequant overhead is small (≲ 10% of GEMM time), you keep ~3.5× decode speedup. If overhead is 50%, you keep 2×. If 100%, you've broken even.</p><div class="controls">
+<label class="inline">weight bits <input id="qz-bits" type="range" min="2" max="16" value="4"><span class="val" id="qz-bits-v">4</span></label>
+<label class="inline">bf16 decode time ms <input id="qz-base" type="range" min="2" max="80" step="0.5" value="14"><span class="val" id="qz-base-v">14</span></label>
+<label class="inline">weight share % <input id="qz-share" type="range" min="20" max="95" value="60"><span class="val" id="qz-share-v">60</span></label>
+<label class="inline">dequant overhead % <input id="qz-over" type="range" min="0" max="200" value="15"><span class="val" id="qz-over-v">15</span></label>
+</div><canvas id="qz-canvas" class="dist-canvas" height="220"></canvas><p class="hint" id="qz-note"></p></div>
+
+<h2>How to identify the next bottleneck</h2>
+<p>A short decision rule for "I made attention faster, now what?"</p>
+<ol>
+  <li>Profile a decode step with timeline markers. Get per-kernel times.</li>
+  <li>Pick the largest non-attention bar. If it's a linear GEMM and the model is bf16, try quantization (with a tuned kernel for your hardware).</li>
+  <li>If it's MoE all-to-all, check routing imbalance and expert-parallel topology.</li>
+  <li>If it's sampling/logits, fuse the pipeline or move to a batched sampling kernel.</li>
+  <li>If it's "GPU idle" (CPU gaps), go back to lesson 06 — graphs, batching, or scheduler are the lever.</li>
+</ol>
+<p>Notice this is exactly the chain from lesson 02, just walked once for each surviving bar. The track was structured to make this loop short.</p>
+
+<h2>What this gives you for the rest of the track</h2>
+<p>Every <em>kernel-level</em> concept is now in place: how the hardware works, what attention does, where KV lives, when prefixes share, how the scheduler hides launch overhead, and how the rest of the chain compresses. Lesson 08 zooms out by one level and shows the framework around those kernels: HTTP entry, queueing, routing, and where end-to-end latency really comes from.</p>
+
+<script>
+(function(){
+  const ids=['bits','base','share','over'];
+  const e=Object.fromEntries(ids.map(k=>[k,document.getElementById('qz-'+k)]));
+  const c=document.getElementById('qz-canvas'),ctx=c.getContext('2d'),note=document.getElementById('qz-note');
+  function draw(){
+    ids.forEach(k=>document.getElementById('qz-'+k+'-v').textContent=e[k].value);
+    c.width=c.clientWidth*devicePixelRatio;c.height=220*devicePixelRatio;ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.clearRect(0,0,c.clientWidth,220);
+    const bits=+e.bits.value,base=+e.base.value,share=+e.share.value/100,over=+e.over.value/100;
+    const wBase = base*share;        // weight portion of decode
+    const wQuant = wBase * (bits/16) * (1+over); // scales by bits / 16 then dequant overhead
+    const other = base*(1-share);
+    const total = wQuant + other;
+    const speedup = base/total;
+    const max = Math.max(base, total);
+    const items=[
+      ['bf16 baseline',base,'#2563eb'],
+      ['quantized total',total,'#16a34a']
+    ];
+    items.forEach(([n,v,col],i)=>{
+      const y=46+i*52,w=(c.clientWidth-220)*v/max;
+      ctx.fillStyle='#eef1f5';ctx.fillRect(170,y,c.clientWidth-220,30);
+      ctx.fillStyle=col;ctx.fillRect(170,y,w,30);
+      ctx.fillStyle='#1f2430';ctx.font='13px sans-serif';
+      ctx.fillText(n,30,y+20);
+      ctx.fillText(v.toFixed(2)+' ms',176+w+6,y+20);
+    });
+    ctx.fillStyle='#5b6573';ctx.font='12px sans-serif';
+    ctx.fillText('weight portion: '+wQuant.toFixed(2)+' ms (was '+wBase.toFixed(2)+')   ·   other: '+other.toFixed(2)+' ms',30,168);
+    ctx.fillText('end-to-end decode speedup: '+speedup.toFixed(2)+'×',30,186);
+    let advice;
+    if(speedup>=1.8) advice='Strong win — verify accuracy and ship. Watch out for batch>32 where the weight share itself shrinks.';
+    else if(speedup>=1.2) advice='Modest win. Confirm dequant overhead is realistic for your kernel; tuned int4 paths land near 10–20%.';
+    else advice='Quantization barely helps here. Either your weight share is low (decode already KV-bound) or dequant overhead is high. Investigate KV-bound levers (paged KV, prefix reuse, KV quantization) first.';
+    note.textContent = advice;
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+<footer class="lesson-nav"><a href="15_quant_sampling_cuda_graphs.html"><span class="dir">Previous</span><span class="ttl">15 · Scheduling &amp; graphs</span></a><a class="next" href="17_serving_framework_bridge.html"><span class="dir">Next</span><span class="ttl">17 · Serving framework</span></a></footer>
+</main></body></html>

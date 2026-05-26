@@ -1,0 +1,884 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>17 · Triton</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">17 · triton</span>
+    <span class="step-pill">lesson 17 / 19</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Triton — the ML kernel DSL</h1>
+<p class="subtitle">Python that compiles to PTX. A "program" is a block, not a thread. SRAM ↔ HBM is your responsibility. The gap between "I can use cuBLAS" and "I can write CUDA" got narrower in 2021 and Triton is what landed in it.</p>
+
+<h2>Where Triton sits</h2>
+
+<p>The toolchain of options for "I need a kernel that doesn't exist in the library":</p>
+
+<table>
+  <thead><tr><th>Tool</th><th>Lines of code (typical kernel)</th><th>Productivity</th><th>Peak performance</th></tr></thead>
+  <tbody>
+    <tr><td>cuBLAS / cuDNN / library call</td><td>1</td><td>Highest</td><td>Vendor-tuned, near-peak</td></tr>
+    <tr><td>Inductor (auto-generated Triton)</td><td>0 (you write PyTorch)</td><td>Implicit</td><td>~70% of hand-tuned</td></tr>
+    <tr><td>Triton (hand-written)</td><td>50–200</td><td>Moderate</td><td>~85% of hand-tuned CUDA</td></tr>
+    <tr><td>CUDA C++ (hand-written)</td><td>500–5000</td><td>Lowest</td><td>~100%</td></tr>
+  </tbody>
+</table>
+
+<p>Triton (Tillet et al. 2019, then dramatically reworked at OpenAI from 2021) bridges the productivity gap. It's not a replacement for cuBLAS — the vendor library is still faster for vanilla matmul — but for the long tail of "matmul + custom epilogue", "fused softmax", "FlashAttention-class fusion", it lets one engineer ship in a week what previously took a team a quarter.</p>
+
+<h2>The programming model — one program per block</h2>
+
+<p>CUDA C++ thinks in terms of <em>threads</em>: thousands of independent threads each running the same kernel, organised into thread blocks of (e.g.) 256 threads. You write code from the perspective of one thread, manage shared memory layout manually, and synchronise with <code>__syncthreads()</code>.</p>
+
+<p>Triton flips this. You write code from the perspective of one <strong>program</strong>, which corresponds to one CUDA thread block. The "data" your program works on is always a <em>block</em> of elements — a 1D, 2D, or 3D tile. There are no individual threads in your code; Triton vectorises the block-level operations across threads automatically.</p>
+
+<p>The canonical Triton vector-add:</p>
+
+<pre><code>@triton.jit
+def add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(axis=0)                       # which block am I?
+    offs = pid * BLOCK + tl.arange(0, BLOCK)          # which elements (vector of BLOCK ints)
+    mask = offs &lt; n                                   # boundary check
+    x = tl.load(x_ptr + offs, mask=mask)              # vector load
+    y = tl.load(y_ptr + offs, mask=mask)
+    tl.store(out_ptr + offs, x + y, mask=mask)
+
+# host side:
+N = x.numel()
+add_kernel[(triton.cdiv(N, 1024),)](x, y, out, N, BLOCK=1024)
+</code></pre>
+
+<p>Three things to notice:</p>
+<ol>
+  <li>The kernel handles <code>BLOCK</code> elements at a time. The <code>pid</code> says which slice it owns. <code>offs</code> is a 1D vector of <code>BLOCK</code> indices.</li>
+  <li>No <code>__syncthreads</code>, no shared-memory declarations. Triton figures out how the vector ops map to threads under the hood.</li>
+  <li>The launch grid (<code>(triton.cdiv(N, 1024),)</code>) is computed in Python at the call site. Triton ahead-of-time-compiles the kernel for each new shape it sees.</li>
+</ol>
+
+<h2>The mental model — SRAM and HBM, explicitly</h2>
+
+<p>The whole game is "load a tile into SRAM, do as much arithmetic as you can with it, then write the result back to HBM." In Triton:</p>
+
+<ul>
+  <li><code>tl.load</code> moves a tile from HBM to SRAM (and from there into registers).</li>
+  <li><strong>Block-level operations</strong> (<code>+</code>, <code>*</code>, <code>tl.dot</code>, <code>tl.exp</code>) act on those SRAM tiles. They produce new SRAM tiles.</li>
+  <li><code>tl.store</code> moves a tile back to HBM.</li>
+</ul>
+
+<p>The "kernel optimization" question becomes: <strong>how many <code>tl.load</code>s and <code>tl.store</code>s do you do per useful arithmetic operation?</strong> This is the arithmetic intensity from lesson 01, made tactile. A good Triton kernel has many block-level ops between every load/store; a bad one has one op per load/store.</p>
+
+<h2>Animated · one Triton program iteration</h2>
+
+<p>Watch one program execute its life-cycle: compute pointers, mask boundary, load a tile from HBM into SRAM, do block-level compute, store back. The blue rectangle at the top represents the kernel's "block of pointers"; the yellow tile in the middle is the SRAM register file. Step through the phases or hit play.</p>
+
+<div class="widget" id="tr-anim">
+  <div class="title">Triton program lifecycle · one block of work</div>
+  <div class="hint">Block size = <code>BLOCK</code> elements. The program computes <code>offs = pid · BLOCK + arange(BLOCK)</code>, masks out-of-range lanes, loads from HBM into SRAM tile, applies block-level ops, stores result.</div>
+
+  <div class="controls">
+    <button id="tr-play">▶ play</button>
+    <button id="tr-step">step ▷</button>
+    <button id="tr-reset">⟲ reset</button>
+    <label class="inline">pid: <input type="range" id="tr-pid" min="0" max="4" step="1" value="2"> <span class="val" id="tr-pid-v">2</span></label>
+    <label class="inline">BLOCK: <input type="range" id="tr-blk" min="4" max="16" step="2" value="8"> <span class="val" id="tr-blk-v">8</span></label>
+  </div>
+
+  <canvas id="tr-canvas" width="760" height="360" style="width:100%; height:360px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">phase</div><div class="v" id="tr-phase" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">active lanes</div><div class="v" id="tr-lanes">—</div></div>
+    <div class="kpi"><div class="k">HBM traffic</div><div class="v" id="tr-hbm" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">SRAM resident</div><div class="v" id="tr-sram" style="font-size:14px;">—</div></div>
+  </div>
+</div>
+
+<h2>2D · SRAM ↔ HBM dance</h2>
+
+<p>HBM as a strip at the bottom, SRAM as a smaller box at the top. Click play and watch chunks travel up (loads) and down (stores). The bigger the <code>BLOCK_SIZE</code>, the fewer trips you make for the same total work — at the cost of holding more in SRAM at once.</p>
+
+<div class="widget" id="td-widget">
+  <div class="title">SRAM ↔ HBM dance · slide BLOCK_SIZE</div>
+  <div class="hint">Each "trip" loads <code>BLOCK</code> contiguous elements up to SRAM, the kernel multiplies them by 2 (cheap stand-in for compute), then stores them back. Big BLOCK = few trips, big SRAM footprint. Small BLOCK = many trips, low SRAM occupancy.</div>
+
+  <div class="controls">
+    <button id="td-play">▶ play</button>
+    <button id="td-reset">⟲ reset</button>
+    <label class="inline">BLOCK_SIZE: <input type="range" id="td-blk" min="4" max="32" step="4" value="8"> <span class="val" id="td-blk-v">8</span></label>
+    <label class="inline">speed: <input type="range" id="td-spd" min="1" max="10" step="1" value="4"> <span class="val" id="td-spd-v">4×</span></label>
+  </div>
+
+  <canvas id="td-canvas" width="760" height="320" style="width:100%; height:320px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">trips so far</div><div class="v" id="td-trips">—</div></div>
+    <div class="kpi"><div class="k">trips per kernel</div><div class="v" id="td-total">—</div></div>
+    <div class="kpi"><div class="k">SRAM footprint</div><div class="v" id="td-foot" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">HBM bytes / trip</div><div class="v" id="td-bytes" style="font-size:14px;">—</div></div>
+  </div>
+</div>
+
+<h2>Fused softmax — the introductory non-trivial kernel</h2>
+
+<p>Softmax across the last dimension of a matrix is a textbook case. The naive PyTorch decomposition is three kernels: subtract max for numerical stability, exp, divide by sum. HBM traffic per row: read row, write (after max), read, write (after exp), read, write — six passes. A fused softmax does one pass:</p>
+
+<pre><code>@triton.jit
+def softmax(in_ptr, out_ptr, stride, n_cols, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols &lt; n_cols
+    x = tl.load(in_ptr + row * stride + cols, mask=mask, other=-float('inf'))
+    m = tl.max(x, axis=0)                # numerical stability
+    e = tl.exp(x - m)
+    z = tl.sum(e, axis=0)
+    tl.store(out_ptr + row * stride + cols, e / z, mask=mask)
+</code></pre>
+
+<p>The whole row is in SRAM throughout. HBM traffic per row: <span class="math">2 · n_cols · dtype_bytes</span>. Speedup over naive PyTorch on a typical transformer: ~3–4×. This is the entry-level Triton tutorial because the win is so visible.</p>
+
+<h2>Matmul — where Triton starts to look like real CUDA</h2>
+
+<p>A Triton matmul is a few dozen lines that handles tiling, accumulation, and the small autotuning decisions (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages). The structure:</p>
+
+<ol>
+  <li>For each output tile <span class="math">(BLOCK_M, BLOCK_N)</span>:</li>
+  <li>Load the corresponding <span class="math">A</span> column-strip and <span class="math">B</span> row-strip in <span class="math">K</span>-direction tiles.</li>
+  <li>For each <span class="math">K</span>-tile: <code>acc += tl.dot(a_tile, b_tile)</code>.</li>
+  <li>Write the accumulator tile out.</li>
+</ol>
+
+<p>Triton's <code>tl.dot</code> compiles to the GPU's tensor-core matmul instructions. The autotuner sweeps block sizes / pipeline stages / warp counts to find the best variant for your shape. Out of the box, hand-written Triton matmul lands within 5–15% of cuBLAS on H100 — not as fast as the vendor library, but close enough that you can usually fuse a custom epilogue and come out ahead.</p>
+
+<h2>The autotuner — Triton's secret weapon</h2>
+
+<p>For a given problem, the best block sizes depend on hardware (SM count, SMEM size), tensor shape, dtype, and what comes after. Triton's <code>@triton.autotune</code> decorator runs the kernel under several configs on real inputs at first call, picks the fastest, caches it on disk, and uses it forever. Typical autotune sets sweep:</p>
+
+<ul>
+  <li><strong>BLOCK_M, BLOCK_N, BLOCK_K</strong> — the tile shapes.</li>
+  <li><strong>num_warps</strong> — how many warps per program (1, 2, 4, 8). More warps = more parallelism, less SRAM per warp.</li>
+  <li><strong>num_stages</strong> — software pipelining depth. More stages overlap loads with compute better but use more registers.</li>
+</ul>
+
+<p>The autotuner is what makes Triton's <em>productivity</em> claim real: you don't have to know the optimal block size for your kernel; Triton finds it.</p>
+
+<h2>2D · code-to-kernels mini-diff</h2>
+
+<p>Same matmul, two ways of writing it. On the left, a few dozen lines of Triton with <code>@triton.autotune</code> sweeping <code>BLOCK_M</code>, <code>BLOCK_N</code>, <code>BLOCK_K</code>, <code>num_warps</code>. On the right, the pseudo-CUDA you'd have to write yourself if you committed to one config. Click a config below — the autotuner's pick gets highlighted in green; the diff updates.</p>
+
+<div class="widget" id="cd-widget">
+  <div class="title">Triton autotune vs pseudo-CUDA · per-shape pick</div>
+  <div class="hint">Each row in the right table is one config the autotuner timed. The fastest one is what Triton uses; the equivalent CUDA on the right shows what hand-writing that exact config would look like.</div>
+
+  <div class="controls">
+    <label class="inline">shape M·N·K:
+      <select id="cd-shape" style="background:var(--code-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px;font-family:var(--mono);font-size:12px;">
+        <option value="0">M=4096 N=4096 K=4096 (square)</option>
+        <option value="1">M=1 N=4096 K=4096 (decode GEMV)</option>
+        <option value="2">M=128 N=11008 K=4096 (MLP up)</option>
+        <option value="3">M=4096 N=128 K=11008 (MLP down · tall)</option>
+      </select>
+    </label>
+  </div>
+
+  <canvas id="cd-canvas" width="760" height="380" style="width:100%; height:380px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">autotuner picks</div><div class="v" id="cd-pick" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">configs tried</div><div class="v" id="cd-n">—</div></div>
+    <div class="kpi"><div class="k">winning TFLOP/s</div><div class="v" id="cd-tf">—</div></div>
+    <div class="kpi"><div class="k">vs naive config</div><div class="v" id="cd-vs">—</div></div>
+  </div>
+</div>
+
+<h2>What Triton makes hard, vs CUDA</h2>
+
+<ul>
+  <li><strong>Asynchronous copies and double buffering</strong> — Triton exposes <code>num_stages</code> as a knob, but you don't write the <code>cp.async</code> instructions yourself. You're at the mercy of the compiler. On Hopper specifically, the "warp-specialisation" pattern that gets the absolute best matmul throughput is awkward to express.</li>
+  <li><strong>Persistent kernels.</strong> Patterns where a kernel runs across all SMs, picks work off a queue, and keeps the SMs alive for many iterations (common in serving / dynamic batching) — Triton can do them but it's not idiomatic.</li>
+  <li><strong>Cross-block coordination.</strong> CUDA can use <code>cooperative_groups</code> and grid-wide barriers. Triton's model is "every program is independent" — you can't have programs talk to each other within one kernel.</li>
+</ul>
+
+<h2>How Triton fits with torch.compile (next lesson)</h2>
+
+<p>PyTorch 2.x's compiler (Inductor) <strong>generates Triton kernels</strong> from your PyTorch code. Most elementwise chains and many reductions end up as Inductor-generated Triton. You can also write Triton yourself and call it from compiled code via <code>torch._library</code>.</p>
+
+<p>The practical division of labour:</p>
+<ul>
+  <li><strong>Inductor-generated Triton</strong> — elementwise chains, simple reductions, the long tail of "this was three eager ops, now it's one kernel."</li>
+  <li><strong>Hand-written Triton</strong> — operator-class fusions (FlashAttention, fused MoE, fused RoPE), kernels with shapes that Inductor's autotuner doesn't explore.</li>
+  <li><strong>Hand-written CUDA</strong> — the very top of the performance budget (FlashAttention itself, persistent kernels in TRT-LLM, cuBLAS replacements).</li>
+</ul>
+
+<h2>Interactive · choose your stack</h2>
+
+<p>For each pattern, pick the tool you'd reach for, and the widget shows likely effort vs likely speedup vs alternatives. The point is the gradient: more effort = more speedup, but the curve flattens fast.</p>
+
+<div class="widget" id="t-widget">
+  <div class="title">Tool selection by pattern</div>
+  <div class="hint">Heuristic only. Numbers are typical, not yours. Use as a starting point, not a recipe.</div>
+
+  <div class="controls">
+    <label class="inline">pattern:
+      <select id="t-pat">
+        <option value="elem">Elementwise chain (add → mul → ReLU)</option>
+        <option value="ln">LayerNorm / RMSNorm</option>
+        <option value="sm">Softmax</option>
+        <option value="mm">Matmul</option>
+        <option value="flash">FlashAttention-class fusion</option>
+        <option value="lora">Multi-LoRA grouped GEMM</option>
+        <option value="moe">MoE expert dispatch</option>
+      </select>
+    </label>
+  </div>
+
+  <table id="t-table">
+    <thead><tr><th>tool</th><th>relative effort</th><th>relative perf</th><th>verdict</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Triton is the productivity sweet spot for kernels that don't yet exist. Block-level programming hides thread-level details; the autotuner finds reasonable block sizes for you. Inductor uses it to compile arbitrary PyTorch into kernels. Hand-written Triton is the right level for "I need FlashAttention with one custom modification" — fast to write, fast enough to ship.
+</div>
+
+<footer class="lesson-nav">
+  <a href="16_kernels_fusion.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">16 · Kernels &amp; fusion</span>
+  </a>
+  <a class="next" href="18_torch_compile.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">18 · torch.compile</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const table = {
+    elem: [
+      ['eager PyTorch', 1, 1, '1× — baseline'],
+      ['torch.compile (Inductor → Triton)', 1, 4, 'recommended · no work'],
+      ['hand-Triton',  3, 4.2, 'marginal vs Inductor'],
+      ['CUDA',        12, 4.5, 'never worth it'],
+    ],
+    ln: [
+      ['eager PyTorch', 1, 1, '1× baseline'],
+      ['torch.compile',1, 2.5, 'good · automatic'],
+      ['hand-Triton',  3, 4, 'better if it\'s a hot kernel'],
+      ['fused LN from Apex / TE', 0, 4, 'use the library if available'],
+    ],
+    sm: [
+      ['eager PyTorch', 1, 1, '1×'],
+      ['torch.compile',1, 2.5, 'good'],
+      ['hand-Triton',  3, 4, 'tutorial-level Triton win'],
+      ['CUDA',        12, 4.2, 'overkill'],
+    ],
+    mm: [
+      ['cuBLAS (default)', 0, 1, 'vendor-tuned — use this'],
+      ['torch.compile',     1, 1.0, 'falls back to cuBLAS'],
+      ['hand-Triton',       6, 0.9, '~90% of cuBLAS, only worth it for custom epilogue'],
+      ['CUTLASS',          15, 1.0, 'cuBLAS-equivalent with more flexibility'],
+    ],
+    flash: [
+      ['eager PyTorch', 1, 1, 'unusably slow long context'],
+      ['torch.compile',1, 1.2, 'Inductor doesn\'t do this kind of fusion'],
+      ['hand-Triton (FlashAttn-2)', 8, 4, 'standard production answer'],
+      ['CUDA (FlashAttn-3)', 30, 4.5, 'absolute peak on Hopper'],
+    ],
+    lora: [
+      ['eager loop', 1, 1, '1× per-adapter loop'],
+      ['torch.compile',2, 1.5, 'partial — limited grouped GEMM'],
+      ['hand-Triton (BGMV)', 8, 6, 'good fit for Triton'],
+      ['Punica / S-LoRA CUDA', 25, 8, 'production serving stack'],
+    ],
+    moe: [
+      ['eager (per-expert loop)', 1, 1, '1×'],
+      ['torch.compile', 2, 1.4, 'limited'],
+      ['hand-Triton', 10, 5, 'achievable'],
+      ['Megablocks / TE MoE', 0, 6, 'library wins'],
+    ],
+  };
+
+  const sel = document.getElementById('t-pat');
+  const body = document.querySelector('#t-table tbody');
+  function render(){
+    body.innerHTML = '';
+    table[sel.value].forEach(row => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${row[0]}</td><td>${row[1]}</td><td>${row[2].toFixed(2)}×</td><td>${row[3]}</td>`;
+      body.appendChild(tr);
+    });
+  }
+  sel.addEventListener('change', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: Triton program lifecycle animation ───
+ * Walk through the 6 phases of one Triton program:
+ *   0: idle  | 1: compute offs  | 2: mask boundary
+ *   3: load HBM→SRAM tile  | 4: compute on tile  | 5: store SRAM→HBM
+ */
+(function(){
+  const C = document.getElementById('tr-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    play:$('tr-play'), step:$('tr-step'), reset:$('tr-reset'),
+    pid:$('tr-pid'), pidv:$('tr-pid-v'),
+    blk:$('tr-blk'), blkv:$('tr-blk-v'),
+    phase:$('tr-phase'), lanes:$('tr-lanes'),
+    hbm:$('tr-hbm'), sram:$('tr-sram'),
+  };
+
+  const PHASES = [
+    'idle', 'compute offs', 'apply mask', 'load HBM → SRAM',
+    'block compute', 'store SRAM → HBM', 'done'
+  ];
+  let phase = 0;
+  let playing = false;
+  let lastT = 0;
+
+  // Total problem size: 35 elements. Pid * BLOCK + arange(BLOCK).
+  const N = 35;
+
+  function step(){
+    phase = (phase + 1) % PHASES.length;
+    render();
+  }
+
+  function tick(ts){
+    if (!playing) return;
+    if (ts - lastT > 700){ step(); lastT = ts; }
+    requestAnimationFrame(tick);
+  }
+
+  els.play.addEventListener('click', ()=>{
+    playing = !playing;
+    els.play.textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastT = performance.now(); requestAnimationFrame(tick); }
+  });
+  els.step.addEventListener('click', step);
+  els.reset.addEventListener('click', ()=>{ phase=0; playing=false; els.play.textContent='▶ play'; render(); });
+  els.pid.addEventListener('input', ()=>{ els.pidv.textContent = els.pid.value; render(); });
+  els.blk.addEventListener('input', ()=>{ els.blkv.textContent = els.blk.value; els.pid.max = Math.max(0, Math.ceil(N / +els.blk.value) - 1); if (+els.pid.value > +els.pid.max) els.pid.value = +els.pid.max; els.pidv.textContent = els.pid.value; render(); });
+
+  function render(){
+    const pid = +els.pid.value, BLOCK = +els.blk.value;
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    // Compute offsets for this program
+    const offs = []; for (let i=0; i<BLOCK; i++) offs.push(pid*BLOCK + i);
+    const masks = offs.map(o => o < N);
+
+    // Layout: top row = pointer block; middle = SRAM tile; bottom = HBM strip
+    const padX = 20;
+    const innerW = W - 2*padX;
+    const cellW = Math.min(40, innerW / BLOCK - 4);
+    const ptrY = 36;
+    const sramY = 110;
+    const hbmY = 250;
+    const hbmCellW = (innerW - 8) / N;
+
+    // Title strip
+    ctx.fillStyle = '#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('block of pointers (BLOCK = ' + BLOCK + ', pid = ' + pid + ')', padX, 22);
+    ctx.fillText('SRAM tile (registers)', padX, sramY - 18);
+    ctx.fillText('HBM — global memory (N = ' + N + ')', padX, hbmY - 8);
+
+    // ===== POINTER BLOCK =====
+    const ptrStartX = (W - BLOCK*cellW - (BLOCK-1)*4) / 2;
+    for (let i=0; i<BLOCK; i++){
+      const x = ptrStartX + i*(cellW+4);
+      const inRange = masks[i];
+      const showVals = phase >= 1;
+      // pointer cell
+      ctx.fillStyle = phase >= 2 && !inRange ? '#eef1f5' : '#dbeafe';
+      ctx.strokeStyle = phase >= 2 && !inRange ? '#fcd34d' : '#2563eb';
+      ctx.lineWidth = 1.2;
+      ctx.fillRect(x, ptrY, cellW, 36);
+      ctx.strokeRect(x, ptrY, cellW, 36);
+      ctx.fillStyle = phase >= 2 && !inRange ? '#94a3b8' : '#2563eb';
+      ctx.font = '11px monospace';
+      const label = showVals ? (offs[i] >= 0 ? offs[i].toString() : '-') : '·';
+      ctx.fillText(label, x + cellW/2 - ctx.measureText(label).width/2, ptrY + 22);
+      // mask badge on phase 2+
+      if (phase >= 2){
+        ctx.fillStyle = inRange ? '#16a34a' : '#dc2626';
+        ctx.font='9px monospace';
+        ctx.fillText(inRange ? 'in' : 'mask', x + 2, ptrY + 32);
+      }
+    }
+
+    // ===== SRAM TILE =====
+    const sramStartX = ptrStartX;
+    for (let i=0; i<BLOCK; i++){
+      const x = sramStartX + i*(cellW+4);
+      const inRange = masks[i];
+      const loaded = phase >= 3 && inRange;
+      const computed = phase >= 4 && inRange;
+      ctx.fillStyle = loaded ? (computed ? '#d97706' : '#dbeafe') : '#f1f3f7';
+      ctx.strokeStyle = loaded ? '#d97706' : '#dde2ea';
+      ctx.lineWidth = 1.2;
+      ctx.fillRect(x, sramY, cellW, 36);
+      ctx.strokeRect(x, sramY, cellW, 36);
+      if (loaded){
+        ctx.fillStyle = computed ? '#ffffff' : '#1f2430';
+        ctx.font = '11px monospace';
+        const v = computed ? (offs[i]*2).toString() : offs[i].toString();
+        ctx.fillText(v, x + cellW/2 - ctx.measureText(v).width/2, sramY + 22);
+      }
+    }
+
+    // ===== HBM STRIP =====
+    for (let i=0; i<N; i++){
+      const x = padX + 4 + i*hbmCellW;
+      const inBlock = offs.includes(i);
+      const storedBack = phase >= 5 && inBlock && masks[offs.indexOf(i)];
+      ctx.fillStyle = storedBack ? '#d97706' : (inBlock ? '#dbeafe' : '#f1f3f7');
+      ctx.strokeStyle = inBlock ? '#2563eb' : '#dde2ea';
+      ctx.lineWidth = 1;
+      ctx.fillRect(x, hbmY, hbmCellW - 2, 30);
+      ctx.strokeRect(x, hbmY, hbmCellW - 2, 30);
+      ctx.fillStyle = '#94a3b8'; ctx.font = '9px monospace';
+      if (hbmCellW > 16){
+        ctx.fillText(i.toString(), x + 3, hbmY + 12);
+      }
+    }
+
+    // ===== ARROWS =====
+    // load arrow (HBM up to SRAM)
+    if (phase === 3){
+      ctx.strokeStyle = '#16a34a'; ctx.lineWidth = 2;
+      for (let i=0; i<BLOCK; i++){
+        if (!masks[i]) continue;
+        const xs = padX + 4 + offs[i]*hbmCellW + (hbmCellW-2)/2;
+        const xt = sramStartX + i*(cellW+4) + cellW/2;
+        ctx.beginPath();
+        ctx.moveTo(xs, hbmY - 2);
+        ctx.bezierCurveTo(xs, hbmY - 40, xt, sramY + 80, xt, sramY + 38);
+        ctx.stroke();
+        // arrowhead
+        ctx.beginPath();
+        ctx.moveTo(xt, sramY + 38);
+        ctx.lineTo(xt - 4, sramY + 46);
+        ctx.lineTo(xt + 4, sramY + 46);
+        ctx.closePath(); ctx.fillStyle = '#16a34a'; ctx.fill();
+      }
+    }
+    // store arrow (SRAM down to HBM)
+    if (phase === 5){
+      ctx.strokeStyle = '#d97706'; ctx.lineWidth = 2;
+      for (let i=0; i<BLOCK; i++){
+        if (!masks[i]) continue;
+        const xt = padX + 4 + offs[i]*hbmCellW + (hbmCellW-2)/2;
+        const xs = sramStartX + i*(cellW+4) + cellW/2;
+        ctx.beginPath();
+        ctx.moveTo(xs, sramY + 38);
+        ctx.bezierCurveTo(xs, sramY + 80, xt, hbmY - 40, xt, hbmY - 2);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(xt, hbmY - 2);
+        ctx.lineTo(xt - 4, hbmY - 10);
+        ctx.lineTo(xt + 4, hbmY - 10);
+        ctx.closePath(); ctx.fillStyle = '#d97706'; ctx.fill();
+      }
+    }
+    // compute glow
+    if (phase === 4){
+      ctx.strokeStyle = '#7c3aed'; ctx.lineWidth = 2;
+      ctx.setLineDash([3,3]);
+      ctx.strokeRect(sramStartX - 6, sramY - 6, BLOCK*(cellW+4) + 8, 48);
+      ctx.setLineDash([]);
+      ctx.fillStyle = '#7c3aed'; ctx.font = '11px monospace';
+      ctx.fillText('block op: x * 2', sramStartX, sramY - 12);
+    }
+
+    // ===== STATUS =====
+    const lanesActive = masks.filter(m=>m).length;
+    els.phase.textContent = phase + '/' + (PHASES.length-1) + ' · ' + PHASES[phase];
+    els.lanes.textContent = lanesActive + ' / ' + BLOCK;
+    els.hbm.textContent = (phase >= 5 ? (lanesActive*2) : (phase >= 3 ? lanesActive : 0)) + 'B (fp8 stand-in)';
+    els.sram.textContent = (phase >= 3 && phase < 6 ? lanesActive : 0) + ' / ' + BLOCK + ' lanes';
+
+    // Step bar at bottom
+    const barY = H - 18;
+    const barW = W - 2*padX;
+    for (let i=0; i<PHASES.length; i++){
+      const x = padX + (i/PHASES.length) * barW;
+      const w = barW / PHASES.length - 4;
+      ctx.fillStyle = i === phase ? '#2563eb' : (i < phase ? '#eef1f5' : '#f1f3f7');
+      ctx.strokeStyle = '#dde2ea';
+      ctx.fillRect(x, barY, w, 10);
+      ctx.strokeRect(x, barY, w, 10);
+    }
+  }
+
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: SRAM ↔ HBM dance ───
+ * Animated chunks travel between HBM strip (bottom) and SRAM box (top),
+ * showing how BLOCK_SIZE affects number of trips and SRAM footprint.
+ */
+(function(){
+  const C = document.getElementById('td-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    play:$('td-play'), reset:$('td-reset'),
+    blk:$('td-blk'), blkv:$('td-blk-v'),
+    spd:$('td-spd'), spdv:$('td-spd-v'),
+    trips:$('td-trips'), total:$('td-total'),
+    foot:$('td-foot'), bytes:$('td-bytes'),
+  };
+
+  const N = 64; // total HBM elements
+  let phase = 0; // 0 = loading, 1 = computing, 2 = storing
+  let trip = 0; // which trip we're on
+  let progress = 0; // 0..1 within current phase
+  let playing = false;
+  let lastT = 0;
+
+  function totalTrips(){ return Math.ceil(N / +els.blk.value); }
+
+  function tick(ts){
+    if (!playing) return;
+    const spd = +els.spd.value;
+    const dt = (ts - lastT) / 1000;
+    progress += dt * spd * 0.6;
+    if (progress >= 1){
+      progress = 0;
+      phase = (phase + 1) % 3;
+      if (phase === 0){
+        trip = (trip + 1) % totalTrips();
+      }
+    }
+    lastT = ts;
+    render();
+    requestAnimationFrame(tick);
+  }
+
+  els.play.addEventListener('click', ()=>{
+    playing = !playing;
+    els.play.textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastT = performance.now(); requestAnimationFrame(tick); }
+  });
+  els.reset.addEventListener('click', ()=>{ phase=0; trip=0; progress=0; playing=false; els.play.textContent='▶ play'; render(); });
+  els.blk.addEventListener('input', ()=>{
+    els.blkv.textContent = els.blk.value;
+    trip = 0; phase = 0; progress = 0; render();
+  });
+  els.spd.addEventListener('input', ()=>{ els.spdv.textContent = els.spd.value + '×'; });
+
+  function render(){
+    const BLOCK = +els.blk.value;
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padX = 20;
+    const innerW = W - 2*padX;
+    const hbmCellW = innerW / N;
+
+    const sramY = 40;
+    const sramH = 100;
+    const hbmY = H - 70;
+    const hbmH = 40;
+
+    // SRAM box at top
+    const sramX = padX + (innerW - BLOCK*hbmCellW)/2;
+    const sramW = BLOCK*hbmCellW;
+    ctx.fillStyle = '#dbeafe';
+    ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 1.5;
+    ctx.fillRect(sramX, sramY, sramW, sramH);
+    ctx.strokeRect(sramX, sramY, sramW, sramH);
+    ctx.fillStyle = '#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('SRAM (BLOCK=' + BLOCK + ' lanes)', sramX, sramY - 8);
+
+    // HBM strip at bottom
+    for (let i=0; i<N; i++){
+      const x = padX + i*hbmCellW;
+      const inBlock = i >= trip*BLOCK && i < (trip+1)*BLOCK;
+      const written = i < trip*BLOCK || (i < (trip+1)*BLOCK && phase === 2 && progress > 0.5);
+      ctx.fillStyle = inBlock && (phase >= 1) ? '#d97706' : (written ? '#3a2818' : '#f1f3f7');
+      ctx.strokeStyle = inBlock ? '#d97706' : '#dde2ea';
+      ctx.lineWidth = inBlock ? 1.4 : 1;
+      ctx.fillRect(x, hbmY, hbmCellW - 1, hbmH);
+      ctx.strokeRect(x, hbmY, hbmCellW - 1, hbmH);
+    }
+    ctx.fillStyle = '#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('HBM (N=' + N + ' elements, contiguous)', padX, hbmY + hbmH + 14);
+
+    // Compute current "chunk" position
+    const chunkY_start_load = hbmY;
+    const chunkY_end_load   = sramY + sramH;
+    const chunkSrcX = padX + trip*BLOCK*hbmCellW;
+    const chunkDestX = sramX;
+
+    // Travelling block
+    if (phase === 0){
+      // loading from HBM up to SRAM
+      const t = progress;
+      const y = chunkY_start_load + (chunkY_end_load - chunkY_start_load) * (1 - t) - 32;
+      const w = BLOCK * hbmCellW;
+      const x = chunkSrcX + (chunkDestX - chunkSrcX) * t;
+      ctx.fillStyle = '#16a34a'; ctx.globalAlpha = 0.75;
+      ctx.fillRect(x, y, w - 1, 28);
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = '#16a34a'; ctx.lineWidth = 1.5;
+      ctx.strokeRect(x, y, w - 1, 28);
+      // up arrow path
+      ctx.strokeStyle = '#16a34a'; ctx.globalAlpha = 0.3;
+      ctx.setLineDash([3,3]);
+      ctx.beginPath(); ctx.moveTo(chunkSrcX + w/2, hbmY); ctx.lineTo(chunkDestX + w/2, sramY + sramH); ctx.stroke();
+      ctx.setLineDash([]); ctx.globalAlpha = 1;
+    } else if (phase === 1){
+      // SRAM glow
+      const pulse = 0.5 + 0.5*Math.sin(progress * Math.PI * 4);
+      ctx.fillStyle = '#7c3aed';
+      ctx.globalAlpha = 0.3 + 0.5*pulse;
+      ctx.fillRect(sramX + 4, sramY + 4, sramW - 8, sramH - 8);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#7c3aed'; ctx.font = '12px monospace';
+      const t = 'block op: x * 2';
+      ctx.fillText(t, sramX + sramW/2 - ctx.measureText(t).width/2, sramY + sramH/2 + 4);
+    } else {
+      // storing from SRAM down to HBM
+      const t = progress;
+      const y = sramY + sramH * t - 32;
+      const w = BLOCK * hbmCellW;
+      const x = chunkDestX + (chunkSrcX - chunkDestX) * t;
+      ctx.fillStyle = '#d97706'; ctx.globalAlpha = 0.75;
+      ctx.fillRect(x, y, w - 1, 28);
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = '#d97706'; ctx.lineWidth = 1.5;
+      ctx.strokeRect(x, y, w - 1, 28);
+      ctx.strokeStyle = '#d97706'; ctx.globalAlpha = 0.3;
+      ctx.setLineDash([3,3]);
+      ctx.beginPath(); ctx.moveTo(chunkDestX + w/2, sramY + sramH); ctx.lineTo(chunkSrcX + w/2, hbmY); ctx.stroke();
+      ctx.setLineDash([]); ctx.globalAlpha = 1;
+    }
+
+    // Status label between SRAM and HBM
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    const phaseLabel = phase === 0 ? 'LOAD →' : phase === 1 ? 'COMPUTE' : 'STORE ←';
+    ctx.fillText('trip ' + (trip+1) + '/' + totalTrips() + ' · ' + phaseLabel, padX, sramY + sramH + 24);
+
+    // KPIs
+    els.trips.textContent = (trip + (phase >= 2 && progress > 0.95 ? 1 : 0)) + ' / ' + totalTrips();
+    els.total.textContent = totalTrips();
+    els.foot.textContent = (BLOCK * 2) + 'B SRAM'; // fp16 stand-in
+    els.bytes.textContent = (BLOCK * 2) + 'B (load) + ' + (BLOCK * 2) + 'B (store)';
+  }
+
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: code-to-kernels mini-diff ───
+ * Show one Triton kernel source + 4 candidate autotune configs (table).
+ * Highlight winning config; preview the equivalent pseudo-CUDA on the right.
+ */
+(function(){
+  const C = document.getElementById('cd-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    shape:$('cd-shape'),
+    pick:$('cd-pick'), n:$('cd-n'),
+    tf:$('cd-tf'), vs:$('cd-vs'),
+  };
+
+  // For each shape, score 5 candidate configs. The shape determines which wins.
+  // Each: BM, BN, BK, warps, stages, "score" (relative). The highest score wins.
+  const SHAPES = [
+    { name:'M=4096 N=4096 K=4096', configs: [
+        {bm:128,bn:128,bk:32,w:8,s:4, score:0.98},
+        {bm:64, bn:128,bk:64,w:4,s:3, score:0.92},
+        {bm:128,bn:64, bk:32,w:4,s:3, score:0.85},
+        {bm:32, bn:32, bk:32,w:2,s:2, score:0.45},
+      ]},
+    { name:'M=1 N=4096 K=4096 (decode GEMV)', configs: [
+        {bm:16, bn:128,bk:32,w:4,s:2, score:0.92},
+        {bm:32, bn:64, bk:64,w:4,s:3, score:0.85},
+        {bm:128,bn:128,bk:32,w:8,s:4, score:0.50},
+        {bm:1,  bn:256,bk:16,w:2,s:1, score:0.74},
+      ]},
+    { name:'M=128 N=11008 K=4096 (MLP up)', configs: [
+        {bm:64, bn:256,bk:32,w:8,s:3, score:0.95},
+        {bm:128,bn:128,bk:32,w:8,s:4, score:0.88},
+        {bm:32, bn:128,bk:64,w:4,s:3, score:0.80},
+        {bm:64, bn:64, bk:64,w:4,s:2, score:0.65},
+      ]},
+    { name:'M=4096 N=128 K=11008 (MLP down · tall)', configs: [
+        {bm:256,bn:64, bk:32,w:8,s:3, score:0.95},
+        {bm:128,bn:128,bk:32,w:8,s:4, score:0.83},
+        {bm:128,bn:64, bk:64,w:4,s:3, score:0.78},
+        {bm:64, bn:32, bk:64,w:2,s:2, score:0.55},
+      ]},
+  ];
+
+  els.shape.addEventListener('change', render);
+  function render(){
+    const idx = +els.shape.value;
+    const shape = SHAPES[idx];
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padX = 16;
+    const colW = (W - 3*padX) / 2;
+    const leftX = padX, rightX = padX*2 + colW;
+    const topY = 14;
+
+    // ===== LEFT: Triton kernel source =====
+    ctx.fillStyle = '#dbeafe'; ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 1.2;
+    ctx.fillRect(leftX, topY, colW, H - topY - 12);
+    ctx.strokeRect(leftX, topY, colW, H - topY - 12);
+
+    ctx.fillStyle = '#2563eb'; ctx.font = 'bold 11px monospace';
+    ctx.fillText('triton_matmul.py', leftX + 8, topY + 16);
+
+    const tritonSrc = [
+      '@triton.autotune(',
+      '    configs=[',
+      '        Config(BM=128,BN=128,BK=32,nw=8,ns=4),',
+      '        Config(BM=64, BN=128,BK=64,nw=4,ns=3),',
+      '        Config(BM=128,BN=64, BK=32,nw=4,ns=3),',
+      '        Config(BM=32, BN=32, BK=32,nw=2,ns=2),',
+      '    ], key=["M","N","K"])',
+      '@triton.jit',
+      'def matmul(a, b, c, M, N, K, ...):',
+      '    pid = tl.program_id(0)',
+      '    # tile coords from pid',
+      '    a_tile = tl.load(a_ptrs)',
+      '    b_tile = tl.load(b_ptrs)',
+      '    acc = tl.zeros((BM, BN), tl.float32)',
+      '    for k in range(0, K, BK):',
+      '        acc += tl.dot(a_tile, b_tile)',
+      '        a_ptrs += BK * stride_ak',
+      '        b_ptrs += BK * stride_bk',
+      '    tl.store(c_ptrs, acc)',
+    ];
+    ctx.fillStyle = '#1f2430'; ctx.font = '10.5px monospace';
+    tritonSrc.forEach((ln, i) => {
+      const y = topY + 34 + i*15;
+      // syntax color
+      if (ln.startsWith('@')) ctx.fillStyle = '#7c3aed';
+      else if (ln.trim().startsWith('#')) ctx.fillStyle = '#94a3b8';
+      else if (ln.includes('tl.')) ctx.fillStyle = '#16a34a';
+      else ctx.fillStyle = '#1f2430';
+      ctx.fillText(ln, leftX + 10, y);
+    });
+
+    // ===== RIGHT: autotuner trial table + winning pseudo-CUDA =====
+    ctx.fillStyle = '#eef1f5'; ctx.strokeStyle = '#d97706'; ctx.lineWidth = 1.2;
+    ctx.fillRect(rightX, topY, colW, H - topY - 12);
+    ctx.strokeRect(rightX, topY, colW, H - topY - 12);
+
+    ctx.fillStyle = '#d97706'; ctx.font = 'bold 11px monospace';
+    ctx.fillText('autotune trials · ' + shape.name, rightX + 8, topY + 16);
+
+    // Trial table
+    const cfgs = shape.configs;
+    const headerY = topY + 34;
+    ctx.fillStyle = '#5b6573'; ctx.font = '10px monospace';
+    ['BM','BN','BK','warp','stage','perf'].forEach((h, i) => {
+      ctx.fillText(h, rightX + 14 + i*48, headerY);
+    });
+    ctx.strokeStyle = '#dde2ea'; ctx.beginPath();
+    ctx.moveTo(rightX + 8, headerY + 4); ctx.lineTo(rightX + colW - 8, headerY + 4); ctx.stroke();
+
+    const best = cfgs.reduce((a,b) => a.score > b.score ? a : b);
+    cfgs.forEach((cfg, i) => {
+      const y = headerY + 20 + i*18;
+      const isWin = cfg === best;
+      if (isWin){
+        ctx.fillStyle = 'rgba(111, 207, 151, 0.18)';
+        ctx.fillRect(rightX + 10, y - 12, colW - 20, 16);
+      }
+      ctx.fillStyle = isWin ? '#16a34a' : '#1f2430';
+      ctx.font = isWin ? 'bold 10.5px monospace' : '10.5px monospace';
+      ctx.fillText(cfg.bm.toString(), rightX + 14, y);
+      ctx.fillText(cfg.bn.toString(), rightX + 14+48, y);
+      ctx.fillText(cfg.bk.toString(), rightX + 14+96, y);
+      ctx.fillText(cfg.w.toString(),  rightX + 14+144, y);
+      ctx.fillText(cfg.s.toString(),  rightX + 14+192, y);
+      // bar
+      const barW = (colW - 60 - 240) * cfg.score;
+      ctx.fillStyle = isWin ? '#16a34a' : '#475569';
+      ctx.fillRect(rightX + 14 + 240, y - 8, Math.max(2, barW), 9);
+    });
+
+    // pseudo-CUDA preview of the winning config
+    const cudaY = headerY + 20 + cfgs.length*18 + 12;
+    ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+    ctx.fillText('// equivalent hand-CUDA for winning config:', rightX + 10, cudaY);
+
+    const cudaSrc = [
+      'dim3 block(' + (best.w * 32) + ');  // ' + best.w + ' warps',
+      'dim3 grid(M/' + best.bm + ', N/' + best.bn + ');',
+      '__shared__ half As[' + best.bm + '][' + best.bk + '];',
+      '__shared__ half Bs[' + best.bk + '][' + best.bn + '];',
+      '#pragma unroll ' + best.s + '  // ' + best.s + '-stage pipeline',
+      'for (int k = 0; k < K; k += ' + best.bk + ') {',
+      '    cp_async_load(As, A + k);',
+      '    cp_async_load(Bs, B + k);',
+      '    cp_async_wait();',
+      '    wmma::mma_sync(acc, As, Bs, acc);',
+      '}',
+    ];
+    ctx.fillStyle = '#d97706'; ctx.font = '10px monospace';
+    cudaSrc.forEach((ln, i) => {
+      const y = cudaY + 14 + i*13;
+      if (ln.trim().startsWith('//')) ctx.fillStyle = '#94a3b8';
+      else if (ln.includes('__shared__') || ln.includes('#pragma') || ln.includes('dim3')) ctx.fillStyle = '#7c3aed';
+      else ctx.fillStyle = '#d97706';
+      ctx.fillText(ln, rightX + 10, y);
+    });
+
+    // KPIs
+    els.pick.textContent = 'BM=' + best.bm + ' BN=' + best.bn + ' BK=' + best.bk;
+    els.n.textContent = cfgs.length;
+    // Fake TFLOP/s: max ~700 (H100 fp16) * best.score
+    els.tf.textContent = (700 * best.score).toFixed(0) + ' TF/s';
+    const worst = cfgs.reduce((a,b) => a.score < b.score ? a : b);
+    els.vs.textContent = (best.score / worst.score).toFixed(2) + '× speedup';
+  }
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

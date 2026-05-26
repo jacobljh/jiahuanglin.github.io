@@ -1,0 +1,863 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>06 · Tensor parallel</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">06 · tensor parallel</span>
+    <span class="step-pill">lesson 6 / 19</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Tensor parallel — sharding inside a single layer</h1>
+<p class="subtitle">When a single transformer block is too big to fit on one GPU, FSDP's just-in-time gather no longer works. The fix is Megatron-LM's column/row trick: split the weights along carefully chosen axes so the math falls out as one local matmul plus one AllReduce per block.</p>
+
+<h2>What FSDP can't do</h2>
+
+<p>FSDP's mechanic depends on temporarily reconstructing a full layer on one rank during forward and freeing it after. For a 70B model split into 80 layers, each layer is ~875M parameters — about 1.75 GB in bf16. Eight ranks holding 1/8 each is 220 MB each. AllGathered up to 1.75 GB on each rank: easily fits.</p>
+
+<p>But: for a 540B model with the same depth, each layer is ~6.75 GB. Or a Llama-style 405B with shorter depth. At some point, even one layer is bigger than one GPU. FSDP needs the full layer "transiently" in HBM; if you can't temporarily fit it, FSDP breaks. Tensor parallel is the response.</p>
+
+<h2>The Megatron-LM MLP split</h2>
+
+<p>An MLP block does <span class="math">y = σ(xA) B</span> with weights <span class="math">A ∈ ℝ^{d × 4d}</span> and <span class="math">B ∈ ℝ^{4d × d}</span>. We want to shard <span class="math">A</span> and <span class="math">B</span> across <span class="math">N</span> ranks. The trick is to choose <em>which axis</em> of each matrix to shard:</p>
+
+<ul>
+  <li><strong>Shard <span class="math">A</span> along its column dimension</strong> ("column-parallel"). Rank <span class="math">i</span> holds <span class="math">A_i ∈ ℝ^{d × 4d/N}</span> — the i-th vertical slice. The full input <span class="math">x ∈ ℝ^{B × d}</span> is broadcast to every rank. Each rank computes <span class="math">x · A_i ∈ ℝ^{B × 4d/N}</span>. No communication; each rank holds <em>different</em> columns of the (notional) full <span class="math">xA</span>. The activation <span class="math">σ</span> is elementwise — fine.</li>
+  <li><strong>Shard <span class="math">B</span> along its row dimension</strong> ("row-parallel"). Rank <span class="math">i</span> holds <span class="math">B_i ∈ ℝ^{4d/N × d}</span>. Each rank's input to <span class="math">B</span> is its slice <span class="math">σ(xA_i) ∈ ℝ^{B × 4d/N}</span>. The output is <span class="math">σ(xA_i) · B_i ∈ ℝ^{B × d}</span> — a full output, but only contributing its <em>partial sum</em> across the <span class="math">4d/N</span> hidden axis. We need: <span class="math">y = Σ_i σ(xA_i) · B_i</span>. <strong>That sum is an AllReduce.</strong></li>
+</ul>
+
+<p>So one MLP block becomes: column-parallel <span class="math">A</span>, elementwise activation, row-parallel <span class="math">B</span>, AllReduce. <strong>One AllReduce per MLP block per forward pass.</strong> Backward does symmetric work — one AllReduce in the other direction during the gradient pass.</p>
+
+<h2>Animated · the column/row dance on 4 GPUs</h2>
+
+<p>Below is the same MLP block — <span class="math">Y = σ(X · A) · B</span> — animated across <span class="math">N = 4</span> ranks. Watch how <span class="math">X</span> stays replicated, <span class="math">A</span> is sharded column-wise (each rank holds a vertical slice), the intermediate <span class="math">σ(XA_i)</span> lives <em>only</em> on its rank, then <span class="math">B</span> is sharded row-wise so each rank produces a partial output of the full shape — and an AllReduce sums them. Step through to see exactly what bytes move at which step.</p>
+
+<div class="widget" id="tp-anim">
+  <div class="title">Column/row TP · 4 GPUs cooperating on one MLP</div>
+  <div class="hint">Five phases: <em>X replicated</em> → <em>local XA_i</em> → <em>elementwise σ</em> → <em>partial Y_i = σ(XA_i)·B_i</em> → <em>AllReduce</em>. The AllReduce is the only communication. Backward mirrors this.</div>
+
+  <div class="controls">
+    <button id="ta-play">▶ play</button>
+    <button id="ta-step">step ▷</button>
+    <button id="ta-reset">⟲ reset</button>
+    <label class="inline">phase: <input type="range" id="ta-t" min="0" max="4" step="1" value="0" style="width:300px"> <span class="val" id="ta-t-v">0/4</span></label>
+    <label class="inline">speed: <input type="range" id="ta-spd" min="1" max="10" step="1" value="3"> <span class="val" id="ta-spd-v">3×</span></label>
+  </div>
+
+  <canvas id="ta-canvas" width="760" height="360" style="width:100%; height:360px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">phase</div><div class="v" id="ta-phase" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">bytes on wire</div><div class="v" id="ta-bytes">—</div></div>
+    <div class="kpi"><div class="k">collective</div><div class="v" id="ta-coll" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">per-rank held</div><div class="v" id="ta-held" style="font-size:13px;">—</div></div>
+  </div>
+</div>
+
+<h2>2D · which axis to shard, and which collective fires</h2>
+
+<p>The choice of <em>axis</em> per matrix is what makes the chain of two matmuls only need <em>one</em> AllReduce. Toggle the two sharding policies below. The smart one (column-A → row-B) needs one AllReduce at the end. The naive one (row-A → column-B, or any mismatched pair) needs <em>two</em> — one to gather the intermediate, one for the output. Each blue/orange tile is a matrix slice; the arrows are the collectives that fire.</p>
+
+<div class="widget" id="tp-shard">
+  <div class="title">Sharding policy explorer · how many AllReduces?</div>
+  <div class="hint">Two matrices in series: <span class="math">A ∈ ℝ^{d×4d}</span> and <span class="math">B ∈ ℝ^{4d×d}</span>. Color = ownership by rank. The arrows below the matrices are the collectives needed between matmuls.</div>
+
+  <div class="controls">
+    <button id="ts-good" class="primary">col-A · row-B (Megatron)</button>
+    <button id="ts-bad">row-A · col-B (naive)</button>
+    <button id="ts-cc">col-A · col-B</button>
+    <button id="ts-rr">row-A · row-B</button>
+    <label class="inline">ranks N: <input type="range" id="ts-N" min="2" max="8" step="1" value="4"> <span class="val" id="ts-N-v">4</span></label>
+  </div>
+
+  <canvas id="ts-canvas" width="760" height="280" style="width:100%; height:280px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">A sharded by</div><div class="v" id="ts-a" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">B sharded by</div><div class="v" id="ts-b" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">AllReduces (fwd)</div><div class="v" id="ts-ar">—</div></div>
+    <div class="kpi"><div class="k">verdict</div><div class="v" id="ts-v" style="font-size:13px;">—</div></div>
+  </div>
+</div>
+
+<h2>3D · 4-GPU tensor-parallel layout, isometric</h2>
+
+<p>Four GPUs in a row, each a cube. The <em>top face</em> of each cube shows that GPU's slice of <span class="math">A</span> (column-sharded — colored by column index); the <em>front face</em> shows its slice of <span class="math">B</span> (row-sharded — colored by row index). The gold edges are the AllReduces that fire twice per layer (once after attention, once after the MLP). Click a GPU to see exactly which slices it owns. Rotate to spin the view.</p>
+
+<div class="widget" id="tp3d">
+  <div class="title">TP topology · click a GPU to see its slices</div>
+  <div class="hint">Each GPU permanently holds one column of <span class="math">A</span> and one row of <span class="math">B</span>. Gold edges = AllReduce ring (NVLink). Per transformer layer: 2 AllReduces in fwd (attention out, MLP out) + 2 in bwd = <strong>4 total</strong>.</div>
+
+  <div class="controls">
+    <label class="inline">ranks: <input type="range" id="t3-n" min="2" max="8" step="1" value="4"> <span class="val" id="t3-n-v">4</span></label>
+    <label class="inline">rotation: <input type="range" id="t3-r" min="-40" max="40" step="1" value="0"> <span class="val" id="t3-r-v">0°</span></label>
+    <label class="inline">highlight:
+      <select id="t3-h" style="background:var(--code-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px;font-family:var(--mono);font-size:12px;">
+        <option value="both">A &amp; B slices</option>
+        <option value="a">A (column-sharded)</option>
+        <option value="b">B (row-sharded)</option>
+      </select>
+    </label>
+  </div>
+
+  <canvas id="t3-canvas" width="760" height="360" style="width:100%; height:360px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">selected GPU</div><div class="v" id="t3-sel" style="font-size:14px;">— click one —</div></div>
+    <div class="kpi"><div class="k">A slice</div><div class="v" id="t3-a" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">B slice</div><div class="v" id="t3-b" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">AllReduces / layer</div><div class="v" id="t3-ar">4</div></div>
+  </div>
+</div>
+
+<svg viewBox="0 0 720 220" class="diagram">
+  <text x="40" y="22" font-size="12" font-family="monospace" fill="var(--text-mute)">column-parallel A · no comm</text>
+  <text x="380" y="22" font-size="12" font-family="monospace" fill="var(--text-mute)">row-parallel B · AllReduce after</text>
+
+  <rect class="node-bg" x="40"  y="40" width="280" height="50" rx="8"/>
+  <text x="180" y="60" text-anchor="middle" font-size="13">x  ·  A_i  (per-rank)</text>
+  <text x="180" y="78" text-anchor="middle" font-size="10" fill="var(--text-mute)">shape: (B, 4d/N) — different columns per rank</text>
+
+  <rect class="node-bg" x="40"  y="120" width="280" height="40" rx="8"/>
+  <text x="180" y="146" text-anchor="middle" font-size="12" fill="#16a34a">σ(·)  elementwise · local</text>
+
+  <rect class="node-bg" x="380" y="40" width="280" height="50" rx="8"/>
+  <text x="520" y="60" text-anchor="middle" font-size="13">y_i = σ(xA_i) · B_i</text>
+  <text x="520" y="78" text-anchor="middle" font-size="10" fill="var(--text-mute)">shape: (B, d) — partial sum across hidden axis</text>
+
+  <rect class="node-bg" x="380" y="120" width="280" height="40" rx="8"/>
+  <text x="520" y="146" text-anchor="middle" font-size="12" fill="var(--accent-2)">y = AllReduce(y_i)   ← cost</text>
+
+  <path class="edge" d="M320 60 L380 60" marker-end="url(#arrow)"/>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/>
+    </marker>
+  </defs>
+</svg>
+
+<h2>The attention split</h2>
+
+<p>Multi-head attention is naturally shardable across heads. Each rank holds <span class="math">h/N</span> Q heads and the corresponding K, V heads. Forward:</p>
+
+<ol>
+  <li><strong>Compute <span class="math">Q_i, K_i, V_i</span> projections.</strong> Like the MLP's column-parallel <span class="math">A</span>: shard the QKV projection matrix column-wise so rank <span class="math">i</span> holds the columns producing only its heads. No comm.</li>
+  <li><strong>Local attention.</strong> Each rank computes softmax(<span class="math">Q_i K_i^T / √d_k</span>) <span class="math">V_i</span>. Heads are independent, so this is rank-local.</li>
+  <li><strong>Output projection.</strong> Like the MLP's row-parallel <span class="math">B</span>: shard the output projection row-wise so rank <span class="math">i</span> contributes only the partial sum from its heads. AllReduce sums across ranks.</li>
+</ol>
+
+<p>So attention costs <strong>one AllReduce per block per forward</strong> too — same pattern as MLP.</p>
+
+<div class="callout warn">
+  <div class="label">GQA / MQA wrinkle</div>
+  Grouped-query attention uses fewer KV heads than Q heads (e.g. Llama-3-70B has 64 Q heads but only 8 KV heads). If you try to TP=16, you can't evenly shard 8 KV heads across 16 ranks. Common solution: replicate the KV projections across pairs of TP ranks. This means TP > h_kv is wasteful — the effective max TP is bounded by the KV-head count. Modern models often deliberately keep h_kv ≥ 8 to support TP=8.
+</div>
+
+<h2>The cost, explicitly</h2>
+
+<p>Per transformer layer, per forward pass: <strong>2 AllReduces</strong> (one for attention output, one for MLP output). Per layer per backward pass: <strong>2 more</strong> (the backward of an AllReduce is itself a no-op, but the backward of column-parallel <span class="math">A</span> needs an AllReduce of input gradients — symmetric to forward). So <strong>4 AllReduces per layer per training step</strong>.</p>
+
+<p>Message size of each AllReduce: the output of the block, shape <span class="math">(B, T, d)</span>, in bf16. That's <span class="math">B · T · d · 2</span> bytes.</p>
+
+<p>For Llama-3-70B at <span class="math">B=4, T=4096, d=8192</span>: each AllReduce is <span class="math">~270 MB</span>. With 80 layers and 4 AllReduces per layer = 320 AllReduces × 270 MB = ~86 GB total. At intra-node 900 GB/s effective NVLink, that's ~95 ms of communication per step. At inter-node 50 GB/s, that's ~1.7 seconds — bigger than the step itself, totally unworkable. <strong>This is the calculation that pins TP to one node.</strong></p>
+
+<h2>Sequence parallel — what TP <em>can't</em> reach</h2>
+
+<p>TP shards along the feature axis. But the inputs to LayerNorm and the dropout immediately around the block are still full <span class="math">(B, T, d)</span> on every rank. For long sequences these activations alone can exceed HBM. Sequence parallel (Korthikanti et al. 2022) shards these along the sequence axis, doing an AllGather right before the next TP block (which needs the full feature dim) and a ReduceScatter right after. <strong>Same total communication as plain TP</strong>, plus the activation memory drops by <span class="math">N×</span>. Lesson 08 covers this and its longer-context cousin (context parallel).</p>
+
+<h2>What changes for inference</h2>
+
+<p>The same TP split applies at inference: AllReduce twice per layer. The cost looks the same but the value is different — at <em>decode</em> time, each forward pass produces just one token but reads the entire weight matrix from HBM. TP=8 spreads that read across 8 GPUs' HBM bandwidth, dividing the per-token time by ~8 (the AllReduce overhead is small relative to the memory read on long context). This is the lesson-11 finding: <strong>TP wins on inference latency, not throughput</strong>.</p>
+
+<h2>The four "stay on one node" facts</h2>
+
+<ol>
+  <li>TP fires 2 AllReduces per layer per forward pass.</li>
+  <li>Each AllReduce is roughly the size of the layer's output activation.</li>
+  <li>That's hundreds of AllReduces per training step.</li>
+  <li>The math only works if those AllReduces run on NVLink, not IB.</li>
+</ol>
+
+<p>This is also why TP is the <em>innermost</em> axis when composing parallelism (lesson 10). The fastest interconnect goes to the heaviest-communicating axis.</p>
+
+<h2>Interactive · scaling TP, fabric-limited</h2>
+
+<p>Pick model dims, sequence, batch, TP size, and the interconnect bandwidth. The widget plots per-layer compute vs per-layer comm and shows whether the AllReduce can hide behind the local matmul (the AllReduce can actually overlap with the <em>next</em> kernel's launch in NCCL, but only marginally — the kernel boundaries usually fence it). Try TP=8 at NVLink vs TP=8 at IB; the second is a disaster.</p>
+
+<div class="widget" id="tp-widget">
+  <div class="title">TP per-block timeline · compute vs AllReduce</div>
+  <div class="hint">Each block is (matmul + AllReduce). Compute scales as <span class="math">B·T·d²/TP</span>; AllReduce scales as <span class="math">B·T·d</span>. Watch the AllReduce fraction climb as you cross from intra-node to inter-node bandwidth.</div>
+
+  <div class="controls">
+    <label class="inline">d (hidden): <input type="range" id="tp-d" min="2048" max="16384" step="512" value="8192"> <span class="val" id="tp-d-v">8192</span></label>
+    <label class="inline">B·T (tokens): <input type="range" id="tp-bt" min="1024" max="65536" step="1024" value="16384"> <span class="val" id="tp-bt-v">16384</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline">TP size: <input type="range" id="tp-N" min="1" max="16" step="1" value="8"> <span class="val" id="tp-N-v">8</span></label>
+    <label class="inline">interconnect BW (GB/s): <input type="range" id="tp-bw" min="20" max="1800" step="20" value="900"> <span class="val" id="tp-bw-v">900</span></label>
+    <label class="inline">peak FLOPs/s (TF): <input type="range" id="tp-pf" min="100" max="2000" step="50" value="400"> <span class="val" id="tp-pf-v">400</span></label>
+  </div>
+
+  <canvas class="dist-canvas" id="tp-canvas" width="760" height="220" style="height: 220px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">compute per block</div><div class="v" id="tp-tc">—</div></div>
+    <div class="kpi"><div class="k">AllReduce per block</div><div class="v" id="tp-ta">—</div></div>
+    <div class="kpi"><div class="k">comm fraction</div><div class="v" id="tp-fr">—</div></div>
+    <div class="kpi"><div class="k">verdict</div><div class="v" id="tp-vd">—</div></div>
+  </div>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  TP shards weights inside a layer. The cost is two AllReduces per block per forward — large and frequent, only affordable on NVLink. It's the right answer when one layer is too big to gather on one GPU; it's the wrong answer for everything else. Below ~30B params, FSDP almost always beats TP for the same memory result with less complexity.
+</div>
+
+<footer class="lesson-nav">
+  <a href="05_fsdp.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">05 · FSDP / ZeRO</span>
+  </a>
+  <a class="next" href="07_pipeline_parallel.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">07 · Pipeline parallel</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const get = id => document.getElementById(id);
+  const els = {
+    d:get('tp-d'),dv:get('tp-d-v'),bt:get('tp-bt'),btv:get('tp-bt-v'),
+    N:get('tp-N'),Nv:get('tp-N-v'),bw:get('tp-bw'),bwv:get('tp-bw-v'),
+    pf:get('tp-pf'),pfv:get('tp-pf-v'),
+    canvas:get('tp-canvas'),
+    tc:get('tp-tc'),ta:get('tp-ta'),fr:get('tp-fr'),vd:get('tp-vd')
+  };
+  const ctx = els.canvas.getContext('2d');
+
+  function compute(){
+    const d = parseInt(els.d.value);
+    const bt = parseInt(els.bt.value);
+    const N = parseInt(els.N.value);
+    const bw = parseInt(els.bw.value) * 1e9;
+    const pf = parseInt(els.pf.value) * 1e12;
+
+    els.dv.textContent = d; els.btv.textContent = bt;
+    els.Nv.textContent = N; els.bwv.textContent = parseInt(els.bw.value);
+    els.pfv.textContent = parseInt(els.pf.value);
+
+    const flops_block = 8 * bt * d * d;
+    const compute_time = (flops_block / N) / (0.5 * pf);
+    const ar_bytes = bt * d * 2;
+    const ar_time  = N <= 1 ? 0 : 2 * 2 * (N-1)/N * ar_bytes / bw;
+
+    els.tc.textContent = (compute_time*1000).toFixed(2) + ' ms';
+    els.ta.textContent = (ar_time*1000).toFixed(2)     + ' ms';
+    const frac = ar_time / (compute_time + ar_time);
+    els.fr.textContent = (frac*100).toFixed(0) + '%';
+    let verdict = 'fine';
+    if (frac > 0.5) verdict = 'comm-bound';
+    if (frac > 0.7) verdict = '✗ infeasible';
+    if (N === 1) verdict = 'no TP';
+    els.vd.textContent = verdict;
+    return { compute_time, ar_time };
+  }
+
+  function render(){
+    const { compute_time, ar_time } = compute();
+    const dpr = window.devicePixelRatio || 1;
+    const W = els.canvas.clientWidth, H = els.canvas.clientHeight;
+    if (els.canvas.width !== Math.round(W*dpr)){
+      els.canvas.width = Math.round(W*dpr); els.canvas.height = Math.round(H*dpr);
+    }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 70, padR = 14, padT = 30, padB = 28;
+    const innerW = W - padL - padR;
+    const total = compute_time + ar_time;
+    const xPerS = innerW / Math.max(1e-9, total);
+
+    const y = padT + 20, h = 36;
+    const wC = compute_time * xPerS;
+    const wA = ar_time * xPerS;
+    ctx.fillStyle = '#2563eb'; ctx.fillRect(padL, y, Math.max(1, wC), h);
+    ctx.fillStyle = '#d97706'; ctx.fillRect(padL + wC, y, Math.max(1, wA), h);
+
+    ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+    ctx.fillText('compute', padL + 6, y - 6);
+    if (wA > 30){ ctx.fillText('AllReduce', padL + wC + 6, y - 6); }
+
+    ctx.strokeStyle = '#dde2ea';
+    ctx.beginPath(); ctx.moveTo(padL, y + h + 8); ctx.lineTo(padL + innerW, y + h + 8); ctx.stroke();
+    ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+    const ticks = 5;
+    for (let i = 0; i <= ticks; i++){
+      const ms = (i*total/ticks)*1000;
+      const x = padL + (i*total/ticks) * xPerS;
+      ctx.fillText(ms.toFixed(1)+'ms', x - 18, y + h + 22);
+    }
+
+    ctx.font = '11px monospace';
+    ctx.fillStyle='#2563eb'; ctx.fillRect(padL, H - 26, 10, 10);
+    ctx.fillStyle='#1f2430'; ctx.fillText('compute (matmul)', padL + 14, H - 17);
+    ctx.fillStyle='#d97706'; ctx.fillRect(padL + 160, H - 26, 10, 10);
+    ctx.fillStyle='#1f2430'; ctx.fillText('AllReduce', padL + 174, H - 17);
+  }
+
+  ['input','change'].forEach(ev=>{
+    [els.d,els.bt,els.N,els.bw,els.pf].forEach(el=>el.addEventListener(ev,render));
+  });
+  window.addEventListener('resize',render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: animated column/row TP step ───
+ * 5 phases on N=4 ranks: X broadcast → XA_i local → σ → Y_i = σ(XA_i)·B_i → AllReduce(Y_i).
+ */
+(function(){
+  const C = document.getElementById('ta-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    play:$('ta-play'),step:$('ta-step'),reset:$('ta-reset'),
+    t:$('ta-t'),tv:$('ta-t-v'),spd:$('ta-spd'),spdv:$('ta-spd-v'),
+    phase:$('ta-phase'),bytes:$('ta-bytes'),coll:$('ta-coll'),held:$('ta-held'),
+  };
+  const N = 4;
+  const COLORS = ['#2563eb','#d97706','#16a34a','#7c3aed'];
+  const PHASES = [
+    {n:'X replicated',      coll:'—',          desc:'X copied to every rank (or already there from prev block).'},
+    {n:'local XA_i',        coll:'—',          desc:'Each rank multiplies X by its column shard A_i. No comm.'},
+    {n:'elementwise σ(·)',  coll:'—',          desc:'Activation function applied locally to each rank\'s slice.'},
+    {n:'partial Y_i',       coll:'—',          desc:'Each rank computes σ(XA_i)·B_i — a full-shape partial sum.'},
+    {n:'AllReduce(Y_i)',    coll:'AllReduce',  desc:'Sum all rank partials into the final Y on every rank.'},
+  ];
+  els.t.max = PHASES.length - 1;
+
+  let playing = false; let lastT = 0;
+
+  function render(){
+    const idx = parseInt(els.t.value);
+    els.tv.textContent = idx + '/' + (PHASES.length-1);
+    els.spdv.textContent = els.spd.value + '×';
+    const ph = PHASES[idx];
+    els.phase.textContent = ph.n;
+    els.coll.textContent  = ph.coll;
+    els.bytes.textContent = idx === 4 ? '2·(N-1)/N · |Y|' : '0';
+    els.held.textContent  = idx === 0 ? 'X (full)' :
+                            idx === 1 ? 'X, A_i, XA_i' :
+                            idx === 2 ? 'σ(XA_i)' :
+                            idx === 3 ? 'σ(XA_i), B_i, Y_i' :
+                                        'Y (full)';
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width = Math.round(W*dpr); C.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    // Header strip
+    ctx.fillStyle = '#5b6573'; ctx.font = '12px monospace';
+    ctx.fillText('Y = σ(X · A) · B  →  shard A column-wise, B row-wise, AllReduce at the end', 12, 20);
+
+    // Layout: each rank is a column. Inside each column, vertical stack of tiles:
+    //   row 1 (top): X (replicated) or σ(XA_i)
+    //   row 2: A_i (column slice of A) or B_i (row slice of B)
+    //   row 3: intermediate / Y_i / Y
+    const padL = 20, padTop = 40, colGap = 8;
+    const colW = (W - padL*2 - (N-1)*colGap) / N;
+    const blockH = (H - padTop - 70) / 3;
+
+    for (let r=0; r<N; r++){
+      const x = padL + r*(colW + colGap);
+      // Rank label
+      ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+      ctx.fillText('rank '+r, x+4, padTop - 10);
+
+      // ── Top tile (X or sigma(XA))
+      {
+        const y = padTop;
+        ctx.fillStyle = '#f1f3f7';
+        ctx.fillRect(x, y, colW, blockH-6);
+        ctx.strokeStyle = '#dde2ea'; ctx.strokeRect(x, y, colW, blockH-6);
+        if (idx === 0){
+          // X replicated — gray fill, label X
+          ctx.fillStyle = '#475569'; ctx.globalAlpha = 0.85;
+          ctx.fillRect(x+4, y+8, colW-8, blockH-22);
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = '#fff'; ctx.font = '12px monospace';
+          ctx.fillText('X (B,d)', x+8, y+blockH/2);
+        } else if (idx >= 1 && idx <= 3){
+          // XA_i then σ(XA_i)
+          ctx.fillStyle = COLORS[r]; ctx.globalAlpha = idx === 2 ? 1.0 : 0.85;
+          ctx.fillRect(x+4, y+8, colW-8, blockH-22);
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = '#ffffff'; ctx.font = '11px monospace';
+          ctx.fillText(idx===1 ? 'XA_'+r : idx===2 ? 'σ(XA_'+r+')' : 'σ(XA_'+r+')', x+8, y+blockH/2);
+          ctx.fillStyle = '#ffffff';
+          ctx.fillText('shape (B, 4d/N)', x+8, y+blockH/2 + 14);
+        } else {
+          // final Y — same on all ranks (sum)
+          ctx.fillStyle = '#16a34a'; ctx.globalAlpha = 0.9;
+          ctx.fillRect(x+4, y+8, colW-8, blockH-22);
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = '#ffffff'; ctx.font = '12px monospace';
+          ctx.fillText('Y (B, d)', x+8, y+blockH/2);
+          ctx.fillText('= Σ_i Y_i', x+8, y+blockH/2+14);
+        }
+      }
+
+      // ── Middle tile: A_i + B_i
+      {
+        const y = padTop + blockH;
+        // A_i — column slice
+        const half = (colW-12)/2;
+        ctx.fillStyle = '#f1f3f7';
+        ctx.fillRect(x, y, half+6, blockH-6);
+        ctx.strokeStyle = '#dde2ea'; ctx.strokeRect(x, y, half+6, blockH-6);
+        ctx.fillStyle = COLORS[r]; ctx.globalAlpha = idx >= 1 ? 1 : 0.4;
+        // Draw A_i as a thin vertical column inside the A footprint
+        const ax = x+4, ay=y+6, aw=half-4, ah=blockH-18;
+        for (let c=0; c<N; c++){
+          ctx.fillStyle = COLORS[c]; ctx.globalAlpha = (c===r) ? 1 : 0.18;
+          ctx.fillRect(ax + c*(aw/N), ay, aw/N - 1, ah);
+        }
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = '#5b6573'; ctx.font = '10px monospace';
+        ctx.fillText('A: col-sharded', ax, y+blockH-4);
+
+        // B_i — row slice
+        const bx = x + half + 8, by = y, bw = half-2, bh = blockH-6;
+        ctx.fillStyle = '#f1f3f7'; ctx.fillRect(bx, by, bw, bh);
+        ctx.strokeStyle = '#dde2ea'; ctx.strokeRect(bx, by, bw, bh);
+        const ix = bx+4, iy=by+6, iw=bw-8, ih=bh-18;
+        for (let c=0; c<N; c++){
+          ctx.fillStyle = COLORS[c]; ctx.globalAlpha = (c===r) ? 1 : 0.18;
+          ctx.fillRect(ix, iy + c*(ih/N), iw, ih/N - 1);
+        }
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = '#5b6573'; ctx.font = '10px monospace';
+        ctx.fillText('B: row-sharded', ix, by+bh-4);
+      }
+
+      // ── Bottom tile: partial Y_i
+      {
+        const y = padTop + blockH*2;
+        ctx.fillStyle = '#f1f3f7';
+        ctx.fillRect(x, y, colW, blockH-6);
+        ctx.strokeStyle = '#dde2ea'; ctx.strokeRect(x, y, colW, blockH-6);
+        if (idx === 3){
+          ctx.fillStyle = COLORS[r]; ctx.globalAlpha = 0.9;
+          ctx.fillRect(x+4, y+6, colW-8, blockH-22);
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = '#ffffff'; ctx.font = '11px monospace';
+          ctx.fillText('Y_'+r+' (partial)', x+8, y+blockH/2);
+          ctx.fillText('shape (B, d)', x+8, y+blockH/2+14);
+        } else if (idx === 4){
+          ctx.fillStyle = '#16a34a'; ctx.globalAlpha = 0.5;
+          ctx.fillRect(x+4, y+6, colW-8, blockH-22);
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = '#fff'; ctx.font = '11px monospace';
+          ctx.fillText('Y (full, summed)', x+8, y+blockH/2);
+        }
+      }
+    }
+
+    // Arrows for the AllReduce
+    if (idx === 4){
+      ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 2;
+      const yArrow = H - 50;
+      for (let r=0; r<N-1; r++){
+        const x1 = padL + r*(colW + colGap) + colW/2;
+        const x2 = padL + (r+1)*(colW + colGap) + colW/2;
+        ctx.beginPath(); ctx.moveTo(x1, yArrow); ctx.lineTo(x2, yArrow); ctx.stroke();
+        // bidirectional ring AllReduce arrows
+        ctx.fillStyle = '#fbbf24';
+        ctx.beginPath();
+        ctx.moveTo(x2, yArrow); ctx.lineTo(x2-6, yArrow-4); ctx.lineTo(x2-6, yArrow+4); ctx.closePath(); ctx.fill();
+      }
+      // wrap-around
+      const x1 = padL + (N-1)*(colW + colGap) + colW/2;
+      const x2 = padL + colW/2;
+      ctx.beginPath(); ctx.moveTo(x1, yArrow+12); ctx.lineTo(x2, yArrow+12); ctx.stroke();
+      ctx.fillStyle = '#fbbf24';
+      ctx.beginPath();
+      ctx.moveTo(x2, yArrow+12); ctx.lineTo(x2+6, yArrow+8); ctx.lineTo(x2+6, yArrow+16); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#fbbf24'; ctx.font = '11px monospace';
+      ctx.fillText('AllReduce ring (NVLink)', padL, yArrow - 6);
+    }
+
+    // Footer / description
+    ctx.fillStyle = '#1f2430'; ctx.font = '12px monospace';
+    ctx.fillText('phase ' + idx + ': ' + PHASES[idx].desc, 12, H - 14);
+  }
+
+  function step(){
+    let v = parseInt(els.t.value);
+    v = (v + 1) % PHASES.length;
+    els.t.value = v;
+    render();
+  }
+
+  function tick(ts){
+    if (!playing) return;
+    const spd = parseInt(els.spd.value);
+    const period = 900 / spd;
+    if (ts - lastT > period){ step(); lastT = ts; }
+    requestAnimationFrame(tick);
+  }
+
+  els.play.addEventListener('click', ()=>{
+    playing = !playing;
+    els.play.textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastT = performance.now(); requestAnimationFrame(tick); }
+  });
+  els.step.addEventListener('click', step);
+  els.reset.addEventListener('click', ()=>{ els.t.value=0; playing=false; els.play.textContent='▶ play'; render(); });
+  els.t.addEventListener('input', render);
+  els.spd.addEventListener('input', ()=>{ els.spdv.textContent = els.spd.value+'×'; });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: 2D sharding policy explorer ─── */
+(function(){
+  const C = document.getElementById('ts-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const COLORS = ['#2563eb','#d97706','#16a34a','#7c3aed','#dc2626','#3b82f6','#f59e0b','#16a34a'];
+
+  let mode = 'good'; // good | bad | cc | rr
+  let N = 4;
+
+  const BTN = { good:$('ts-good'), bad:$('ts-bad'), cc:$('ts-cc'), rr:$('ts-rr') };
+  Object.entries(BTN).forEach(([k,b])=>{
+    b.addEventListener('click', ()=>{ mode = k;
+      Object.values(BTN).forEach(x=>x.classList.remove('primary'));
+      b.classList.add('primary'); render();
+    });
+  });
+  const sN = $('ts-N'), sNv = $('ts-N-v');
+  sN.addEventListener('input', ()=>{ N = +sN.value; sNv.textContent = N; render(); });
+
+  function policy(){
+    if (mode==='good') return { a:'col', b:'row', ar:1, v:'Megatron — one AllReduce at the end.' };
+    if (mode==='bad')  return { a:'row', b:'col', ar:2, v:'Naive — AllGather mid + AllReduce end.' };
+    if (mode==='cc')   return { a:'col', b:'col', ar:2, v:'Mismatched — AllGather between matmuls.' };
+    if (mode==='rr')   return { a:'row', b:'row', ar:2, v:'Mismatched — extra reduce between matmuls.' };
+  }
+
+  function drawMatrix(x, y, w, h, shardKind, label){
+    // shardKind: 'col' (vertical stripes) or 'row' (horizontal stripes)
+    ctx.fillStyle = '#f1f3f7';
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = '#dde2ea'; ctx.strokeRect(x, y, w, h);
+    for (let r=0; r<N; r++){
+      ctx.fillStyle = COLORS[r % COLORS.length];
+      if (shardKind === 'col'){
+        const sw = (w-4)/N;
+        ctx.fillRect(x+2 + r*sw, y+2, sw-1, h-4);
+      } else {
+        const sh = (h-4)/N;
+        ctx.fillRect(x+2, y+2 + r*sh, w-4, sh-1);
+      }
+    }
+    ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+    ctx.fillText(label, x, y - 6);
+    ctx.fillStyle = '#5b6573';
+    ctx.fillText(shardKind === 'col' ? 'column-sharded (N vertical slices)' : 'row-sharded (N horizontal slices)', x, y + h + 14);
+  }
+
+  function arrow(x1, y1, x2, y2, color, label){
+    ctx.strokeStyle = color; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    ctx.fillStyle = color;
+    const ang = Math.atan2(y2-y1, x2-x1);
+    ctx.beginPath();
+    ctx.moveTo(x2, y2);
+    ctx.lineTo(x2 - 8*Math.cos(ang-0.4), y2 - 8*Math.sin(ang-0.4));
+    ctx.lineTo(x2 - 8*Math.cos(ang+0.4), y2 - 8*Math.sin(ang+0.4));
+    ctx.closePath(); ctx.fill();
+    if (label){
+      ctx.fillStyle = color; ctx.font = '11px monospace';
+      ctx.fillText(label, (x1+x2)/2 - 30, (y1+y2)/2 - 6);
+    }
+  }
+
+  function render(){
+    const p = policy();
+    $('ts-a').textContent = p.a === 'col' ? 'columns (vertical)' : 'rows (horizontal)';
+    $('ts-b').textContent = p.b === 'col' ? 'columns (vertical)' : 'rows (horizontal)';
+    $('ts-ar').textContent = p.ar;
+    $('ts-v').textContent = p.v;
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width = Math.round(W*dpr); C.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const mh = 140, ax = 80, ay = 60, aw = 200;
+    const bx = 380, by = 60, bw = 200;
+    drawMatrix(ax, ay, aw, mh, p.a, 'A  (d × 4d)');
+    drawMatrix(bx, by, bw, mh, p.b, 'B  (4d × d)');
+
+    // Arrow + collective between A and B
+    const arY = ay + mh/2;
+    if ((p.a === 'col' && p.b === 'row')){
+      // good — no comm between; just pipe
+      arrow(ax + aw + 4, arY, bx - 4, arY, '#16a34a', 'no comm');
+    } else if (p.a === 'row' && p.b === 'col'){
+      arrow(ax + aw + 4, arY, bx - 4, arY, '#dc2626', 'AllGather');
+    } else if (p.a === 'col' && p.b === 'col'){
+      arrow(ax + aw + 4, arY, bx - 4, arY, '#d97706', 'AllGather');
+    } else if (p.a === 'row' && p.b === 'row'){
+      arrow(ax + aw + 4, arY, bx - 4, arY, '#d97706', 'AllReduce');
+    }
+
+    // Final AllReduce at the right
+    const outX = bx + bw + 30, outY = arY;
+    if (p.b === 'row'){
+      arrow(bx + bw + 4, arY, outX, outY, '#fbbf24', 'AllReduce');
+    } else {
+      arrow(bx + bw + 4, arY, outX, outY, '#16a34a', '(partials already aligned)');
+    }
+    // Output box
+    ctx.fillStyle = '#f1f3f7';
+    ctx.fillRect(outX, outY - 24, 80, 48);
+    ctx.strokeStyle = '#dde2ea'; ctx.strokeRect(outX, outY - 24, 80, 48);
+    ctx.fillStyle = '#16a34a'; ctx.globalAlpha = 0.7; ctx.fillRect(outX+4, outY-20, 72, 40); ctx.globalAlpha = 1;
+    ctx.fillStyle = '#ffffff'; ctx.font = '12px monospace';
+    ctx.fillText('Y', outX + 35, outY + 4);
+
+    // Color legend
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('color = rank owning the slice', 10, H - 14);
+    for (let r=0; r<N; r++){
+      ctx.fillStyle = COLORS[r % COLORS.length];
+      ctx.fillRect(220 + r*40, H - 24, 14, 12);
+      ctx.fillStyle = '#1f2430'; ctx.font = '10px monospace';
+      ctx.fillText('r'+r, 236 + r*40, H - 14);
+    }
+  }
+
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: 3D isometric TP layout ─── */
+(function(){
+  const C = document.getElementById('t3-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const COLORS = ['#2563eb','#d97706','#16a34a','#7c3aed','#dc2626','#3b82f6','#f59e0b','#16a34a'];
+
+  let N = 4, rot = 0, hl = 'both', selected = null;
+
+  const sN = $('t3-n'), sNv = $('t3-n-v'),
+        sR = $('t3-r'), sRv = $('t3-r-v'),
+        sH = $('t3-h');
+  sN.addEventListener('input', ()=>{ N = +sN.value; sNv.textContent = N; render(); });
+  sR.addEventListener('input', ()=>{ rot = +sR.value; sRv.textContent = rot+'°'; render(); });
+  sH.addEventListener('change', ()=>{ hl = sH.value; render(); });
+
+  function proj(x, y, z, cx, cy){
+    const rad = rot*Math.PI/180;
+    const a = Math.PI/6 + rad;
+    const sx = (x - y) * Math.cos(a);
+    const sy = (x + y) * Math.sin(a) - z;
+    return [cx + sx, cy + sy];
+  }
+
+  function gpuOrigin(i){ return { x: i*80, y: 0, z: 0 }; }
+
+  function shade(col, f){
+    const m = col.replace('#','');
+    const r = parseInt(m.substr(0,2),16), g = parseInt(m.substr(2,2),16), b = parseInt(m.substr(4,2),16);
+    return 'rgb('+Math.round(r*f)+','+Math.round(g*f)+','+Math.round(b*f)+')';
+  }
+
+  function drawCube(x, y, z, s, sH, color, selected, cx, cy){
+    const p000 = proj(x, y, z, cx, cy);
+    const p100 = proj(x+s, y, z, cx, cy);
+    const p110 = proj(x+s, y+s, z, cx, cy);
+    const p010 = proj(x, y+s, z, cx, cy);
+    const p001 = proj(x, y, z+sH, cx, cy);
+    const p101 = proj(x+s, y, z+sH, cx, cy);
+    const p111 = proj(x+s, y+s, z+sH, cx, cy);
+    const p011 = proj(x, y+s, z+sH, cx, cy);
+
+    // Top face
+    ctx.fillStyle = shade(color, 1.0);
+    ctx.beginPath(); ctx.moveTo(p001[0],p001[1]); ctx.lineTo(p101[0],p101[1]); ctx.lineTo(p111[0],p111[1]); ctx.lineTo(p011[0],p011[1]); ctx.closePath(); ctx.fill();
+    // Left front face
+    ctx.fillStyle = shade(color, 0.55);
+    ctx.beginPath(); ctx.moveTo(p001[0],p001[1]); ctx.lineTo(p011[0],p011[1]); ctx.lineTo(p010[0],p010[1]); ctx.lineTo(p000[0],p000[1]); ctx.closePath(); ctx.fill();
+    // Right face
+    ctx.fillStyle = shade(color, 0.78);
+    ctx.beginPath(); ctx.moveTo(p011[0],p011[1]); ctx.lineTo(p111[0],p111[1]); ctx.lineTo(p110[0],p110[1]); ctx.lineTo(p010[0],p010[1]); ctx.closePath(); ctx.fill();
+
+    if (selected){
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(p001[0],p001[1]); ctx.lineTo(p101[0],p101[1]); ctx.lineTo(p111[0],p111[1]); ctx.lineTo(p011[0],p011[1]); ctx.closePath(); ctx.stroke();
+    }
+    return { p000,p100,p110,p010,p001,p101,p111,p011 };
+  }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width = Math.round(W*dpr); C.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const totalW = N*80;
+    const cx = (W - totalW*Math.cos(Math.PI/6)) / 2 + 60;
+    const cy = H/2 - 30;
+
+    // Draw AllReduce ring underneath
+    if (true){
+      ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2; ctx.globalAlpha = 0.7;
+      ctx.beginPath();
+      for (let i=0; i<N; i++){
+        const o = gpuOrigin(i);
+        const p = proj(o.x+30, o.y+30, -8, cx, cy);
+        if (i===0) ctx.moveTo(p[0], p[1]); else ctx.lineTo(p[0], p[1]);
+      }
+      // close ring
+      const o0 = gpuOrigin(0);
+      const oN = gpuOrigin(N-1);
+      const pStart = proj(o0.x+30, o0.y+30, -8, cx, cy);
+      const pEnd = proj(oN.x+30, oN.y+30, -8, cx, cy);
+      ctx.stroke();
+      // wrap
+      ctx.beginPath();
+      ctx.moveTo(pEnd[0], pEnd[1]);
+      const mid = proj((o0.x+oN.x)/2+30, oN.y+90, -8, cx, cy);
+      ctx.quadraticCurveTo(mid[0], mid[1], pStart[0], pStart[1]);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      // label
+      ctx.fillStyle = '#f59e0b'; ctx.font = '11px monospace';
+      const lbl = proj(totalW/2 - 20, 60, -8, cx, cy);
+      ctx.fillText('AllReduce ring (NVLink) — 2× per layer fwd, 2× bwd', lbl[0]-100, lbl[1]+12);
+    }
+
+    // Draw each GPU cube
+    const hits = [];
+    for (let i=0; i<N; i++){
+      const o = gpuOrigin(i);
+      const isSel = selected === i;
+      const color = COLORS[i % COLORS.length];
+      const cube = drawCube(o.x, o.y, 0, 60, 50, color, isSel, cx, cy);
+      // label rank
+      const lp = proj(o.x+30, o.y - 8, 0, cx, cy);
+      ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+      ctx.fillText('GPU '+i, lp[0]-14, lp[1]);
+
+      // On the top face: draw A slice (column shard) - vertical stripes, only this rank's column highlighted
+      if (hl === 'both' || hl === 'a'){
+        // we'll overlay strips on the top face using its 4 corners
+        const tc = [cube.p001, cube.p101, cube.p111, cube.p011]; // top quad in screen space
+        // map columns 0..N-1 along edge (p001 -> p101)
+        for (let c=0; c<N; c++){
+          const t0 = c/N, t1=(c+1)/N;
+          const aTop = [tc[0][0]*(1-t0)+tc[1][0]*t0, tc[0][1]*(1-t0)+tc[1][1]*t0];
+          const bTop = [tc[0][0]*(1-t1)+tc[1][0]*t1, tc[0][1]*(1-t1)+tc[1][1]*t1];
+          const aBot = [tc[3][0]*(1-t0)+tc[2][0]*t0, tc[3][1]*(1-t0)+tc[2][1]*t0];
+          const bBot = [tc[3][0]*(1-t1)+tc[2][0]*t1, tc[3][1]*(1-t1)+tc[2][1]*t1];
+          ctx.fillStyle = COLORS[c % COLORS.length];
+          ctx.globalAlpha = (c === i) ? 0.95 : 0.18;
+          ctx.beginPath();
+          ctx.moveTo(aTop[0], aTop[1]); ctx.lineTo(bTop[0], bTop[1]);
+          ctx.lineTo(bBot[0], bBot[1]); ctx.lineTo(aBot[0], aBot[1]); ctx.closePath();
+          ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+      }
+      // On the front (left) face: draw B slice (row shard) horizontal stripes
+      if (hl === 'both' || hl === 'b'){
+        const fc = [cube.p001, cube.p011, cube.p010, cube.p000]; // front quad
+        for (let r=0; r<N; r++){
+          const t0 = r/N, t1=(r+1)/N;
+          // interpolate top edge p001->p011 by row dimension (depth)
+          // we want stripes parallel to the slope; use y direction
+          const aTop = [fc[0][0]*(1-t0)+fc[1][0]*t0, fc[0][1]*(1-t0)+fc[1][1]*t0];
+          const bTop = [fc[0][0]*(1-t1)+fc[1][0]*t1, fc[0][1]*(1-t1)+fc[1][1]*t1];
+          const aBot = [fc[3][0]*(1-t0)+fc[2][0]*t0, fc[3][1]*(1-t0)+fc[2][1]*t0];
+          const bBot = [fc[3][0]*(1-t1)+fc[2][0]*t1, fc[3][1]*(1-t1)+fc[2][1]*t1];
+          ctx.fillStyle = COLORS[r % COLORS.length];
+          ctx.globalAlpha = (r === i) ? 0.7 : 0.12;
+          ctx.beginPath();
+          ctx.moveTo(aTop[0], aTop[1]); ctx.lineTo(bTop[0], bTop[1]);
+          ctx.lineTo(bBot[0], bBot[1]); ctx.lineTo(aBot[0], aBot[1]); ctx.closePath();
+          ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+      }
+      // hit center
+      const hitC = proj(o.x+30, o.y+30, 25, cx, cy);
+      hits.push({i, x:hitC[0], y:hitC[1]});
+    }
+
+    // Legend
+    ctx.fillStyle = '#5b6573'; ctx.font = '10.5px monospace';
+    ctx.fillText('top face = A (col-sharded · own column highlighted)', 12, H - 22);
+    ctx.fillText('front face = B (row-sharded · own row highlighted)', 12, H - 8);
+
+    // KPIs
+    if (selected != null){
+      $('t3-sel').textContent = 'GPU ' + selected;
+      $('t3-a').textContent = 'col '+selected+' of A (d × 4d/N)';
+      $('t3-b').textContent = 'row '+selected+' of B (4d/N × d)';
+    } else {
+      $('t3-sel').textContent = '— click one —';
+      $('t3-a').textContent = '—';
+      $('t3-b').textContent = '—';
+    }
+    C._hits = hits;
+  }
+
+  C.addEventListener('click', e=>{
+    const rect = C.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    const hits = C._hits || [];
+    let best = null, bestD = 1e9;
+    for (const h of hits){
+      const d = Math.hypot(h.x - x, h.y - y);
+      if (d < bestD){ bestD = d; best = h.i; }
+    }
+    if (best != null && bestD < 40){
+      selected = (selected === best) ? null : best;
+      render();
+    }
+  });
+
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,842 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>18 · torch.compile</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">18 · torch.compile</span>
+    <span class="step-pill">lesson 18 / 19</span>
+  </div>
+</header>
+
+<main>
+
+<h1>torch.compile — Dynamo + AOT Autograd + Inductor</h1>
+<p class="subtitle">Three components, each with its own job. The first captures a graph out of your Python. The second attaches a backward pass. The third generates kernels. Most of "torch.compile is slower than I expected" is one of them silently falling back.</p>
+
+<h2>The three-stage pipeline</h2>
+
+<svg viewBox="0 0 760 240" class="diagram">
+  <text x="380" y="20" font-size="12" font-family="monospace" fill="var(--text-mute)" text-anchor="middle">torch.compile internal stages</text>
+
+  <rect class="node-bg" x="20"  y="40" width="170" height="70" rx="8"/>
+  <text x="105" y="65" text-anchor="middle" font-weight="600" font-size="13">Dynamo</text>
+  <text x="105" y="84" text-anchor="middle" font-size="10" fill="var(--text-mute)">capture FX graph</text>
+  <text x="105" y="98" text-anchor="middle" font-size="10" fill="var(--text-mute)">from Python bytecode</text>
+
+  <rect class="node-bg" x="220" y="40" width="170" height="70" rx="8"/>
+  <text x="305" y="65" text-anchor="middle" font-weight="600" font-size="13">AOT Autograd</text>
+  <text x="305" y="84" text-anchor="middle" font-size="10" fill="var(--text-mute)">build forward + backward</text>
+  <text x="305" y="98" text-anchor="middle" font-size="10" fill="var(--text-mute)">graph, decompose into prims</text>
+
+  <rect class="node-bg" x="420" y="40" width="170" height="70" rx="8"/>
+  <text x="505" y="65" text-anchor="middle" font-weight="600" font-size="13">Inductor</text>
+  <text x="505" y="84" text-anchor="middle" font-size="10" fill="var(--text-mute)">fuse + lower to Triton</text>
+  <text x="505" y="98" text-anchor="middle" font-size="10" fill="var(--text-mute)">or C++ for CPU</text>
+
+  <rect class="node-bg" x="620" y="40" width="120" height="70" rx="8"/>
+  <text x="680" y="65" text-anchor="middle" font-weight="600" font-size="13">runtime</text>
+  <text x="680" y="84" text-anchor="middle" font-size="10" fill="var(--text-mute)">call generated</text>
+  <text x="680" y="98" text-anchor="middle" font-size="10" fill="var(--text-mute)">kernels</text>
+
+  <path class="edge" d="M190 75 L220 75" marker-end="url(#arrow)"/>
+  <path class="edge" d="M390 75 L420 75" marker-end="url(#arrow)"/>
+  <path class="edge" d="M590 75 L620 75" marker-end="url(#arrow)"/>
+
+  <rect class="node-bg" x="20"  y="150" width="720" height="60" rx="8" fill="#13141c"/>
+  <text x="380" y="170" text-anchor="middle" font-size="12" fill="var(--text-mute)">guards (runtime shape/dtype checks)</text>
+  <text x="380" y="188" text-anchor="middle" font-size="11" fill="var(--text-mute)">on miss → recompile or fall back to eager</text>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/>
+    </marker>
+  </defs>
+</svg>
+
+<h2>Stage 1 — Dynamo, the Python-bytecode tracer</h2>
+
+<p>Dynamo intercepts a function call at the Python bytecode level via CPython's frame-evaluation API (PEP 523, available since CPython 3.6; later versions like 3.11+ extended the hook with more useful per-instruction control). It runs the function's instructions <em>symbolically</em> on "FakeTensor" placeholders, recording operations into an FX graph. The result is two things:</p>
+
+<ul>
+  <li><strong>An FX graph</strong> — a clean DAG of PyTorch ops, no Python control flow inside.</li>
+  <li><strong>A set of guards</strong> — runtime predicates that, if violated by future inputs, invalidate the captured graph (e.g. "argument 0 is a CUDA bf16 tensor of shape (4, 4096)").</li>
+</ul>
+
+<p>This is genius and constraining at once. Because guards check shapes/dtypes/devices on every call, dynamic Python (data-dependent control flow, runtime-shape branches) breaks the trace — Dynamo emits a <strong>graph break</strong>: it falls back to eager mode for the unsupported chunk, then resumes tracing afterwards. A function with three graph breaks compiles into three small graphs interleaved with eager.</p>
+
+<div class="callout warn">
+  <div class="label">Graph breaks are the failure mode you'll fight</div>
+  Common causes:
+  <ul>
+    <li><code>.item()</code> or <code>.tolist()</code> — pulls a tensor value into Python, makes downstream control flow data-dependent.</li>
+    <li><code>print()</code>, <code>logging</code>, custom assertions on tensors.</li>
+    <li>Python-level iteration over tensor data.</li>
+    <li><code>tensor.shape[0]</code> used as a Python int in an arithmetic chain (Dynamo's "dynamic shapes" mode handles many of these now, but not all).</li>
+    <li>Calls into unsupported Python libraries.</li>
+  </ul>
+  Diagnose with <code>TORCH_LOGS="graph_breaks"</code>. Often you can refactor a single <code>.item()</code> away and a 12-graph trace becomes a 1-graph trace.
+</div>
+
+<h2>Animated · Dynamo graph capture, line by line</h2>
+
+<p>Watch Dynamo read Python code from left to right, extracting nodes into the FX graph on the right. When it hits a <code>.item()</code> or other unsupported op, the graph <em>breaks</em>: the partial graph is sealed, eager Python runs for a step, then a fresh graph starts. Pick a workload to see different break patterns.</p>
+
+<div class="widget" id="dy-widget">
+  <div class="title">Dynamo trace · graphs forming as bytecode flows</div>
+  <div class="hint">Left pane = Python source, line by line. Right pane = FX graphs being built. Solid line = a captured node; orange break = graph break (eager fallback).</div>
+
+  <div class="controls">
+    <button id="dy-play">▶ play</button>
+    <button id="dy-step">step ▷</button>
+    <button id="dy-reset">⟲ reset</button>
+    <label class="inline">workload:
+      <select id="dy-w" style="background:var(--code-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px;font-family:var(--mono);font-size:12px;">
+        <option value="clean">Clean — 1 graph</option>
+        <option value="item">.item() in middle — splits</option>
+        <option value="ifprint">Python if + print — 2 breaks</option>
+      </select>
+    </label>
+  </div>
+
+  <canvas id="dy-canvas" width="760" height="400" style="width:100%; height:400px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">line</div><div class="v" id="dy-line">—</div></div>
+    <div class="kpi"><div class="k">graphs so far</div><div class="v" id="dy-g">—</div></div>
+    <div class="kpi"><div class="k">nodes captured</div><div class="v" id="dy-n">—</div></div>
+    <div class="kpi"><div class="k">graph breaks</div><div class="v" id="dy-b">—</div></div>
+  </div>
+</div>
+
+<h2>Stage 2 — AOT Autograd</h2>
+
+<p>Dynamo's FX graph is <em>forward only</em>. To compile a training step we also need backward. AOT (Ahead-Of-Time) Autograd takes the forward graph, runs PyTorch's autograd machinery <em>once</em> at compile time to derive the backward graph, then hands both to Inductor as a single combined graph.</p>
+
+<p>It also <strong>decomposes</strong> high-level ops into a smaller set of "primitive" ops. For example, <code>aten::softmax</code> decomposes into <code>max</code>, <code>sub</code>, <code>exp</code>, <code>sum</code>, <code>div</code>. The decomposition exposes fusion opportunities that the original opaque op hides. This is why <code>torch.compile</code> often beats eager softmax: the decomposed primitives can be fused into one Triton kernel and chained with adjacent pointwise ops (dropout, scale, residual). They do <em>not</em> get fused into the matmul body itself — matmul stays in cuBLAS — but they can avoid the HBM round-trip between matmul output and the next pointwise op via Inductor's epilogue-fusion path.</p>
+
+<p>AOT Autograd also handles the <strong>functionalization</strong> step: in-place ops (<code>add_</code>, <code>copy_</code>) are rewritten as out-of-place versions, so the downstream pipeline can reason about a pure data-flow graph. This is one of the more invasive transformations and occasionally causes subtle bugs in code that depended on in-place semantics.</p>
+
+<h2>2D · AOT autograd flow — click an op for its backward partner</h2>
+
+<p>The forward graph is on top, the backward graph mirrors it on the bottom (in reverse order). Click any forward op to see which backward op it generates and which intermediate tensors get saved. The "saved" tensors are the activations — they live in HBM between forward and backward and dominate the activation memory budget.</p>
+
+<div class="widget" id="aot-widget">
+  <div class="title">AOT autograd · forward + backward in one graph</div>
+  <div class="hint">Solid arrows = data flow. Dashed arrows = saved tensors crossing from forward to backward. Click any forward op.</div>
+
+  <div class="controls">
+    <label class="inline">model snippet:
+      <select id="aot-m" style="background:var(--code-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px;font-family:var(--mono);font-size:12px;">
+        <option value="mlp">MLP block (linear → gelu → linear)</option>
+        <option value="attn">Attention QK softmax V</option>
+        <option value="norm">LayerNorm + residual</option>
+      </select>
+    </label>
+    <label class="inline"><input type="checkbox" id="aot-save" checked> show saved tensors</label>
+  </div>
+
+  <canvas id="aot-canvas" width="760" height="380" style="width:100%; height:380px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">selected</div><div class="v" id="aot-sel" style="font-size:14px;">— click a fwd op —</div></div>
+    <div class="kpi"><div class="k">backward op</div><div class="v" id="aot-bwd" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">saved tensors</div><div class="v" id="aot-st" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">recomputable?</div><div class="v" id="aot-rec" style="font-size:14px;">—</div></div>
+  </div>
+</div>
+
+<h2>Stage 3 — Inductor, the codegen</h2>
+
+<p>Inductor takes a pure FX graph and outputs:</p>
+<ul>
+  <li><strong>Triton kernels</strong> for elementwise chains, reductions, pointwise+reduction fusions. These are autotuned at first call (per lesson 17).</li>
+  <li><strong>C++ kernels</strong> for CPU paths.</li>
+  <li><strong>Calls into cuBLAS / cuDNN</strong> for matmul and conv — Inductor doesn't try to outperform the vendor library.</li>
+  <li><strong>An orchestrator</strong> that ties them together with explicit allocation and buffer reuse.</li>
+</ul>
+
+<p>Inductor's three big optimisations:</p>
+<ol>
+  <li><strong>Vertical fusion.</strong> Chains of elementwise / pointwise ops become a single Triton kernel — the lesson-16 fusion case.</li>
+  <li><strong>Horizontal fusion.</strong> Independent ops with the same shape can share a kernel launch.</li>
+  <li><strong>Memory planning.</strong> The compiler knows the lifetime of every tensor and reuses buffers, avoiding allocator churn for known intermediates. This is one of the larger wins in practice.</li>
+</ol>
+
+<h2>The four modes of <code>torch.compile</code></h2>
+
+<table>
+  <thead><tr><th>Mode</th><th>What it adds</th><th>Use case</th></tr></thead>
+  <tbody>
+    <tr><td><code>"default"</code></td><td>Dynamo + AOT + Inductor</td><td>Most training. 1.3–2× typical speedup.</td></tr>
+    <tr><td><code>"reduce-overhead"</code></td><td>Default + CUDA Graphs wrapping (lesson 19)</td><td>Decode-heavy inference. Drops launch overhead.</td></tr>
+    <tr><td><code>"max-autotune"</code></td><td>Default + exhaustive autotuning of matmul shapes</td><td>Long training runs that justify minutes of compile time.</td></tr>
+    <tr><td><code>"max-autotune-no-cudagraphs"</code></td><td>max-autotune but skip CUDA Graph capture</td><td>Dynamic-shape workloads.</td></tr>
+  </tbody>
+</table>
+
+<h2>Three failure modes, in order of how often they bite</h2>
+
+<ol>
+  <li><strong>Graph breaks.</strong> A 100-line model with one <code>.item()</code> deep in it gets cut into many small graphs. The Python tax you wanted to avoid is back. Diagnose with <code>TORCH_LOGS="graph_breaks"</code>; fix by removing data-dependent Python.</li>
+  <li><strong>Recompilation.</strong> Every new shape, dtype, or device combination triggers a fresh compile. By default Dynamo has a recompile budget (typically 8 per call site); past that it gives up and falls back to eager. Diagnose with <code>TORCH_LOGS="recompiles"</code>; fix by using <code>dynamic=True</code> or by padding inputs to a fixed shape.</li>
+  <li><strong>Inductor fallbacks.</strong> Some ops (sparse, custom, weird-stride) aren't supported by Inductor and become a synchronous cuBLAS/eager call. Doesn't break correctness but kills the fusion win. Diagnose with <code>TORCH_LOGS="output_code"</code>.</li>
+</ol>
+
+<h2>2D · failure-modes timeline</h2>
+
+<p>A simulated training loop. Step time is plotted across 200 steps; each failure mode can be toggled on. Watch the spikes: graph breaks add a small constant overhead per step; recompilations land a huge spike every time a new shape is seen; fallbacks add per-step overhead that doesn't recover.</p>
+
+<div class="widget" id="fm-widget">
+  <div class="title">Failure-mode timeline · step time over a training run</div>
+  <div class="hint">Baseline = clean compiled run at 50 ms/step. Toggle each failure mode to overlay its impact. The y-axis is step time (ms); the x-axis is step number.</div>
+
+  <div class="controls">
+    <label class="inline"><input type="checkbox" id="fm-gb" checked> graph breaks (every step)</label>
+    <label class="inline"><input type="checkbox" id="fm-re"> recompiles (shape changes)</label>
+    <label class="inline"><input type="checkbox" id="fm-fb"> Inductor fallback (every step)</label>
+  </div>
+
+  <canvas id="fm-canvas" width="760" height="300" style="width:100%; height:300px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">median step (ms)</div><div class="v" id="fm-med">—</div></div>
+    <div class="kpi"><div class="k">p99 step (ms)</div><div class="v" id="fm-p99">—</div></div>
+    <div class="kpi"><div class="k">total time (s)</div><div class="v" id="fm-tot">—</div></div>
+    <div class="kpi"><div class="k">vs clean compile</div><div class="v" id="fm-vs">—</div></div>
+  </div>
+</div>
+
+<h2>Compile cost — when is it worth it?</h2>
+
+<p>First-call compile time is real: Dynamo trace + AOT decomposition + Inductor codegen + autotuning often adds <strong>10–60 seconds</strong> to the first forward, then per-shape recompiles on top. The breakeven against eager is somewhere around 1000 steps for training and ~100 prompts for inference (since each saves a few ms).</p>
+
+<p>If you're doing a long training run, compile pays off in the first hour. If you're doing one-off research code, the compile time can dominate. PyTorch's compile cache (on-disk by default since 2.5) makes the <em>second</em> run of the same model much faster.</p>
+
+<h2>Where torch.compile beats hand-written CUDA — and where it doesn't</h2>
+
+<ul>
+  <li><strong>Beats hand-written</strong> when the win is "fuse this long chain of pointwise ops." A 20-op decode-norm path collapsed to one Triton kernel is a thing humans rarely write but compilers reliably produce.</li>
+  <li><strong>Beats hand-written</strong> when memory planning is the bottleneck. Compilers can reuse buffers a human author would forget.</li>
+  <li><strong>Loses to hand-written</strong> when the fusion crosses a matmul (FlashAttention-class). Inductor doesn't yet generate fused matmul + custom-softmax kernels at FlashAttention quality.</li>
+  <li><strong>Loses to hand-written</strong> when the kernel needs hardware-specific tricks: warp specialisation on Hopper, persistent kernels, async copy double-buffering. Triton-via-Inductor can't reach those reliably.</li>
+</ul>
+
+<h2>Inference vs training compile</h2>
+
+<p>For training, the AOT-Autograd path matters: backward is compiled too, and the activation-saving optimisation (Inductor can decide what to recompute vs save based on costs) is a real lever. For inference, you usually want <code>mode="reduce-overhead"</code> — same compile path plus CUDA Graphs around the compiled forward. The graph-break problem is worse at inference (decoder loops have inherent Python in them) but the per-step compile is amortised over thousands of tokens.</p>
+
+<h2>Interactive · what does the compile pipeline keep, fuse, fall back?</h2>
+
+<p>Pick a forward pass shape and trace it through Dynamo's eyes: which calls become graph breaks (and why), which decompose, which fuse. The widget is a simulation of how a few common motifs land in the pipeline — illustrative, not exhaustive.</p>
+
+<div class="widget" id="c-widget">
+  <div class="title">Pipeline trace · what survives capture</div>
+  <div class="hint">Each row is a line of "user code". Columns show whether Dynamo captures it, AOT decomposes it, Inductor fuses it, or something causes a graph break.</div>
+
+  <div class="controls">
+    <label class="inline">workload:
+      <select id="c-w">
+        <option value="clean">Clean transformer block (matmul + norm + activation)</option>
+        <option value="dotitem">Code with hidden <code>.item()</code></option>
+        <option value="dynshape">Variable sequence length each call</option>
+        <option value="custom">Custom op (unsupported)</option>
+      </select>
+    </label>
+  </div>
+
+  <table id="c-table">
+    <thead><tr><th>line</th><th>dynamo</th><th>AOT decompose</th><th>inductor fuse</th><th>notes</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">graph breaks</div><div class="v" id="c-gb">—</div></div>
+    <div class="kpi"><div class="k">recompiles likely</div><div class="v" id="c-re">—</div></div>
+    <div class="kpi"><div class="k">expected speedup</div><div class="v" id="c-sp">—</div></div>
+    <div class="kpi"><div class="k">verdict</div><div class="v" id="c-vd">—</div></div>
+  </div>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  <code>torch.compile</code> is three stages: capture, derive backward, codegen. Each can fall back. Most of the speedup comes from Inductor's vertical fusion + memory planning; the rest from CUDA Graphs in <code>reduce-overhead</code>. The job of the engineer is to keep the graph clean — no <code>.item()</code>, no Python control flow on tensor values, no exotic ops — and let the compiler do its work.
+</div>
+
+<footer class="lesson-nav">
+  <a href="17_triton.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">17 · Triton</span>
+  </a>
+  <a class="next" href="19_cuda_graphs_tensorrt.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">19 · CUDA Graphs &amp; TensorRT</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const cases = {
+    clean: {
+      lines: [
+        ['x = self.norm(x)',          '✓', 'fused ops', '✓ with next', ''],
+        ['q,k,v = self.qkv(x).split(...)', '✓', 'aten.mm + split', '—', 'matmul stays cuBLAS'],
+        ['o = attn(q,k,v)',           '✓', 'flash_attention prim', '—', 'leaves attention to library'],
+        ['o = self.proj(o)',          '✓', 'aten.mm',      '—', 'matmul stays cuBLAS'],
+        ['x = x + o',                 '✓', 'aten.add',     '✓ with next', 'fused with norm-eps'],
+        ['x = self.mlp(x)',           '✓', 'GEMM + GeLU + GEMM', 'epilogue', ''],
+      ],
+      gb: 0, re: 'low', sp: '~1.6×', vd: 'OK · the common case'
+    },
+    dotitem: {
+      lines: [
+        ['x = self.norm(x)',          '✓', 'ok', '✓', ''],
+        ['t = x.abs().max().item()',  '✗', 'break', '—', 'breaks · pulls tensor into Python'],
+        ['if t > 1.0:',               'eager', 'eager', '—', 'Python control flow'],
+        ['  x = x / t',               'eager', 'eager', '—', ''],
+        ['x = self.mlp(x)',           '✓', 'ok', '✓', 'separate graph resumes here'],
+      ],
+      gb: 1, re: 'medium', sp: '~1.2×', vd: '⚠ one <code>.item()</code> halved the win'
+    },
+    dynshape: {
+      lines: [
+        ['x = self.norm(x)',          '✓', 'ok', '✓', 'shape (B, T_n, d)'],
+        ['next call · shape (B, T_n+1, d)', 'recompile', '—', '—', 'T changed → new guard miss'],
+      ],
+      gb: 0, re: 'high (8+ shapes)', sp: '<1×', vd: '⚠ use <code>dynamic=True</code> or pad'
+    },
+    custom: {
+      lines: [
+        ['x = self.norm(x)',          '✓', 'ok', '✓', ''],
+        ['x = my_cuda_op(x)',         '✓', 'opaque', 'fallback', 'no fusion across boundary'],
+        ['x = self.mlp(x)',           '✓', 'ok', '✓', 'fusion resumes'],
+      ],
+      gb: 0, re: 'low', sp: '~1.3×', vd: 'OK · register a meta + decomp to fuse across'
+    }
+  };
+
+  const sel = document.getElementById('c-w');
+  const body = document.querySelector('#c-table tbody');
+  const gb = document.getElementById('c-gb');
+  const re = document.getElementById('c-re');
+  const sp = document.getElementById('c-sp');
+  const vd = document.getElementById('c-vd');
+
+  function render(){
+    const c = cases[sel.value];
+    body.innerHTML = '';
+    c.lines.forEach(row => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td><code>' + row[0] + '</code></td>' + row.slice(1).map(x => '<td>' + x + '</td>').join('');
+      body.appendChild(tr);
+    });
+    gb.textContent = c.gb;
+    re.textContent = c.re;
+    sp.textContent = c.sp;
+    vd.innerHTML = c.vd;
+  }
+  sel.addEventListener('change', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: Dynamo trace animation ───
+ * Python source on the left, FX graph nodes on the right. Each step advances
+ * one line. If the line triggers a graph break, the in-progress graph closes
+ * and a new one is started.
+ */
+(function(){
+  const C = document.getElementById('dy-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    play:$('dy-play'), step:$('dy-step'), reset:$('dy-reset'),
+    w:$('dy-w'),
+    line:$('dy-line'), g:$('dy-g'), n:$('dy-n'), b:$('dy-b'),
+  };
+
+  // workload definitions: each line is { src, op (graph node name, '' = no op), brk (break flag) }
+  const WORKLOADS = {
+    clean: [
+      { src:'x = self.norm(x)',          op:'aten.layer_norm' },
+      { src:'q = self.q_proj(x)',        op:'aten.mm' },
+      { src:'k = self.k_proj(x)',        op:'aten.mm' },
+      { src:'v = self.v_proj(x)',        op:'aten.mm' },
+      { src:'a = scaled_dot_product(q,k,v)', op:'aten.sdpa' },
+      { src:'o = self.out_proj(a)',      op:'aten.mm' },
+      { src:'x = x + o',                 op:'aten.add' },
+      { src:'x = self.mlp(x)',           op:'mlp_block' },
+      { src:'return x',                  op:'aten.return' },
+    ],
+    item: [
+      { src:'x = self.norm(x)',          op:'aten.layer_norm' },
+      { src:'q = self.q_proj(x)',        op:'aten.mm' },
+      { src:'m = x.abs().max().item()',  op:'',  brk:true, why:'.item() pulls value to Python' },
+      { src:'if m > 1.0:',               op:'eager' },
+      { src:'    x = x / m',             op:'eager' },
+      { src:'k = self.k_proj(x)',        op:'aten.mm' },
+      { src:'v = self.v_proj(x)',        op:'aten.mm' },
+      { src:'a = sdpa(q,k,v)',           op:'aten.sdpa' },
+      { src:'return self.mlp(a)',        op:'mlp_block' },
+    ],
+    ifprint: [
+      { src:'x = self.norm(x)',          op:'aten.layer_norm' },
+      { src:'if self.training:',         op:'',  brk:true, why:'Python branch on a module attr' },
+      { src:'    print("step", step)',   op:'eager' },
+      { src:'q = self.q_proj(x)',        op:'aten.mm' },
+      { src:'logging.info(q.shape)',     op:'',  brk:true, why:'logging triggers eager fallback' },
+      { src:'k = self.k_proj(x)',        op:'aten.mm' },
+      { src:'v = self.v_proj(x)',        op:'aten.mm' },
+      { src:'return sdpa(q,k,v)',        op:'aten.sdpa' },
+    ],
+  };
+
+  let cursor = 0;
+  let playing = false;
+  let lastT = 0;
+
+  function lines(){ return WORKLOADS[els.w.value]; }
+
+  function step(){
+    cursor = (cursor + 1) % (lines().length + 1);
+    render();
+  }
+  function tick(ts){
+    if (!playing) return;
+    if (ts - lastT > 700){ step(); lastT = ts; }
+    requestAnimationFrame(tick);
+  }
+  els.play.addEventListener('click', ()=>{
+    playing = !playing; els.play.textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastT = performance.now(); requestAnimationFrame(tick); }
+  });
+  els.step.addEventListener('click', step);
+  els.reset.addEventListener('click', ()=>{ cursor=0; playing=false; els.play.textContent='▶ play'; render(); });
+  els.w.addEventListener('change', ()=>{ cursor=0; render(); });
+
+  function buildGraphs(upto){
+    // Walk the lines, producing a list of graphs, each = { nodes: [...], eager: [...] }
+    const ls = lines();
+    const out = [{ nodes:[], eager:[] }];
+    for (let i=0; i<upto && i<ls.length; i++){
+      const ln = ls[i];
+      if (ln.brk){
+        // close current graph; start new one
+        out.push({ nodes:[], eager:[ln.src] });
+      } else if (ln.op === 'eager'){
+        out[out.length-1].eager.push(ln.src);
+      } else if (ln.op){
+        out[out.length-1].nodes.push(ln.op);
+      }
+    }
+    return out;
+  }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padX = 14;
+    const leftW = 350, rightX = leftW + padX*2, rightW = W - rightX - padX;
+
+    // Left: Python source
+    ctx.fillStyle = '#f1f3f7'; ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+    ctx.fillRect(padX, 12, leftW, H - 24);
+    ctx.strokeRect(padX, 12, leftW, H - 24);
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('forward(x)  # Python source', padX + 8, 26);
+
+    const ls = lines();
+    const lineH = 24;
+    ls.forEach((ln, i) => {
+      const y = 46 + i*lineH;
+      const cur = (i === cursor - 1);
+      const done = (i < cursor - 1);
+      if (cur){ ctx.fillStyle = 'rgba(106, 169, 255, 0.18)'; ctx.fillRect(padX + 4, y - 14, leftW - 8, lineH); }
+      // gutter num
+      ctx.fillStyle = ln.brk ? '#dc2626' : (done ? '#94a3b8' : (cur ? '#2563eb' : '#5b6573'));
+      ctx.font = '10px monospace';
+      ctx.fillText((i+1).toString().padStart(2, ' '), padX + 8, y);
+      // src
+      ctx.fillStyle = ln.op === 'eager' ? '#d97706' : (ln.brk ? '#dc2626' : (done ? '#1f2430' : (cur ? '#fff' : '#5b6573')));
+      ctx.font = '12px monospace';
+      ctx.fillText(ln.src, padX + 32, y);
+      // brk reason
+      if (cur && ln.brk){
+        ctx.fillStyle = '#dc2626'; ctx.font = '10px monospace';
+        ctx.fillText('⚠ break: ' + ln.why, padX + 32, y + 12);
+      }
+    });
+
+    // Right: FX graphs
+    ctx.fillStyle = '#f1f3f7'; ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+    ctx.fillRect(rightX, 12, rightW, H - 24);
+    ctx.strokeRect(rightX, 12, rightW, H - 24);
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('captured FX graph(s)', rightX + 8, 26);
+
+    const graphs = buildGraphs(cursor);
+    let y = 42;
+    graphs.forEach((g, gi) => {
+      // graph card
+      const nodes = g.nodes.length;
+      const cardH = Math.max(40, 28 + nodes*22 + (g.eager.length ? 18 + g.eager.length*16 : 0));
+      ctx.fillStyle = nodes ? 'rgba(106, 169, 255, 0.08)' : 'rgba(255, 184, 106, 0.08)';
+      ctx.strokeStyle = nodes ? '#2563eb' : '#d97706';
+      ctx.lineWidth = 1.2;
+      ctx.fillRect(rightX + 10, y, rightW - 20, cardH);
+      ctx.strokeRect(rightX + 10, y, rightW - 20, cardH);
+      ctx.fillStyle = nodes ? '#2563eb' : '#d97706';
+      ctx.font = 'bold 10px monospace';
+      ctx.fillText('graph #' + (gi+1) + ' · ' + (nodes ? nodes + ' nodes' : 'empty'), rightX + 16, y + 14);
+
+      g.nodes.forEach((nd, i) => {
+        const ny = y + 28 + i*22;
+        ctx.fillStyle = '#dbeafe'; ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 1;
+        ctx.fillRect(rightX + 18, ny - 14, rightW - 36, 18);
+        ctx.strokeRect(rightX + 18, ny - 14, rightW - 36, 18);
+        ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+        ctx.fillText(nd, rightX + 26, ny);
+        // arrow to next node
+        if (i < g.nodes.length - 1){
+          ctx.strokeStyle = '#475569'; ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(rightX + 30, ny + 4); ctx.lineTo(rightX + 30, ny + 8); ctx.stroke();
+        }
+      });
+      if (g.eager.length){
+        const ey = y + 28 + nodes*22 + 6;
+        ctx.fillStyle = '#d97706'; ctx.font = 'bold 10px monospace';
+        ctx.fillText('— eager region —', rightX + 18, ey);
+        g.eager.forEach((e, i) => {
+          ctx.fillStyle = '#d97706'; ctx.font = '10px monospace';
+          ctx.fillText('▸ ' + e, rightX + 22, ey + 14 + i*14);
+        });
+      }
+      y += cardH + 8;
+    });
+
+    // KPIs
+    const totalNodes = graphs.reduce((a,b) => a + b.nodes.length, 0);
+    const totalBreaks = Math.max(0, graphs.length - 1);
+    els.line.textContent = cursor + ' / ' + ls.length;
+    els.g.textContent = graphs.filter(g=>g.nodes.length>0).length;
+    els.n.textContent = totalNodes;
+    els.b.textContent = totalBreaks;
+  }
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: AOT autograd forward + backward ─── */
+(function(){
+  const C = document.getElementById('aot-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    m:$('aot-m'), save:$('aot-save'),
+    sel:$('aot-sel'), bwd:$('aot-bwd'), st:$('aot-st'), rec:$('aot-rec'),
+  };
+
+  // Each model: list of forward ops; each has a backward partner, saved tensors, and recomputable flag.
+  const MODELS = {
+    mlp: [
+      { fwd:'linear₁',  bwd:'matmul_grad₁',   saved:'input x',         rec:false },
+      { fwd:'gelu',     bwd:'gelu_grad',      saved:'pre-activation', rec:true  },
+      { fwd:'linear₂',  bwd:'matmul_grad₂',   saved:'gelu output',    rec:false },
+    ],
+    attn: [
+      { fwd:'q_proj',   bwd:'matmul_grad_q',  saved:'x',              rec:false },
+      { fwd:'k_proj',   bwd:'matmul_grad_k',  saved:'x',              rec:false },
+      { fwd:'v_proj',   bwd:'matmul_grad_v',  saved:'x',              rec:false },
+      { fwd:'qk^T·scale', bwd:'qk_grad',      saved:'q, k',           rec:false },
+      { fwd:'softmax',  bwd:'softmax_grad',   saved:'softmax out',    rec:true  },
+      { fwd:'·V',       bwd:'attn_v_grad',    saved:'softmax, V',     rec:false },
+      { fwd:'o_proj',   bwd:'matmul_grad_o',  saved:'attn out',       rec:false },
+    ],
+    norm: [
+      { fwd:'mean',     bwd:'mean_grad',      saved:'-',              rec:true  },
+      { fwd:'sub',      bwd:'sub_grad',       saved:'-',              rec:true  },
+      { fwd:'rsqrt(var)', bwd:'rsqrt_grad',   saved:'inv_std',        rec:false },
+      { fwd:'scale·γ',  bwd:'mul_grad',       saved:'normalized',     rec:false },
+      { fwd:'add·β',    bwd:'add_grad',       saved:'-',              rec:true  },
+      { fwd:'+ residual', bwd:'add_grad',     saved:'-',              rec:true  },
+    ],
+  };
+
+  let selectedIdx = -1;
+
+  els.m.addEventListener('change', ()=>{ selectedIdx = -1; render(); });
+  els.save.addEventListener('change', render);
+
+  // Op positions for hit testing
+  let opBoxes = [];
+
+  C.addEventListener('click', e => {
+    const rect = C.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    for (let i=0; i<opBoxes.length; i++){
+      const b = opBoxes[i];
+      if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h){
+        selectedIdx = (selectedIdx === i) ? -1 : i;
+        render();
+        return;
+      }
+    }
+  });
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const ops = MODELS[els.m.value];
+    const padX = 24;
+    const innerW = W - 2*padX;
+    const boxW = Math.min(110, innerW / ops.length - 14);
+    const gap = (innerW - boxW * ops.length) / (ops.length - 1);
+    const fwdY = 52, bwdY = H - 90, boxH = 44;
+
+    // Title lines
+    ctx.fillStyle = '#2563eb'; ctx.font = 'bold 11px monospace';
+    ctx.fillText('FORWARD  →', padX, fwdY - 16);
+    ctx.fillStyle = '#d97706'; ctx.fillText('←  BACKWARD', padX, bwdY + boxH + 18);
+
+    // Draw forward + backward boxes
+    opBoxes = [];
+    for (let i=0; i<ops.length; i++){
+      const x = padX + i*(boxW + gap);
+      const isSel = (i === selectedIdx);
+      // fwd
+      ctx.fillStyle = isSel ? '#2563eb' : '#dbeafe';
+      ctx.strokeStyle = isSel ? '#fff' : '#2563eb'; ctx.lineWidth = isSel ? 2 : 1.2;
+      ctx.fillRect(x, fwdY, boxW, boxH);
+      ctx.strokeRect(x, fwdY, boxW, boxH);
+      ctx.fillStyle = isSel ? '#ffffff' : '#1f2430';
+      ctx.font = 'bold 12px monospace';
+      ctx.fillText(ops[i].fwd, x + 8, fwdY + 20);
+      ctx.fillStyle = isSel ? '#ffffff' : '#94a3b8'; ctx.font = '10px monospace';
+      ctx.fillText('fwd #' + (i+1), x + 8, fwdY + 36);
+      opBoxes.push({ x, y: fwdY, w: boxW, h: boxH });
+
+      // bwd (mirror: backward runs in reverse order, so bwd[ops.length-1-i] corresponds)
+      const bi = ops.length - 1 - i;
+      const isBwdMate = (i === selectedIdx);
+      const xb = padX + bi*(boxW + gap);
+      ctx.fillStyle = isBwdMate ? '#d97706' : '#fef3c7';
+      ctx.strokeStyle = isBwdMate ? '#fff' : '#d97706'; ctx.lineWidth = isBwdMate ? 2 : 1.2;
+      ctx.fillRect(xb, bwdY, boxW, boxH);
+      ctx.strokeRect(xb, bwdY, boxW, boxH);
+      ctx.fillStyle = isBwdMate ? '#ffffff' : '#d97706';
+      ctx.font = 'bold 11px monospace';
+      ctx.fillText(ops[i].bwd, xb + 8, bwdY + 20);
+      ctx.fillStyle = isBwdMate ? '#ffffff' : '#94a3b8'; ctx.font = '10px monospace';
+      ctx.fillText('bwd #' + (ops.length - i), xb + 8, bwdY + 36);
+    }
+
+    // Forward flow arrows
+    ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 1.2;
+    for (let i=0; i<ops.length-1; i++){
+      const x1 = padX + i*(boxW + gap) + boxW;
+      const x2 = padX + (i+1)*(boxW + gap);
+      ctx.beginPath(); ctx.moveTo(x1, fwdY + boxH/2); ctx.lineTo(x2, fwdY + boxH/2); ctx.stroke();
+      // arrowhead
+      ctx.beginPath();
+      ctx.moveTo(x2, fwdY + boxH/2);
+      ctx.lineTo(x2 - 5, fwdY + boxH/2 - 3);
+      ctx.lineTo(x2 - 5, fwdY + boxH/2 + 3);
+      ctx.closePath(); ctx.fillStyle = '#2563eb'; ctx.fill();
+    }
+    // Backward flow arrows (right to left)
+    ctx.strokeStyle = '#d97706'; ctx.lineWidth = 1.2;
+    for (let i=ops.length-1; i>0; i--){
+      const x1 = padX + i*(boxW + gap);
+      const x2 = padX + (i-1)*(boxW + gap) + boxW;
+      ctx.beginPath(); ctx.moveTo(x1, bwdY + boxH/2); ctx.lineTo(x2, bwdY + boxH/2); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(x2, bwdY + boxH/2);
+      ctx.lineTo(x2 + 5, bwdY + boxH/2 - 3);
+      ctx.lineTo(x2 + 5, bwdY + boxH/2 + 3);
+      ctx.closePath(); ctx.fillStyle = '#d97706'; ctx.fill();
+    }
+
+    // Saved tensor connections (fwd → bwd via dashed)
+    if (els.save.checked){
+      ctx.strokeStyle = '#7c3aed'; ctx.lineWidth = 1;
+      ctx.setLineDash([4,3]);
+      for (let i=0; i<ops.length; i++){
+        if (ops[i].saved === '-') continue;
+        if (selectedIdx !== -1 && i !== selectedIdx) ctx.globalAlpha = 0.18;
+        else ctx.globalAlpha = (selectedIdx === i) ? 1 : 0.45;
+        const xf = padX + i*(boxW + gap) + boxW/2;
+        const bi = ops.length - 1 - i;
+        const xb = padX + bi*(boxW + gap) + boxW/2;
+        ctx.beginPath();
+        ctx.moveTo(xf, fwdY + boxH);
+        ctx.bezierCurveTo(xf, fwdY + boxH + 60, xb, bwdY - 60, xb, bwdY);
+        ctx.stroke();
+      }
+      ctx.setLineDash([]); ctx.globalAlpha = 1;
+      ctx.fillStyle = '#7c3aed'; ctx.font = '10px monospace';
+      ctx.fillText('┄ saved tensor (HBM during fwd→bwd)', padX, H - 8);
+    }
+
+    // KPIs
+    if (selectedIdx >= 0){
+      const o = ops[selectedIdx];
+      els.sel.textContent = o.fwd;
+      els.bwd.textContent = o.bwd;
+      els.st.textContent = o.saved;
+      els.rec.textContent = o.rec ? 'yes (cheap recompute)' : 'no (must save)';
+    } else {
+      els.sel.textContent = '— click a fwd op —';
+      els.bwd.textContent = '—'; els.st.textContent = '—'; els.rec.textContent = '—';
+    }
+  }
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: failure-modes timeline ─── */
+(function(){
+  const C = document.getElementById('fm-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    gb:$('fm-gb'), re:$('fm-re'), fb:$('fm-fb'),
+    med:$('fm-med'), p99:$('fm-p99'), tot:$('fm-tot'), vs:$('fm-vs'),
+  };
+
+  const STEPS = 200;
+  const BASE = 50; // ms
+
+  // Toggle handlers
+  [els.gb, els.re, els.fb].forEach(el => el.addEventListener('change', render));
+
+  function simulate(){
+    const out = new Float32Array(STEPS);
+    let prevShape = 'A';
+    for (let i=0; i<STEPS; i++){
+      let t = BASE;
+      // graph breaks: every step adds ~5ms (Python-eager fallback for a chunk)
+      if (els.gb.checked) t += 5 + Math.sin(i*0.3)*0.6;
+      // recompilations: every ~30 steps a new shape causes a big spike
+      if (els.re.checked && (i % 35 === 5 || i % 50 === 12 || i === 80 || i === 150)){
+        t += 900; // big compile spike
+      }
+      // fallback: +12ms constant per step
+      if (els.fb.checked) t += 12;
+      // jitter
+      t += Math.random() * 1.2 - 0.6;
+      out[i] = t;
+    }
+    return out;
+  }
+
+  function render(){
+    const data = simulate();
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 40, padR = 16, padT = 18, padB = 28;
+    const innerW = W - padL - padR, innerH = H - padT - padB;
+    const maxV = Math.max(...data, 80);
+    const stepW = innerW / STEPS;
+
+    // axes
+    ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + innerH); ctx.lineTo(padL + innerW, padT + innerH);
+    ctx.stroke();
+
+    // gridlines / y-axis ticks
+    ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+    for (let i=0; i<=4; i++){
+      const v = (maxV * i) / 4;
+      const y = padT + innerH - (i/4)*innerH;
+      ctx.fillText(v.toFixed(0), 4, y + 3);
+      ctx.strokeStyle = '#eef1f5'; ctx.lineWidth = 0.5;
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + innerW, y); ctx.stroke();
+    }
+
+    // x-axis labels
+    for (let i=0; i<=4; i++){
+      const x = padL + (i/4)*innerW;
+      const lbl = ((STEPS*i)/4).toFixed(0);
+      ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+      ctx.fillText(lbl, x - 8, padT + innerH + 14);
+    }
+    ctx.fillStyle = '#5b6573';
+    ctx.fillText('step', padL + innerW - 30, padT + innerH + 24);
+    ctx.fillText('ms', 4, padT - 4);
+
+    // baseline reference
+    const baseY = padT + innerH - (BASE/maxV)*innerH;
+    ctx.strokeStyle = '#16a34a'; ctx.setLineDash([4,3]);
+    ctx.beginPath(); ctx.moveTo(padL, baseY); ctx.lineTo(padL+innerW, baseY); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#16a34a'; ctx.font = '10px monospace';
+    ctx.fillText('clean compile baseline (50 ms)', padL + innerW - 200, baseY - 4);
+
+    // bars per step
+    for (let i=0; i<STEPS; i++){
+      const x = padL + i*stepW;
+      const h = (data[i]/maxV) * innerH;
+      let color = '#16a34a';
+      if (data[i] > 400) color = '#dc2626'; // recompile spike
+      else if (els.fb.checked && data[i] > 60) color = '#7c3aed';
+      else if (els.gb.checked && data[i] > 53) color = '#d97706';
+      ctx.fillStyle = color;
+      ctx.fillRect(x, padT + innerH - h, Math.max(0.6, stepW - 0.3), h);
+    }
+
+    // event annotations
+    if (els.re.checked){
+      ctx.fillStyle = '#dc2626'; ctx.font = '10px monospace';
+      for (let i=0; i<STEPS; i++){
+        if (data[i] > 400){
+          const x = padL + i*stepW;
+          ctx.fillText('⟲ recompile', x - 12, padT + 12);
+        }
+      }
+    }
+
+    // KPIs
+    const sorted = [...data].sort((a,b)=>a-b);
+    const med = sorted[Math.floor(STEPS/2)];
+    const p99 = sorted[Math.floor(STEPS*0.99)];
+    const tot = data.reduce((a,b)=>a+b, 0);
+    els.med.textContent = med.toFixed(1);
+    els.p99.textContent = p99.toFixed(0);
+    els.tot.textContent = (tot/1000).toFixed(1);
+    els.vs.textContent = (tot / (BASE * STEPS)).toFixed(2) + '×';
+  }
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

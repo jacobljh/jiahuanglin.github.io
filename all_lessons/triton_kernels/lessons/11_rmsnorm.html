@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>11 · RMSNorm — fused stat + scale</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">Triton kernels / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">11 · rmsnorm</span>
+    <span class="step-pill">lesson 11 / 14</span>
+  </div>
+</header>
+
+<main>
+
+<h1>RMSNorm — fused stat + scale</h1>
+<p class="subtitle">Per-row mean-square reduction, rsqrt, multiply by a learned weight. Three ops in math, but in Triton it's one kernel — and the pattern generalises to <strong>any normalisation</strong>: LayerNorm, GroupNorm, anything that's "compute a tile-axis statistic, then rescale by it".</p>
+
+<h2>The math</h2>
+
+<pre class="math block">RMSNorm(x)<sub>i</sub> = x<sub>i</sub> · w<sub>i</sub> / √( (1/N) · Σ<sub>j</sub> x<sub>j</sub><sup>2</sup> + ε )</pre>
+
+<p>One reduction (the sum of squares), one rsqrt, one multiply. The weight <em>w</em> is a learned per-channel scale.</p>
+
+<p>Eager PyTorch evaluates this as ~5 launches:</p>
+
+<ol>
+  <li><code>x * x</code> — elementwise square</li>
+  <li><code>.mean(-1)</code> — row-wise reduction</li>
+  <li><code>+ eps</code>, <code>rsqrt</code> — two small kernels</li>
+  <li><code>x * inv_rms[:, None]</code> — broadcast multiply</li>
+  <li><code>* w</code> — broadcast multiply by weight</li>
+</ol>
+
+<p>Each pass reads or writes <em>x</em> from HBM. Total: ~3 reads of <em>x</em>, 1 write of <em>y</em>. Triton fuses to: 1 read of <em>x</em>, 1 read of <em>w</em>, 1 write of <em>y</em>. Roughly 3× less bandwidth.</p>
+
+<h2>The kernel</h2>
+
+<pre><code>@triton.jit
+def rmsnorm_kernel(
+    x_ptr, w_ptr, y_ptr,
+    stride_x_row, stride_y_row,
+    N, eps,
+    BLOCK: tl.constexpr,
+):
+    row  = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs &lt; N
+
+    x_row = x_ptr + row * stride_x_row
+    y_row = y_ptr + row * stride_y_row
+
+    # 1 · load row + weight (weight is shared across rows)
+    x = tl.load(x_row + offs, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+
+    # 2 · reduction: mean of squares
+    var  = tl.sum(x * x, axis=0) / N
+
+    # 3 · rsqrt + scale + weight, all in registers
+    rstd = 1.0 / tl.sqrt(var + eps)
+    y    = (x * rstd) * w
+
+    # 4 · store, cast to output dtype
+    tl.store(y_row + offs, y.to(tl.bfloat16), mask=mask)</code></pre>
+
+<p>The whole thing is one pass over the row. The reduction is one <code>tl.sum</code> (warp shuffle + SMEM, lesson 06). Everything else is per-lane register math.</p>
+
+<h2>Why we promote to fp32 inside</h2>
+
+<p>The accumulator for <code>x*x</code> needs more precision than bf16 — long rows accumulate too much error otherwise. The pattern is identical to the fp32 accumulator inside <code>tl.dot</code> (lesson 05): <strong>compute statistics in fp32, store the result in the input dtype.</strong></p>
+
+<div class="callout warn">
+  <div class="label">Common bug</div>
+  Computing <code>var</code> in bf16 looks fine on small models and explodes on long sequence lengths. The mean-square of a 4K-element row in bf16 has ~5 bits of precision — enough to be silently wrong. Always <code>.to(tl.float32)</code> before the reduction.
+</div>
+
+<h2>The wrapper</h2>
+
+<pre><code>def rmsnorm(x, w, eps=1e-6):
+    assert x.is_cuda and w.is_cuda
+    M, N = x.shape
+    y = torch.empty_like(x)
+    BLOCK = triton.next_power_of_2(N)
+    num_warps = 4 if BLOCK &lt; 2048 else (8 if BLOCK &lt; 4096 else 16)
+    rmsnorm_kernel[(M,)](
+        x, w, y,
+        x.stride(0), y.stride(0),
+        N, eps,
+        BLOCK=BLOCK, num_warps=num_warps,
+    )
+    return y</code></pre>
+
+<p>One program per row. Same shape as softmax (lesson 10) — the row-per-program pattern is the canonical kernel for any per-row reduction.</p>
+
+<h2>LayerNorm — same kernel, two statistics</h2>
+
+<p>LayerNorm subtracts the mean before computing variance. Two reductions instead of one:</p>
+
+<pre><code>x_f32 = x.to(tl.float32)
+mean  = tl.sum(x_f32, axis=0) / N            # reduction 1
+xc    = x_f32 - mean
+var   = tl.sum(xc * xc, axis=0) / N           # reduction 2
+rstd  = 1.0 / tl.sqrt(var + eps)
+y     = xc * rstd * w + b                     # broadcast scale + bias
+tl.store(...)</code></pre>
+
+<p>Two warp-shuffle reductions instead of one — about 1.3× as expensive as RMSNorm. RMSNorm exists in modern transformers (LLaMA, Mistral, Qwen) specifically because it's faster.</p>
+
+<h2>The fusion-with-residual trick</h2>
+
+<p>In a transformer block the actual pattern is:</p>
+
+<pre><code>y = norm(x + residual)         # add then norm
+# or
+x = x + residual; y = norm(x); residual = x   # update residual</code></pre>
+
+<p>You can fuse the residual add into the norm kernel — load <em>x</em> and <em>residual</em>, add, then proceed with the variance reduction. One fewer HBM read of the post-residual value. This is a 10–15% kernel speedup on long-context transformer blocks.</p>
+
+<pre><code>x = tl.load(...) + tl.load(...)        # x = x + residual
+# rest of norm proceeds as above</code></pre>
+
+<h2>Backward — the only norm with a tricky backward</h2>
+
+<p>Forward RMSNorm is one row reduction. Backward needs <em>two</em> row reductions: one over the gradient times <em>w</em>, one over the gradient times <em>w</em> times <em>x</em>. We won't derive them here — lesson 14 shows the full <code>torch.autograd.Function</code> wrapping forward and backward Triton kernels. Note that this is one of the operations where having a hand-fused kernel really matters: PyTorch's eager backward is ~10 launches.</p>
+
+<h2>Why the row-per-program pattern is so common</h2>
+
+<p>Look at the kernel shape:</p>
+
+<svg viewBox="0 0 760 200" class="diagram" role="img" aria-label="Row-per-program: M programs, each handles its row, reductions stay intra-program">
+  <g font-size="11" fill="var(--text-mute)">
+    <text x="20" y="24" font-weight="700" fill="var(--text)">M programs · each owns one row · all reductions are intra-row</text>
+    <g transform="translate(20,40)">
+      <rect width="700" height="20" fill="#dbeafe" stroke="#bfdbfe"/>
+      <text x="350" y="14" text-anchor="middle" font-family="var(--mono)">row 0 (BLOCK lanes) — program 0</text>
+    </g>
+    <g transform="translate(20,66)">
+      <rect width="700" height="20" fill="#dcfce7" stroke="#86efac"/>
+      <text x="350" y="14" text-anchor="middle" font-family="var(--mono)">row 1 — program 1</text>
+    </g>
+    <g transform="translate(20,92)">
+      <rect width="700" height="20" fill="#fef3c7" stroke="#fcd34d"/>
+      <text x="350" y="14" text-anchor="middle" font-family="var(--mono)">row 2 — program 2</text>
+    </g>
+    <text x="370" y="135" text-anchor="middle" fill="var(--text-mute)">…</text>
+    <text x="20" y="170" fill="var(--text-mute)">No cross-program communication. No atomics. Grid scales linearly with row count.</text>
+    <text x="20" y="186" fill="var(--text-mute)">This pattern is the right one for: softmax, RMSNorm, LayerNorm, any per-row reduce-then-scale.</text>
+  </g>
+</svg>
+
+<p>The pattern is so common it's worth a name: <strong>row-per-program reduction kernel</strong>. Recognise it in code reviews, and you'll see it everywhere.</p>
+
+<h2>Interactive · eager PyTorch vs fused Triton on RMSNorm</h2>
+<p>Pick (rows, columns). See the eager HBM traffic vs the fused HBM traffic and the predicted wall-clock on an H100.</p>
+
+<div class="widget"><div class="title">RMSNorm fusion savings</div><p class="hint">Eager: 3 reads of x + 1 read of w + 1 write of y = 4 × Mx2 + Nx2 bytes. Fused: 1 read + 1 read + 1 write = 2 × Mx2 + Nx2 bytes.</p><div class="controls">
+<label class="inline">M (rows) <input id="t11-M" type="range" min="64" max="32768" step="64" value="4096"><span class="val" id="t11-M-v">4096</span></label>
+<label class="inline">N (cols) <input id="t11-N" type="range" min="64" max="16384" step="64" value="4096"><span class="val" id="t11-N-v">4096</span></label>
+</div><div id="t11-out" class="kpi-grid"></div><p class="hint" id="t11-note"></p></div>
+
+<h2>What's next</h2>
+
+<p>You've built five kernels. Lesson 12 is the synthesis: Flash Attention combines lesson 09's matmul tile loop, lesson 10's online softmax recurrence, and lesson 11's row-per-program structure into one kernel that never materialises the full attention matrix. Every primitive you've met shows up.</p>
+
+<footer class="lesson-nav">
+  <a href="10_softmax.html"><span class="dir">Previous</span><span class="ttl">10 · Softmax</span></a>
+  <a class="next" href="12_flash_attention.html"><span class="dir">Next</span><span class="ttl">12 · Flash Attention</span></a>
+</footer>
+
+<script>
+(function(){
+  const e={M:document.getElementById('t11-M'),N:document.getElementById('t11-N')};
+  const out=document.getElementById('t11-out'),note=document.getElementById('t11-note');
+  function draw(){
+    document.getElementById('t11-M-v').textContent=e.M.value;
+    document.getElementById('t11-N-v').textContent=e.N.value;
+    const M=+e.M.value, N=+e.N.value;
+    const xbytes = M*N*2; // bf16
+    const wbytes = N*2;
+    const eager = 3*xbytes + wbytes + xbytes; // 3 reads of x, 1 read of w, 1 write of y
+    const fused = xbytes + wbytes + xbytes; // 1 read of x, 1 read of w, 1 write
+    const hbm = 3e12;
+    const eager_ms = eager/hbm*1000;
+    const fused_ms = fused/hbm*1000;
+    out.innerHTML='';
+    function kpi(k,v,col){const d=document.createElement('div');d.className='kpi';d.innerHTML='<div class="k">'+k+'</div><div class="v" style="color:'+(col||'#1f2430')+'">'+v+'</div>';out.appendChild(d);}
+    kpi('eager HBM',(eager/1e6).toFixed(1)+' MB','#1f2430');
+    kpi('fused HBM',(fused/1e6).toFixed(1)+' MB','#16a34a');
+    kpi('eager time',eager_ms.toFixed(3)+' ms','#1f2430');
+    kpi('fused time',fused_ms.toFixed(3)+' ms','#16a34a');
+    kpi('speedup','~'+(eager_ms/fused_ms).toFixed(2)+'×','#16a34a');
+    kpi('saved bytes',((eager-fused)/1e6).toFixed(1)+' MB / call','#16a34a');
+    note.textContent='RMSNorm is purely bandwidth-bound. The fusion saves exactly the eager-PyTorch round-trips on x. For long context (large N), savings dominate. Add residual fusion (read residual once, add, then norm) and you get another ~30% saving.';
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

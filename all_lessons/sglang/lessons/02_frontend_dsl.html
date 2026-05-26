@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>02 · The frontend DSL</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">sglang</a>
+    <span class="crumb">/</span>
+    <span class="crumb">02 · DSL</span>
+    <span class="step-pill">lesson 2 / 11</span>
+  </div>
+</header>
+
+<main>
+
+<h1>The frontend DSL — programs over LLM calls</h1>
+<p class="subtitle">A stateless POST cannot tell the runtime "I'm about to fork 32 branches off this prefix." SGLang's DSL is the smallest possible vocabulary that lets the client say so — five primitives, embedded in Python, recorded as an IR the runtime can plan against.</p>
+
+<h2>The problem the DSL exists to solve</h2>
+
+<p>Lesson 01 ended with the observation that 50–95% of every modern workload is redundant prefill. Whose job is it to notice the redundancy?</p>
+
+<ul>
+  <li><strong>The runtime could try.</strong> Hash incoming prompts, look for shared prefixes, schedule them together. This is what vLLM's automatic prefix cache (APC) does. It works <em>if</em> the requests arrive close enough in time that nothing has been evicted, and if the framework can hash blocks fast enough to keep up.</li>
+  <li><strong>The client could declare it.</strong> If the client knows it's about to fan out 32 samples from one prompt, it can <em>tell</em> the runtime — "here is a prefix; here are 32 continuations from it." The runtime then needs no inference, just allocation.</li>
+</ul>
+
+<p>SGLang offers both. The runtime does prefix detection (lesson 04 — RadixAttention). But for workloads where the structure is known at the client (which is most of them), declaring is strictly cheaper, more reliable, and unlocks scheduler optimizations the runtime cannot do from string-comparison alone.</p>
+
+<h2>The five primitives</h2>
+
+<p>The DSL is small on purpose. The whole vocabulary fits in this table:</p>
+
+<table>
+  <thead><tr><th>Primitive</th><th>Meaning</th><th>What the runtime sees</th></tr></thead>
+  <tbody>
+    <tr><td><code>+= "text"</code></td><td>Append plain text to the current state.</td><td>Bytes appended to the active prefix.</td></tr>
+    <tr><td><code>gen(name, …)</code></td><td>Sample tokens until stop, bind to <code>name</code>.</td><td>A decode segment with constraints, sampling params, max tokens.</td></tr>
+    <tr><td><code>select(name, choices=[…])</code></td><td>Pick one of N strings by log-prob.</td><td>N parallel cheap forward passes, then a logical fork.</td></tr>
+    <tr><td><code>fork(k)</code></td><td>Branch the current state into k independent children.</td><td>k requests, all rooted at the same KV.</td></tr>
+    <tr><td><code>system / user / assistant</code></td><td>Open a chat-role-tagged section.</td><td>Same as <code>+=</code> with role tokens added.</td></tr>
+  </tbody>
+</table>
+
+<p>That's the entire surface area. Five primitives is enough to express agent loops, tree search, self-consistency, RAG, and constrained-output JSON generation — which is the entire workload palette from lesson 01.</p>
+
+<h2>What an actual program looks like</h2>
+
+<p>Here's a self-consistency program — sample <em>n</em>=5 chains-of-thought from one prompt and majority-vote the answer:</p>
+
+<pre><code>import sglang as sgl
+
+@sgl.function
+def majority_vote(s, question):
+    s += sgl.system("You are a careful mathematician.")
+    s += sgl.user(question)
+
+    forks = s.fork(5)                       # ← runtime sees: 5 children, same KV up to here
+    for f in forks:
+        f += sgl.assistant("Let me reason step by step. ")
+        f += sgl.gen("reasoning", max_tokens=400, stop="\n\n")
+        f += "\nFinal answer: "
+        f += sgl.gen("answer", max_tokens=20, regex=r"[0-9]+")   # constraint detail in lesson 06; treat as "only digits"
+
+    answers = [f["answer"] for f in forks]
+    return max(set(answers), key=answers.count)
+</code></pre>
+
+<p>What the runtime sees, in order:</p>
+
+<ol>
+  <li>System + user prompt assembled. KV grows linearly. Total: 1 prefill.</li>
+  <li><code>fork(5)</code>: <em>not</em> 5 copies of the KV. The runtime takes a refcount on the blocks holding the prompt and gives each child a block table that initially points to them.</li>
+  <li>5 parallel <code>gen</code> calls run as continuous-batched decodes. They <em>read</em> the shared prefix's KV through their block tables; they <em>write</em> new blocks for the new tokens they emit.</li>
+  <li>Inside each <code>gen("answer", regex=…)</code>, a finite-automaton mask is applied so only digits are sampled (lesson 06).</li>
+  <li>The 5 answers come back to the client; Python does the vote.</li>
+</ol>
+
+<p>The key observation: the client never wrote any of the cache management. It said "fork" and "gen" — the runtime turned that into refcount-and-decode.</p>
+
+<h2>Why this isn't expressible in the chat-completions API</h2>
+
+<svg viewBox="0 0 760 280" class="diagram" role="img" aria-label="Stateless API vs DSL: what the runtime can see">
+  <text x="20" y="22" font-weight="700" font-size="13">stateless API (chat/completions)</text>
+  <g>
+    <rect class="node-bg" x="20" y="36" width="280" height="200" rx="6"/>
+    <rect x="40" y="56"  width="240" height="22" fill="#2563eb88"/><text x="50" y="71" font-size="11" fill="var(--text)">POST {messages: [sys, user]}</text>
+    <rect x="40" y="84"  width="240" height="22" fill="#2563eb88"/><text x="50" y="99" font-size="11" fill="var(--text)">POST {messages: [sys, user]}</text>
+    <rect x="40" y="112" width="240" height="22" fill="#2563eb88"/><text x="50" y="127" font-size="11" fill="var(--text)">POST {messages: [sys, user]}</text>
+    <text x="40" y="152" font-size="11" fill="var(--text-mute)">runtime must <em>guess</em>:</text>
+    <text x="40" y="170" font-size="11" fill="var(--text-mute)">• hash request bodies</text>
+    <text x="40" y="186" font-size="11" fill="var(--text-mute)">• compare block-by-block</text>
+    <text x="40" y="202" font-size="11" fill="var(--text-mute)">• hope none has been evicted</text>
+    <text x="40" y="222" font-size="11" fill="var(--text-dim)">inference, not declaration.</text>
+  </g>
+
+  <text x="400" y="22" font-weight="700" font-size="13">SGLang program (recorded IR)</text>
+  <g>
+    <rect class="node-bg" x="400" y="36" width="340" height="200" rx="6"/>
+    <text x="420" y="58" font-size="12" font-family="var(--mono)">s += system + user        # 1 prefill</text>
+    <text x="420" y="78" font-size="12" font-family="var(--mono)">forks = s.fork(5)         # refcount</text>
+    <text x="420" y="98" font-size="12" font-family="var(--mono)">for f in forks:           # 5 decodes</text>
+    <text x="420" y="118" font-size="12" font-family="var(--mono)">    f += gen("ans", regex=…)</text>
+    <text x="420" y="152" font-size="11" fill="var(--text-mute)">runtime <em>knows</em>:</text>
+    <text x="420" y="170" font-size="11" fill="var(--text-mute)">• fan-out factor = 5</text>
+    <text x="420" y="186" font-size="11" fill="var(--text-mute)">• shared prefix = entire context up to fork</text>
+    <text x="420" y="202" font-size="11" fill="var(--text-mute)">• constraint on each leaf already</text>
+    <text x="420" y="222" font-size="11" fill="var(--text-dim)">declaration — no inference needed.</text>
+  </g>
+</svg>
+
+<p>The chat-completions API was designed so each request stands alone. That's a fine abstraction for a chatbot. For a program of 96 related calls it forces the runtime to recover structure that the client already had.</p>
+
+<h2>What the IR actually is</h2>
+
+<p>A SGLang program is a sequence of operations against a <code>State</code> object. Internally, when you write <code>s += "foo"</code> or <code>s += gen(…)</code>, the State records an op:</p>
+
+<pre><code># conceptually (simplified)
+class Op: pass
+class AppendText(Op): text: str
+class GenTokens(Op): name: str; max_tokens: int; constraint: Optional[FSM]
+class Fork(Op):      k: int
+class Select(Op):    name: str; choices: list[str]
+
+# the program is just a list[Op] plus a parent pointer per state
+</code></pre>
+
+<p>The runtime turns this list into scheduler work items. <code>AppendText</code> grows the prefix; <code>GenTokens</code> creates a decode request; <code>Fork</code> creates <em>k</em> child decode requests pointing at the parent's KV; <code>Select</code> issues <em>n</em> short forward passes and picks the best. Nothing here is novel as a programming model — it's a small embedded effect system. What's novel is that <em>every op is something the scheduler benefits from seeing</em>.</p>
+
+<h2>The OpenAI-compatible escape hatch</h2>
+
+<p>You don't have to rewrite your application to use SGLang. The server speaks the OpenAI chat-completions protocol; you can point your existing client at it and immediately benefit from RadixAttention (lesson 04) and the fast kernel stack (lesson 08). What you give up:</p>
+
+<ul>
+  <li>The runtime no longer knows fork structure ahead of time; it has to discover prefix overlap via the radix tree.</li>
+  <li>You cannot express <code>select</code> or constrained <code>gen</code> directly — though JSON / regex masks can still be passed in a request header (see lesson 06).</li>
+</ul>
+
+<p>The decision tree, in one line: <em>If your workload is high-shared-prefix and you can change the client, use the DSL. Otherwise use the OpenAI endpoint and let RadixAttention catch what it can.</em></p>
+
+<h2>Interactive · what the runtime sees</h2>
+
+<p>Toggle between API-mode and DSL-mode for the same workload. The widget shows what the runtime can plan against in each case — and what it has to guess.</p>
+
+<div class="widget"><div class="title">Stateless API vs DSL — runtime visibility</div><p class="hint">Same workload, different surface. The DSL surface is strictly more legible to the scheduler.</p>
+<div class="controls">
+<label class="inline">workload <select id="d-w">
+  <option value="cot">self-consistency (32 samples)</option>
+  <option value="agent">agent loop (30 turns)</option>
+  <option value="rag">RAG (100 queries / 10 docs)</option>
+  <option value="tot">tree of thought (4 × 3 × 8)</option>
+</select></label>
+<label class="inline">mode <select id="d-mode">
+  <option value="api">OpenAI chat-completions</option>
+  <option value="dsl">SGLang DSL</option>
+</select></label>
+</div>
+<div id="d-out" style="border-top: 1px solid var(--border); margin-top: 12px; padding-top: 12px; font-family: var(--mono); font-size: 13px; white-space: pre-wrap;"></div>
+</div>
+
+<h2>What this gives the next lesson</h2>
+
+<p>With the DSL on the table, we can ask the central technical question: how does the runtime <em>physically</em> share KV between a parent and its forked children, between two unrelated requests that happen to share the first 1,800 tokens, between today's RAG call and tomorrow's? The answer is a data structure — a radix tree over token sequences — and that is lesson 04. Lesson 03 first re-establishes the KV recap you need to read lesson 04.</p>
+
+<footer class="lesson-nav">
+  <a href="01_workload.html"><span class="dir">Previous</span><span class="ttl">01 · workload</span></a>
+  <a class="next" href="03_kv_recap.html"><span class="dir">Next</span><span class="ttl">03 · KV recap and the prefix problem</span></a>
+</footer>
+
+<script>
+(function(){
+  const w = document.getElementById('d-w'), m = document.getElementById('d-mode'), out = document.getElementById('d-out');
+  const scripts = {
+    cot: {
+      api:  '↘ 32× POST /v1/chat/completions with identical {system,user}.\n  Runtime sees: 32 independent prompt hashes.\n  Best case: hashmap lookup finds shared prefix after request 1.\n  Risk: 32 calls in flight, scheduler does not know they are 32 of the same.\n  Prefill cost: depends on cache hit rate.',
+      dsl:  '↘ 1 program, 1 fork(32).\n  Runtime sees: 1 prefill, 32 children that share its KV explicitly.\n  Scheduler can pack the 32 decodes into one continuous batch.\n  Prefill cost: exactly 1×. Guaranteed.'
+    },
+    agent: {
+      api:  '↘ 30× POST, each carrying the full history.\n  Runtime sees: prompts that look "almost the same" but differ at the suffix.\n  vLLM APC: hashes block-aligned prefixes; recovers the shared prefix only.\n  Risk: long history blocks may be evicted between turns.',
+      dsl:  '↘ 1 persistent State.\n  Runtime sees: monotone-growing prefix; KV is never re-prefilled.\n  Scheduler keeps the conversation pinned (until quota hit).\n  Prefill cost per turn: only the new tokens.'
+    },
+    rag: {
+      api:  '↘ 100× POST with prompts of shape [sys|tools|doc|query].\n  Runtime sees: shared sys+tools prefix; doc shared across some calls.\n  vLLM APC: usually recovers sys+tools. Doc-level sharing depends on hash-alignment.',
+      dsl:  '↘ 100 programs; runtime explicitly told tools prefix.\n  Optionally: doc bodies declared as named pinned segments.\n  Scheduler can cache documents at a different LRU tier than queries.'
+    },
+    tot: {
+      api:  '↘ 96 POSTs. The tree structure is invisible to the runtime.\n  vLLM APC: recovers trunk prefix; cannot recover intermediate node prefixes\n  without explicit cache-control headers.',
+      dsl:  '↘ 1 program with nested fork(4) and fork(8).\n  Every intermediate node\'s KV is explicitly shared with its children.\n  Scheduler: depth-first or breadth-first, knowing the tree shape.'
+    }
+  };
+  function up(){ out.textContent = scripts[w.value][m.value]; }
+  w.addEventListener('change', up); m.addEventListener('change', up); up();
+})();
+</script>
+
+</main>
+</body>
+</html>

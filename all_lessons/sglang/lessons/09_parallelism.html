@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>09 · Parallelism</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">sglang</a>
+    <span class="crumb">/</span>
+    <span class="crumb">09 · parallelism</span>
+    <span class="step-pill">lesson 9 / 11</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Tensor, data, and expert parallelism</h1>
+<p class="subtitle">A 70B model doesn't fit on one GPU. The way you split it changes what scales and what doesn't. SGLang ships TP for dense linears, DP attention for MLA-style architectures, and EP for MoE experts — and the choice between them is determined by what becomes the bottleneck after the previous split.</p>
+
+<h2>The three parallelism axes</h2>
+
+<svg viewBox="0 0 760 240" class="diagram" role="img" aria-label="TP, DP, EP — what each splits">
+  <text x="20" y="22" font-weight="700">tensor-parallel (TP)</text>
+  <g>
+    <rect x="20" y="34" width="200" height="80" fill="#eef1f5" stroke="var(--border)"/>
+    <line x1="120" y1="34" x2="120" y2="114" stroke="var(--accent)" stroke-width="2" stroke-dasharray="4,3"/>
+    <text x="70" y="60" font-size="11" text-anchor="middle">W₁ cols 0..d/2</text>
+    <text x="170" y="60" font-size="11" text-anchor="middle">W₁ cols d/2..d</text>
+    <text x="70" y="80" font-size="11" text-anchor="middle">GPU 0</text>
+    <text x="170" y="80" font-size="11" text-anchor="middle">GPU 1</text>
+    <text x="120" y="104" font-size="10" fill="var(--text-mute)" text-anchor="middle">all-reduce after each layer</text>
+  </g>
+
+  <text x="280" y="22" font-weight="700">data-parallel attention (DP)</text>
+  <g>
+    <rect x="280" y="34" width="200" height="80" fill="#eef1f5" stroke="var(--border)"/>
+    <line x1="380" y1="34" x2="380" y2="114" stroke="var(--accent-2)" stroke-width="2" stroke-dasharray="4,3"/>
+    <text x="330" y="60" font-size="11" text-anchor="middle">seqs 0..N/2</text>
+    <text x="430" y="60" font-size="11" text-anchor="middle">seqs N/2..N</text>
+    <text x="330" y="80" font-size="11" text-anchor="middle">replica 0</text>
+    <text x="430" y="80" font-size="11" text-anchor="middle">replica 1</text>
+    <text x="380" y="104" font-size="10" fill="var(--text-mute)" text-anchor="middle">no comm; per-replica KV</text>
+  </g>
+
+  <text x="540" y="22" font-weight="700">expert-parallel (EP)</text>
+  <g>
+    <rect x="540" y="34" width="200" height="80" fill="#eef1f5" stroke="var(--border)"/>
+    <line x1="640" y1="34" x2="640" y2="114" stroke="#7c3aed" stroke-width="2" stroke-dasharray="4,3"/>
+    <text x="590" y="60" font-size="11" text-anchor="middle">experts 0..E/2</text>
+    <text x="690" y="60" font-size="11" text-anchor="middle">experts E/2..E</text>
+    <text x="590" y="80" font-size="11" text-anchor="middle">GPU 0</text>
+    <text x="690" y="80" font-size="11" text-anchor="middle">GPU 1</text>
+    <text x="640" y="104" font-size="10" fill="var(--text-mute)" text-anchor="middle">all-to-all on every MoE layer</text>
+  </g>
+
+  <text x="20" y="148" font-size="11" fill="var(--text-mute)">TP splits <em>weight matrices</em>; DP splits <em>batch</em>; EP splits <em>experts</em>. They are orthogonal — a real deployment uses all three.</text>
+
+  <text x="20" y="190" font-weight="700" font-size="13">Communication cost summary (per layer):</text>
+  <text x="20" y="208" font-size="11" font-family="var(--mono)">TP: ~2·B·S·d bytes via all-reduce per layer (ring all-reduce is rank-count independent).</text>
+  <text x="20" y="224" font-size="11" font-family="var(--mono)">DP: 0 inside attention; a small all-gather at the attention↔MLP boundary.</text>
+  <text x="20" y="240" font-size="11" font-family="var(--mono)">EP: B·S·top_k·d bytes via all-to-all — every MoE layer, only when the MLP is replaced.</text>
+</svg>
+
+<h2>Tensor parallelism — the default split</h2>
+
+<p>Tensor parallelism (Megatron-style) shards the linear layers across <em>N</em> GPUs. The two big linears in a transformer block (QKV projection and the MLP up-projection) are split column-wise: each rank holds <code>hidden/N</code> output channels. The reverse-direction linears (output projection, MLP down-projection) are split row-wise. After each block, an <code>all-reduce</code> sums the partial outputs.</p>
+
+<p>The good: TP linearly increases the available HBM and bandwidth for weights and activations. A 70B fp16 model needs ~140 GB of weights → fits on 2× H100 80 GB at TP=2; on 4× at TP=4.</p>
+
+<p>The bad: <strong>TP requires fast intra-node interconnect</strong>. Ring all-reduce moves roughly <code>2 × batch × seq × hidden</code> bytes per layer per step <em>regardless of rank count</em> (each rank sends ~2(N−1)/N of the data). For batch 8 × seq 1 (decode) × hidden 8192 × 2 B ≈ 256 KB per layer per step — tiny per layer, but ×80 layers ≈ 20 MB per step. At those small message sizes the NVLink <em>latency</em> floor (~10 µs per all-reduce) is the binding cost, not bandwidth. Above TP=8 most servers lose NVLink and fall back to PCIe / IB; the per-all-reduce latency jumps an order of magnitude, throughput drops despite the larger model fitting.</p>
+
+<h3>Where TP saturates</h3>
+
+<table>
+  <thead><tr><th>Model</th><th>Sweet TP</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Llama-3-8B</td><td>1</td><td>Fits on one H100; TP only hurts.</td></tr>
+    <tr><td>Llama-3-70B fp16</td><td>4 or 8</td><td>Two H100s is tight; 4 is comfortable.</td></tr>
+    <tr><td>Llama-3-405B fp8</td><td>8</td><td>Fills one DGX node.</td></tr>
+    <tr><td>DeepSeek-V3 (671B, MoE)</td><td>8 (with EP)</td><td>Weights × experts force EP, not pure TP.</td></tr>
+  </tbody>
+</table>
+
+<h2>DP attention — the right answer for MLA</h2>
+
+<p>DeepSeek's Multi-head Latent Attention (MLA) compresses the KV cache to a single low-rank vector per token instead of per-head K and V. This gives huge memory savings (~10× smaller KV for the same model). But it also breaks the standard TP-on-attention layout: with TP=8 and only one logical KV per token, splitting along the head dimension shards a vector that has no head dimension to shard.</p>
+
+<p>The real problem with TP on MLA: head-parallel TP would force every rank to keep a full copy of the (tiny) latent KV cache — duplicating the very thing MLA exists to compress. SGLang's response: <strong>DP attention</strong>. The attention path is <em>data-parallel</em> across DP ranks; each rank owns its <em>own slice</em> of the (small) latent KV pool, holding KV only for the sequences assigned to it. The MLP and other linears stay tensor-parallel as before. Concretely:</p>
+
+<svg viewBox="0 0 760 220" class="diagram" role="img" aria-label="DP attention layout for MLA">
+  <rect class="node-bg" x="20" y="20" width="700" height="40" rx="6"/>
+  <text x="370" y="44" text-anchor="middle" font-size="13" font-weight="700">input batch (sequences 0..N)</text>
+
+  <path d="M120 60 L120 80" stroke="var(--text-dim)"/>
+  <path d="M270 60 L270 80" stroke="var(--text-dim)"/>
+  <path d="M470 60 L470 80" stroke="var(--text-dim)"/>
+  <path d="M620 60 L620 80" stroke="var(--text-dim)"/>
+
+  <rect x="40"  y="80" width="160" height="50" rx="6" fill="#d9770622" stroke="var(--accent-2)"/>
+  <text x="120" y="100" text-anchor="middle" font-size="12" font-weight="700">DP rank 0: attn(seqs 0..)</text>
+  <text x="120" y="118" text-anchor="middle" font-size="11" fill="var(--text-mute)">own KV cache</text>
+
+  <rect x="200" y="80" width="160" height="50" rx="6" fill="#d9770622" stroke="var(--accent-2)"/>
+  <text x="280" y="100" text-anchor="middle" font-size="12" font-weight="700">DP rank 1: attn(seqs …)</text>
+  <text x="280" y="118" text-anchor="middle" font-size="11" fill="var(--text-mute)">own KV cache</text>
+
+  <rect x="380" y="80" width="160" height="50" rx="6" fill="#d9770622" stroke="var(--accent-2)"/>
+  <text x="460" y="100" text-anchor="middle" font-size="12" font-weight="700">DP rank 2: attn(seqs …)</text>
+
+  <rect x="560" y="80" width="160" height="50" rx="6" fill="#d9770622" stroke="var(--accent-2)"/>
+  <text x="640" y="100" text-anchor="middle" font-size="12" font-weight="700">DP rank 3: attn(seqs …)</text>
+
+  <rect x="20" y="150" width="700" height="40" rx="6" fill="#2563eb22" stroke="var(--accent)"/>
+  <text x="370" y="174" text-anchor="middle" font-size="13" font-weight="700">all-gather → TP MLP (shared layout) → all-reduce → next attention</text>
+</svg>
+
+<p>What this buys you:</p>
+
+<ul>
+  <li><strong>Each rank has its own full KV pool.</strong> 4 ranks × 60 GB = 240 GB total KV. With TP, you'd share one logical 60 GB pool across all ranks.</li>
+  <li><strong>No all-reduce inside attention.</strong> Each rank's attention runs independently and writes to its own KV.</li>
+  <li><strong>Throughput scales with rank count for attention.</strong> Each rank now has its <em>own</em> HBM bandwidth serving its <em>own</em> KV slice. Two ranks at batch B/2 deliver 2× the aggregate KV bandwidth of one rank at batch B — which is what matters for the bandwidth-bound decode step.</li>
+</ul>
+
+<p>The cost: an all-gather at the boundary between DP-attention and TP-MLP, and KV is not shared between ranks (so RadixAttention is per-rank). The all-gather is small (one hidden dim per token), and most workloads have enough request-locality that per-rank caches still work well.</p>
+
+<div class="callout">
+  <div class="label">When DP attention is the right call</div>
+  Use DP attention when the model uses MLA <em>or</em> when KV cache pressure dominates the workload. For standard GQA models with sufficient TP headroom (Llama-3-70B at TP=4), pure TP is simpler and roughly equivalent.
+</div>
+
+<h2>Expert parallelism for MoE</h2>
+
+<p>A Mixture-of-Experts model replaces each MLP with a router that picks <em>top-k</em> of <em>E</em> experts. DeepSeek-V3 has 256 routed experts; at <em>k</em>=8, every token activates 8 of them. The experts' weights are gigantic in aggregate (~600 GB for V3 at fp8) but only ~16 GB are active per token.</p>
+
+<p>Naive serving: replicate the experts across all ranks. Cost: 600 GB × N replicas. Unaffordable.</p>
+
+<p>Expert parallelism: <em>distribute</em> the experts across ranks. Each rank holds <code>E/EP</code> experts. At each MoE layer, tokens routed to expert <em>i</em> are sent (all-to-all) to the rank that owns <em>i</em>, computed there, and returned.</p>
+
+<svg viewBox="0 0 760 220" class="diagram" role="img" aria-label="MoE all-to-all routing">
+  <defs><marker id="ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+
+  <rect x="20"  y="20" width="140" height="50" rx="6" fill="#2563eb22" stroke="var(--accent)"/>
+  <text x="90" y="42" text-anchor="middle" font-size="12" font-weight="700">rank 0 tokens</text>
+  <text x="90" y="58" text-anchor="middle" font-size="11" fill="var(--text-mute)">routes to 0,1,2,3,4,5,6,7</text>
+
+  <rect x="200" y="20" width="140" height="50" rx="6" fill="#d9770622" stroke="var(--accent-2)"/>
+  <text x="270" y="42" text-anchor="middle" font-size="12" font-weight="700">rank 1 tokens</text>
+
+  <rect x="380" y="20" width="140" height="50" rx="6" fill="#16a34a22" stroke="var(--ok)"/>
+  <text x="450" y="42" text-anchor="middle" font-size="12" font-weight="700">rank 2 tokens</text>
+
+  <rect x="560" y="20" width="140" height="50" rx="6" fill="#7c3aed22" stroke="#7c3aed"/>
+  <text x="630" y="42" text-anchor="middle" font-size="12" font-weight="700">rank 3 tokens</text>
+
+  <text x="370" y="100" text-anchor="middle" font-size="12" fill="var(--text-mute)">all-to-all dispatch (by routed expert id)</text>
+
+  <path d="M90 70 L600 130" stroke="var(--text-dim)" fill="none" marker-end="url(#ar4)" stroke-width="1"/>
+  <path d="M270 70 L120 130" stroke="var(--text-dim)" fill="none" marker-end="url(#ar4)" stroke-width="1"/>
+  <path d="M450 70 L430 130" stroke="var(--text-dim)" fill="none" marker-end="url(#ar4)" stroke-width="1"/>
+  <path d="M630 70 L300 130" stroke="var(--text-dim)" fill="none" marker-end="url(#ar4)" stroke-width="1"/>
+
+  <rect x="20"  y="130" width="140" height="60" rx="6" fill="#2563eb22" stroke="var(--accent)"/>
+  <text x="90" y="152" text-anchor="middle" font-size="12" font-weight="700">experts 0..63</text>
+  <text x="90" y="170" text-anchor="middle" font-size="11" fill="var(--text-mute)">on rank 0</text>
+
+  <rect x="200" y="130" width="140" height="60" rx="6" fill="#d9770622" stroke="var(--accent-2)"/>
+  <text x="270" y="152" text-anchor="middle" font-size="12" font-weight="700">experts 64..127</text>
+
+  <rect x="380" y="130" width="140" height="60" rx="6" fill="#16a34a22" stroke="var(--ok)"/>
+  <text x="450" y="152" text-anchor="middle" font-size="12" font-weight="700">experts 128..191</text>
+
+  <rect x="560" y="130" width="140" height="60" rx="6" fill="#7c3aed22" stroke="#7c3aed"/>
+  <text x="630" y="152" text-anchor="middle" font-size="12" font-weight="700">experts 192..255</text>
+</svg>
+
+<p>The all-to-all is the dominant communication primitive for MoE serving. SGLang integrates DeepEP — DeepSeek's optimized all-to-all library — for the dispatch and combine. Without an optimized all-to-all, EP overhead can exceed 30% of the layer time; DeepEP brings it down to single-digit percentages on H800/H100 with NVLink.</p>
+
+<div class="callout warn">
+  <div class="label">Why EP and TP have to coexist for V3-class models</div>
+  TP=8 alone can't hold 671B at fp8 (~600 GB > 8 × 80 GB). EP alone can't shard the dense attention path. The actual layout is TP=8 for attention + dense linears, EP=8 across the same ranks for experts. Each rank owns 1/8 of every dense weight AND 1/8 of the routed experts. The two parallelisms compose because they target different layers.
+</div>
+
+<h2>Pipeline parallelism — present but rarely needed at inference</h2>
+
+<p>Pipeline parallelism splits the model <em>by layer</em>: ranks 0–3 hold layers 0–20, ranks 4–7 hold layers 21–40, etc. Activations flow rank-to-rank. It is the standard way to fit huge dense models at training time.</p>
+
+<p>At inference time PP is rarely worth it. Reasons:</p>
+
+<ul>
+  <li>Decode is autoregressive — there's only one new token per step, so the pipeline "bubble" (time spent waiting for the previous stage) is harder to hide than at training.</li>
+  <li>For models that fit in one node with TP, PP adds latency without throughput.</li>
+  <li>PP shines when you need to span multiple nodes, which is when network bandwidth becomes the binding constraint anyway.</li>
+</ul>
+
+<p>SGLang supports PP but defaults to TP/DP/EP for single-node deployments.</p>
+
+<h2>Reading a real deployment</h2>
+
+<p>An H200 node serving DeepSeek-R1 today looks like:</p>
+
+<table>
+  <thead><tr><th>Knob</th><th>Value</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>--tp 8</td><td>8</td><td>Full node; saturates NVLink; dense weights fit.</td></tr>
+    <tr><td>--dp 8</td><td>8</td><td>DP attention reuses the <em>same</em> 8 ranks (not 8 × 8 = 64). Each rank acts as TP for the MLP and DP for attention.</td></tr>
+    <tr><td>--enable-dp-attention</td><td>true</td><td>Activates the DP attention path for MLA.</td></tr>
+    <tr><td>--ep-size 8</td><td>8</td><td>256 experts across the same 8 ranks.</td></tr>
+    <tr><td>--mem-fraction-static</td><td>0.9</td><td>Pool size — lesson 03.</td></tr>
+    <tr><td>--enable-torch-compile</td><td>true</td><td>Slight extra speed on supported ops.</td></tr>
+  </tbody>
+</table>
+
+<p>Reading this config, you can predict the bottlenecks: KV is bandwidth-bound (mitigated by MLA + DP attention); the MoE layer's all-to-all is bandwidth-bound (mitigated by DeepEP); the dense linears need NVLink (TP=8). Any one of these going wrong is visible in the profiler trace.</p>
+
+<h2>Interactive · pick your parallelism</h2>
+
+<p>Set model size, KV pressure, and expert count. Watch which parallelism dominates the layer time.</p>
+
+<div class="widget"><div class="title">Layer-time decomposition under parallelism</div><p class="hint">Drag KV pressure up; DP-attention starts to look strictly better than TP for the attention term.</p>
+<div class="controls">
+<label class="inline">model has MoE? <input id="p-moe" type="checkbox"></label>
+<label class="inline">use MLA (DP attention)? <input id="p-mla" type="checkbox"></label>
+<label class="inline">KV pressure (% of HBM) <input id="p-kv" type="range" min="10" max="95" step="5" value="60"><span class="val" id="p-kv-v">60</span>%</label>
+<label class="inline">TP <input id="p-tp" type="range" min="1" max="8" value="4"><span class="val" id="p-tp-v">4</span></label>
+</div>
+<canvas id="p-canvas" class="dist-canvas" height="220"></canvas>
+<p class="hint" id="p-note"></p></div>
+
+<h2>What lesson 10 builds</h2>
+
+<p>With the model fitting and the kernels fast, the remaining lever on decode throughput is <em>how many useful tokens come out of each forward pass</em>. Lesson 10 turns one big-model forward into multiple emitted tokens via speculative decoding — draft K tokens cheaply, verify them all in one target-model forward, accept what the target would have sampled anyway.</p>
+
+<footer class="lesson-nav">
+  <a href="08_kernel_stack.html"><span class="dir">Previous</span><span class="ttl">08 · kernel stack</span></a>
+  <a class="next" href="10_speculative.html"><span class="dir">Next</span><span class="ttl">10 · speculative decoding</span></a>
+</footer>
+
+<script>
+(function(){
+  const moe = document.getElementById('p-moe'), mla = document.getElementById('p-mla'),
+        kv  = document.getElementById('p-kv'),  tp  = document.getElementById('p-tp');
+  const c = document.getElementById('p-canvas'), ctx = c.getContext('2d'), note = document.getElementById('p-note');
+  function draw(){
+    document.getElementById('p-kv-v').textContent = kv.value;
+    document.getElementById('p-tp-v').textContent = tp.value;
+    const T = +tp.value, K = +kv.value/100, isMoe = moe.checked, isMla = mla.checked;
+    // toy ms-per-layer
+    const dense_linear  = 0.30 / T;
+    const tp_allreduce  = 0.05 + 0.04 * Math.log2(T) ;          // grows w/ TP
+    const attn_TP       = (0.25 + 0.4 * K) / T;
+    const attn_DP       = (0.25 + 0.2 * K);                     // DP: each rank handles its own batch, no scaling with TP
+    const attn          = isMla ? attn_DP : attn_TP;
+    const dp_allgather  = isMla ? 0.04 : 0;
+    const moe_compute   = isMoe ? 0.20 / T : 0;
+    const moe_a2a       = isMoe ? 0.18 : 0;
+    const items = [
+      ['dense linear (TP-sharded)', dense_linear, '#2563eb88'],
+      ['TP all-reduce',             tp_allreduce, '#dc262688'],
+      ['attention ('+(isMla?'DP':'TP')+')', attn, '#d9770688'],
+      isMla ? ['DP all-gather',     dp_allgather, '#94a3b888'] : null,
+      isMoe ? ['MoE compute',       moe_compute,  '#16a34a88'] : null,
+      isMoe ? ['MoE all-to-all',    moe_a2a,      '#7c3aed88'] : null,
+    ].filter(Boolean);
+    const total = items.reduce((s,[,v])=>s+v,0);
+    const dpr = window.devicePixelRatio||1;
+    c.width = c.clientWidth*dpr; c.height = 220*dpr;
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,c.clientWidth,220);
+    let x=220; const W=c.clientWidth-240, H=32, y=20;
+    items.forEach(([n,v,col])=>{
+      const w = W*v/Math.max(total,0.001);
+      ctx.fillStyle=col; ctx.fillRect(x,y,w,H);
+      ctx.strokeStyle='#fff'; ctx.strokeRect(x,y,w,H);
+      x += w;
+    });
+    items.forEach(([n,v,col],i)=>{
+      ctx.fillStyle=col; ctx.fillRect(20, 72+i*22, 14, 14);
+      ctx.fillStyle='#1f2430'; ctx.font='12px sans-serif';
+      ctx.fillText(n+' — '+v.toFixed(2)+' ms ('+(100*v/total).toFixed(0)+'%)', 40, 84+i*22);
+    });
+    ctx.fillStyle='#5b6573'; ctx.font='12px sans-serif';
+    ctx.fillText('Per-layer total: '+total.toFixed(2)+' ms.', 20, 200);
+    const dominant = items.reduce((m, it) => it[1] > m[1] ? it : m, items[0]);
+    note.textContent = 'Dominant cost: ' + dominant[0] + '. ' + (
+      dominant[0].includes('all-to-all') ? 'EP is communication-bound — DeepEP / fast IB matter.'
+      : dominant[0].includes('all-reduce') ? 'TP comm overhead is biting; consider lower TP or DP attention.'
+      : dominant[0].includes('attention') ? 'Attention dominates — quantize KV or shrink batch.'
+                                          : 'Compute-bound; tile fusion gains here.');
+  }
+  [moe, mla, kv, tp].forEach(x => x.addEventListener('input', draw));
+  draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

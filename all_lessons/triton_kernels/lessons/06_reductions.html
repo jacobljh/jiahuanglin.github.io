@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>06 · Reductions and online algorithms</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">Triton kernels / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">06 · reductions</span>
+    <span class="step-pill">lesson 06 / 14</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Reductions and online algorithms</h1>
+<p class="subtitle">Half of every transformer kernel is "reduce a tile axis". <code>tl.sum</code>, <code>tl.max</code>, <code>tl.min</code>, <code>tl.cumsum</code> do the visible work; under them is a warp-shuffle + shared-memory dance the compiler emits for you. The lesson ends with the <strong>online softmax recurrence</strong> — the trick that makes Flash Attention possible.</p>
+
+<h2>The DSL surface</h2>
+
+<table>
+  <thead><tr><th>Op</th><th>Semantics</th><th>Axis</th></tr></thead>
+  <tbody>
+    <tr><td><code>tl.sum(x, axis)</code></td><td>Σ over <code>axis</code></td><td>0 or 1 (2D), 0 (1D)</td></tr>
+    <tr><td><code>tl.max(x, axis)</code></td><td>max over <code>axis</code></td><td>same</td></tr>
+    <tr><td><code>tl.min(x, axis)</code></td><td>min over <code>axis</code></td><td>same</td></tr>
+    <tr><td><code>tl.cumsum(x, axis)</code></td><td>prefix sum (inclusive)</td><td>same</td></tr>
+    <tr><td><code>tl.argmax(x, axis)</code></td><td>index of max</td><td>same</td></tr>
+    <tr><td><code>tl.reduce(x, axis, combine_fn)</code></td><td>generic associative reduction</td><td>same</td></tr>
+  </tbody>
+</table>
+
+<p>All of these take a tile (1D or 2D), reduce along the specified axis, and return a tile with that axis dropped. Example:</p>
+
+<pre><code>x = tl.load(...)                # (BM, BN)
+row_sum = tl.sum(x, axis=1)     # (BM,)
+col_max = tl.max(x, axis=0)     # (BN,)</code></pre>
+
+<h2>What a reduction compiles to</h2>
+
+<p>A tile-axis reduction lowers to a two-stage hardware operation:</p>
+
+<svg viewBox="0 0 760 280" class="diagram" role="img" aria-label="Reduction lowering: warp shuffle then shared memory">
+  <g font-size="11" fill="var(--text-mute)">
+    <text x="20" y="24" font-weight="700" fill="var(--text)">Stage 1: intra-warp reduction (warp shuffles, no shared memory)</text>
+    <g transform="translate(20,40)">
+      <rect width="700" height="32" fill="#dbeafe" stroke="#bfdbfe"/>
+      <text x="350" y="20" text-anchor="middle" font-family="var(--mono)">32 lanes → __shfl_xor (5 steps) → 1 partial sum per warp</text>
+    </g>
+    <text x="20" y="100" font-weight="700" fill="var(--text)">Stage 2: inter-warp reduction (shared memory)</text>
+    <g transform="translate(20,116)">
+      <rect width="700" height="32" fill="#dcfce7" stroke="#86efac"/>
+      <text x="350" y="20" text-anchor="middle" font-family="var(--mono)">N warp partials → SMEM → 1 final result</text>
+    </g>
+    <text x="20" y="176" font-weight="700" fill="var(--text)">Stage 3 (optional): broadcast result back to every lane</text>
+    <g transform="translate(20,192)">
+      <rect width="700" height="32" fill="#fef3c7" stroke="#fcd34d"/>
+      <text x="350" y="20" text-anchor="middle" font-family="var(--mono)">load result from SMEM into every lane (for x/result style ops)</text>
+    </g>
+    <text x="20" y="260" fill="var(--text-mute)">tl.sum(x, axis=...) is 3 instructions in your source. The compiler emits all of this; you never write a __syncthreads.</text>
+  </g>
+</svg>
+
+<p>The cost: roughly <em>log<sub>2</sub>(N)</em> shuffle steps within a warp, then one round-trip through SMEM if you have more than one warp. For a 1024-lane tile on 4 warps, that's 5 shuffles + 1 SMEM round-trip per reduction — fast.</p>
+
+<h2>Naive softmax in Triton</h2>
+
+<p>Let's apply this. Standard softmax for a row of length N:</p>
+
+<pre class="math block">softmax(x)<sub>i</sub> = exp(x<sub>i</sub>) / Σ<sub>j</sub> exp(x<sub>j</sub>)</pre>
+
+<p>Done literally, this overflows: <code>exp(x)</code> blows up for moderately large <code>x</code>. The standard fix is the max-subtract trick:</p>
+
+<pre class="math block">softmax(x)<sub>i</sub> = exp(x<sub>i</sub> − m) / Σ<sub>j</sub> exp(x<sub>j</sub> − m),   m = max<sub>j</sub> x<sub>j</sub></pre>
+
+<p>So a numerically stable softmax is three passes over the row: find <em>m</em>, sum <code>exp(x − m)</code>, divide. In Triton:</p>
+
+<pre><code>@triton.jit
+def softmax_row(x_ptr, y_ptr, N, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs &lt; N
+    x = tl.load(x_ptr + row*N + offs, mask=mask, other=-float('inf'))
+    m = tl.max(x, axis=0)                      # 1 reduction
+    e = tl.exp(x - m)
+    s = tl.sum(e, axis=0)                      # 1 reduction
+    y = e / s
+    tl.store(y_ptr + row*N + offs, y, mask=mask)</code></pre>
+
+<p>Two reductions, both compile to warp-shuffle + SMEM. One row per program. This works — and it's what most beginners write. But it has a subtle problem: <strong>it assumes the whole row fits in one tile</strong>. If the row is longer than the maximum tile size (typically 2048), you can't process it in one program.</p>
+
+<h2>The two-tile problem and the online trick</h2>
+
+<p>Suppose the row is 8192 elements and your tile is BLOCK=2048. You'd want to process it in 4 chunks. But softmax depends on a <em>global</em> max and a <em>global</em> sum. How do you fold partial computations from each chunk into a final answer?</p>
+
+<p>This is where the <strong>online softmax</strong> recurrence (Milakov &amp; Gimelshein, 2018) comes in. Given two chunks with their own running max <em>m</em><sub>1</sub>, <em>m</em><sub>2</sub> and running sum-of-exponentials ℓ<sub>1</sub>, ℓ<sub>2</sub>:</p>
+
+<pre class="math block">m' = max(m<sub>1</sub>, m<sub>2</sub>)<br>ℓ' = e<sup>m<sub>1</sub>−m'</sup>·ℓ<sub>1</sub> + e<sup>m<sub>2</sub>−m'</sup>·ℓ<sub>2</sub></pre>
+
+<p>That's the entire recurrence. <em>m'</em> is the running max of the combined chunks. ℓ' is the sum-of-exp-of-(x − new-max) for the combined chunks. The clever step: each previous ℓ is rescaled by <em>e<sup>(old m − new m)</sup></em>, which corrects for the change in the max.</p>
+
+<svg viewBox="0 0 760 260" class="diagram" role="img" aria-label="Online softmax recurrence: streaming m and l across chunks">
+  <g font-size="11" fill="var(--text-mute)">
+    <text x="20" y="24" font-weight="700" fill="var(--text)">Streaming over chunks while keeping (m, ℓ) in registers</text>
+    <g transform="translate(20,42)">
+      <rect width="140" height="50" fill="#dbeafe" stroke="#bfdbfe"/>
+      <text x="70" y="28" text-anchor="middle" font-weight="600">chunk 1</text>
+      <text x="70" y="44" text-anchor="middle" font-family="var(--mono)">m₁ = max, ℓ₁ = Σe^(x−m₁)</text>
+    </g>
+    <g transform="translate(180,42)">
+      <rect width="140" height="50" fill="#dcfce7" stroke="#86efac"/>
+      <text x="70" y="28" text-anchor="middle" font-weight="600">chunk 2</text>
+      <text x="70" y="44" text-anchor="middle" font-family="var(--mono)">m₂, ℓ₂</text>
+    </g>
+    <text x="330" y="73" font-family="var(--mono)" fill="var(--text)">→</text>
+    <g transform="translate(360,42)">
+      <rect width="220" height="50" fill="#fef3c7" stroke="#fcd34d"/>
+      <text x="110" y="28" text-anchor="middle" font-weight="600">merged (online)</text>
+      <text x="110" y="44" text-anchor="middle" font-family="var(--mono)">m', ℓ' (one register pair)</text>
+    </g>
+    <g transform="translate(20,120)">
+      <text x="0" y="0" font-weight="700" fill="var(--text)">Key property</text>
+      <text x="0" y="22" fill="var(--text-mute)">After the loop you have one (m, ℓ) for the whole row. Final divide is e^(x − m) / ℓ.</text>
+      <text x="0" y="44" fill="var(--text-mute)">No need to materialise the entire row — you stream it through registers.</text>
+      <text x="0" y="80" font-weight="700" fill="var(--text)">Why this matters</text>
+      <text x="0" y="102" fill="var(--text-mute)">For attention, the row is N tokens long. Materialising N×N attention scores</text>
+      <text x="0" y="120" fill="var(--text-mute)">into HBM is what Flash Attention avoids. The online trick lets you stream them.</text>
+      <text x="0" y="138" fill="var(--text-mute)">Lesson 10 derives this fully; lesson 12 uses it inside the attention kernel.</text>
+    </g>
+  </g>
+</svg>
+
+<h2>Generic associative reductions with <code>tl.reduce</code></h2>
+
+<p>What if you want a reduction that isn't sum or max — say, the (max, sum-of-exp) pair used in online softmax, as one combined reduction? Triton lets you supply the combine function:</p>
+
+<pre><code>@triton.jit
+def combine_max_sum(m1, l1, m2, l2):
+    m  = tl.maximum(m1, m2)
+    l  = l1 * tl.exp(m1 - m) + l2 * tl.exp(m2 - m)
+    return m, l
+
+# Build per-lane (m, ℓ) tiles: each lane treated as its own one-element chunk
+# whose max is its value and whose ℓ relative to that max is 1.
+m_tile = x                                  # (BLOCK,)  per-lane local max
+l_tile = tl.full(x.shape, 1.0, tl.float32)  # (BLOCK,)  per-lane local ℓ = e^(x-x) = 1
+m, l = tl.reduce((m_tile, l_tile), axis=0, combine_fn=combine_max_sum)</code></pre>
+
+<p>The function must be <em>associative</em> — the compiler will apply it in a tree reduction, not left-to-right. The (max, sum) recurrence above is associative; that's what makes it work as a tile reduction. (In practice you'll often hand-write the streaming loop — lesson 12 — instead of using <code>tl.reduce</code> with a tuple combiner, but the API is there.)</p>
+
+<h2>Multi-dim reductions</h2>
+
+<p>For a 2D tile <code>x[M, N]</code>:</p>
+
+<ul>
+  <li><code>tl.sum(x, axis=0)</code> reduces rows → <code>(N,)</code></li>
+  <li><code>tl.sum(x, axis=1)</code> reduces columns → <code>(M,)</code></li>
+  <li><code>tl.sum(x)</code> reduces both → scalar</li>
+</ul>
+
+<p>For attention, you reduce the K-axis (axis=1 if you laid out scores as <code>(M, N)</code> with N = key sequence length).</p>
+
+<h2>Watch out for the boundary tile</h2>
+
+<p>For a reduction, the <code>other</code> argument on the load must be the <em>identity</em> of the reduction:</p>
+
+<pre><code>x = tl.load(p+offs, mask=offs&lt;N, other=0.0)        # for tl.sum
+m = tl.load(p+offs, mask=offs&lt;N, other=-float('inf')) # for tl.max</code></pre>
+
+<p>If you load with <code>other=0.0</code> and then do <code>tl.max</code>, the boundary lanes contribute 0, which is wrong if the real data is negative (the boundary 0s will win). Use <code>-inf</code> for max, <code>+inf</code> for min, <code>0</code> for sum, <code>1</code> for product. The lesson 04 table is the law.</p>
+
+<h2>Interactive · watch the online recurrence converge</h2>
+<p>Stream a row through the recurrence one chunk at a time. The "true" softmax denominator is the dashed line; the running ℓ catches up to it.</p>
+
+<div class="widget"><div class="title">Online (max, sum) recurrence</div><p class="hint">Each step processes one chunk and updates the running (m, ℓ). After N steps the result matches a 3-pass softmax — but you only ever held one register pair, not the whole row.</p><div class="controls">
+<label class="inline">row length <input id="t6-N" type="range" min="64" max="4096" step="64" value="512"><span class="val" id="t6-N-v">512</span></label>
+<label class="inline">chunk size <input id="t6-bk" type="range" min="32" max="1024" step="32" value="64"><span class="val" id="t6-bk-v">64</span></label>
+<label class="inline">step <input id="t6-step" type="range" min="1" max="64" step="1" value="1"><span class="val" id="t6-step-v">1</span></label>
+</div><canvas id="t6-canvas" class="dist-canvas" height="220"></canvas><p class="hint" id="t6-note"></p></div>
+
+<h2>What's next</h2>
+
+<p>You've met every primitive: <code>tl.load</code>, <code>tl.dot</code>, <code>tl.sum</code>/<code>tl.max</code>, <code>tl.reduce</code>. Lesson 07 puts them together in the simplest possible end-to-end kernel — vector add — with the full Triton workflow: write, launch, mask, autotune, benchmark, verify.</p>
+
+<footer class="lesson-nav">
+  <a href="05_dot_tensor_cores.html"><span class="dir">Previous</span><span class="ttl">05 · tl.dot</span></a>
+  <a class="next" href="07_vector_add.html"><span class="dir">Next</span><span class="ttl">07 · Vector add — your first kernel</span></a>
+</footer>
+
+<script>
+(function(){
+  const e={N:document.getElementById('t6-N'),bk:document.getElementById('t6-bk'),step:document.getElementById('t6-step')};
+  const c=document.getElementById('t6-canvas'),ctx=c.getContext('2d'),note=document.getElementById('t6-note');
+  // synth data: a row of random values to softmax
+  let row=null, rowN=0;
+  function regen(N){ row = new Float32Array(N); for(let i=0;i<N;i++) row[i] = Math.sin(i*0.137)*3 + Math.cos(i*0.043)*2 + (i%97)*0.05; rowN=N; }
+  function trueDen(N){ let m=-Infinity; for(let i=0;i<N;i++) if(row[i]>m) m=row[i]; let s=0; for(let i=0;i<N;i++) s+=Math.exp(row[i]-m); return {m,s}; }
+  function onlineN(steps, bk){
+    let m=-Infinity, l=0;
+    let i=0;
+    for (let step=0;step<steps && i<rowN;step++){
+      const end=Math.min(i+bk, rowN);
+      let cm=-Infinity; for(let j=i;j<end;j++) if (row[j]>cm) cm=row[j];
+      let cl=0; for(let j=i;j<end;j++) cl += Math.exp(row[j]-cm);
+      // merge
+      const nm = Math.max(m,cm);
+      l = l*Math.exp(m-nm) + cl*Math.exp(cm-nm);
+      m = nm;
+      i = end;
+    }
+    return {m,l,coverage:i};
+  }
+  function draw(){
+    const N=+e.N.value, bk=+e.bk.value;
+    document.getElementById('t6-N-v').textContent=N;
+    document.getElementById('t6-bk-v').textContent=bk;
+    if (row===null || rowN!==N) regen(N);
+    const totalChunks = Math.ceil(N/bk);
+    e.step.max = totalChunks;
+    if (+e.step.value > totalChunks) e.step.value = totalChunks;
+    document.getElementById('t6-step-v').textContent=e.step.value;
+    const step=+e.step.value;
+    const {m:trueM, s:trueL} = trueDen(N);
+    c.width=c.clientWidth*devicePixelRatio;c.height=220*devicePixelRatio;ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.clearRect(0,0,c.clientWidth,220);
+    // plot: x = chunk index, y = ratio of running ℓ to trueL (after rescaling so true is 1)
+    const padL=40, padR=10, padT=24, padB=24, w=c.clientWidth-padL-padR, h=220-padT-padB;
+    // axes
+    ctx.strokeStyle='#94a3b8'; ctx.beginPath(); ctx.moveTo(padL,padT); ctx.lineTo(padL,padT+h); ctx.lineTo(padL+w,padT+h); ctx.stroke();
+    ctx.fillStyle='#5b6573'; ctx.font='11px var(--mono)';
+    ctx.fillText('chunks processed', padL+w/2-50, padT+h+18);
+    ctx.fillText('ℓ / true ℓ', padL-32, padT+12);
+    // true line
+    ctx.strokeStyle='#dc2626'; ctx.setLineDash([4,3]);
+    ctx.beginPath(); ctx.moveTo(padL, padT + h*0.1); ctx.lineTo(padL+w, padT + h*0.1); ctx.stroke();
+    ctx.setLineDash([]); ctx.fillStyle='#dc2626'; ctx.fillText('true denominator', padL+w-110, padT + h*0.1 - 4);
+    // running
+    ctx.strokeStyle='#2563eb'; ctx.lineWidth=1.6;
+    ctx.beginPath();
+    for (let s=1; s<=step; s++){
+      const {l} = onlineN(s, bk);
+      const ratio = l / trueL;
+      const x = padL + w * (s/totalChunks);
+      const y = padT + h*(1 - 0.9*Math.min(ratio,1.1));
+      if (s===1) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      ctx.fillStyle='#2563eb';
+      ctx.beginPath(); ctx.arc(x,y,2.5,0,Math.PI*2); ctx.fill();
+    }
+    ctx.stroke();
+    ctx.lineWidth=1;
+    const {m:rm, l:rl, coverage} = onlineN(step, bk);
+    const err = Math.abs(rl - trueL) / trueL;
+    note.textContent = 'After '+step+'/'+totalChunks+' chunks ('+coverage+'/'+N+' elements): running ℓ matches true to '+(err<1e-6 ? 'machine ε' : err.toExponential(2))+'. The recurrence is exact.';
+  }
+  ['input','change'].forEach(ev => Object.values(e).forEach(x => x.addEventListener(ev,draw)));
+  draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

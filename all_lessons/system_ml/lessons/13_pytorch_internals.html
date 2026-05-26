@@ -1,0 +1,894 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>13 · PyTorch internals</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">13 · pytorch internals</span>
+    <span class="step-pill">lesson 13 / 19</span>
+  </div>
+</header>
+
+<main>
+
+<h1>PyTorch internals — what <code>x @ W</code> actually does</h1>
+<p class="subtitle">From Python line to GPU kernel is roughly twelve translation layers. The performance of every distributed system above this rides on how few of them you make Python touch.</p>
+
+<h2>The naive picture vs the real one</h2>
+
+<p>The mental model most engineers start with: "PyTorch calls cuBLAS, cuBLAS runs on the GPU." That's true at the bottom. But between your Python <code>y = x @ W</code> and the cuBLAS kernel, every line does the following:</p>
+
+<ol>
+  <li><strong>Python interpreter</strong> looks up <code>__matmul__</code> on the tensor.</li>
+  <li><strong>Tensor's C++ binding</strong> (via pybind11) calls into ATen.</li>
+  <li><strong>ATen's dispatcher</strong> picks the right implementation based on the input tensors' device, dtype, layout, and other "dispatch keys" (autograd, autocast, vmap, etc.).</li>
+  <li><strong>The autocast layer</strong> (if enabled) fires first, casting inputs to bf16/fp16 and redispatching to Autograd.</li>
+  <li><strong>The autograd layer</strong> then records a node in the backward graph if any input requires grad — on the already-cast tensors.</li>
+  <li><strong>The backend kernel</strong> (CUDA, here) finally runs — which itself is dispatch into cuBLAS, with shape/strides selection, workspace allocation, and stream binding.</li>
+  <li><strong>cuBLAS</strong> picks one of dozens of pre-tuned matmul implementations and launches it on the GPU's default stream.</li>
+</ol>
+
+<p>The work of the dispatcher and autograd is microseconds per call. That sounds free until you remember that <em>decode emits one token per forward</em>, and a forward of a 70B model is many kernel launches. The framework overhead is comparable to the actual HBM-bound compute of decode (lesson 11). This is the gap <code>torch.compile</code> and CUDA Graphs (lessons 18, 19) close.</p>
+
+<h2>The dispatcher — one function, many implementations</h2>
+
+<p>The dispatcher is the data structure that decides which version of <code>aten::matmul</code> to run. A function in ATen isn't a single C++ function — it's a <em>set</em> of implementations indexed by <strong>dispatch keys</strong>. Every tensor carries a bitmap of dispatch keys: which device (CPU, CUDA, MPS, XLA), which layout (Strided, Sparse), which autograd backend, plus optional layers like Autocast, Functorch, NestedTensor.</p>
+
+<p>When you call <code>x @ W</code>, the dispatcher walks the priority list of keys present on the inputs, and for each one runs the registered kernel for that level. A typical call stack:</p>
+
+<pre><code>x.shape = (4, 4096), W.shape = (4096, 4096), both CUDA fp32, requires_grad=True
+                            │
+                            ▼
+       Python Tensor.__matmul__   ←─ pybind11 entry
+                            │
+                            ▼
+       at::matmul  (dispatcher)   ←─ key set: {CUDA, Autograd, Autocast?}
+                            │
+              ┌─────────────┼─────────────┐
+              ▼             ▼             ▼
+         Autocast       Autograd        CUDA
+        (cast bf16   (record op for   (call cuBLAS)
+         if enabled,    backward, on
+         fires first,   already-cast
+         redispatches)  tensors)
+</code></pre>
+
+<p>Each layer's kernel optionally calls <code>callBoxedNext</code> (or its unboxed sibling) to <em>redispatch</em> down to the next key. Autograd's kernel records the op then redispatches to the underlying backend; the CUDA kernel does the real work; the result bubbles back up. (The narrower term "fall-through" in PyTorch's source refers specifically to keys that have <em>no</em> registered kernel and pass through automatically — Autograd/Autocast both have real kernels that explicitly redispatch.)</p>
+
+<h2>Animated · one matmul through the dispatcher stack</h2>
+
+<p>Below: a single <code>torch.matmul(a, b)</code> as it travels down the dispatch stack — Python entry → Autocast (casts to bf16 if active, fires first) → Autograd (records <code>MmBackward0</code> on already-cast tensors) → CUDA backend → cuBLAS heuristic → kernel launch on the GPU. Each layer adds its own slice to the running "Python overhead" counter on the right. Hit play and watch where the microseconds go.</p>
+
+<div class="widget" id="dt-widget">
+  <div class="title">Dispatcher trace · scrub or play</div>
+  <div class="hint">Each layer in the dispatcher key stack contributes some overhead before any GPU work happens. Toggle autograd / autocast to add or remove their slices. The counter on the right is the cumulative host-side cost up to the current step.</div>
+
+  <div class="controls">
+    <button id="dt-play">▶ play</button>
+    <button id="dt-step">step ▷</button>
+    <button id="dt-reset">⟲ reset</button>
+    <label class="inline">speed: <input type="range" id="dt-spd" min="1" max="10" step="1" value="4"> <span class="val" id="dt-spd-v">4×</span></label>
+    <label class="inline">requires_grad <input type="checkbox" id="dt-grad" checked></label>
+    <label class="inline">autocast <input type="checkbox" id="dt-cast"></label>
+  </div>
+
+  <canvas id="dt-canvas" width="760" height="320" style="width:100%; height:320px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">current layer</div><div class="v" id="dt-cur" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">host overhead so far</div><div class="v" id="dt-oh">0 μs</div></div>
+    <div class="kpi"><div class="k">total host overhead</div><div class="v" id="dt-tot">— μs</div></div>
+    <div class="kpi"><div class="k">step</div><div class="v" id="dt-st">0 / —</div></div>
+  </div>
+</div>
+
+<h2>The autograd graph — built as a side effect</h2>
+
+<p>You don't explicitly build a computational graph in PyTorch — the dispatcher's autograd layer does it for you, every time an op is called on a tensor with <code>requires_grad=True</code>. The graph is a DAG of <code>Node</code> objects (each one a "function with a saved context"), with edges pointing to the inputs that need gradients.</p>
+
+<p>Concretely, when you do <code>y = x @ W</code> with both requires_grad: the autograd layer creates an <code>MmBackward0</code> node, saves <code>x</code> and <code>W</code> as context (because the gradient of matmul needs both operands), and attaches the node to <code>y.grad_fn</code>. When you later call <code>loss.backward()</code>, PyTorch walks the graph in reverse topological order, calling each node's <code>apply()</code> method to compute input gradients from output gradients.</p>
+
+<div class="callout warn">
+  <div class="label">Why this design is fast — and where it bites</div>
+  Eager autograd is "tape-style": the graph is constructed as you go, so dynamic control flow (<code>if</code>, <code>while</code>, varying shapes) just works. The cost is that the graph is rebuilt every forward pass — Python and dispatcher overhead per op are paid every step. Static-graph frameworks (XLA, TensorFlow 1) avoided this by capturing the graph once and replaying; PyTorch's bet was that the developer ergonomics paid for the runtime cost. The compromise — <code>torch.compile</code> — keeps the eager API and tries to capture chunks of static graph behind it.
+</div>
+
+<h2>Saving the right things — and the activation memory wall</h2>
+
+<p>Every autograd node has a "context" of tensors it saves for backward. <code>MmBackward0</code> saves both inputs of the matmul. <code>ReluBackward0</code> saves the output (so backward can mask gradients where the output was 0). <code>SoftmaxBackward0</code> saves the output. Etc.</p>
+
+<p>These saved tensors are exactly what lesson 01 called "activation memory". They live on the GPU until backward consumes them. For a 70B model, this is the GB-scale state we tackled with activation checkpointing — which works by <em>not</em> saving most intermediates and recomputing them during backward. Mechanism-wise, checkpointing wraps a sub-graph in a custom <code>Function</code> whose backward re-runs the forward.</p>
+
+<h2>2D · autograd graph builder</h2>
+
+<p>Pick an expression. The widget builds the <em>forward</em> graph (top) node by node, and the <em>backward</em> graph (bottom, mirrored) grows in lock-step. Each forward op leaves a <code>grad_fn</code> on its output tensor; the backward graph's edges are exactly the saved-tensor references the forward pass left behind. Notice that <em>leaf</em> tensors with <code>requires_grad=True</code> are the only nodes whose <code>.grad</code> ever gets populated.</p>
+
+<div class="widget" id="ag-widget">
+  <div class="title">Autograd graph · forward (top) + backward (bottom)</div>
+  <div class="hint">Step through to grow the graph one op at a time. The bottom half is the chain of <code>*Backward</code> nodes that <code>loss.backward()</code> will walk in reverse. Solid nodes are tensors; rounded boxes are <code>grad_fn</code>s.</div>
+
+  <div class="controls">
+    <button class="primary" id="ag-1">y = x @ W + b</button>
+    <button id="ag-2">y = ReLU(x @ W)</button>
+    <button id="ag-3">y = (a + b) * (a - b)</button>
+    <button id="ag-step">step ▷</button>
+    <button id="ag-all">build all</button>
+    <button id="ag-reset">⟲</button>
+  </div>
+
+  <canvas id="ag-canvas" width="760" height="360" style="width:100%; height:360px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">expression</div><div class="v" id="ag-exp" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">forward nodes</div><div class="v" id="ag-fn">0</div></div>
+    <div class="kpi"><div class="k">backward nodes</div><div class="v" id="ag-bn">0</div></div>
+    <div class="kpi"><div class="k">tensors w/ grad_fn</div><div class="v" id="ag-gfn">0</div></div>
+  </div>
+</div>
+
+<h2>Eager mode vs graph mode</h2>
+
+<table>
+  <thead><tr><th>Property</th><th>Eager (default)</th><th>Graph (compile/JIT)</th></tr></thead>
+  <tbody>
+    <tr><td>Python overhead per op</td><td>~10 μs</td><td>Amortised once</td></tr>
+    <tr><td>Op fusion</td><td>None (kernel boundaries)</td><td>Lots (lesson 16, 18)</td></tr>
+    <tr><td>Memory planning</td><td>Per-op alloc/free</td><td>Whole-program plan</td></tr>
+    <tr><td>Dynamic control flow</td><td>Free</td><td>Graph breaks (lesson 18)</td></tr>
+    <tr><td>Debuggability</td><td>Set breakpoints anywhere</td><td>Need to inspect captured IR</td></tr>
+  </tbody>
+</table>
+
+<p>Three "graph modes" coexist:</p>
+<ul>
+  <li><strong>TorchScript (legacy).</strong> A Python subset and tracer; now in maintenance mode.</li>
+  <li><strong>torch.compile</strong> (lesson 18). Capture-by-bytecode (Dynamo) + Inductor codegen. The current default for "make eager code faster."</li>
+  <li><strong>CUDA Graphs</strong> (lesson 19). Below the framework level — captures a sequence of kernel launches into a single replayable graph.</li>
+</ul>
+
+<h2>The cost of Python in the decode loop</h2>
+
+<p>Numbers to keep in head (rough, very workload-dependent): each PyTorch op in eager mode costs roughly</p>
+
+<ul>
+  <li><strong>~5 μs</strong> for the actual kernel launch (driver submission, command-processor queue)</li>
+  <li><strong>~10–30 μs</strong> for Python interpreter + pybind + dispatcher + autograd bookkeeping (the "Python tax")</li>
+  <li><strong>actual kernel time</strong> on top of that</li>
+</ul>
+
+<p>So small-op eager-mode cost is typically <strong>15–50 μs</strong> per op before any GPU work. For a transformer decode step (~hundreds of ops at batch=1), the framework overhead can easily approach the kernel time on a 7B-class model decoded on an H100 (where the actual compute is also a few ms). Take any of these numbers as a fermi estimate, not a benchmark — the exact split depends on op size, dtype, and PyTorch version.</p>
+
+<h2>Animated · the per-op Python tax timeline</h2>
+
+<p>Two timelines, side-by-side: <em>N small unfused ops</em> vs <em>M fused ops</em>. The fused version does identical math but in fewer kernel launches. Watch the unfused timeline pay a fresh slice of Python overhead per op — the GPU sits idle between launches when the dispatcher is the bottleneck. Slide "ops/step" to see how the gap widens as op count grows.</p>
+
+<div class="widget" id="pt-widget">
+  <div class="title">Python tax over time · unfused vs fused</div>
+  <div class="hint">Red blocks = Python / dispatcher overhead (host-side, GPU idle). Blue blocks = GPU kernel running. Same total math; the fused version has many fewer red blocks because it pays the host tax once per fused kernel.</div>
+
+  <div class="controls">
+    <button id="pt-play">▶ play</button>
+    <button id="pt-reset">⟲</button>
+    <label class="inline">ops/step: <input type="range" id="pt-n" min="4" max="40" step="1" value="16"> <span class="val" id="pt-n-v">16</span></label>
+    <label class="inline">fusion factor: <input type="range" id="pt-f" min="1" max="8" step="1" value="4"> <span class="val" id="pt-f-v">4</span></label>
+    <label class="inline">Python μs/op: <input type="range" id="pt-py" min="2" max="30" step="1" value="10"> <span class="val" id="pt-py-v">10</span></label>
+    <label class="inline">kernel μs/op: <input type="range" id="pt-k" min="2" max="60" step="1" value="14"> <span class="val" id="pt-k-v">14</span></label>
+  </div>
+
+  <canvas id="pt-canvas" width="760" height="240" style="width:100%; height:240px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">unfused total</div><div class="v" id="pt-ut">—</div></div>
+    <div class="kpi"><div class="k">fused total</div><div class="v" id="pt-ft">—</div></div>
+    <div class="kpi"><div class="k">tax fraction (unfused)</div><div class="v" id="pt-frac">—</div></div>
+    <div class="kpi"><div class="k">speedup</div><div class="v" id="pt-sp">—</div></div>
+  </div>
+</div>
+
+<h2>Strides, views, contiguity</h2>
+
+<p>A PyTorch tensor is a tuple <code>(storage, offset, shape, strides)</code>. Many ops return a <em>view</em>: a new tensor descriptor pointing into the same storage. <code>transpose</code>, <code>permute</code>, <code>view</code>, <code>squeeze</code>, slicing — all return views, no data movement. The trap: most kernels want their inputs <strong>contiguous</strong> (stride[i] = product of shape[i+1:]). A non-contiguous input often triggers an implicit <code>copy</code> kernel — invisible HBM bandwidth burned.</p>
+
+<p>This is a real overhead source in custom code. Whenever you see a mystery <code>aten::copy_</code> in your profiler, the upstream op produced a non-contiguous view and the downstream kernel forced a contiguous copy. Cure: explicit <code>.contiguous()</code> at the point you control, or pick a different op order.</p>
+
+<h2>Interactive · per-op overhead and amortisation</h2>
+
+<p>Pick a model decode size and a batch. The widget plots: per-step kernel time (the work), Python framework overhead (the launch cost), and what <code>torch.compile</code> / CUDA Graphs would buy. Try batch=1, model=7B: the framework is half the cost. Crank batch to 32: the framework's fraction drops because each kernel does more work per launch.</p>
+
+<div class="widget" id="oh-widget">
+  <div class="title">Per-decode overhead: kernel time vs framework tax</div>
+  <div class="hint">Toy model: <code>ops/step</code> kernel launches, each one paying <code>launch_us</code> of Python + <code>kernel_us</code> of GPU work. Bars stack; the framework slice is what graph capture removes.</div>
+
+  <div class="controls">
+    <label class="inline">ops/step: <input type="range" id="oh-ops" min="50" max="2000" step="50" value="600"> <span class="val" id="oh-ops-v">600</span></label>
+    <label class="inline">Python overhead (μs/op): <input type="range" id="oh-py" min="1" max="20" step="1" value="8"> <span class="val" id="oh-py-v">8</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline">kernel time (μs/op): <input type="range" id="oh-k" min="1" max="200" step="1" value="20"> <span class="val" id="oh-k-v">20</span></label>
+    <label class="inline">batch size (multiplies kernel only): <input type="range" id="oh-b" min="1" max="64" step="1" value="1"> <span class="val" id="oh-b-v">1</span></label>
+  </div>
+
+  <canvas class="dist-canvas" id="oh-canvas" width="760" height="220" style="height: 220px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">step time (eager)</div><div class="v" id="oh-eager">—</div></div>
+    <div class="kpi"><div class="k">step time (graph)</div><div class="v" id="oh-graph">—</div></div>
+    <div class="kpi"><div class="k">overhead fraction</div><div class="v" id="oh-frac">—</div></div>
+    <div class="kpi"><div class="k">graph speedup</div><div class="v" id="oh-sp">—</div></div>
+  </div>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Every line of PyTorch traverses a fixed-cost dispatcher + autograd stack. Eager mode pays that cost per op; graph mode (torch.compile, CUDA Graphs) pays it once. When you're decoding small batches of large models, framework overhead is a first-class system bottleneck, not a footnote — and the rest of Part IV exists to flatten it.
+</div>
+
+<footer class="lesson-nav">
+  <a href="12_disaggregated_serving.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">12 · Disaggregated serving</span>
+  </a>
+  <a class="next" href="14_mixed_precision.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">14 · Mixed precision</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const get = id => document.getElementById(id);
+  const els = {
+    ops:get('oh-ops'),opsv:get('oh-ops-v'),
+    py:get('oh-py'),pyv:get('oh-py-v'),
+    k:get('oh-k'),kv:get('oh-k-v'),
+    b:get('oh-b'),bv:get('oh-b-v'),
+    canvas:get('oh-canvas'),
+    eager:get('oh-eager'),graph:get('oh-graph'),frac:get('oh-frac'),sp:get('oh-sp')
+  };
+  const ctx = els.canvas.getContext('2d');
+
+  function compute(){
+    const ops = parseInt(els.ops.value);
+    const py = parseInt(els.py.value);
+    const k = parseInt(els.k.value);
+    const b = parseInt(els.b.value);
+    els.opsv.textContent = ops; els.pyv.textContent = py;
+    els.kv.textContent = k; els.bv.textContent = b;
+
+    const k_eff = k * (1 + Math.log2(Math.max(1, b))*0.4);
+    const eager_us = ops * (py + k_eff);
+    const graph_us = ops * k_eff + 30;
+    const frac = (eager_us - graph_us) / eager_us;
+    els.eager.textContent = (eager_us/1000).toFixed(2) + ' ms';
+    els.graph.textContent = (graph_us/1000).toFixed(2) + ' ms';
+    els.frac.textContent = (frac*100).toFixed(0) + '%';
+    els.sp.textContent = (eager_us / graph_us).toFixed(2) + '×';
+    return { ops, py, k_eff, eager_us, graph_us };
+  }
+
+  function render(){
+    const r = compute();
+    const dpr = window.devicePixelRatio || 1;
+    const W = els.canvas.clientWidth, H = els.canvas.clientHeight;
+    if (els.canvas.width !== Math.round(W*dpr)){
+      els.canvas.width = Math.round(W*dpr); els.canvas.height = Math.round(H*dpr);
+    }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 110, padR = 40, padT = 30, padB = 30;
+    const innerW = W - padL - padR;
+    const max = r.eager_us * 1.1;
+    const rows = [
+      { name:'eager',     v: r.eager_us, parts: [{c:'#dc2626', v: r.ops*r.py}, {c:'#2563eb', v: r.ops*r.k_eff}] },
+      { name:'graph',     v: r.graph_us, parts: [{c:'#94a3b8', v: 30}, {c:'#2563eb', v: r.ops*r.k_eff}] },
+    ];
+    const rowH = 36;
+    rows.forEach((row, i) => {
+      const y = padT + i*(rowH+18);
+      ctx.fillStyle = '#1f2430'; ctx.font = '12px monospace';
+      ctx.fillText(row.name, 8, y + 22);
+      let x = padL;
+      row.parts.forEach(p => {
+        const w = (p.v / max) * innerW;
+        ctx.fillStyle = p.c;
+        ctx.fillRect(x, y, Math.max(1, w), rowH);
+        x += w;
+      });
+      ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+      ctx.fillText((row.v/1000).toFixed(2) + ' ms', x + 4, y + 22);
+    });
+
+    ctx.fillStyle = '#dc2626'; ctx.fillRect(padL, H-22, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+    ctx.fillText('Python / dispatcher overhead', padL+14, H-13);
+    ctx.fillStyle = '#2563eb'; ctx.fillRect(padL+240, H-22, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('GPU kernel time', padL+254, H-13);
+  }
+
+  ['input','change'].forEach(ev=>{
+    [els.ops,els.py,els.k,els.b].forEach(el=>el.addEventListener(ev,render));
+  });
+  window.addEventListener('resize',render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: animated dispatcher trace ───
+ * Stepwise walk through Python → Autocast → Autograd → CUDA → cuBLAS → kernel launch.
+ * Each layer adds its own host-side overhead slice to a cumulative counter.
+ */
+(function(){
+  const C = document.getElementById('dt-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    play: $('dt-play'), step: $('dt-step'), reset: $('dt-reset'),
+    spd: $('dt-spd'), spdv: $('dt-spd-v'),
+    grad: $('dt-grad'), cast: $('dt-cast'),
+    cur: $('dt-cur'), oh: $('dt-oh'), tot: $('dt-tot'), st: $('dt-st'),
+  };
+
+  function buildLayers(){
+    const L = [
+      { name:'Python interp.', desc:'__matmul__ lookup, pybind11 bridge', us:2.2, color:'#7c3aed', active:true },
+      { name:'ATen dispatcher', desc:'compute dispatch key set, pick first kernel', us:1.4, color:'#2563eb', active:true },
+      { name:'Autocast',        desc:'cast inputs to bf16 (if context active), redispatch to Autograd', us:2.0, color:'#dc2626', active: els.cast.checked },
+      { name:'Autograd',        desc:'record MmBackward0 on cast tensors, save x and W refs', us:3.5, color:'#d97706', active: els.grad.checked },
+      { name:'CUDA backend',    desc:'shape/stride check, workspace alloc', us:1.6, color:'#16a34a', active:true },
+      { name:'cuBLAS heuristic',desc:'pick GEMM algorithm', us:1.2, color:'#3b82f6', active:true },
+      { name:'kernel launch',   desc:'driver submission, command queue', us:1.8, color:'#16a34a', active:true },
+      { name:'GPU compute',     desc:'tensor cores doing the actual math', us:8.0, color:'#f59e0b', active:true, gpu:true },
+    ];
+    return L;
+  }
+
+  let idx = 0;
+  let playing = false;
+  let lastT = 0;
+
+  function activeLayers(){ return buildLayers().filter(l => l.active); }
+
+  function render(){
+    const L = activeLayers();
+    const total = L.reduce((a,l)=>a+l.us, 0);
+    const hostTotal = L.filter(l=>!l.gpu).reduce((a,l)=>a+l.us, 0);
+
+    els.spdv.textContent = els.spd.value + '×';
+    els.st.textContent = idx + ' / ' + (L.length-1);
+    els.tot.textContent = hostTotal.toFixed(1) + ' μs';
+    const cur = L[Math.min(idx, L.length-1)];
+    els.cur.textContent = cur.name;
+    let ohSoFar = 0;
+    for (let i=0; i<=idx && i<L.length; i++) if (!L[i].gpu) ohSoFar += L[i].us;
+    els.oh.textContent = ohSoFar.toFixed(1) + ' μs';
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    // Left: vertical stack of layer boxes
+    const padL = 20, padT = 16;
+    const boxW = 320, boxH = 30, gap = 4;
+    const stackH = L.length * (boxH + gap);
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('dispatch stack · top → bottom = call order', padL, padT - 2);
+
+    L.forEach((layer, i) => {
+      const y = padT + 10 + i*(boxH + gap);
+      const isCur = i === idx;
+      const isPast = i < idx;
+      ctx.globalAlpha = isCur ? 1 : (isPast ? 0.85 : 0.35);
+      ctx.fillStyle = layer.color;
+      ctx.fillRect(padL, y, 6, boxH);
+      ctx.fillStyle = isCur ? '#1e2435' : '#f1f3f7';
+      ctx.fillRect(padL + 6, y, boxW - 6, boxH);
+      ctx.strokeStyle = isCur ? layer.color : '#dde2ea';
+      ctx.lineWidth = isCur ? 1.6 : 1;
+      ctx.strokeRect(padL + 6, y, boxW - 6, boxH);
+
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = isCur || isPast ? '#1f2430' : '#94a3b8';
+      ctx.font = 'bold 12px monospace';
+      ctx.fillText(layer.name, padL + 14, y + 14);
+      ctx.font = '10.5px monospace';
+      ctx.fillStyle = isCur || isPast ? '#5b6573' : '#cbd5e1';
+      ctx.fillText(layer.desc, padL + 14, y + 26);
+      ctx.fillStyle = isCur || isPast ? '#f59e0b' : '#cbd5e1';
+      ctx.font = '11px monospace';
+      const txt = layer.us.toFixed(1) + ' μs';
+      ctx.fillText(txt, padL + boxW - 50, y + 20);
+    });
+
+    // Arrows between current and next
+    if (idx < L.length-1){
+      const y = padT + 10 + idx*(boxH + gap) + boxH;
+      const x = padL + boxW/2;
+      ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.moveTo(x, y); ctx.lineTo(x, y + gap + 2);
+      ctx.stroke();
+      ctx.fillStyle = '#2563eb';
+      ctx.beginPath(); ctx.moveTo(x, y + gap + 4); ctx.lineTo(x - 4, y + gap - 1); ctx.lineTo(x + 4, y + gap - 1); ctx.closePath(); ctx.fill();
+    }
+
+    // Right: cumulative overhead bar
+    const rx = padL + boxW + 30, rw = W - rx - 20;
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('cumulative host overhead', rx, padT - 2);
+
+    // big number
+    ctx.fillStyle = '#d97706'; ctx.font = 'bold 36px monospace';
+    ctx.fillText(ohSoFar.toFixed(1), rx, padT + 50);
+    ctx.fillStyle = '#5b6573'; ctx.font = '13px monospace';
+    ctx.fillText('μs (host)', rx + 110, padT + 50);
+
+    // stacked bar of contributions
+    const barY = padT + 80;
+    const barH = 24;
+    let xC = rx;
+    const maxBar = rw;
+    L.forEach((layer, i) => {
+      const w = (layer.us / total) * maxBar;
+      if (layer.gpu){
+        ctx.fillStyle = '#cbd5e1';
+      } else {
+        ctx.fillStyle = layer.color;
+      }
+      ctx.globalAlpha = i <= idx ? 1 : 0.18;
+      ctx.fillRect(xC, barY, Math.max(1, w-1), barH);
+      ctx.globalAlpha = 1;
+      xC += w;
+    });
+    ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+    ctx.strokeRect(rx, barY, maxBar, barH);
+
+    // current arrow marker
+    let xMark = rx;
+    for (let i=0; i<=idx && i<L.length; i++) xMark += (L[i].us / total) * maxBar;
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(xMark, barY - 4); ctx.lineTo(xMark, barY + barH + 4); ctx.stroke();
+
+    // GPU vs host legend
+    const legY = barY + barH + 22;
+    ctx.fillStyle = '#d97706'; ctx.fillRect(rx, legY, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+    ctx.fillText('host (Python/disp.)', rx + 14, legY + 9);
+    ctx.fillStyle = '#cbd5e1'; ctx.fillRect(rx + 140, legY, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('GPU kernel', rx + 154, legY + 9);
+
+    // Hint sentence
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    const lines = [
+      'every PyTorch op pays this stack once,',
+      'before the GPU does any math.',
+      '',
+      'torch.compile + CUDA Graphs amortise',
+      'most of these layers across many ops.',
+    ];
+    lines.forEach((s,i)=> ctx.fillText(s, rx, legY + 36 + i*16));
+  }
+
+  function step(){
+    const L = activeLayers();
+    idx = (idx + 1) % L.length;
+    render();
+  }
+
+  function tick(ts){
+    if (!playing) return;
+    const spd = parseInt(els.spd.value);
+    const period = 700 / spd;
+    if (ts - lastT > period){ step(); lastT = ts; }
+    requestAnimationFrame(tick);
+  }
+
+  els.play.addEventListener('click', () => {
+    playing = !playing;
+    els.play.textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastT = performance.now(); requestAnimationFrame(tick); }
+  });
+  els.step.addEventListener('click', step);
+  els.reset.addEventListener('click', () => { idx = 0; playing = false; els.play.textContent = '▶ play'; render(); });
+  [els.grad, els.cast].forEach(el => el.addEventListener('change', () => { idx = 0; render(); }));
+  els.spd.addEventListener('input', () => { els.spdv.textContent = els.spd.value + '×'; });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: autograd graph builder (2D) ───
+ * Pick an expression; advance step by step; draws fwd nodes top-half and bwd nodes bottom-half.
+ */
+(function(){
+  const C = document.getElementById('ag-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+
+  // Each expression: a list of (forward step) records.
+  // type: 'leaf' | 'op'. op has: name, fwd_node id, bwd_name, inputs (ids), out_id
+  const EXPRS = {
+    1: {
+      name: 'y = x @ W + b',
+      steps: [
+        { type:'leaf', id:'x', label:'x', leaf:true, rg:true },
+        { type:'leaf', id:'W', label:'W', leaf:true, rg:true },
+        { type:'leaf', id:'b', label:'b', leaf:true, rg:true },
+        { type:'op', op:'@', inputs:['x','W'], out:'t1', bwd:'MmBackward0' },
+        { type:'op', op:'+', inputs:['t1','b'], out:'y', bwd:'AddBackward0' },
+      ],
+    },
+    2: {
+      name: 'y = ReLU(x @ W)',
+      steps: [
+        { type:'leaf', id:'x', label:'x', leaf:true, rg:true },
+        { type:'leaf', id:'W', label:'W', leaf:true, rg:true },
+        { type:'op', op:'@', inputs:['x','W'], out:'t1', bwd:'MmBackward0' },
+        { type:'op', op:'ReLU', inputs:['t1'], out:'y', bwd:'ReluBackward0' },
+      ],
+    },
+    3: {
+      name: 'y = (a + b) * (a - b)',
+      steps: [
+        { type:'leaf', id:'a', label:'a', leaf:true, rg:true },
+        { type:'leaf', id:'b', label:'b', leaf:true, rg:true },
+        { type:'op', op:'+', inputs:['a','b'], out:'s', bwd:'AddBackward0' },
+        { type:'op', op:'-', inputs:['a','b'], out:'d', bwd:'SubBackward0' },
+        { type:'op', op:'×', inputs:['s','d'], out:'y', bwd:'MulBackward0' },
+      ],
+    },
+  };
+
+  let curExpr = 1;
+  let stepIdx = 0;
+
+  const btns = { 1:$('ag-1'), 2:$('ag-2'), 3:$('ag-3') };
+  Object.entries(btns).forEach(([k,b]) => {
+    b.addEventListener('click', () => {
+      curExpr = +k; stepIdx = 0;
+      Object.values(btns).forEach(x => x.classList.remove('primary'));
+      b.classList.add('primary');
+      render();
+    });
+  });
+  $('ag-step').addEventListener('click', () => {
+    const e = EXPRS[curExpr];
+    if (stepIdx < e.steps.length) stepIdx++;
+    render();
+  });
+  $('ag-all').addEventListener('click', () => {
+    stepIdx = EXPRS[curExpr].steps.length;
+    render();
+  });
+  $('ag-reset').addEventListener('click', () => { stepIdx = 0; render(); });
+
+  function nodeColor(t){
+    if (t === 'leaf') return '#2563eb';
+    if (t === 'tensor') return '#3b82f6';
+    if (t === 'op') return '#d97706';
+    if (t === 'bwd') return '#7c3aed';
+    return '#16a34a';
+  }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const e = EXPRS[curExpr];
+    $('ag-exp').textContent = e.name;
+
+    // Take first stepIdx steps as built. Each step contributes one or two nodes.
+    const built = e.steps.slice(0, stepIdx);
+
+    // Lay out tensor nodes left-to-right by order of creation in forward.
+    const tensors = []; // {id,label,rg,leaf,gradFn}
+    const ops = [];     // {op, inputs, out, bwd}
+    built.forEach(s => {
+      if (s.type === 'leaf') tensors.push({ id:s.id, label:s.label, rg:s.rg, leaf:true, gradFn:null });
+      else {
+        ops.push(s);
+        tensors.push({ id:s.out, label:s.out, rg:true, leaf:false, gradFn:s.bwd });
+      }
+    });
+
+    // Position: 6 slots horizontally
+    const N = Math.max(1, tensors.length);
+    const padL = 50, padR = 50;
+    const slotW = (W - padL - padR) / Math.max(N, 1);
+    const fwdY = 80;
+    const bwdY = H - 80;
+    const pos = {};
+    tensors.forEach((t,i) => { pos[t.id] = { x: padL + slotW*(i+0.5), y: fwdY }; });
+
+    // Divider line
+    const midY = (fwdY + bwdY)/2 - 10;
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('forward graph', 8, fwdY - 32);
+    ctx.fillText('backward graph (built as side effect)', 8, bwdY + 50);
+    ctx.strokeStyle = '#dde2ea'; ctx.setLineDash([4,4]); ctx.beginPath();
+    ctx.moveTo(0, midY); ctx.lineTo(W, midY); ctx.stroke(); ctx.setLineDash([]);
+
+    // Draw fwd edges (op -> output, inputs -> op)
+    ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 1.5;
+    ops.forEach((op, oi) => {
+      const opX = pos[op.out].x;
+      const opY = fwdY - 35;
+      // Draw op-node "diamond" above output
+      ctx.fillStyle = nodeColor('op');
+      ctx.beginPath();
+      ctx.moveTo(opX, opY-12); ctx.lineTo(opX+14, opY); ctx.lineTo(opX, opY+12); ctx.lineTo(opX-14, opY);
+      ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#ffffff'; ctx.font = 'bold 11px monospace';
+      ctx.textAlign = 'center'; ctx.fillText(op.op, opX, opY+4); ctx.textAlign = 'start';
+
+      // Inputs → op
+      op.inputs.forEach(inId => {
+        const ip = pos[inId];
+        if (!ip) return;
+        ctx.strokeStyle = '#2563eb';
+        ctx.beginPath(); ctx.moveTo(ip.x, ip.y - 14); ctx.lineTo(opX, opY + 12); ctx.stroke();
+      });
+      // op → out
+      ctx.strokeStyle = '#3b82f6';
+      ctx.beginPath(); ctx.moveTo(opX, opY - 12); ctx.lineTo(opX, pos[op.out].y + 14); ctx.stroke();
+    });
+
+    // Forward tensor circles
+    tensors.forEach((t) => {
+      const p = pos[t.id];
+      ctx.fillStyle = t.leaf ? nodeColor('leaf') : nodeColor('tensor');
+      ctx.strokeStyle = t.gradFn ? '#f59e0b' : '#dde2ea';
+      ctx.lineWidth = t.gradFn ? 2 : 1;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 14, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#ffffff'; ctx.font = 'bold 12px monospace';
+      ctx.textAlign = 'center'; ctx.fillText(t.label, p.x, p.y + 4); ctx.textAlign = 'start';
+      // requires_grad badge
+      if (t.rg){
+        ctx.fillStyle = '#f59e0b'; ctx.font = '9px monospace';
+        ctx.fillText('rg', p.x + 12, p.y - 14);
+      }
+    });
+
+    // Backward graph: mirror — each op gets a *Backward box, edges in REVERSE
+    ops.forEach((op) => {
+      const bx = pos[op.out].x;
+      const by = bwdY;
+      // Box
+      ctx.fillStyle = '#1e2435'; ctx.strokeStyle = nodeColor('bwd'); ctx.lineWidth = 1.5;
+      const bw = Math.max(80, op.bwd.length*7 + 18);
+      ctx.beginPath();
+      // rounded rect
+      const rx = bx - bw/2, ry = by - 14, rh = 28;
+      const rr = 8;
+      ctx.moveTo(rx+rr, ry);
+      ctx.lineTo(rx+bw-rr, ry); ctx.quadraticCurveTo(rx+bw, ry, rx+bw, ry+rr);
+      ctx.lineTo(rx+bw, ry+rh-rr); ctx.quadraticCurveTo(rx+bw, ry+rh, rx+bw-rr, ry+rh);
+      ctx.lineTo(rx+rr, ry+rh); ctx.quadraticCurveTo(rx, ry+rh, rx, ry+rh-rr);
+      ctx.lineTo(rx, ry+rr); ctx.quadraticCurveTo(rx, ry, rx+rr, ry);
+      ctx.fill(); ctx.stroke();
+      ctx.fillStyle = nodeColor('bwd'); ctx.font = 'bold 11px monospace';
+      ctx.textAlign = 'center'; ctx.fillText(op.bwd, bx, by + 4); ctx.textAlign = 'start';
+
+      // dotted edge from forward tensor to its grad_fn box (the "grad_fn pointer")
+      ctx.strokeStyle = '#7c3aed'; ctx.setLineDash([3,3]); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(bx, pos[op.out].y + 14); ctx.lineTo(bx, by - 14); ctx.stroke();
+      ctx.setLineDash([]);
+    });
+
+    // backward edges (next op's gradient flows back to previous op's grad_fn / input leaves)
+    // op order is creation order; edges go from later op's bwd → earlier op's bwd OR to leaf "AccumulateGrad"
+    ops.forEach((op) => {
+      const dst = { x: pos[op.out].x, y: bwdY };
+      op.inputs.forEach(inId => {
+        const src = pos[inId];
+        if (!src) return;
+        // is input a leaf (no op produced it) or an op output?
+        const isLeaf = built.find(s => s.type === 'leaf' && s.id === inId);
+        if (isLeaf){
+          // AccumulateGrad sink (small circle at bottom of leaf column)
+          const ax = src.x, ay = bwdY + 35;
+          ctx.fillStyle = '#16a34a'; ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.arc(ax, ay, 10, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+          ctx.fillStyle = '#ffffff'; ctx.font = '9px monospace';
+          ctx.textAlign = 'center'; ctx.fillText('∇'+inId, ax, ay+3); ctx.textAlign = 'start';
+          // edge from op bwd to AccumulateGrad
+          ctx.strokeStyle = '#7c3aed'; ctx.lineWidth = 1.2;
+          ctx.beginPath(); ctx.moveTo(dst.x, dst.y); ctx.lineTo(ax, ay - 10); ctx.stroke();
+        } else {
+          // edge from this op's bwd box → earlier op's bwd box
+          const srcOp = ops.find(o => o.out === inId);
+          if (srcOp){
+            const ex = pos[srcOp.out].x, ey = bwdY;
+            ctx.strokeStyle = '#7c3aed'; ctx.lineWidth = 1.2;
+            ctx.beginPath(); ctx.moveTo(dst.x - 20, dst.y); ctx.lineTo(ex + 20, ey); ctx.stroke();
+            // small arrow
+            ctx.fillStyle = '#7c3aed';
+            ctx.beginPath();
+            ctx.moveTo(ex + 22, ey);
+            ctx.lineTo(ex + 28, ey - 3);
+            ctx.lineTo(ex + 28, ey + 3);
+            ctx.closePath(); ctx.fill();
+          }
+        }
+      });
+    });
+
+    // KPIs
+    const fwdNodes = tensors.length + ops.length;
+    const bwdNodes = ops.length + tensors.filter(t => t.leaf && t.rg).length;
+    const gradFnCount = tensors.filter(t => t.gradFn).length;
+    $('ag-fn').textContent = fwdNodes;
+    $('ag-bn').textContent = bwdNodes;
+    $('ag-gfn').textContent = gradFnCount;
+
+    // Footer legend
+    ctx.font = '10px monospace';
+    ctx.fillStyle = '#2563eb'; ctx.fillText('● leaf', padL, H - 6);
+    ctx.fillStyle = '#3b82f6'; ctx.fillText('● intermediate', padL + 60, H - 6);
+    ctx.fillStyle = '#d97706'; ctx.fillText('◆ op', padL + 180, H - 6);
+    ctx.fillStyle = '#7c3aed'; ctx.fillText('▭ *Backward', padL + 230, H - 6);
+    ctx.fillStyle = '#16a34a'; ctx.fillText('● AccumulateGrad', padL + 330, H - 6);
+    ctx.fillStyle = '#f59e0b'; ctx.fillText('rg = requires_grad', padL + 460, H - 6);
+  }
+
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: per-op Python tax timeline ───
+ * Two-track timeline. Top = unfused (N small ops, each pays py+kernel).
+ * Bottom = fused (N/F ops, each pays py once for F worth of kernel work).
+ * Animate a moving "current time" cursor sweeping left → right.
+ */
+(function(){
+  const C = document.getElementById('pt-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    play: $('pt-play'), reset: $('pt-reset'),
+    n: $('pt-n'), nv: $('pt-n-v'),
+    f: $('pt-f'), fv: $('pt-f-v'),
+    py: $('pt-py'), pyv: $('pt-py-v'),
+    k: $('pt-k'), kv: $('pt-k-v'),
+    ut: $('pt-ut'), ft: $('pt-ft'), frac: $('pt-frac'), sp: $('pt-sp'),
+  };
+  let cursor = 0;
+  let playing = false;
+  let lastT = 0;
+
+  function compute(){
+    const N = parseInt(els.n.value);
+    const F = parseInt(els.f.value);
+    const py = parseInt(els.py.value);
+    const k = parseInt(els.k.value);
+    els.nv.textContent = N; els.fv.textContent = F+'×'; els.pyv.textContent = py; els.kv.textContent = k;
+
+    // unfused blocks: N ops, each py + k
+    const unfused = [];
+    let t = 0;
+    for (let i=0; i<N; i++){
+      unfused.push({ kind:'py', t0:t, t1:t+py }); t += py;
+      unfused.push({ kind:'k',  t0:t, t1:t+k }); t += k;
+    }
+    const totU = t;
+
+    // fused: M = N/F ops, each py + k*F
+    const M = Math.max(1, Math.ceil(N / F));
+    const fused = [];
+    t = 0;
+    for (let i=0; i<M; i++){
+      fused.push({ kind:'py', t0:t, t1:t+py }); t += py;
+      fused.push({ kind:'k', t0:t, t1:t+k*F }); t += k*F;
+    }
+    const totF = t;
+    return { unfused, fused, totU, totF, N, M, py, k, F };
+  }
+
+  function render(){
+    const r = compute();
+    els.ut.textContent = (r.totU).toFixed(0) + ' μs';
+    els.ft.textContent = (r.totF).toFixed(0) + ' μs';
+    const taxU = r.N * r.py;
+    els.frac.textContent = ((taxU / r.totU) * 100).toFixed(0) + '%';
+    els.sp.textContent = (r.totU / r.totF).toFixed(2) + '×';
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 100, padR = 30, padT = 22, padB = 28;
+    const innerW = W - padL - padR;
+    const xScale = innerW / r.totU;
+    const rowH = 38, rowGap = 24;
+    const y1 = padT + 6, y2 = y1 + rowH + rowGap;
+
+    // axis: timing labels
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('unfused (N='+r.N+' ops)', 8, y1 + 22);
+    ctx.fillText('fused ('+r.F+'×, M='+r.M+' kernels)', 8, y2 + 22);
+
+    // bars
+    function drawTrack(blocks, y){
+      blocks.forEach(b => {
+        const x = padL + b.t0 * xScale;
+        const w = (b.t1 - b.t0) * xScale;
+        ctx.fillStyle = b.kind === 'py' ? '#dc2626' : '#2563eb';
+        ctx.fillRect(x, y, Math.max(0.5, w-0.5), rowH);
+      });
+      // outline
+      ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+      ctx.strokeRect(padL, y, innerW, rowH);
+    }
+    drawTrack(r.unfused, y1);
+    drawTrack(r.fused, y2);
+
+    // moving cursor (animation), x is fraction of unfused total
+    if (cursor > r.totU) cursor = 0;
+    const cx = padL + cursor * xScale;
+    ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2;
+    ctx.setLineDash([3,3]);
+    ctx.beginPath(); ctx.moveTo(cx, padT); ctx.lineTo(cx, padT + 2*rowH + rowGap + 8); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // tick marks
+    ctx.fillStyle = '#94a3b8'; ctx.font='10px monospace';
+    for (let t=0; t<=r.totU; t += Math.max(50, Math.round(r.totU/8))){
+      const x = padL + t * xScale;
+      ctx.fillRect(x, y2 + rowH + 2, 1, 4);
+      ctx.fillText(t+'μs', x - 8, y2 + rowH + 16);
+    }
+
+    // legend
+    ctx.fillStyle = '#dc2626'; ctx.fillRect(padL, H - 14, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.font='11px monospace';
+    ctx.fillText('Python / dispatcher (host)', padL+14, H - 5);
+    ctx.fillStyle = '#2563eb'; ctx.fillRect(padL+200, H - 14, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('GPU kernel', padL+214, H - 5);
+    ctx.fillStyle = '#f59e0b'; ctx.fillText('▎now', padL + 320, H - 5);
+  }
+
+  function tick(ts){
+    if (!playing) return;
+    const r = compute();
+    const dt = ts - lastT; lastT = ts;
+    cursor += dt * 0.06; // μs per ms
+    if (cursor > r.totU) cursor = 0;
+    render();
+    requestAnimationFrame(tick);
+  }
+
+  els.play.addEventListener('click', () => {
+    playing = !playing;
+    els.play.textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastT = performance.now(); requestAnimationFrame(tick); }
+  });
+  els.reset.addEventListener('click', () => { cursor = 0; playing = false; els.play.textContent = '▶ play'; render(); });
+  [els.n, els.f, els.py, els.k].forEach(el => el.addEventListener('input', render));
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

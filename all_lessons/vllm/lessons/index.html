@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vLLM, from first principles</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <span class="crumb">vllm / lessons</span>
+    <span class="crumb">/</span>
+    <span class="crumb">index</span>
+    <span class="step-pill">12 lessons · ~2h read</span>
+  </div>
+</header>
+
+<main>
+
+<h1>vLLM, from first principles</h1>
+<p class="subtitle">A linearized tour of <em>why vLLM is fast</em>. Each lesson isolates one mechanism — read top to bottom, or skip to whichever bottleneck you're currently fighting.</p>
+
+<div class="callout">
+  <div class="label">Who this is for</div>
+  You know what a transformer is and you've served some kind of LLM. The numbers — bytes per token, HBM bandwidth, batch utilization — are about to start meaning something to you. By the end you can read vLLM's scheduler source and predict its behavior on your workload.
+</div>
+
+<h2>The system you're learning</h2>
+
+<p>Every vLLM optimization aims at one object: the KV cache, the per-sequence state that grows by one row every decode step. Throughput is gated on <strong>how many concurrent sequences fit in HBM</strong>; latency is gated on <strong>how many bytes leave HBM per token</strong>. The three architectural layers below each tackle one of those axes.</p>
+
+<svg viewBox="0 0 720 380" class="diagram" id="hero-diagram">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/>
+    </marker>
+  </defs>
+
+  <g data-node="queue">
+    <rect class="node-bg" x="40"  y="30"  width="200" height="50" rx="8"/>
+    <text x="140" y="55" text-anchor="middle" font-weight="600" font-size="14">REQUEST QUEUE</text>
+    <text x="140" y="72" text-anchor="middle" font-size="11" fill="var(--text-mute)">HTTP · async streaming</text>
+  </g>
+
+  <g data-node="sched">
+    <rect class="node-bg" x="40"  y="120" width="200" height="60" rx="8"/>
+    <text x="140" y="145" text-anchor="middle" font-weight="600" font-size="14">SCHEDULER</text>
+    <text x="140" y="164" text-anchor="middle" font-size="11" fill="var(--text-mute)">admit · evict · pack</text>
+  </g>
+
+  <g data-node="bm">
+    <rect class="node-bg" x="40"  y="220" width="200" height="60" rx="8"/>
+    <text x="140" y="245" text-anchor="middle" font-weight="600" font-size="14">BLOCK MANAGER</text>
+    <text x="140" y="264" text-anchor="middle" font-size="11" fill="var(--text-mute)">paged KV · CoW · refcount</text>
+  </g>
+
+  <g data-node="krn">
+    <rect class="node-bg" x="40"  y="320" width="200" height="50" rx="8"/>
+    <text x="140" y="345" text-anchor="middle" font-weight="600" font-size="14">ATTENTION KERNEL</text>
+    <text x="140" y="362" text-anchor="middle" font-size="11" fill="var(--text-mute)">tiled · gather-from-blocks</text>
+  </g>
+
+  <path class="edge" d="M140 80  L140 120" marker-end="url(#arrow)"/>
+  <path class="edge" d="M140 180 L140 220" marker-end="url(#arrow)"/>
+  <path class="edge" d="M140 280 L140 320" marker-end="url(#arrow)"/>
+
+  <!-- right column: axis labels -->
+  <g>
+    <text x="320" y="150" font-size="13" fill="var(--accent)" font-family="monospace">axis · scheduling</text>
+    <text x="320" y="170" font-size="11" fill="var(--text-mute)">continuous batching, chunked prefill, prefix cache, preemption</text>
+    <text x="320" y="186" font-size="11" fill="var(--text-mute)">lessons 04, 05, 10, 11</text>
+  </g>
+  <g>
+    <text x="320" y="245" font-size="13" fill="var(--accent-2)" font-family="monospace">axis · KV memory</text>
+    <text x="320" y="265" font-size="11" fill="var(--text-mute)">PagedAttention, GQA, KV quantization, P/D disagg</text>
+    <text x="320" y="281" font-size="11" fill="var(--text-mute)">lessons 02, 08, 09</text>
+  </g>
+  <g>
+    <text x="320" y="340" font-size="13" fill="#16a34a" font-family="monospace">axis · per-step compute</text>
+    <text x="320" y="360" font-size="11" fill="var(--text-mute)">FlashAttention, spec decoding, CUDA graphs, LoRA grouped GEMM</text>
+    <text x="320" y="376" font-size="11" fill="var(--text-mute)">lessons 03, 07, 12</text>
+  </g>
+</svg>
+
+<h2>The four questions this series answers</h2>
+
+<ol>
+  <li><strong>How are PagedAttention and FlashAttention different?</strong> They are. Different groups, different problems, both used. Lessons 02 + 03.</li>
+  <li><strong>Why does everyone use vLLM?</strong> Paged KV + continuous batching + Flash kernels pushes throughput 2–24× over <code>HF generate</code>, with an OpenAI-compatible URL. Lessons 02 + 04 + 03.</li>
+  <li><strong>What's the core piece?</strong> The block manager and the scheduler that talks to it. Everything else either depends on paged KV or becomes dramatically easier because of it. Lessons 02 + 04.</li>
+  <li><strong>What optimizations are layered on top?</strong> Twelve of them, ranked by throughput impact below.</li>
+</ol>
+
+<h2>Part I · Fundamentals <span style="color: var(--text-mute); font-weight: 400; font-size: 14px;">(lessons 01–05 · the core curriculum)</span></h2>
+
+<div class="toc-grid">
+  <a class="toc-card" href="01_kv_cache.html">
+    <div class="num">01</div>
+    <div>
+      <div class="ttl">The KV cache — where every optimization is aimed</div>
+      <div class="sum">Bytes-per-token, the one formula. Why a 2048-slot pre-allocation wastes 95% of HBM. The two consequences (throughput ↔ HBM occupancy; decode is memory-bound) that drive every later lesson.</div>
+    </div>
+  </a>
+
+  <a class="toc-card" href="02_paged_attention.html">
+    <div class="num">02</div>
+    <div>
+      <div class="ttl">PagedAttention — vLLM's central innovation</div>
+      <div class="sum">The OS virtual-memory analogy: fixed-size blocks + per-sequence block tables + refcounts + copy-on-write. Beam search and prefix sharing fall out for free. The CUDA cost: one pointer indirection.</div>
+    </div>
+  </a>
+
+  <a class="toc-card" href="03_flash_attention.html">
+    <div class="num">03</div>
+    <div>
+      <div class="ttl">FlashAttention — tiled online softmax</div>
+      <div class="sum">Orthogonal to paging. Rewrite attention as a streaming op over (Q, K, V) tiles, keep (m, ℓ, O) running statistics in SRAM, never materialize the T×T matrix. 75× HBM reduction → 2–4× wall-clock.</div>
+    </div>
+  </a>
+
+  <a class="toc-card" href="04_continuous_batching.html">
+    <div class="num">04</div>
+    <div>
+      <div class="ttl">Continuous batching — the scheduling win</div>
+      <div class="sum">Static batching wastes 50% of cycles waiting for stragglers. Iteration-level batching admits new requests every step. Why this is impossible without paged KV.</div>
+    </div>
+  </a>
+
+  <a class="toc-card" href="05_optimizations.html">
+    <div class="num">05</div>
+    <div>
+      <div class="ttl">Optimization catalog — APC, quant, CUDA graphs, TP</div>
+      <div class="sum">Automatic Prefix Caching (with the runnable demo), KV quantization, tensor parallelism, CUDA graph capture, and a first look at speculative decoding (deep-dived in lesson 07).</div>
+    </div>
+  </a>
+</div>
+
+<h2>Part II · System layer and deep dives <span style="color: var(--text-mute); font-weight: 400; font-size: 14px;">(lessons 06–12 · stand alone after Part I)</span></h2>
+
+<p>Each of these is a self-contained deep dive on one mechanism. Pick whichever your current workload is bottlenecked on.</p>
+
+<div class="toc-grid">
+  <a class="toc-card" href="06_serving_architecture.html">
+    <div class="num">06</div>
+    <div>
+      <div class="ttl">Serving architecture — HTTP to tokens at scale</div>
+      <div class="sum">The async engine loop, FastAPI plumbing, Ray workers, the TP/PP/DP knobs. Why <code>asyncio</code> (not threads) and why the engine runs on a dedicated thread.</div>
+    </div>
+  </a>
+
+  <a class="toc-card" href="07_speculative_decoding.html">
+    <div class="num">07</div>
+    <div>
+      <div class="ttl">Speculative decoding — draft, verify, accept</div>
+      <div class="sum">The asymmetry that makes it work, the rejection-sampling rule that keeps it <em>exact</em>, the speedup formula, and the Medusa / EAGLE / Lookahead family.</div>
+    </div>
+  </a>
+
+  <a class="toc-card" href="08_pd_disaggregation.html">
+    <div class="num">08</div>
+    <div>
+      <div class="ttl">Prefill / decode disaggregation</div>
+      <div class="sum">Prefill is compute-bound; decode is memory-bound. Separate them onto different hardware pools. The KV-transfer cost and when it's worth it.</div>
+    </div>
+  </a>
+
+  <a class="toc-card" href="09_gqa_mqa.html">
+    <div class="num">09</div>
+    <div>
+      <div class="ttl">GQA / MQA — the architecture change that shrinks the cache</div>
+      <div class="sum">Multi-head → grouped-query → multi-query. Why 8× KV reduction with no measurable quality loss. If you don't know GQA, your serving math is wrong by an order of magnitude.</div>
+    </div>
+  </a>
+
+  <a class="toc-card" href="10_chunked_prefill.html">
+    <div class="num">10</div>
+    <div>
+      <div class="ttl">Chunked prefill — saturate both bottlenecks</div>
+      <div class="sum">Break long prefills into chunks, pack with decode steps in one fused forward. FLOPs and HBM fire simultaneously. The <code>max_num_batched_tokens</code> tradeoff.</div>
+    </div>
+  </a>
+
+  <a class="toc-card" href="11_preemption_swap.html">
+    <div class="num">11</div>
+    <div>
+      <div class="ttl">Preemption and swap — when the cache fills up</div>
+      <div class="sum">Recompute vs swap, why vLLM picks swap, who gets evicted, and why your p99 latency cliff lines up with the block pool's saturation point.</div>
+    </div>
+  </a>
+
+  <a class="toc-card" href="12_lora_serving.html">
+    <div class="num">12</div>
+    <div>
+      <div class="ttl">Multi-LoRA serving — one base, N adapters</div>
+      <div class="sum">Why we never merge in the multi-tenant case. Unified adapter memory + grouped GEMM (BGMV / SGMV). 1000 adapters in one process.</div>
+    </div>
+  </a>
+</div>
+
+<h2>Optimization ranking, by throughput impact</h2>
+
+<table>
+  <thead><tr><th>Rank</th><th>Technique</th><th>Where</th><th>Mechanism</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>PagedAttention</td><td><a href="02_paged_attention.html">02</a></td><td>60–80% more effective KV per GB of HBM</td></tr>
+    <tr><td>2</td><td>Continuous batching</td><td><a href="04_continuous_batching.html">04</a></td><td>Decode-step utilization 45% → 90%</td></tr>
+    <tr><td>3</td><td>FlashAttention</td><td><a href="03_flash_attention.html">03</a></td><td>HBM traffic O(T²) → O(T) per attention op</td></tr>
+    <tr><td>4</td><td>GQA / MQA</td><td><a href="09_gqa_mqa.html">09</a></td><td>Model-architecture: 4–8× smaller KV</td></tr>
+    <tr><td>5</td><td>Chunked prefill</td><td><a href="10_chunked_prefill.html">10</a></td><td>Both bottlenecks saturated in one step</td></tr>
+    <tr><td>6</td><td>Automatic Prefix Caching</td><td><a href="05_optimizations.html">05</a></td><td>Shared system prompts → ~95% prefill skip</td></tr>
+    <tr><td>7</td><td>Quantization (weights + KV)</td><td><a href="05_optimizations.html">05</a></td><td>fp16 → fp8: 2× bytes/step, 2× cache capacity</td></tr>
+    <tr><td>8</td><td>Speculative decoding</td><td><a href="07_speculative_decoding.html">07</a></td><td>K draft tokens / 1 target step, ~2× decode</td></tr>
+    <tr><td>9</td><td>Preemption + swap</td><td><a href="11_preemption_swap.html">11</a></td><td>Stability under load, p99 protection</td></tr>
+    <tr><td>10</td><td>Tensor parallelism</td><td><a href="06_serving_architecture.html">06</a></td><td>Spread weights + activations across N GPUs</td></tr>
+    <tr><td>11</td><td>CUDA graph capture</td><td><a href="05_optimizations.html">05</a></td><td>Eliminate Python overhead per decode step</td></tr>
+    <tr><td>12</td><td>Disaggregated prefill/decode</td><td><a href="08_pd_disaggregation.html">08</a></td><td>Opposite workloads → opposite hardware</td></tr>
+    <tr><td>13</td><td>Multi-LoRA (S-LoRA / Punica)</td><td><a href="12_lora_serving.html">12</a></td><td>Grouped GEMM, unified adapter pool</td></tr>
+  </tbody>
+</table>
+
+<h2>Common misconceptions</h2>
+
+<ul>
+  <li><strong>PagedAttention ≠ FlashAttention.</strong> Different papers, different groups. vLLM ships a kernel that does Flash-style tiling over a Paged-style block layout.</li>
+  <li><strong>Continuous batching is not a vLLM invention.</strong> Orca (OSDI 2022) had it first. vLLM made it <em>practical</em> by pairing it with paged KV.</li>
+  <li><strong>Decode is memory-bound; prefill is compute-bound.</strong> Same model, same kernels — opposite bottlenecks. Many design choices flow from this.</li>
+  <li><strong>Block size is a tradeoff, not a constant.</strong> 16 is empirically sweet on H100/A100. Smaller → less tail waste, more launch overhead.</li>
+  <li><strong>Speculative decoding is exact, not approximate.</strong> The rejection rule preserves the target model's sampling distribution exactly.</li>
+</ul>
+
+<h2>How to use this</h2>
+
+<ol>
+  <li><strong>Sequential.</strong> Lessons 01–05 build the mental model. After that the order can be your own.</li>
+  <li><strong>Touch the widgets.</strong> Each lesson has one interactive piece — the surprise it surfaces is the lesson. Find the configuration that breaks the system; the bug is the point.</li>
+  <li><strong>Open the code.</strong> Every lesson links to a runnable Python file under <code>vllm/</code>. The lessons explain <em>why</em>; the code is <em>what</em>.</li>
+</ol>
+
+<div class="callout ok">
+  <div class="label">Companion code</div>
+  Each lesson corresponds to one Python file under <a href="../"><code>vllm/</code></a>. Run any of them with <code>uv run python vllm/0X_*.py</code> from the repo root.
+</div>
+
+<footer class="lesson-nav">
+  <a href="index.html" style="visibility:hidden"></a>
+  <a class="next" href="01_kv_cache.html">
+    <span class="dir">Start →</span>
+    <span class="ttl">01 · The KV cache</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+document.querySelectorAll('#hero-diagram [data-node]').forEach(g => {
+  g.style.cursor = 'pointer';
+  g.addEventListener('mouseenter', () => g.querySelector('rect').classList.add('active'));
+  g.addEventListener('mouseleave', () => g.querySelector('rect').classList.remove('active'));
+});
+</script>
+
+</body>
+</html>

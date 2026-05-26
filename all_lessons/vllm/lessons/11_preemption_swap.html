@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>11 · Preemption and swap</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">vllm_lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">11 · preemption and swap</span>
+    <span class="step-pill">lesson 11 / 12</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Preemption and swap</h1>
+<p class="subtitle">Everything in lessons 02–10 quietly assumed there was always a free block when a sequence needed one. There isn't. This is what vLLM does when the cache fills up.</p>
+
+<h2>The reality we've been ducking</h2>
+
+<p>The block pool is a fixed-size resource. Three ways to exhaust it:</p>
+
+<ol>
+  <li>An oversized prompt arrives. A 6000-token request needs <span class="math">⌈6000/16⌉ = 375</span> blocks before it can even start decoding.</li>
+  <li>An active decoder runs longer than expected. The model kept sampling past where you guessed the EOS would land; that one extra block is no longer free.</li>
+  <li>A burst of arrivals pushes the active set above the steady-state working set the pool was sized for.</li>
+</ol>
+
+<p>vLLM's invariant: <strong>never admit work it can't fit</strong>. But it has already admitted plenty of in-flight requests, and one of them just needs a block that isn't there. The scheduler has to do something. What it does is <em>preempt</em>.</p>
+
+<h2>The two strategies</h2>
+
+<h3>Strategy A · Recompute</h3>
+
+<p>Drop the preempted sequence's KV blocks entirely. The blocks go back to the pool. Put the sequence back in the waiting queue. When it gets re-admitted, recompute its prefill from the original token IDs (which are basically free to store — a few KB).</p>
+
+<ul>
+  <li><strong>Cost:</strong> redo the full prefill — <em>(P + G) tokens worth of compute</em>, where P is prompt length and G is the tokens generated so far at the time of preemption.</li>
+  <li><strong>Saves:</strong> all HBM bandwidth — no transfer.</li>
+  <li><strong>Wins when:</strong> prompts are short (small P), generations are short (small G), or you're compute-rich and bandwidth-starved.</li>
+</ul>
+
+<h3>Strategy B · Swap</h3>
+
+<p>Copy the preempted sequence's KV blocks from HBM to CPU DRAM. On resume, allocate fresh GPU blocks and copy the saved KV back in. Both transfers are block-level memcpys over NVLink / PCIe Gen5 — sequential, coalesced, fast (~50 GB/s on H100).</p>
+
+<ul>
+  <li><strong>Cost:</strong> HBM ↔ DRAM transfer of <em>(P + G) tokens worth of KV bytes</em>, twice (out then in).</li>
+  <li><strong>Saves:</strong> recomputing the prefill.</li>
+  <li><strong>Wins when:</strong> prompts are long (P large → prefill is expensive), CPU DRAM is plentiful, and the swap bandwidth beats the prefill compute rate.</li>
+</ul>
+
+<h2>Why vLLM defaults to swap</h2>
+
+<p>Because paged KV (<a href="02_paged_attention.html">lesson 02</a>) makes the unit of transfer small and uniform: one block is <span class="math">block_size · n_layers · h<sub>kv</sub> · d_head · dtype</span> bytes, independent of how long the sequence is. There's no large contiguous allocation to find or to move. CPU DRAM is cheap and large (often 512 GB+ on a serving node). And the worst-case latency of a swap is bounded by bandwidth, not by compute; recompute's worst case is unbounded prefill.</p>
+
+<h2>The eviction rule · reverse FIFO</h2>
+
+<p>Which in-flight sequence gets preempted? vLLM picks the <em>most recently admitted</em> active sequence first. Two reasons, both from first principles:</p>
+
+<ol>
+  <li><strong>Least work lost.</strong> The most-recently admitted sequence has produced the fewest tokens. Preempting it discards/swaps the smallest amount of KV. Preempting the oldest sequence is the opposite of what you want.</li>
+  <li><strong>Least likely to be near completion.</strong> If you preempt a sequence that was about to emit its EOS, you've just doubled its latency for one block of memory. Reverse-FIFO biases evictions toward sequences that are statistically far from the finish line.</li>
+</ol>
+
+<p>Alternatives exist (LRU, longest-remaining, SLO-priority) and are tunable. For the typical mix, reverse-FIFO is the right default.</p>
+
+<h2>Cost-model arithmetic</h2>
+
+<p>Let:</p>
+
+<ul>
+  <li><span class="math">P</span> = prompt length, <span class="math">G</span> = tokens generated so far</li>
+  <li><span class="math">B</span> = bytes per token in the KV (e.g. 0.5 MB for LLaMA-1 7B fp16, 0.32 MB for LLaMA-2 70B at one TP shard)</li>
+  <li><span class="math">C<sub>f</sub></span> = effective prefill throughput in bytes/sec (compute-bound — roughly model weights size / step time)</li>
+  <li><span class="math">C<sub>s</sub></span> = swap bandwidth in bytes/sec (HBM ↔ DRAM)</li>
+</ul>
+
+<p>Then:</p>
+
+<div class="math block">
+  t<sub>recompute</sub> &nbsp;≈&nbsp; (P + G) · B / C<sub>f</sub>
+</div>
+
+<div class="math block">
+  t<sub>swap-out</sub> + t<sub>swap-in</sub> &nbsp;≈&nbsp; 2 · (P + G) · B / C<sub>s</sub>
+</div>
+
+<p>The ratio of costs is <span class="math">C<sub>s</sub> / (2 · C<sub>f</sub>)</span>. For LLaMA-2 7B numbers (effective prefill ~10 GB/s of KV-equivalent work, swap ~30 GB/s over NVLink/PCIe Gen5): swap is about <strong>1.5×</strong> cheaper per unit KV. In practice, swap's advantage grows when the recompute side has to redo G generated tokens too (lost on KV drop), so for long generations swap can be 2–3× cheaper than what the steady-state cost model alone predicts. The 1.5× figure is the floor; real production gaps land closer to 2–3× on long-prompt long-generation workloads.</p>
+
+<h2>SLO impact · the double hit</h2>
+
+<p>A preempted request takes the latency hit twice:</p>
+
+<ol>
+  <li>The work done before preemption is wasted (recompute) or paused (swap).</li>
+  <li>It re-enters the waiting queue and competes with new arrivals for the next admission slot.</li>
+</ol>
+
+<p>p99 latency is what suffers. Under bursty load you'll see a clean knee in the latency curve at exactly the request rate where the pool first saturates: below it, no preemptions, latency follows queue theory; above it, preemptions kick in and the tail explodes.</p>
+
+<h2>Mitigations</h2>
+
+<ul>
+  <li><strong>Stability floor.</strong> Never preempt a sequence that has emitted fewer than <span class="math">K</span> tokens since its prefill completed. Prevents pathological thrash where the same sequence is repeatedly admitted and evicted.</li>
+  <li><strong>SLO-aware admission.</strong> Don't admit a new request if doing so would force a preemption that violates a latency bound. This trades throughput for tail latency.</li>
+  <li><strong>--max-num-seqs cap.</strong> The blunt instrument: cap concurrent admissions to a fixed number known to fit comfortably in the pool. Throughput drops; preempt rate goes to zero. Use it when your workload is unpredictable.</li>
+</ul>
+
+<h2>Interactive · pool pressure simulator</h2>
+
+<p>200 simulated steps of a bursty workload. The blue bar shows pool usage over time; red flashes are preempted sequences. The KPI shows what the two strategies give you. The reveal: at pool capacity below the workload's sustained working set, swap dramatically beats recompute on long-prompt mixes. At capacity well above the working set, both approach zero preempt rate and the choice doesn't matter.</p>
+
+<div class="widget" id="pe-widget">
+  <div class="title">Pool-pressure simulator (200 steps)</div>
+  <div class="hint">Try pool=600 with strategy=recompute vs swap at long_prompt_pct=40 — the latency gap is the lesson.</div>
+
+  <div class="controls">
+    <label class="inline">pool capacity (blocks): <input type="range" id="pe-pool" min="200" max="2000" step="50" value="600"> <span class="val" id="pe-pool-val">600</span></label>
+    <label class="inline">arrival rate (req/step): <input type="range" id="pe-arr" min="1" max="10" step="1" value="3"> <span class="val" id="pe-arr-val">3</span></label>
+  </div>
+
+  <div class="controls">
+    <label class="inline">long-prompt %: <input type="range" id="pe-long" min="0" max="60" step="5" value="25"> <span class="val" id="pe-long-val">25</span></label>
+    <label class="inline">strategy:
+      <select id="pe-strat">
+        <option value="recompute">preempt + recompute</option>
+        <option value="swap" selected>preempt + swap</option>
+      </select>
+    </label>
+    <button id="pe-run">run simulation</button>
+  </div>
+
+  <canvas class="dist-canvas" id="pe-canvas" width="760" height="220" style="height: 220px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">mean latency</div><div class="v" id="pe-mean">—</div></div>
+    <div class="kpi"><div class="k">p99 latency</div><div class="v" id="pe-p99">—</div></div>
+    <div class="kpi"><div class="k">preempt rate</div><div class="v" id="pe-rate">—</div></div>
+    <div class="kpi"><div class="k">work wasted</div><div class="v" id="pe-waste">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">show the cost model the simulator uses</summary>
+<pre><code>// Per token costs (ms):
+const PREFILL_MS_PER_TOK = 0.5;     // compute-bound (recompute cost)
+const SWAP_MS_PER_TOK    = 0.1;     // HBM <-> DRAM
+const DECODE_MS          = 10.0;    // per step over the active set
+const BLOCK_SIZE         = 16;      // tokens per block
+
+// When the pool is full and an admission requires `need` blocks,
+// pop the most-recently admitted active seq (reverse FIFO) and either:
+//   recompute: drop KV, requeue, pay full prefill again on re-admit
+//   swap     : pay swap-out time now, pay swap-in time on resume</code></pre>
+  </details>
+</div>
+
+<h2>Putting it together</h2>
+
+<table>
+  <thead><tr><th>regime</th><th>preempt rate</th><th>p99 latency</th><th>which wins</th></tr></thead>
+  <tbody>
+    <tr><td>pool ≫ working set</td><td>~0%</td><td>queue-theory tail only</td><td>doesn't matter</td></tr>
+    <tr><td>pool ≈ working set</td><td>5–15%</td><td>2–3× mean</td><td>swap (if long prompts)</td></tr>
+    <tr><td>pool &lt; working set</td><td>30%+</td><td>5–10× mean</td><td>swap, by a lot</td></tr>
+  </tbody>
+</table>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Preemption is what makes vLLM degrade gracefully under load instead of OOMing or rejecting requests. Swap is the default because the cost model (<span class="math">2 · B / C<sub>s</sub> &lt; B / C<sub>f</sub></span>) usually picks it. Reverse-FIFO is the eviction rule because it minimizes work lost and tail-latency damage. If your p99 has a sharp cliff above some QPS, that's the pool saturating — raise <code>--max-num-seqs</code> conservatively or add HBM.
+</div>
+
+<footer class="lesson-nav">
+  <a href="10_chunked_prefill.html">
+    <span class="dir">← Prev</span>
+    <span class="ttl">10 · Chunked prefill</span>
+  </a>
+  <a class="next" href="12_lora_serving.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">12 · Multi-LoRA serving</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const BLOCK_SIZE = 16;
+  const PREFILL_MS_PER_TOK = 0.5;
+  const SWAP_MS_PER_TOK    = 0.1;
+  const DECODE_MS          = 10.0;
+  const N_STEPS = 200;
+
+  const canvas = document.getElementById('pe-canvas');
+  const ctx = canvas.getContext('2d');
+  const rPool = document.getElementById('pe-pool');
+  const rArr  = document.getElementById('pe-arr');
+  const rLong = document.getElementById('pe-long');
+  const sStrat= document.getElementById('pe-strat');
+  const btn   = document.getElementById('pe-run');
+  const vPool = document.getElementById('pe-pool-val');
+  const vArr  = document.getElementById('pe-arr-val');
+  const vLong = document.getElementById('pe-long-val');
+
+  function mulberry32(a) {
+    return function() {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      let t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  function nBlocks(n) { return Math.ceil(n / BLOCK_SIZE); }
+
+  let trace = null;
+
+  function simulate() {
+    const pool = parseInt(rPool.value);
+    const arr = parseInt(rArr.value);
+    const longPct = parseInt(rLong.value);
+    const strat = sStrat.value;
+    const rng = mulberry32(7);
+
+    let nextId = 0;
+    let pending = [];           // {id, arrive, P, L, tokens, was_pre}
+    let active = [];
+    let swapped = [];           // pending-swapped-in
+    let t = 0;
+    const evictedHist = [];     // per-step flashes (count)
+    const usageHist = [];       // per-step pool usage in blocks
+    const finished = [];
+
+    function blocksUsed() {
+      return active.reduce((s, r) => s + nBlocks(r.P + r.tokens), 0);
+    }
+
+    function admit(r) {
+      // Preempt as needed.
+      let evictedThisStep = 0;
+      const need = nBlocks(r.P + r.tokens);
+      if (need > pool) return false; // bigger than the pool, drop
+      while (pool - blocksUsed() < need) {
+        if (active.length === 0) return false;
+        const victim = active.pop();   // reverse FIFO
+        victim.was_pre++;
+        const tokens = victim.P + victim.tokens;
+        if (strat === 'swap') {
+          t += tokens * SWAP_MS_PER_TOK;
+          swapped.push(victim);
+        } else {
+          // Drop KV, requeue. Resume will redo full prefill.
+          victim.kv_dropped = true;
+          pending.push(victim);
+        }
+        evictedThisStep++;
+      }
+      // Pay prefill if needed.
+      if (!r.kv_loaded) {
+        t += r.P * PREFILL_MS_PER_TOK;
+        r.kv_loaded = true;
+      } else if (r.kv_dropped) {
+        t += r.P * PREFILL_MS_PER_TOK;
+        r.kv_dropped = false;
+      }
+      active.push(r);
+      return { ok: true, evicted: evictedThisStep };
+    }
+
+    function tryUnswap() {
+      let didOne = false;
+      let evicted = 0;
+      const remaining = [];
+      for (const r of swapped) {
+        const need = nBlocks(r.P + r.tokens);
+        if (pool - blocksUsed() >= need) {
+          // pay swap-in
+          t += (r.P + r.tokens) * SWAP_MS_PER_TOK;
+          active.push(r);
+          didOne = true;
+        } else {
+          remaining.push(r);
+        }
+      }
+      swapped = remaining;
+      return evicted;
+    }
+
+    for (let step = 0; step < N_STEPS; step++) {
+      let evictedThisStep = 0;
+
+      // Arrivals.
+      for (let a = 0; a < arr; a++) {
+        const u = rng();
+        const isLong = (rng() * 100) < longPct;
+        const P = isLong ? 1000 + Math.floor(rng() * 2000) : 80 + Math.floor(rng() * 200);
+        const L = 20 + Math.floor(rng() * 60);
+        pending.push({
+          id: nextId++, arrive: step, P, L,
+          tokens: 0, was_pre: 0, kv_loaded: false, kv_dropped: false,
+        });
+      }
+
+      // Try to bring back swapped sequences (cheap; they have a complete KV).
+      tryUnswap();
+
+      // Try to admit from pending.
+      const stillPending = [];
+      for (const r of pending) {
+        if (r.arrive > step) { stillPending.push(r); continue; }
+        const result = admit(r);
+        if (!result || !result.ok) {
+          stillPending.push(r);
+        } else {
+          evictedThisStep += result.evicted;
+        }
+      }
+      pending = stillPending;
+
+      // One decode step over active.
+      if (active.length > 0) {
+        t += DECODE_MS;
+        for (const r of active) {
+          r.tokens++;
+          if (r.tokens >= r.L) {
+            r.finish = t;
+            finished.push(r);
+          }
+        }
+        active = active.filter(r => r.tokens < r.L);
+      }
+
+      evictedHist.push(evictedThisStep);
+      usageHist.push(blocksUsed());
+    }
+
+    // Stats.
+    const lats = finished.map(r => r.finish - r.arrive * 1.0);
+    lats.sort((a, b) => a - b);
+    const mean = lats.length === 0 ? 0 : lats.reduce((s, x) => s + x, 0) / lats.length;
+    const p99 = lats.length === 0 ? 0 : lats[Math.max(0, Math.floor(0.99 * lats.length) - 1)];
+    const preemptedDone = finished.filter(r => r.was_pre > 0).length;
+    const rate = finished.length === 0 ? 0 : preemptedDone / finished.length;
+    const waste = finished.reduce((s, r) => s + r.was_pre * r.P * (strat === 'recompute' ? 0.5 : 0.1), 0);
+
+    trace = { usageHist, evictedHist, pool };
+
+    document.getElementById('pe-mean').textContent = mean.toFixed(0) + " ms";
+    document.getElementById('pe-p99').textContent = p99.toFixed(0) + " ms";
+    document.getElementById('pe-rate').textContent = (100 * rate).toFixed(0) + "%";
+    document.getElementById('pe-waste').textContent = waste.toFixed(0) + " ms (" + (strat === 'recompute' ? "prefill" : "swap") + ")";
+
+    render();
+  }
+
+  function render() {
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    if (!trace) {
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '13px monospace';
+      ctx.fillText('press "run simulation" to start', 20, 30);
+      return;
+    }
+
+    const padX = 36, padY = 20;
+    const w = W - 2 * padX;
+    const h = H - 2 * padY - 30;
+    const n = trace.usageHist.length;
+
+    // Capacity background
+    ctx.fillStyle = '#f1f3f7';
+    ctx.fillRect(padX, padY, w, h);
+    ctx.strokeStyle = '#dde2ea';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(padX, padY, w, h);
+
+    // Usage curve.
+    const colW = w / n;
+    for (let i = 0; i < n; i++) {
+      const frac = trace.usageHist[i] / trace.pool;
+      const barH = Math.min(1, frac) * h;
+      const x = padX + i * colW;
+      ctx.fillStyle = frac >= 0.98 ? '#dc2626' : '#2563eb';
+      ctx.fillRect(x, padY + h - barH, Math.max(1, colW - 0.2), barH);
+    }
+
+    // Evict flashes — red squares at top.
+    for (let i = 0; i < n; i++) {
+      if (trace.evictedHist[i] > 0) {
+        const x = padX + i * colW;
+        ctx.fillStyle = '#dc2626';
+        ctx.globalAlpha = Math.min(1, trace.evictedHist[i] / 3);
+        ctx.fillRect(x, padY - 6, Math.max(2, colW), 4);
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // Capacity line.
+    ctx.strokeStyle = '#d97706';
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(padX, padY);
+    ctx.lineTo(padX + w, padY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Labels.
+    ctx.font = '11px monospace';
+    ctx.fillStyle = '#5b6573';
+    ctx.fillText("pool usage / capacity (red flashes = preemption events)", padX, padY - 8);
+    ctx.fillText("0", 12, padY + h);
+    ctx.fillText(trace.pool.toString(), 4, padY + 8);
+    ctx.fillText("step 0",   padX, padY + h + 16);
+    ctx.fillText("step " + (n - 1), padX + w - 60, padY + h + 16);
+  }
+
+  [rPool, rArr, rLong, sStrat].forEach(el => el.addEventListener('input', () => {
+    vPool.textContent = rPool.value;
+    vArr.textContent = rArr.value;
+    vLong.textContent = rLong.value;
+  }));
+  btn.addEventListener('click', simulate);
+  window.addEventListener('resize', render);
+
+  vPool.textContent = rPool.value;
+  vArr.textContent = rArr.value;
+  vLong.textContent = rLong.value;
+  render();
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,1017 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>15 · CUDA memory & the caching allocator</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">15 · caching allocator</span>
+    <span class="step-pill">lesson 15 / 19</span>
+  </div>
+</header>
+
+<main>
+
+<h1>CUDA memory &amp; the caching allocator</h1>
+<p class="subtitle">Why <code>cudaMalloc</code> is too slow to call per-op, what PyTorch does instead, and why your perfectly-fitting model still OOMs sometimes.</p>
+
+<h2>The two-line problem</h2>
+
+<p><code>cudaMalloc(N)</code> takes roughly <strong>30–200 microseconds</strong> per call — it goes into the driver, possibly synchronises the device, may even talk to the OS for backing pages. Per-op allocation would dominate the framework overhead from lesson 13, and gradient/activation tensors are allocated and freed every step. If every <code>aten::add</code>'s output tensor required a <code>cudaMalloc</code>, eager-mode PyTorch would be slower than CPU NumPy.</p>
+
+<p>So PyTorch (and JAX and TensorFlow and friends) implements a <strong>caching allocator</strong>: a big pool of GPU memory owned by the framework, sub-allocated from in <strong>microseconds</strong> by a custom data structure that lives in the host process. Every time you "free" a tensor, it goes back into the pool — not back to CUDA — and is reused for the next tensor of compatible size.</p>
+
+<h2>What the allocator actually looks like</h2>
+
+<p>PyTorch's <code>CUDACachingAllocator</code> maintains, per device and per stream:</p>
+
+<ul>
+  <li>A list of <strong>segments</strong>, each one obtained from <code>cudaMalloc</code>. PyTorch maintains two pools: a <em>small</em> pool with 2 MB segments for allocations &lt;1 MB, and a <em>large</em> pool whose segments start at ~20 MB and grow with allocation size.</li>
+  <li>Each segment is carved into <strong>blocks</strong>. Each block is either free or in use.</li>
+  <li>Free blocks are kept in a <em>size-ordered set</em> (best-fit lookup, <span class="math">O(log n)</span>). Modern PyTorch also subdivides large allocations via <code>roundup_power2_divisions</code> to reduce fragmentation within a size class.</li>
+</ul>
+
+<p>When you do <code>torch.empty(N)</code>:</p>
+<ol>
+  <li>Round <span class="math">N</span> up by the configured rounding rule (minimum 512 B for small allocations; large allocations are rounded by power-of-2 divisions configured via <code>PYTORCH_CUDA_ALLOC_CONF</code>).</li>
+  <li>Search the free set for a block of at least that size. If found, take it.</li>
+  <li>Otherwise, take a large free block and split it.</li>
+  <li>Otherwise, ask CUDA for a new segment via <code>cudaMalloc</code>.</li>
+</ol>
+
+<p>When you "free" a tensor (its Python refcount drops to zero):</p>
+<ol>
+  <li>The block returns to its free list.</li>
+  <li>If it's adjacent to other free blocks in the same segment, they coalesce into one larger free block.</li>
+  <li>The segment is <em>not</em> released to CUDA — it stays in PyTorch's pool for next time.</li>
+</ol>
+
+<p>This is why the cost in the typical case is "find a free block in a size-ordered set" — a few hundred nanoseconds. The driver doesn't see it.</p>
+
+<h2>Animated · the memory strip, alloc and free events</h2>
+
+<p>A single 128 MB segment laid out horizontally. Each button enqueues an alloc or free event; the timeline animates the block being inserted, split off a free block, or coalesced with its neighbours on free. Watch fragmentation build up as you alternate small and large allocations, then disappear when adjacent blocks merge.</p>
+
+<div class="widget" id="mp-widget">
+  <div class="title">Memory pool · alloc / free events on one segment</div>
+  <div class="hint">Colored blocks = allocations (each color = one tensor). Dark gaps = free space. Click an alloc button to fire a request; the simulator finds best-fit, splits the free block, animates the insertion. "free random" releases one live block — adjacent free blocks coalesce.</div>
+
+  <div class="controls">
+    <button class="primary" id="mp-a8">alloc 8 MB</button>
+    <button class="primary" id="mp-a16">alloc 16 MB</button>
+    <button class="primary" id="mp-a32">alloc 32 MB</button>
+    <button id="mp-free">free random</button>
+    <button id="mp-compact">compact</button>
+    <button id="mp-reset">⟲ reset</button>
+  </div>
+
+  <canvas id="mp-canvas" width="760" height="260" style="width:100%; height:260px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">live MB</div><div class="v" id="mp-live">0</div></div>
+    <div class="kpi"><div class="k">free MB</div><div class="v" id="mp-free-mb">128</div></div>
+    <div class="kpi"><div class="k">largest free block</div><div class="v" id="mp-lf">128 MB</div></div>
+    <div class="kpi"><div class="k">fragmentation</div><div class="v" id="mp-frag">0%</div></div>
+  </div>
+</div>
+
+<h2>The fragmentation trap</h2>
+
+<p>The caching allocator's worst-case is what a textbook OS allocator's worst-case is: <strong>external fragmentation</strong>. A segment can have lots of free bytes but no single free block of the size you need. The 60 GB of allocator-reserved memory can be "full" of 1 MB free holes when you're trying to fit a 2 GB tensor.</p>
+
+<p>Real-world cause #1: <strong>varying batch sizes / sequence lengths</strong>. A training step allocates a giant activation tensor of shape <span class="math">(B, T, d)</span>. Next step uses <span class="math">B' &gt; B</span> — the old activation block is now too small; allocate a new one, splitting a different segment. Several iterations of this and the pool is full of dead blocks of the wrong sizes.</p>
+
+<p>Real-world cause #2: <strong>retained tensors</strong>. A debug print, a metric being kept, an unintentional reference in a closure. Those tensors don't free, the surrounding blocks can't coalesce, and the segment is "pinned" with holes.</p>
+
+<p>Symptom: training has been running fine for hours and suddenly OOMs. The "reserved memory" in <code>torch.cuda.memory_summary()</code> is large, but "active memory" is much smaller — most of the reserve is fragmented.</p>
+
+<div class="callout warn">
+  <div class="label">The two-fix toolkit</div>
+  <ol>
+    <li><strong>Empty the cache</strong> (rarely): <code>torch.cuda.empty_cache()</code>. Returns all unused segments to CUDA. Cheap to do, but if your allocator is full of <em>used</em> blocks it does nothing — and the next op pays a fresh <code>cudaMalloc</code>.</li>
+    <li><strong>Switch to expandable segments</strong> (often): set <code>PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True</code>. A modern allocator mode (introduced in PyTorch 2.1) where segments are virtual ranges that grow / shrink via <code>cuMemMap</code> instead of fixed-size <code>cudaMalloc</code>'d slabs. Drastically reduces fragmentation at the cost of using CUDA's virtual-memory API. Recommended by default for variable-shape training.</li>
+  </ol>
+</div>
+
+<h2>2D · fixed-pool vs expandable_segments, side by side</h2>
+
+<p>The same allocation trace, run twice. <strong>Left:</strong> traditional fixed-size segments — when a request can't fit in any existing segment, a new fixed segment is allocated from CUDA, wasting its tail. <strong>Right:</strong> expandable segments — one virtual range that grows by mapping new physical pages on demand, with no fixed pool boundaries. The right-hand pool tracks the high-water mark of live memory; the left's reserved memory drifts upward.</p>
+
+<div class="widget" id="seg-widget">
+  <div class="title">Fixed segments vs expandable_segments</div>
+  <div class="hint">Each square = 1 MB of address space. Bright color = in use, dim = free-but-reserved, dark = unmapped. Click step to issue the next alloc/free in the trace. The two simulators see identical events; only the allocator differs.</div>
+
+  <div class="controls">
+    <button class="primary" id="seg-step">step ▷</button>
+    <button id="seg-10">×10</button>
+    <button id="seg-auto">▶ auto</button>
+    <button id="seg-reset">⟲</button>
+    <label class="inline">trace:
+      <select id="seg-trace" style="background:var(--code-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px;font-family:var(--mono);font-size:12px;">
+        <option value="vary">varying batch sizes</option>
+        <option value="growing">monotonically growing</option>
+        <option value="random">random churn</option>
+      </select>
+    </label>
+  </div>
+
+  <canvas id="seg-canvas" width="760" height="340" style="width:100%; height:340px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">step</div><div class="v" id="seg-step-v">0</div></div>
+    <div class="kpi"><div class="k">fixed reserved</div><div class="v" id="seg-fr">0</div></div>
+    <div class="kpi"><div class="k">expandable reserved</div><div class="v" id="seg-er">0</div></div>
+    <div class="kpi"><div class="k">savings</div><div class="v" id="seg-sav">—</div></div>
+  </div>
+</div>
+
+<h2>Streams and the per-stream pool</h2>
+
+<p>Every CUDA op runs on a <strong>stream</strong> — an ordered queue of work for the GPU. The default stream is implicit; <code>torch.cuda.Stream</code> objects let you create new ones. Two ops on the same stream are ordered (op B starts after op A completes); two ops on different streams run concurrently if the device has capacity (e.g. compute kernel on one, NCCL collective on another — this is exactly the DDP overlap from lesson 04).</p>
+
+<p>The allocator is <strong>stream-aware</strong>: when a tensor is freed, it can only be reused on the same stream that last touched it, until the GPU has signalled that any in-flight work on that stream has finished. This is to prevent the case where stream A frees a tensor at the host while a kernel on stream A is still using its bytes; if stream B grabbed the same bytes and wrote to them, you'd race.</p>
+
+<p>Practically: <em>cross-stream sharing of tensors requires explicit synchronisation</em> (<code>record_stream</code>), and "free" doesn't mean "available" until the device says so. Forgetting this is a frequent source of subtle race conditions in custom multi-stream code.</p>
+
+<h2>2D · per-stream pool visualiser</h2>
+
+<p>Three streams, each with its own pool. Allocations on a stream return blocks from that stream's pool; freed blocks stay assigned to the stream that last used them until a kernel completes there. The bottom event log shows the in-flight kernels per stream — a freed block on a busy stream is highlighted yellow ("held"), unable to be reused even by its own stream until the stream signals.</p>
+
+<div class="widget" id="ps-widget">
+  <div class="title">Per-stream pools · cross-stream sharing has rules</div>
+  <div class="hint">Click "alloc on Sₙ" to put a tensor in stream n's pool. "free + record_stream(other)" lets a different stream pick up the free block once the original stream syncs. Without record_stream, you'd risk a use-after-free across streams.</div>
+
+  <div class="controls">
+    <button class="primary" id="ps-a0">alloc on S0</button>
+    <button class="primary" id="ps-a1">alloc on S1</button>
+    <button class="primary" id="ps-a2">alloc on S2</button>
+    <button id="ps-f0">free on S0</button>
+    <button id="ps-f1">free on S1</button>
+    <button id="ps-sync">sync all streams</button>
+    <button id="ps-reset">⟲</button>
+  </div>
+
+  <canvas id="ps-canvas" width="760" height="320" style="width:100%; height:320px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">S0 live / pool</div><div class="v" id="ps-s0" style="font-size:13px;">0 / 0</div></div>
+    <div class="kpi"><div class="k">S1 live / pool</div><div class="v" id="ps-s1" style="font-size:13px;">0 / 0</div></div>
+    <div class="kpi"><div class="k">S2 live / pool</div><div class="v" id="ps-s2" style="font-size:13px;">0 / 0</div></div>
+    <div class="kpi"><div class="k">blocks held (pending)</div><div class="v" id="ps-held" style="font-size:13px;">0</div></div>
+  </div>
+</div>
+
+<h2>The big picture of HBM accounting</h2>
+
+<p>For an H100 with 80 GB HBM, a typical training run uses memory like this:</p>
+
+<pre class="ascii">  ┌────────────────────────────────────────────────────── 80 GB
+  │ CUDA context        ~ 0.5–1.5 GB  (driver, kernels, workspace)
+  │ Model state         ~ depends    (lesson 01: ~16P bytes / shard)
+  │ Optimizer state     ~ included above
+  │ Activations         ~ varies    (lesson 01: BT·L·d · k bytes)
+  │ NCCL buffers        ~ 100–500 MB
+  │ cuDNN workspace     ~ 100–500 MB
+  │ Allocator headroom  ~ should be small if well-tuned
+  └────────────────────────────────────────────────────── 0
+</pre>
+
+<p>The numbers add up tightly. The first OOM in a training run usually means one of three things:</p>
+
+<ul>
+  <li>Activations don't fit at the current batch / sequence — drop one, or turn on activation checkpointing.</li>
+  <li>Allocator is fragmented — try expandable segments.</li>
+  <li>NCCL is holding too much — reduce <code>NCCL_BUFFSIZE</code> (the per-channel NCCL buffer; distinct from PyTorch DDP's gradient-bucket size from lesson 04).</li>
+</ul>
+
+<h2>Diagnostic tooling — what to look at</h2>
+
+<table>
+  <thead><tr><th>Tool</th><th>What it tells you</th></tr></thead>
+  <tbody>
+    <tr><td><code>torch.cuda.memory_summary()</code></td><td>Reserved (allocator total), active (in-use), and a per-bucket breakdown</td></tr>
+    <tr><td><code>torch.cuda.memory_snapshot()</code></td><td>Every segment and block with its lifetime — feed to <code>memviz</code></td></tr>
+    <tr><td><code>torch.cuda.memory._record_memory_history()</code></td><td>Record allocations with stack traces — for finding what's <em>retained</em></td></tr>
+    <tr><td><code>nvidia-smi</code></td><td>Driver's view of <em>total</em> process memory — allocator-reserved + CUDA context + cuDNN workspace + NCCL buffers. Always larger than PyTorch's "reserved"; the gap is the non-PyTorch pieces.</td></tr>
+    <tr><td><code>NCCL_DEBUG=WARN</code></td><td>NCCL's own buffer allocations and errors</td></tr>
+  </tbody>
+</table>
+
+<p>A real debugging session for an "I'm OOMing at step 200" bug is roughly: turn on <code>_record_memory_history</code>, run until OOM, save a snapshot, open it in memviz (a Chrome trace), look at what segments are pinned by what.</p>
+
+<h2>Why pinned memory exists</h2>
+
+<p>Host RAM that's been "pinned" (page-locked) can be transferred to the GPU via DMA without staging through a pinned bounce buffer first — meaningfully faster H2D copies. <code>DataLoader(pin_memory=True)</code> ensures inputs go through this fast path. The cost is host RAM (pinned pages can't be paged out), so don't pin everything — only the staging buffer for the next batch.</p>
+
+<h2>Interactive · the fragmentation simulator</h2>
+
+<p>Simulate a sequence of alloc / free operations with varying sizes, and watch the segment fill, fragment, and OOM. Toggle expandable-segments mode to see fragmentation go away (at the cost of more virtual-address-space gymnastics). Try the "vary batch size" workload — it OOMs without expandable segments much earlier than its total live bytes would suggest.</p>
+
+<div class="widget" id="alc-widget">
+  <div class="title">Caching allocator · live bytes vs reserved bytes</div>
+  <div class="hint">Each "step" allocates a few tensors of varying size and frees the previous step's. Grey = free block, blue = active block. When a new alloc can't find a fitting free block, a fresh segment is added (or with expandable segments, the existing one is extended).</div>
+
+  <div class="controls">
+    <button class="primary" id="alc-step">Step ×1</button>
+    <button id="alc-step10">×10</button>
+    <button id="alc-reset">Reset</button>
+    <label class="inline">size variance: <input type="range" id="alc-var" min="0" max="100" step="5" value="40"> <span class="val" id="alc-var-v">40</span></label>
+    <label class="inline">expandable_segments
+      <input type="checkbox" id="alc-exp">
+    </label>
+  </div>
+
+  <canvas class="dist-canvas" id="alc-canvas" width="760" height="240" style="height: 240px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">step</div><div class="v" id="alc-step-v">0</div></div>
+    <div class="kpi"><div class="k">active MB</div><div class="v" id="alc-act">0</div></div>
+    <div class="kpi"><div class="k">reserved MB</div><div class="v" id="alc-res">0</div></div>
+    <div class="kpi"><div class="k">fragmentation</div><div class="v" id="alc-frag">0%</div></div>
+  </div>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  The caching allocator turns "thousands of <code>cudaMalloc</code>s per second" into a near-zero-overhead pool operation. The price is fragmentation, which appears any time block sizes vary across steps. <code>expandable_segments</code> is the modern workaround. Cross-stream tensor sharing needs <code>record_stream</code> or you get races. Master these three and most OOMs go from mysterious to mechanical.
+</div>
+
+<footer class="lesson-nav">
+  <a href="14_mixed_precision.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">14 · Mixed precision</span>
+  </a>
+  <a class="next" href="16_kernels_fusion.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">16 · Kernels &amp; fusion</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const get = id => document.getElementById(id);
+  const els = {
+    canvas: get('alc-canvas'),
+    step: get('alc-step'), step10: get('alc-step10'), reset: get('alc-reset'),
+    vr: get('alc-var'), vrv: get('alc-var-v'),
+    exp: get('alc-exp'),
+    stepV: get('alc-step-v'),
+    actV: get('alc-act'), resV: get('alc-res'),
+    fragV: get('alc-frag')
+  };
+  const ctx = els.canvas.getContext('2d');
+
+  let segments = [];
+  let stepN = 0;
+  let liveTensors = [];
+  let prevTensors = [];
+
+  const SEGMENT_CAP = 64;
+
+  function reset(){
+    segments = []; stepN = 0; liveTensors = []; prevTensors = [];
+    render();
+  }
+
+  function findFit(size, expandable){
+    for (let s = 0; s < segments.length; s++){
+      const seg = segments[s];
+      for (let b = 0; b < seg.blocks.length; b++){
+        const blk = seg.blocks[b];
+        if (!blk.active && blk.size >= size){
+          if (blk.size > size){
+            seg.blocks.splice(b + 1, 0, { offset: blk.offset + size, size: blk.size - size, active: false });
+            blk.size = size;
+          }
+          blk.active = true;
+          return { seg: s, offset: blk.offset, size };
+        }
+      }
+    }
+    if (expandable && segments.length){
+      const seg = segments[segments.length - 1];
+      const last = seg.blocks[seg.blocks.length - 1];
+      if (!last.active){
+        seg.cap += size;
+        last.size += size;
+        last.active = true;
+        return { seg: segments.length - 1, offset: last.offset, size };
+      }
+      const off = seg.cap;
+      seg.cap += size;
+      seg.blocks.push({ offset: off, size, active: true });
+      return { seg: segments.length - 1, offset: off, size };
+    }
+    const seg = { cap: SEGMENT_CAP, blocks: [{ offset: 0, size, active: true }] };
+    if (size < SEGMENT_CAP) seg.blocks.push({ offset: size, size: SEGMENT_CAP - size, active: false });
+    else { seg.cap = size; seg.blocks = [{ offset: 0, size, active: true }]; }
+    segments.push(seg);
+    return { seg: segments.length - 1, offset: 0, size };
+  }
+
+  function freeTensor(t){
+    const seg = segments[t.seg];
+    const blk = seg.blocks.find(b => b.offset === t.offset);
+    if (blk){
+      blk.active = false;
+      for (let i = 0; i < seg.blocks.length - 1; ){
+        const cur = seg.blocks[i], nxt = seg.blocks[i+1];
+        if (!cur.active && !nxt.active && cur.offset + cur.size === nxt.offset){
+          cur.size += nxt.size; seg.blocks.splice(i+1, 1);
+        } else { i++; }
+      }
+    }
+  }
+
+  function doStep(){
+    const v = parseInt(els.vr.value)/100;
+    prevTensors.forEach(freeTensor);
+    prevTensors = liveTensors;
+    liveTensors = [];
+    const base = 8 + Math.floor(Math.random() * 20 * v);
+    const sizes = [base*2, base*3, Math.floor(base*1.5)];
+    const exp = els.exp.checked;
+    for (const sz of sizes){
+      try {
+        const t = findFit(sz, exp);
+        liveTensors.push(t);
+      } catch(e){ break; }
+    }
+    stepN++;
+  }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = els.canvas.clientWidth, H = els.canvas.clientHeight;
+    if (els.canvas.width !== Math.round(W*dpr)){
+      els.canvas.width = Math.round(W*dpr); els.canvas.height = Math.round(H*dpr);
+    }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 80, padR = 14, padT = 14, padB = 18;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+    const rowH = Math.max(20, innerH / Math.max(1, segments.length + 1));
+
+    let totalActive = 0, totalReserved = 0;
+    segments.forEach((seg, i) => {
+      const y = padT + i*rowH + 4;
+      const xPerMB = innerW / Math.max(SEGMENT_CAP, seg.cap);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(padL, y, seg.cap * xPerMB, rowH - 8);
+      seg.blocks.forEach(b => {
+        const x = padL + b.offset * xPerMB;
+        const w = b.size * xPerMB;
+        ctx.fillStyle = b.active ? '#2563eb' : '#dde2ea';
+        ctx.fillRect(x, y, Math.max(1, w), rowH - 8);
+        if (b.active) totalActive += b.size;
+      });
+      totalReserved += seg.cap;
+      ctx.fillStyle = '#5b6573'; ctx.font = '10px monospace';
+      ctx.fillText('seg ' + i, 4, y + rowH/2 + 2);
+    });
+
+    els.stepV.textContent = stepN;
+    els.actV.textContent = totalActive + ' MB';
+    els.resV.textContent = totalReserved + ' MB';
+    const frag = totalReserved > 0 ? (1 - totalActive / totalReserved) : 0;
+    els.fragV.textContent = (frag*100).toFixed(0) + '%';
+
+    ctx.fillStyle = '#2563eb'; ctx.fillRect(padL, H - 14, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+    ctx.fillText('active', padL+14, H - 5);
+    ctx.fillStyle = '#dde2ea'; ctx.fillRect(padL+80, H - 14, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('free (held in pool)', padL+94, H - 5);
+  }
+
+  els.step.addEventListener('click', () => { doStep(); render(); });
+  els.step10.addEventListener('click', () => { for (let i=0;i<10;i++) doStep(); render(); });
+  els.reset.addEventListener('click', reset);
+  els.vr.addEventListener('input', () => { els.vrv.textContent = els.vr.value; });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: memory pool with animated alloc/free events ─── */
+(function(){
+  const C = document.getElementById('mp-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+
+  const CAP = 128;
+  let blocks = []; // {offset, size, active, color, id, anim:0..1}
+  let nextId = 0;
+  const PALETTE = ['#2563eb','#d97706','#16a34a','#7c3aed','#dc2626','#3b82f6','#f59e0b','#16a34a'];
+  let lastEvent = '— click an alloc/free button —';
+  let raf = null;
+
+  function reset(){
+    blocks = [{offset:0, size:CAP, active:false, color:null, anim:1}];
+    nextId = 0;
+    lastEvent = 'reset';
+    render();
+  }
+  reset();
+
+  function findBestFit(size){
+    let best = -1, bestSize = Infinity;
+    for (let i=0; i<blocks.length; i++){
+      const b = blocks[i];
+      if (!b.active && b.size >= size && b.size < bestSize){ best = i; bestSize = b.size; }
+    }
+    return best;
+  }
+
+  function coalesce(){
+    for (let i=0; i<blocks.length - 1; ){
+      const a = blocks[i], b = blocks[i+1];
+      if (!a.active && !b.active){
+        a.size += b.size;
+        blocks.splice(i+1, 1);
+      } else { i++; }
+    }
+  }
+
+  function alloc(size){
+    const idx = findBestFit(size);
+    if (idx < 0){
+      lastEvent = 'alloc ' + size + ' MB FAILED — no free block large enough (fragmented!)';
+      animatePulse();
+      render();
+      return;
+    }
+    const b = blocks[idx];
+    const color = PALETTE[nextId % PALETTE.length];
+    if (b.size > size){
+      blocks.splice(idx+1, 0, { offset: b.offset + size, size: b.size - size, active: false, color: null, anim: 1 });
+      b.size = size;
+    }
+    b.active = true; b.color = color; b.id = nextId++; b.anim = 0;
+    lastEvent = 'alloc ' + size + ' MB → block #' + b.id + ' at offset ' + b.offset;
+    animate();
+  }
+
+  function freeRandom(){
+    const actives = blocks.filter(b => b.active);
+    if (!actives.length){ lastEvent = 'nothing to free'; render(); return; }
+    const pick = actives[Math.floor(Math.random()*actives.length)];
+    pick.active = false; pick.color = null; pick.anim = 0;
+    lastEvent = 'free block #' + pick.id + ' (' + pick.size + ' MB) → coalescing with neighbours';
+    animate();
+    setTimeout(()=>{ coalesce(); render(); }, 350);
+  }
+
+  function compact(){
+    // Move all active blocks to the front, sum free at end
+    const actives = blocks.filter(b => b.active);
+    let off = 0;
+    actives.forEach(b => { b.offset = off; off += b.size; });
+    const freeSize = CAP - off;
+    blocks = actives.slice();
+    if (freeSize > 0) blocks.push({ offset: off, size: freeSize, active: false, color: null, anim: 1 });
+    lastEvent = 'compact: moved live blocks to the front (note: real allocators do NOT do this — illustrative)';
+    render();
+  }
+
+  let pulse = 0;
+  function animatePulse(){
+    pulse = 1;
+    if (raf) cancelAnimationFrame(raf);
+    function tick(){
+      pulse *= 0.92;
+      render();
+      if (pulse > 0.05) raf = requestAnimationFrame(tick);
+    }
+    tick();
+  }
+
+  function animate(){
+    if (raf) cancelAnimationFrame(raf);
+    function tick(){
+      let any = false;
+      blocks.forEach(b => {
+        if (b.anim < 1){ b.anim = Math.min(1, b.anim + 0.08); any = true; }
+      });
+      render();
+      if (any) raf = requestAnimationFrame(tick);
+    }
+    tick();
+  }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 30, padR = 30, padT = 30;
+    const barY = 70, barH = 70;
+    const innerW = W - padL - padR;
+
+    // header
+    ctx.fillStyle = '#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('1 segment · ' + CAP + ' MB · best-fit allocator', padL, padT - 4);
+
+    // Memory strip
+    ctx.fillStyle = '#f1f3f7';
+    ctx.fillRect(padL, barY, innerW, barH);
+    ctx.strokeStyle = pulse > 0 ? '#dc2626' : '#dde2ea';
+    ctx.lineWidth = pulse > 0 ? 2 + pulse*2 : 1;
+    ctx.strokeRect(padL, barY, innerW, barH);
+
+    blocks.forEach(b => {
+      const x = padL + (b.offset / CAP) * innerW;
+      const w = (b.size / CAP) * innerW;
+      if (b.active){
+        const grow = b.anim;
+        ctx.fillStyle = b.color;
+        ctx.globalAlpha = 0.85 + 0.15 * grow;
+        ctx.fillRect(x + 1, barY + 1 + (1-grow)*barH/2, w - 2, (barH - 2) * grow);
+        ctx.globalAlpha = 1;
+        // label
+        if (w > 30){
+          ctx.fillStyle = '#ffffff'; ctx.font='bold 10px monospace';
+          ctx.fillText('#'+b.id, x + 4, barY + 12);
+          ctx.fillText(b.size+'MB', x + 4, barY + barH - 4);
+        }
+      } else {
+        // free: dim
+        ctx.fillStyle = '#eef1f5';
+        ctx.fillRect(x + 1, barY + 1, w - 2, barH - 2);
+        // diagonal hatch
+        ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+        for (let xx = x; xx < x + w; xx += 6){
+          ctx.beginPath(); ctx.moveTo(xx, barY); ctx.lineTo(xx + 8, barY + barH); ctx.stroke();
+        }
+        if (w > 30){
+          ctx.fillStyle = '#94a3b8'; ctx.font='10px monospace';
+          ctx.fillText('free ' + b.size + 'MB', x + 4, barY + barH/2 + 3);
+        }
+      }
+    });
+
+    // ruler
+    ctx.fillStyle = '#94a3b8'; ctx.font='10px monospace';
+    for (let m=0; m<=CAP; m+=16){
+      const x = padL + (m / CAP) * innerW;
+      ctx.fillRect(x, barY + barH + 2, 1, 4);
+      ctx.fillText(m+'M', x - 8, barY + barH + 16);
+    }
+
+    // event log
+    ctx.fillStyle = '#1f2430'; ctx.font='12px monospace';
+    ctx.fillText('▸ ' + lastEvent, padL, H - 60);
+
+    // running stats
+    let live = 0, free = 0, largestFree = 0, holes = 0;
+    blocks.forEach(b => {
+      if (b.active) live += b.size;
+      else { free += b.size; largestFree = Math.max(largestFree, b.size); holes++; }
+    });
+    const reserved = CAP;
+    const frag = reserved > 0 ? (1 - largestFree / Math.max(1, free)) : 0;
+    $('mp-live').textContent = live + ' MB';
+    $('mp-free-mb').textContent = free + ' MB';
+    $('mp-lf').textContent = largestFree + ' MB';
+    $('mp-frag').textContent = free > 0 ? (frag*100).toFixed(0) + '%' : '0%';
+
+    // legend
+    ctx.fillStyle = '#94a3b8'; ctx.font='10.5px monospace';
+    ctx.fillText('color = block #; hatched = free; pool returned to CUDA only via empty_cache()', padL, H - 16);
+  }
+
+  $('mp-a8').addEventListener('click', () => alloc(8));
+  $('mp-a16').addEventListener('click', () => alloc(16));
+  $('mp-a32').addEventListener('click', () => alloc(32));
+  $('mp-free').addEventListener('click', freeRandom);
+  $('mp-compact').addEventListener('click', compact);
+  $('mp-reset').addEventListener('click', reset);
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: fixed segments vs expandable_segments ─── */
+(function(){
+  const C = document.getElementById('seg-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+
+  const FIXED_SEG = 32; // each new fixed segment is 32 MB
+  let trace = []; // {op:'alloc'|'free', id, size}
+  let idx = 0;
+  let autoH = null;
+
+  // Two allocator states
+  let fixed = { segs: [] }; // [{cap, blocks:[{offset,size,active,id}]}]
+  let exp   = { cap: 0, blocks: [{offset:0,size:0,active:false}], nextOff:0 }; // single growing segment
+
+  function buildTrace(kind){
+    const out = [];
+    if (kind === 'vary'){
+      // varying batch sizes — alloc grows over time
+      const sizes = [8, 12, 6, 18, 10, 24, 14, 30, 18, 40];
+      for (let i=0; i<sizes.length; i++){
+        out.push({op:'alloc', id:i, size:sizes[i]});
+        if (i >= 1) out.push({op:'free', id:i-1});
+      }
+    } else if (kind === 'growing'){
+      const sizes = [6, 10, 14, 18, 22, 26, 30, 34, 38];
+      for (let i=0; i<sizes.length; i++){
+        out.push({op:'alloc', id:i, size:sizes[i]});
+        if (i >= 2) out.push({op:'free', id:i-2});
+      }
+    } else {
+      const sizes = [12, 6, 20, 8, 14, 24, 10, 16, 30];
+      for (let i=0; i<sizes.length; i++){
+        out.push({op:'alloc', id:i, size:sizes[i]});
+        if (i >= 1 && Math.random() < 0.6) out.push({op:'free', id:Math.max(0, i-1)});
+      }
+    }
+    return out;
+  }
+
+  function reset(){
+    trace = buildTrace($('seg-trace').value);
+    idx = 0;
+    fixed = { segs: [] };
+    exp = { cap: 0, blocks: [{offset:0,size:0,active:false}] };
+    if (autoH){ clearInterval(autoH); autoH = null; $('seg-auto').textContent = '▶ auto'; }
+    render();
+  }
+
+  function fixedAlloc(size, id){
+    // Try existing segments
+    for (let s=0; s<fixed.segs.length; s++){
+      const seg = fixed.segs[s];
+      for (let b=0; b<seg.blocks.length; b++){
+        const blk = seg.blocks[b];
+        if (!blk.active && blk.size >= size){
+          if (blk.size > size){
+            seg.blocks.splice(b+1, 0, { offset: blk.offset+size, size: blk.size-size, active:false });
+            blk.size = size;
+          }
+          blk.active = true; blk.id = id;
+          return;
+        }
+      }
+    }
+    // new segment of FIXED_SEG (or rounded up to fit)
+    const cap = Math.max(FIXED_SEG, size);
+    const seg = { cap, blocks: [{offset:0, size, active:true, id}] };
+    if (cap > size) seg.blocks.push({offset:size, size: cap - size, active:false});
+    fixed.segs.push(seg);
+  }
+  function fixedFree(id){
+    for (const seg of fixed.segs){
+      for (const blk of seg.blocks){
+        if (blk.active && blk.id === id){ blk.active = false; blk.id = null; break; }
+      }
+      // coalesce
+      for (let i=0; i<seg.blocks.length - 1; ){
+        const a = seg.blocks[i], b = seg.blocks[i+1];
+        if (!a.active && !b.active){ a.size += b.size; seg.blocks.splice(i+1,1); } else i++;
+      }
+    }
+  }
+
+  function expAlloc(size, id){
+    // find free block
+    for (let b=0; b<exp.blocks.length; b++){
+      const blk = exp.blocks[b];
+      if (!blk.active && blk.size >= size){
+        if (blk.size > size){
+          exp.blocks.splice(b+1, 0, {offset: blk.offset+size, size: blk.size-size, active:false});
+          blk.size = size;
+        }
+        blk.active = true; blk.id = id;
+        return;
+      }
+    }
+    // grow segment
+    const off = exp.cap;
+    exp.cap += size;
+    exp.blocks.push({offset:off, size, active:true, id});
+  }
+  function expFree(id){
+    for (const blk of exp.blocks){
+      if (blk.active && blk.id === id){ blk.active = false; blk.id = null; break; }
+    }
+    for (let i=0; i<exp.blocks.length - 1; ){
+      const a = exp.blocks[i], b = exp.blocks[i+1];
+      if (!a.active && !b.active){ a.size += b.size; exp.blocks.splice(i+1,1); } else i++;
+    }
+  }
+
+  function step(){
+    if (idx >= trace.length) return;
+    const e = trace[idx];
+    if (e.op === 'alloc'){
+      fixedAlloc(e.size, e.id);
+      expAlloc(e.size, e.id);
+    } else {
+      fixedFree(e.id);
+      expFree(e.id);
+    }
+    idx++;
+    render();
+  }
+
+  function totalReserved(state, kind){
+    if (kind === 'fixed') return state.segs.reduce((a,s)=>a+s.cap,0);
+    return state.cap;
+  }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 20, padT = 20;
+    const colW = (W - padL*2 - 20) / 2;
+    const colTop = padT + 24;
+    const colH = H - colTop - 40;
+    const MAX = 160; // MB max for display scale
+
+    ctx.fillStyle = '#5b6573'; ctx.font='12px monospace';
+    ctx.fillText('fixed segments (' + FIXED_SEG + ' MB each)', padL + 8, padT + 14);
+    ctx.fillText('expandable_segments (single virtual range)', padL + colW + 28, padT + 14);
+
+    function drawCol(x, state, kind){
+      // background
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(x, colTop, colW, colH);
+      ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+      ctx.strokeRect(x, colTop, colW, colH);
+
+      // each square = 1 MB; arrange as a wrapped grid of squares
+      const cellsPerRow = 32;
+      const cellW = (colW - 6) / cellsPerRow;
+      const rowH = cellW;
+      function drawCell(mbIdx, color){
+        const r = Math.floor(mbIdx / cellsPerRow);
+        const c = mbIdx % cellsPerRow;
+        const cx = x + 3 + c*cellW;
+        const cy = colTop + 3 + r*rowH;
+        ctx.fillStyle = color;
+        ctx.fillRect(cx, cy, cellW - 1, rowH - 1);
+      }
+
+      if (kind === 'fixed'){
+        let baseMB = 0;
+        state.segs.forEach((seg, si) => {
+          // segment separator
+          // mark seg cap range with sublty different background
+          for (let m=0; m<seg.cap; m++){
+            drawCell(baseMB + m, '#eef1f5');
+          }
+          seg.blocks.forEach(blk => {
+            for (let m=0; m<blk.size; m++){
+              const idxAbs = baseMB + blk.offset + m;
+              drawCell(idxAbs, blk.active ? PALETTE[blk.id % PALETTE.length] : '#dde2ea');
+            }
+          });
+          // seg boundary line
+          const r = Math.floor((baseMB + seg.cap) / cellsPerRow);
+          const c = (baseMB + seg.cap) % cellsPerRow;
+          ctx.strokeStyle = '#dc2626'; ctx.lineWidth = 1.5;
+          if (c === 0){
+            const yy = colTop + 3 + r*rowH;
+            ctx.beginPath(); ctx.moveTo(x + 3, yy); ctx.lineTo(x + 3 + cellsPerRow*cellW, yy); ctx.stroke();
+          } else {
+            const cx = x + 3 + c*cellW;
+            const yy = colTop + 3 + r*rowH;
+            ctx.beginPath(); ctx.moveTo(cx, yy); ctx.lineTo(cx, yy + rowH); ctx.stroke();
+          }
+          baseMB += seg.cap;
+        });
+      } else {
+        // expandable: one contiguous range up to cap
+        for (let m=0; m<state.cap; m++) drawCell(m, '#eef1f5');
+        state.blocks.forEach(blk => {
+          if (blk.size === 0) return;
+          for (let m=0; m<blk.size; m++){
+            drawCell(blk.offset + m, blk.active ? PALETTE[blk.id % PALETTE.length] : '#dde2ea');
+          }
+        });
+      }
+
+      // reserved bar at bottom
+      const reserved = totalReserved(state, kind);
+      const reservedFrac = Math.min(1, reserved / MAX);
+      const by = colTop + colH - 10;
+      ctx.fillStyle = '#f1f3f7';
+      ctx.fillRect(x, by, colW, 6);
+      ctx.fillStyle = kind === 'fixed' ? '#dc2626' : '#16a34a';
+      ctx.fillRect(x, by, colW * reservedFrac, 6);
+      ctx.fillStyle = '#1f2430'; ctx.font='10.5px monospace';
+      ctx.fillText('reserved: ' + reserved + ' MB', x + 4, by - 4);
+    }
+
+    const PALETTE = ['#2563eb','#d97706','#16a34a','#7c3aed','#dc2626','#3b82f6','#f59e0b','#16a34a'];
+    window.__PALETTE = PALETTE; // expose
+    drawCol(padL, fixed, 'fixed');
+    drawCol(padL + colW + 20, exp, 'exp');
+
+    // KPIs
+    $('seg-step-v').textContent = idx + ' / ' + trace.length;
+    const fr = totalReserved(fixed, 'fixed');
+    const er = totalReserved(exp, 'exp');
+    $('seg-fr').textContent = fr + ' MB';
+    $('seg-er').textContent = er + ' MB';
+    $('seg-sav').textContent = fr > 0 ? (((fr-er)/fr)*100).toFixed(0) + '% less reserved' : '—';
+
+    // bottom note
+    ctx.fillStyle = '#94a3b8'; ctx.font='10.5px monospace';
+    ctx.fillText('red boundary = fixed-segment cutoff (new cudaMalloc); green = unified growing range', padL, H - 8);
+  }
+
+  $('seg-step').addEventListener('click', step);
+  $('seg-10').addEventListener('click', () => { for (let i=0; i<10; i++) step(); });
+  $('seg-auto').addEventListener('click', () => {
+    if (autoH){ clearInterval(autoH); autoH=null; $('seg-auto').textContent='▶ auto'; }
+    else { autoH = setInterval(() => { step(); if (idx >= trace.length){ clearInterval(autoH); autoH=null; $('seg-auto').textContent='▶ auto'; } }, 280); $('seg-auto').textContent='❚❚ pause'; }
+  });
+  $('seg-reset').addEventListener('click', reset);
+  $('seg-trace').addEventListener('change', reset);
+  window.addEventListener('resize', render);
+  reset();
+})();
+</script>
+
+<script>
+/* ─── Widget: per-stream pool ─── */
+(function(){
+  const C = document.getElementById('ps-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const STREAMS = 3;
+  // each stream: {pool: [{id, active, color, held:boolean}], busy: int (kernels in flight)}
+  let state;
+  let nextId = 0;
+  let lastMsg = '— click alloc/free to drive events —';
+  const PAL = ['#2563eb','#d97706','#16a34a','#7c3aed','#dc2626','#3b82f6','#f59e0b','#16a34a'];
+
+  function reset(){
+    state = Array.from({length: STREAMS}, () => ({ pool: [], busy: 0 }));
+    nextId = 0;
+    lastMsg = 'reset';
+    render();
+  }
+  reset();
+
+  function alloc(s){
+    // try to reuse a non-held free block in this stream's pool
+    const reuseIdx = state[s].pool.findIndex(b => !b.active && !b.held);
+    if (reuseIdx >= 0){
+      state[s].pool[reuseIdx].active = true;
+      state[s].pool[reuseIdx].color = PAL[nextId % PAL.length];
+      state[s].pool[reuseIdx].id = nextId++;
+      lastMsg = 'S'+s+': reused free block from S'+s+"'s pool";
+    } else {
+      const id = nextId++;
+      state[s].pool.push({ id, active: true, color: PAL[id % PAL.length], held: false });
+      lastMsg = 'S'+s+': new block from CUDA → S'+s+"'s pool";
+    }
+    state[s].busy++; // kernel using this block in flight
+    render();
+  }
+
+  function freeOnStream(s){
+    const idx = state[s].pool.findIndex(b => b.active);
+    if (idx < 0){ lastMsg = 'S'+s+': nothing live to free'; render(); return; }
+    const b = state[s].pool[idx];
+    b.active = false;
+    b.held = state[s].busy > 0;
+    lastMsg = 'S'+s+': free block #' + b.id + (b.held ? ' (HELD — stream still busy)' : ' → reusable');
+    render();
+  }
+
+  function syncAll(){
+    state.forEach((st, i) => {
+      st.busy = 0;
+      st.pool.forEach(b => { b.held = false; });
+    });
+    lastMsg = 'all streams synchronised → held blocks now reusable';
+    render();
+  }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 90, padT = 22, padR = 14;
+    const laneH = (H - padT - 80) / STREAMS;
+
+    for (let s=0; s<STREAMS; s++){
+      const y = padT + s*laneH;
+      // lane header
+      ctx.fillStyle = '#f1f3f7';
+      ctx.fillRect(padL - 4, y, W - padL - padR, laneH - 6);
+      ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+      ctx.strokeRect(padL - 4, y, W - padL - padR, laneH - 6);
+      ctx.fillStyle = '#1f2430'; ctx.font='bold 12px monospace';
+      ctx.fillText('Stream S' + s, 8, y + laneH/2 - 6);
+      ctx.fillStyle = '#94a3b8'; ctx.font='10px monospace';
+      ctx.fillText('busy: ' + state[s].busy, 8, y + laneH/2 + 10);
+
+      // pool boxes
+      const blkW = 60, blkH = laneH - 28;
+      const startX = padL + 6;
+      state[s].pool.forEach((b, i) => {
+        const x = startX + i * (blkW + 6);
+        const yy = y + 14;
+        if (b.active){
+          ctx.fillStyle = b.color;
+          ctx.globalAlpha = 1;
+          ctx.fillRect(x, yy, blkW, blkH);
+          ctx.fillStyle = '#ffffff'; ctx.font='bold 11px monospace';
+          ctx.fillText('#' + b.id, x + 4, yy + 14);
+          ctx.fillStyle = '#ffffff'; ctx.font='9px monospace';
+          ctx.fillText('LIVE', x + 4, yy + blkH - 4);
+        } else if (b.held){
+          // held: yellow border, dim fill
+          ctx.fillStyle = '#eef1f5';
+          ctx.fillRect(x, yy, blkW, blkH);
+          ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2;
+          ctx.strokeRect(x, yy, blkW, blkH);
+          ctx.fillStyle = '#f59e0b'; ctx.font='bold 11px monospace';
+          ctx.fillText('#' + b.id, x + 4, yy + 14);
+          ctx.font='9px monospace';
+          ctx.fillText('HELD', x + 4, yy + blkH - 4);
+        } else {
+          ctx.fillStyle = '#dde2ea';
+          ctx.fillRect(x, yy, blkW, blkH);
+          ctx.strokeStyle = '#cbd5e1'; ctx.lineWidth = 1;
+          ctx.strokeRect(x, yy, blkW, blkH);
+          ctx.fillStyle = '#5b6573'; ctx.font='10px monospace';
+          ctx.fillText('free', x + 4, yy + 14);
+          ctx.fillText('#' + b.id, x + 4, yy + blkH - 4);
+        }
+      });
+
+      // running kernel indicator
+      if (state[s].busy > 0){
+        const kx = W - padR - 60;
+        ctx.fillStyle = '#16a34a';
+        ctx.globalAlpha = 0.5 + 0.5 * Math.sin(performance.now()/200);
+        ctx.beginPath(); ctx.arc(kx, y + laneH/2 - 4, 6, 0, Math.PI*2); ctx.fill();
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = '#16a34a'; ctx.font='10px monospace';
+        ctx.fillText('kernel running', kx + 10, y + laneH/2);
+      }
+    }
+
+    // event log
+    ctx.fillStyle = '#1f2430'; ctx.font='12px monospace';
+    ctx.fillText('▸ ' + lastMsg, 8, H - 40);
+    ctx.fillStyle = '#94a3b8'; ctx.font='10.5px monospace';
+    ctx.fillText('A "HELD" block is freed but cannot be reused yet — the stream that last touched it is still busy.', 8, H - 22);
+    ctx.fillText('Call torch.cuda.synchronize() (or record_stream) to release them.', 8, H - 8);
+
+    // KPIs
+    for (let s=0; s<STREAMS; s++){
+      const live = state[s].pool.filter(b=>b.active).length;
+      const total = state[s].pool.length;
+      $('ps-s'+s).textContent = live + ' / ' + total;
+    }
+    const held = state.reduce((a,st)=>a + st.pool.filter(b=>b.held).length, 0);
+    $('ps-held').textContent = held;
+  }
+
+  $('ps-a0').addEventListener('click', () => alloc(0));
+  $('ps-a1').addEventListener('click', () => alloc(1));
+  $('ps-a2').addEventListener('click', () => alloc(2));
+  $('ps-f0').addEventListener('click', () => freeOnStream(0));
+  $('ps-f1').addEventListener('click', () => freeOnStream(1));
+  $('ps-sync').addEventListener('click', syncAll);
+  $('ps-reset').addEventListener('click', reset);
+  window.addEventListener('resize', render);
+
+  // gentle redraw for the pulsing kernel indicator
+  function loop(){ render(); requestAnimationFrame(loop); }
+  loop();
+})();
+</script>
+
+</body>
+</html>

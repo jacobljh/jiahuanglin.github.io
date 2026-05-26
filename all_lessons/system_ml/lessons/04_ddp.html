@@ -1,0 +1,864 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>04 · Data parallel (DDP)</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">04 · data parallel</span>
+    <span class="step-pill">lesson 4 / 19</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Data parallel — the simplest fan-out</h1>
+<p class="subtitle">Every rank holds the full model. Every rank gets a different micro-batch. The only collective is one AllReduce of gradients per step. The whole lesson is how that AllReduce hides behind backward.</p>
+
+<h2>The setup in one paragraph</h2>
+
+<p>Pick <span class="math">N</span> GPUs. Replicate the model on each one. Split your effective batch <span class="math">B</span> into <span class="math">N</span> micro-batches of size <span class="math">B/N</span>. Each rank does forward + backward on its own micro-batch independently — no communication. At the end of backward, each rank holds <em>its own</em> local gradient. To match the math of single-GPU SGD with batch <span class="math">B</span>, we need every rank to step on the <em>average</em> gradient:</p>
+
+<div class="math block">
+  g_global &nbsp;=&nbsp; (1/N) · Σ<sub>i</sub> g_local<sup>(i)</sup>
+</div>
+
+<p>That averaging is one AllReduce. The optimizer step is rank-local: every rank has the same averaged gradient, the same weights, and a deterministic optimizer, so they all arrive at the same post-step weights. Lockstep, no drift.</p>
+
+<div class="callout">
+  <div class="label">A subtle correctness detail</div>
+  AllReduce with op=SUM is exact (floating-point associativity issues aside). To get an <em>average</em>, you can either AllReduce + divide locally, or AllReduce with op=AVG (NCCL supports it). In practice NCCL does sum-then-divide; the tiny non-associativity error is bounded and ignored. RNG also matters: dropout, sampling, and so on must be seeded the same per rank if you want deterministic forward results across replicas (PyTorch's <code>DistributedSampler</code> shards data indices per rank but doesn't manage per-op RNG state — handle that yourself when correctness depends on it).
+</div>
+
+<h2>2D · the lockstep, four ranks sharing gradients</h2>
+
+<p>Four ranks, each holding the full model. They forward and backward on different data. Then, an animated AllReduce sweeps gradients into an average and broadcasts that average back. At the end of one step, every rank is back in sync. Watch the "diverged" indicator turn green at the AllReduce moment.</p>
+
+<div class="widget" id="lock-widget">
+  <div class="title">DDP lockstep · forward → backward → AllReduce → step</div>
+  <div class="hint">Each rank box shows: W (weights), G (local gradient). Different shades on G represent local-gradient values. After AllReduce, all G's converge to the average (orange).</div>
+
+  <div class="controls">
+    <button id="lk-play" class="primary">▶ play</button>
+    <button id="lk-step">step ▷</button>
+    <button id="lk-reset">⟲ reset</button>
+    <label class="inline">N ranks: <input type="range" id="lk-N" min="2" max="8" step="1" value="4"> <span class="val" id="lk-N-v">4</span></label>
+    <label class="inline">speed: <input type="range" id="lk-spd" min="1" max="10" step="1" value="3"> <span class="val" id="lk-spd-v">3×</span></label>
+  </div>
+
+  <canvas id="lk-canvas" width="760" height="320" style="width:100%; height:320px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">phase</div><div class="v" id="lk-ph" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">ranks agree on G?</div><div class="v" id="lk-ag" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">ranks agree on W?</div><div class="v" id="lk-aw" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">collective active</div><div class="v" id="lk-co" style="font-size:14px;">—</div></div>
+  </div>
+</div>
+
+<h2>The basic cost, before any tricks</h2>
+
+<p>Per step: one AllReduce of all gradients. Gradients are <span class="math">bf16</span>, so volume per rank moved through the ring is:</p>
+
+<div class="math block">
+  bytes_per_step &nbsp;=&nbsp; 2 · (N − 1)/N · |params| · 2  &nbsp;≈&nbsp; 4 · |params|  (large N)
+</div>
+
+<p>For a 7B model: <span class="math">~28 GB</span> per rank per step. At intra-node ring bandwidth of ~150 GB/s (effective, well below the NVLink peak because NCCL serialises ring steps): <span class="math">~190 ms</span>. Step time on a 7B forward+backward at batch 4 × sequence 4k is roughly 100 ms. So an unhidden AllReduce <strong>doubles</strong> the step time. Hidden behind backward — see below — it costs essentially nothing.</p>
+
+<h2>The overlap trick (the real lesson)</h2>
+
+<p>Gradients become available <em>during</em> backward, not after it. Backward proceeds layer by layer from the loss backward to the input: layer <span class="math">L</span>'s gradient is computed first, then <span class="math">L-1</span>, then <span class="math">L-2</span>, …, then layer 0. Each layer's gradient takes some compute time to materialise.</p>
+
+<p>Naive approach: wait for <em>all</em> gradients, then AllReduce the whole flat buffer. Wall-clock = <span class="math">T_bwd + T_ar</span>.</p>
+
+<p>Overlap approach: as soon as a layer's gradient is ready, fire its AllReduce <em>now</em> on a separate CUDA stream. The main stream continues computing earlier layers' gradients. NCCL's collective runs concurrently with the compute kernels:</p>
+
+<pre><code>main stream:    [bwd L=80] [bwd L=79] [bwd L=78] ...  [bwd L=1]
+nccl stream:                [AR L=80]  [AR L=79]  ...  [AR L=2] [AR L=1]
+                            ↑ fires when L=80 grad is ready
+</code></pre>
+
+<p>If the AllReduce of layer L finishes before backward of layer L-1 finishes, the comm is free. If it doesn't, the gap is exposed and counts. The condition for "free" is:</p>
+
+<div class="math block">
+  T<sub>AR</sub>(layer) &nbsp;≤&nbsp; T<sub>bwd</sub>(earlier layers since AR fired)
+</div>
+
+<p>For inter-node DDP on a large model, this usually holds layer-by-layer if backward is bandwidth-rich enough; for intra-node DDP on a small model, it usually does <em>not</em>, because there's almost no compute to hide behind. The right thing in either case is to <em>bucket</em>.</p>
+
+<h2>Bucketing — the size knob you'll actually tune</h2>
+
+<p>Per-tensor AllReduce has a per-message latency floor (NCCL launch overhead ≈ tens of microseconds). If you fire one AllReduce per layer, on a 100-layer model that's 100 × tens-of-μs = milliseconds of latency tax, before any bytes flow. So we bundle <em>consecutive layers' gradients</em> into a flat bucket, and AllReduce the bucket as a unit.</p>
+
+<p>Two competing pressures:</p>
+
+<ul>
+  <li><strong>Bigger buckets</strong> → fewer NCCL launches, higher effective bandwidth (the asymptotic ring rate kicks in), less latency tax.</li>
+  <li><strong>Smaller buckets</strong> → AllReduce can start earlier in backward (you don't wait for many layers to fill a big bucket), so there's more compute left to hide behind.</li>
+</ul>
+
+<p>PyTorch DDP's default bucket size is 25 MB. The right value depends on bandwidth, message-latency, and model layer-count; it's a one-line constructor knob (<code>bucket_cap_mb</code>) and you can profile to find your sweet spot. The widget below makes the tradeoff visible.</p>
+
+<h2>Animated · backward + bucketed AllReduce, scrubbable</h2>
+
+<p>Same idea as the simulator below, but you can <em>see</em> it. The top lane is backward compute proceeding layer-by-layer from L-1 down to 0. The bottom lane is the NCCL stream; as each bucket fills, an AllReduce fires. Press play, then drag the bucket-size slider while it's playing — watch the orange bars resize and reposition in real time.</p>
+
+<div class="widget" id="ovl-widget">
+  <div class="title">Backward + AllReduce overlap timeline · play and tune buckets</div>
+  <div class="hint">When a layer's gradient is ready, it's appended to the current bucket. Bucket flushes (AllReduces) when it exceeds <em>bucket size</em>. Exposed comm (red shading) is wall-clock you pay over backward time.</div>
+
+  <div class="controls">
+    <button id="ov-play" class="primary">▶ play</button>
+    <button id="ov-reset">⟲ reset</button>
+    <label class="inline">bucket (MB): <input type="range" id="ov-bk" min="1" max="2000" step="5" value="100"> <span class="val" id="ov-bk-v">100</span></label>
+    <label class="inline">layers: <input type="range" id="ov-L" min="8" max="80" step="2" value="32"> <span class="val" id="ov-L-v">32</span></label>
+    <label class="inline">speed: <input type="range" id="ov-spd" min="1" max="10" step="1" value="4"> <span class="val" id="ov-spd-v">4×</span></label>
+  </div>
+
+  <canvas id="ov-canvas" width="760" height="280" style="width:100%; height:280px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">step time</div><div class="v" id="ov-tt">—</div></div>
+    <div class="kpi"><div class="k">backward time</div><div class="v" id="ov-tb">—</div></div>
+    <div class="kpi"><div class="k">exposed comm</div><div class="v" id="ov-te">—</div></div>
+    <div class="kpi"><div class="k">scaling efficiency</div><div class="v" id="ov-se">—</div></div>
+  </div>
+</div>
+
+<h2>What "scaling efficiency" really measures</h2>
+
+<p>Scaling efficiency = throughput at <span class="math">N</span> GPUs / (<span class="math">N</span> × throughput at 1 GPU). 100% is impossible — there's always some unhidden communication. 95% is excellent. 80% is mediocre. Below 70% means you should look hard at:</p>
+
+<ul>
+  <li>NCCL bucket size (above).</li>
+  <li>Whether AllReduce is on a separate stream and overlapping (an <code>nsys</code> profile will show NCCL on a different stream than compute).</li>
+  <li>Whether some ranks are stragglers (per-rank step time should be flat ± 1%).</li>
+  <li>Whether you're inter-node DDP on a model that should have been FSDP or 3D-parallel.</li>
+</ul>
+
+<h2>2D · step time vs bucket size — find the sweet spot</h2>
+
+<p>The same simulator the timeline above ran, swept across all bucket sizes from 1 MB to 2 GB. The curve is non-monotonic: too small → latency tax dominates (many tiny AllReduces, each paying α launch overhead); too large → one big AllReduce at the end of backward with no overlap. The valley between is your bucket-size choice. The vertical line shows where PyTorch's 25 MB default lands; drag the inputs to see the valley shift.</p>
+
+<div class="widget" id="sw-widget">
+  <div class="title">Bucket sweep · the step-time valley</div>
+  <div class="hint">Each x is a bucket size; each y is the simulated total step time. The minimum is the sweet spot; defaults are decent but profiling can find a 5–15% improvement.</div>
+
+  <div class="controls">
+    <label class="inline">layers: <input type="range" id="sw-L" min="8" max="120" step="2" value="32"> <span class="val" id="sw-L-v">32</span></label>
+    <label class="inline">per-layer bwd (ms): <input type="range" id="sw-tl" min="1" max="50" step="1" value="6"> <span class="val" id="sw-tl-v">6</span></label>
+    <label class="inline">params/layer (MB): <input type="range" id="sw-sl" min="10" max="800" step="10" value="200"> <span class="val" id="sw-sl-v">200</span></label>
+    <label class="inline">BW (GB/s): <input type="range" id="sw-bw" min="20" max="300" step="10" value="150"> <span class="val" id="sw-bw-v">150</span></label>
+    <label class="inline">α (μs): <input type="range" id="sw-al" min="5" max="500" step="5" value="30"> <span class="val" id="sw-al-v">30</span></label>
+  </div>
+
+  <canvas id="sw-canvas" width="760" height="280" style="width:100%; height:280px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">optimal bucket</div><div class="v" id="sw-opt" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">optimal step time</div><div class="v" id="sw-tmin">—</div></div>
+    <div class="kpi"><div class="k">default (25 MB) step time</div><div class="v" id="sw-tdef">—</div></div>
+    <div class="kpi"><div class="k">gap vs optimal</div><div class="v" id="sw-gap" style="font-size:14px;">—</div></div>
+  </div>
+</div>
+
+<h2>Gradient accumulation — fewer AllReduces, smaller effective batch per micro-step</h2>
+
+<p>If your effective batch is too small to be compute-bound (think tiny per-GPU batch on a small model), you can do <span class="math">K</span> backward passes <em>without</em> sync, accumulating gradients on each rank locally, and only AllReduce on the <span class="math">K</span>-th. PyTorch's <code>no_sync()</code> context manager does this:</p>
+
+<pre><code>for k in range(K - 1):
+    with model.no_sync():
+        loss = forward(model, micro_batch_k); loss.backward()
+loss = forward(model, micro_batch_K); loss.backward()  # this one syncs
+optimizer.step()</code></pre>
+
+<p>This reduces AllReduce frequency by <span class="math">K×</span>, lets each rank see effectively <span class="math">K · B/N</span> tokens per step, and gives a numerically equivalent (modulo precision) gradient to running batch <span class="math">B · K</span>. The cost is <span class="math">K</span> backward passes' worth of activations on each rank — unless you activation-checkpoint.</p>
+
+<h2>The wall DDP eventually hits</h2>
+
+<p>DDP scales <em>throughput</em> linearly with GPUs (in the overlap regime), but each rank still holds the full model state. Recall lesson 01: a 70B model takes 1.1 TB of training state per rank under Adam. No amount of DDP fixes that — every rank has its own copy. <strong>DDP cannot solve the memory wall.</strong> When you hit it, the response is FSDP / ZeRO (lesson 05), which shards the state across ranks at the cost of more communication.</p>
+
+<p>DDP is also unkind to inter-node bandwidth when scaled large: 4 · params bytes per step, all crossing the ring. At 1000 GPUs and a 7B model, the AllReduce still asymptotes to ~28 GB per rank but the per-link load on a flat ring grows. NCCL's hierarchical AllReduce (lesson 02) saves you there.</p>
+
+<div class="callout warn">
+  <div class="label">When DDP "stops working"</div>
+  <ol>
+    <li>The model state doesn't fit on one rank → use FSDP / ZeRO instead.</li>
+    <li>You can't hide the AllReduce behind backward → check bucket size, check whether you should have been FSDP-HSDP.</li>
+    <li>The AllReduce dominates the inter-node link → use HSDP or compose with PP across nodes.</li>
+  </ol>
+</div>
+
+<h2>Interactive · bucket size and overlap</h2>
+
+<p>One pane shows a simulated backward: layer-by-layer compute (blue) and the corresponding AllReduce (orange) on a separate stream. With a small bucket size, you see many small AllReduces — high latency tax. With a huge bucket size, you see one big AllReduce that fires only after backward is essentially done — no overlap. The sweet spot is in between. The KPIs show total step time, exposed comm, and effective scaling efficiency.</p>
+
+<div class="widget" id="ddp-widget">
+  <div class="title">DDP step timeline · bucket size vs overlap</div>
+  <div class="hint">Each layer takes T_layer to backward. Each AllReduce takes α + S/BW where S is the bucket size. The orange bars are AllReduces fired on a separate stream; gaps after backward ends are <em>exposed comm</em> — pure overhead.</div>
+
+  <div class="controls">
+    <label class="inline">layers: <input type="range" id="d-L" min="8" max="120" step="2" value="32"> <span class="val" id="d-L-v">32</span></label>
+    <label class="inline">per-layer bwd (ms): <input type="range" id="d-tl" min="1" max="50" step="1" value="6"> <span class="val" id="d-tl-v">6</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline">params/layer (MB): <input type="range" id="d-sl" min="10" max="800" step="10" value="200"> <span class="val" id="d-sl-v">200</span></label>
+    <label class="inline">bucket size (MB): <input type="range" id="d-bk" min="1" max="2000" step="5" value="100"> <span class="val" id="d-bk-v">100</span></label>
+    <label class="inline">AllReduce BW (GB/s): <input type="range" id="d-bw" min="20" max="300" step="10" value="150"> <span class="val" id="d-bw-v">150</span></label>
+    <label class="inline">α (μs): <input type="range" id="d-al" min="5" max="500" step="5" value="30"> <span class="val" id="d-al-v">30</span></label>
+  </div>
+
+  <canvas class="dist-canvas" id="d-canvas" width="760" height="220" style="height: 220px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">backward time</div><div class="v" id="d-tb">—</div></div>
+    <div class="kpi"><div class="k">comm time</div><div class="v" id="d-tc">—</div></div>
+    <div class="kpi"><div class="k">exposed comm</div><div class="v" id="d-te">—</div></div>
+    <div class="kpi"><div class="k">scaling efficiency</div><div class="v" id="d-se">—</div></div>
+  </div>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  DDP is a one-AllReduce-per-step strategy that scales linearly until you hit either the memory wall (parameters won't replicate) or the inter-node link (AllReduce can't be hidden). Both walls are real and both are addressed by the lessons ahead — FSDP for the first, hierarchical/HSDP for the second.
+</div>
+
+<footer class="lesson-nav">
+  <a href="03_interconnect.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">03 · Interconnect</span>
+  </a>
+  <a class="next" href="05_fsdp.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">05 · FSDP / ZeRO</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const get = id => document.getElementById(id);
+  const els = {
+    L:get('d-L'),Lv:get('d-L-v'),tl:get('d-tl'),tlv:get('d-tl-v'),
+    sl:get('d-sl'),slv:get('d-sl-v'),bk:get('d-bk'),bkv:get('d-bk-v'),
+    bw:get('d-bw'),bwv:get('d-bw-v'),al:get('d-al'),alv:get('d-al-v'),
+    canvas:get('d-canvas'),
+    tb:get('d-tb'),tc:get('d-tc'),te:get('d-te'),se:get('d-se')
+  };
+  const ctx = els.canvas.getContext('2d');
+
+  function compute(){
+    const L  = parseInt(els.L.value);
+    const tl = parseInt(els.tl.value);
+    const sl = parseInt(els.sl.value);
+    const bk = parseInt(els.bk.value);
+    const bw = parseInt(els.bw.value);
+    const al = parseInt(els.al.value);
+
+    els.Lv.textContent=L; els.tlv.textContent=tl; els.slv.textContent=sl;
+    els.bkv.textContent=bk; els.bwv.textContent=bw; els.alv.textContent=al;
+
+    let comm_ready_at = 0;
+    let bucket_mb = 0;
+    let bucket_ready_at = 0;
+    let total_comm = 0;
+    let exposed_comm = 0;
+    const layerBars = [];
+    const arBars = [];
+    let cur_t = 0;
+    for (let i = L - 1; i >= 0; i--){
+      const start = cur_t;
+      const end = cur_t + tl;
+      layerBars.push({ start, end, idx: i });
+      cur_t = end;
+      bucket_mb += sl;
+      bucket_ready_at = end;
+      if (bucket_mb >= bk || i === 0){
+        const ar_dur = al/1000 + bucket_mb / bw;
+        const ar_start = Math.max(bucket_ready_at, comm_ready_at);
+        const ar_end = ar_start + ar_dur;
+        arBars.push({ start: ar_start, end: ar_end, mb: bucket_mb });
+        total_comm += ar_dur;
+        comm_ready_at = ar_end;
+        bucket_mb = 0;
+      }
+    }
+    const t_bwd = cur_t;
+    const t_total = Math.max(t_bwd, comm_ready_at);
+    exposed_comm = Math.max(0, comm_ready_at - t_bwd);
+
+    const eff = t_bwd / t_total;
+
+    els.tb.textContent = t_bwd.toFixed(1) + ' ms';
+    els.tc.textContent = total_comm.toFixed(1) + ' ms';
+    els.te.textContent = exposed_comm.toFixed(2) + ' ms';
+    els.se.textContent = (eff * 100).toFixed(1) + '%';
+
+    return { layerBars, arBars, t_total };
+  }
+
+  function render(){
+    const { layerBars, arBars, t_total } = compute();
+    const dpr = window.devicePixelRatio || 1;
+    const W = els.canvas.clientWidth, H = els.canvas.clientHeight;
+    if (els.canvas.width !== Math.round(W*dpr)){
+      els.canvas.width = Math.round(W*dpr);
+      els.canvas.height = Math.round(H*dpr);
+    }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 80, padR = 12, padT = 18, padB = 24;
+    const innerW = W - padL - padR;
+    const xPerMs = innerW / Math.max(1, t_total);
+
+    const rowY1 = padT + 20;
+    const rowY2 = padT + 80;
+    const rowH  = 26;
+
+    ctx.fillStyle = '#5b6573';
+    ctx.font = '11px monospace';
+    ctx.fillText('compute stream (backward)', 4, rowY1 + 16);
+    ctx.fillText('nccl stream (AllReduce)',     4, rowY2 + 16);
+
+    ctx.strokeStyle = '#dde2ea';
+    [rowY1+rowH+2, rowY2+rowH+2].forEach(y => {
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + innerW, y); ctx.stroke();
+    });
+
+    ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+    const ticks = 5;
+    for (let i = 0; i <= ticks; i++){
+      const ms = i * t_total / ticks;
+      const x = padL + ms * xPerMs;
+      ctx.fillText(ms.toFixed(0) + ' ms', x - 12, H - 8);
+      ctx.beginPath(); ctx.moveTo(x, H - padB); ctx.lineTo(x, H - padB - 4); ctx.stroke();
+    }
+
+    layerBars.forEach(b => {
+      const x = padL + b.start * xPerMs;
+      const w = (b.end - b.start) * xPerMs;
+      ctx.fillStyle = '#2563eb';
+      ctx.fillRect(x, rowY1, Math.max(1, w), rowH);
+    });
+
+    arBars.forEach(b => {
+      const x = padL + b.start * xPerMs;
+      const w = (b.end - b.start) * xPerMs;
+      ctx.fillStyle = '#d97706';
+      ctx.fillRect(x, rowY2, Math.max(1, w), rowH);
+    });
+
+    const bwd_end = Math.max(...layerBars.map(b=>b.end));
+    const ar_end  = arBars.length ? Math.max(...arBars.map(b=>b.end)) : 0;
+    if (ar_end > bwd_end){
+      ctx.fillStyle = 'rgba(255,122,144,0.18)';
+      ctx.fillRect(padL + bwd_end * xPerMs, padT, (ar_end - bwd_end) * xPerMs, rowY2 + rowH - padT);
+      ctx.fillStyle = '#dc2626'; ctx.font = '11px monospace';
+      ctx.fillText('exposed', padL + bwd_end * xPerMs + 4, padT + 10);
+    }
+  }
+
+  ['input','change'].forEach(ev=>{
+    [els.L,els.tl,els.sl,els.bk,els.bw,els.al].forEach(el=>el.addEventListener(ev,render));
+  });
+  window.addEventListener('resize',render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: DDP lockstep · 2D rank grid with gradient sync animation ───
+ * N ranks (boxes), each with W and G compartments. Stepping through phases:
+ *  0. initial (all W equal, G empty)
+ *  1. forward
+ *  2. backward (G filled with rank-distinct values)
+ *  3. AllReduce starts (arrows fly out)
+ *  4. AllReduce ends (G averaged = same orange everywhere)
+ *  5. step (W updated, slightly darker)
+ *  6. back to (1) for next step
+ */
+(function(){
+  const C  = document.getElementById('lk-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  let N = 4;
+  let phase = 0; // 0..5 across a step
+  let subProg = 0;
+  let playing = false, lastTs = 0, speed = 3;
+
+  $('lk-N').addEventListener('input', e=>{ N = +e.target.value; $('lk-N-v').textContent = N; phase = 0; subProg = 0; render(); });
+  $('lk-spd').addEventListener('input', e=>{ speed = +e.target.value; $('lk-spd-v').textContent = speed+'×'; });
+
+  $('lk-play').addEventListener('click', ()=>{
+    playing = !playing;
+    $('lk-play').textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastTs = performance.now(); requestAnimationFrame(tick); }
+  });
+  $('lk-step').addEventListener('click', ()=>{
+    phase = (phase + 1) % 6; subProg = 0; render();
+  });
+  $('lk-reset').addEventListener('click', ()=>{
+    phase = 0; subProg = 0; playing = false; $('lk-play').textContent='▶ play'; render();
+  });
+
+  function tick(ts){
+    if (!playing) return;
+    const dt = (ts - lastTs) / 1000; lastTs = ts;
+    subProg += dt * 0.5 * speed;
+    if (subProg >= 1){ subProg = 0; phase = (phase + 1) % 6; }
+    render();
+    if (playing) requestAnimationFrame(tick);
+  }
+
+  function phaseName(p){
+    return ['idle','forward','backward','AllReduce','step','synced'][p];
+  }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 20, padR = 20, padT = 30, padB = 40;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+    const colW = innerW / N;
+
+    // Title bar
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('phase: '+phaseName(phase)+(playing?' · running':''), padL, padT - 8);
+
+    // Each rank box
+    const COLORS = ['#2563eb','#d97706','#16a34a','#7c3aed','#dc2626','#3b82f6','#f59e0b','#16a34a'];
+    const SUM = '#fbbf24';
+
+    // Determine state of G per rank
+    let g_state = null;
+    let g_alpha = 1;
+    if (phase === 0 || phase === 1){
+      g_state = 'empty';
+    } else if (phase === 2){
+      g_state = 'local';
+      g_alpha = subProg;
+    } else if (phase === 3){
+      g_state = 'local-fading'; // AllReduce animating
+    } else if (phase === 4){
+      g_state = 'averaged';
+    } else if (phase === 5){
+      g_state = 'averaged';
+    }
+
+    // For each rank
+    const rcs = [];
+    for (let r=0; r<N; r++){
+      const x = padL + r*colW + 6;
+      const y = padT + 20;
+      const w = colW - 12;
+      const h = innerH - 40;
+      rcs.push({x, y, w, h});
+
+      // background box
+      ctx.fillStyle = '#f7f8fa';
+      ctx.fillRect(x, y, w, h);
+      ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+      ctx.strokeRect(x, y, w, h);
+      ctx.fillStyle = '#5b6573'; ctx.font = 'bold 11px monospace';
+      ctx.fillText('rank '+r, x + 6, y - 4);
+
+      // W compartment
+      const wH = h * 0.4;
+      const wColor = phase >= 5 ? '#3b82f6' : '#2563eb';
+      ctx.fillStyle = wColor;
+      ctx.fillRect(x + 4, y + 4, w - 8, wH - 8);
+      ctx.fillStyle = '#ffffff'; ctx.font = 'bold 12px monospace'; ctx.textAlign='center';
+      ctx.fillText('W', x + w/2, y + wH/2 + 4);
+      ctx.textAlign = 'left';
+
+      // G compartment
+      const gY = y + wH;
+      const gH = h - wH;
+      ctx.fillStyle = '#f1f3f7';
+      ctx.fillRect(x + 4, gY + 4, w - 8, gH - 8);
+
+      if (g_state === 'local' || g_state === 'local-fading'){
+        const fill = g_state === 'local' ? g_alpha : (1 - subProg);
+        ctx.globalAlpha = fill;
+        ctx.fillStyle = COLORS[r % COLORS.length];
+        ctx.fillRect(x + 4, gY + 4, w - 8, gH - 8);
+        ctx.globalAlpha = 1;
+      }
+      if (g_state === 'local-fading'){
+        ctx.globalAlpha = subProg;
+        ctx.fillStyle = SUM;
+        ctx.fillRect(x + 4, gY + 4, w - 8, gH - 8);
+        ctx.globalAlpha = 1;
+      }
+      if (g_state === 'averaged'){
+        ctx.fillStyle = SUM;
+        ctx.fillRect(x + 4, gY + 4, w - 8, gH - 8);
+      }
+      ctx.fillStyle = '#ffffff'; ctx.font = 'bold 12px monospace'; ctx.textAlign='center';
+      ctx.fillText('G' + (g_state === 'averaged' ? ' = avg' : g_state === 'empty' ? ' = ∅' : ''),
+        x + w/2, gY + gH/2 + 4);
+      ctx.textAlign = 'left';
+    }
+
+    // AllReduce arrows (between rank columns) during phase 3
+    if (phase === 3){
+      ctx.strokeStyle = SUM; ctx.lineWidth = 2; ctx.globalAlpha = 0.7;
+      const yArr = padT + 20 + innerH * 0.55;
+      for (let r=0; r<N-1; r++){
+        const a = rcs[r], b = rcs[r+1];
+        const x0 = a.x + a.w, x1 = b.x;
+        const dx = x1 - x0;
+        const xm = x0 + dx * subProg;
+        ctx.beginPath();
+        ctx.moveTo(x0, yArr);
+        ctx.lineTo(xm, yArr);
+        ctx.stroke();
+        // arrowhead
+        ctx.fillStyle = SUM;
+        ctx.beginPath();
+        ctx.moveTo(xm, yArr);
+        ctx.lineTo(xm-6, yArr-4);
+        ctx.lineTo(xm-6, yArr+4);
+        ctx.closePath(); ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // Bottom info row
+    ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+    ctx.fillText('W = weights; G = gradient buffer (per-rank during backward, averaged after AllReduce)', padL, H - 14);
+
+    // KPIs
+    $('lk-ph').textContent = phaseName(phase);
+    const gAgree = (phase === 0 || phase === 1 || phase === 4 || phase === 5);
+    const wAgree = true;
+    $('lk-ag').textContent = gAgree ? 'yes' : 'no (diverged)';
+    $('lk-ag').style.color = gAgree ? '#16a34a' : '#dc2626';
+    $('lk-aw').textContent = 'yes';
+    $('lk-aw').style.color = '#16a34a';
+    $('lk-co').textContent = phase === 3 ? 'AllReduce' : '—';
+  }
+
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: animated DDP overlap timeline (live) ───
+ * Plays the layer-by-layer backward with bucketed AllReduce. Like the simulator,
+ * but the playhead sweeps left to right and we can change bucket size live.
+ */
+(function(){
+  const C = document.getElementById('ov-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+
+  let bucket_mb = 100, L = 32;
+  const TL = 6;             // ms per layer (fixed)
+  const sl = 200;           // params per layer in MB (fixed for animation)
+  const bw_gbs = 150;       // GB/s
+  const al_us = 30;         // μs
+  let playhead_ms = 0;
+  let playing = false, speed = 4, lastTs = 0;
+
+  $('ov-bk').addEventListener('input', e=>{ bucket_mb = +e.target.value; $('ov-bk-v').textContent = bucket_mb; render(); });
+  $('ov-L').addEventListener('input', e=>{ L = +e.target.value; $('ov-L-v').textContent = L; render(); });
+  $('ov-spd').addEventListener('input', e=>{ speed = +e.target.value; $('ov-spd-v').textContent = speed+'×'; });
+
+  $('ov-play').addEventListener('click', ()=>{
+    playing = !playing;
+    $('ov-play').textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ if (playhead_ms >= simulate().t_total) playhead_ms = 0; lastTs = performance.now(); requestAnimationFrame(tick); }
+  });
+  $('ov-reset').addEventListener('click', ()=>{
+    playhead_ms = 0; playing = false; $('ov-play').textContent = '▶ play'; render();
+  });
+
+  function tick(ts){
+    if (!playing) return;
+    const dt = (ts - lastTs); lastTs = ts;
+    playhead_ms += dt * speed * 0.05;
+    const sim = simulate();
+    if (playhead_ms >= sim.t_total){
+      playhead_ms = sim.t_total; playing = false; $('ov-play').textContent = '▶ play';
+    }
+    render();
+    if (playing) requestAnimationFrame(tick);
+  }
+
+  function simulate(){
+    let bucket_acc = 0;
+    let bucket_ready_at = 0;
+    let comm_ready_at = 0;
+    let cur_t = 0;
+    const layers = [];
+    const ars = [];
+    for (let i = L - 1; i >= 0; i--){
+      const start = cur_t, end = cur_t + TL;
+      layers.push({ start, end, idx: i });
+      cur_t = end;
+      bucket_acc += sl;
+      bucket_ready_at = end;
+      if (bucket_acc >= bucket_mb || i === 0){
+        const ar_dur = al_us/1000 + bucket_acc / bw_gbs;
+        const ar_start = Math.max(bucket_ready_at, comm_ready_at);
+        const ar_end = ar_start + ar_dur;
+        ars.push({ start: ar_start, end: ar_end, mb: bucket_acc });
+        comm_ready_at = ar_end;
+        bucket_acc = 0;
+      }
+    }
+    const t_bwd = cur_t;
+    const t_total = Math.max(t_bwd, comm_ready_at);
+    const exposed = Math.max(0, comm_ready_at - t_bwd);
+    return { layers, ars, t_bwd, t_total, exposed, eff: t_bwd / t_total };
+  }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const sim = simulate();
+    const padL = 100, padR = 20, padT = 24, padB = 28;
+    const innerW = W - padL - padR;
+    const xPerMs = innerW / Math.max(1, sim.t_total);
+
+    const rowY1 = padT + 10;
+    const rowY2 = padT + 90;
+    const rowH = 36;
+
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('compute (backward)', 4, rowY1 + 22);
+    ctx.fillText('nccl (AllReduce)', 4, rowY2 + 22);
+
+    // Layer bars (compute stream)
+    sim.layers.forEach(b => {
+      const x = padL + b.start * xPerMs;
+      const w = Math.max(1, (b.end - b.start) * xPerMs);
+      const shown = playhead_ms >= b.end;
+      const partial = !shown && playhead_ms > b.start;
+      ctx.fillStyle = '#2563eb';
+      ctx.globalAlpha = shown ? 1 : partial ? 0.7 : 0.15;
+      if (partial){
+        const w2 = (playhead_ms - b.start) * xPerMs;
+        ctx.fillRect(x, rowY1, Math.max(1, w2), rowH);
+      } else {
+        ctx.fillRect(x, rowY1, w, rowH);
+      }
+      ctx.globalAlpha = 1;
+      // layer index label (tiny)
+      ctx.fillStyle = '#ffffff'; ctx.font = '9px monospace';
+      if (w > 14) ctx.fillText('L'+b.idx, x + 3, rowY1 + 14);
+    });
+
+    // AR bars (nccl stream)
+    sim.ars.forEach(b => {
+      const x = padL + b.start * xPerMs;
+      const w = Math.max(1, (b.end - b.start) * xPerMs);
+      const shown = playhead_ms >= b.end;
+      const partial = !shown && playhead_ms > b.start;
+      ctx.fillStyle = '#d97706';
+      ctx.globalAlpha = shown ? 1 : partial ? 0.7 : 0.15;
+      if (partial){
+        const w2 = (playhead_ms - b.start) * xPerMs;
+        ctx.fillRect(x, rowY2, Math.max(1, w2), rowH);
+      } else {
+        ctx.fillRect(x, rowY2, w, rowH);
+      }
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#ffffff'; ctx.font = '9px monospace';
+      if (w > 30) ctx.fillText(b.mb+' MB', x + 3, rowY2 + 14);
+    });
+
+    // Exposed comm region
+    if (sim.exposed > 0){
+      const x0 = padL + sim.t_bwd * xPerMs;
+      const w = sim.exposed * xPerMs;
+      ctx.fillStyle = 'rgba(255, 122, 144, 0.18)';
+      ctx.fillRect(x0, rowY1, w, rowY2 + rowH - rowY1);
+      ctx.fillStyle = '#dc2626'; ctx.font = '11px monospace';
+      ctx.fillText('exposed comm', x0 + 4, rowY1 - 6);
+    }
+
+    // Playhead
+    const xPh = padL + playhead_ms * xPerMs;
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(xPh, padT); ctx.lineTo(xPh, rowY2 + rowH + 6); ctx.stroke();
+
+    // x-axis ticks
+    ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+    const ticks = 5;
+    for (let i=0; i<=ticks; i++){
+      const ms = i * sim.t_total / ticks;
+      const x = padL + ms * xPerMs;
+      ctx.fillText(ms.toFixed(0) + ' ms', x - 12, H - 10);
+    }
+
+    // KPIs
+    $('ov-tt').textContent = sim.t_total.toFixed(1) + ' ms';
+    $('ov-tb').textContent = sim.t_bwd.toFixed(1) + ' ms';
+    $('ov-te').textContent = sim.exposed.toFixed(2) + ' ms';
+    $('ov-se').textContent = (sim.eff * 100).toFixed(1) + '%';
+  }
+
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: bucket-size sweep · step-time valley ───
+ * Sweep bucket_mb across a wide range, plot step time. Mark minimum and 25 MB default.
+ */
+(function(){
+  const C  = document.getElementById('sw-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+
+  let L = 32, TL = 6, sl = 200, BW = 150, AL = 30;
+  $('sw-L').addEventListener('input',  e => { L = +e.target.value; $('sw-L-v').textContent = L; render(); });
+  $('sw-tl').addEventListener('input', e => { TL = +e.target.value; $('sw-tl-v').textContent = TL; render(); });
+  $('sw-sl').addEventListener('input', e => { sl = +e.target.value; $('sw-sl-v').textContent = sl; render(); });
+  $('sw-bw').addEventListener('input', e => { BW = +e.target.value; $('sw-bw-v').textContent = BW; render(); });
+  $('sw-al').addEventListener('input', e => { AL = +e.target.value; $('sw-al-v').textContent = AL; render(); });
+
+  function stepTime(bucket_mb){
+    let bucket_acc = 0;
+    let bucket_ready_at = 0;
+    let comm_ready_at = 0;
+    let cur_t = 0;
+    for (let i = L - 1; i >= 0; i--){
+      cur_t += TL;
+      bucket_acc += sl;
+      bucket_ready_at = cur_t;
+      if (bucket_acc >= bucket_mb || i === 0){
+        const ar_dur = AL/1000 + bucket_acc / BW;
+        const ar_start = Math.max(bucket_ready_at, comm_ready_at);
+        comm_ready_at = ar_start + ar_dur;
+        bucket_acc = 0;
+      }
+    }
+    const t_bwd = cur_t;
+    return Math.max(t_bwd, comm_ready_at);
+  }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    // x: log-spaced bucket sizes from 1 to 2000 MB
+    const xs = [];
+    for (let logX = 0; logX <= 3.3; logX += 0.03){
+      xs.push(Math.pow(10, logX));
+    }
+    const ys = xs.map(stepTime);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+    const minIdx = ys.indexOf(minY);
+    const minX = xs[minIdx];
+
+    const padL = 60, padR = 20, padT = 24, padB = 36;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+    const xMin = 1, xMax = 2000;
+    const xToPx = (mb) => padL + (Math.log10(mb) - Math.log10(xMin)) / (Math.log10(xMax) - Math.log10(xMin)) * innerW;
+    const yToPx = (ms) => padT + innerH - (ms - minY*0.95) / (maxY*1.05 - minY*0.95) * innerH;
+
+    // axis
+    ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT+innerH); ctx.lineTo(padL+innerW, padT+innerH); ctx.stroke();
+
+    // x ticks (log decades)
+    ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+    [1, 10, 100, 1000].forEach(v => {
+      const x = xToPx(v);
+      ctx.fillText(v + ' MB', x - 14, padT + innerH + 14);
+      ctx.beginPath(); ctx.moveTo(x, padT+innerH); ctx.lineTo(x, padT+innerH+4); ctx.stroke();
+    });
+    // y ticks
+    for (let i=0; i<=4; i++){
+      const t = i/4;
+      const ms = minY*0.95 + t * (maxY*1.05 - minY*0.95);
+      const y = padT + innerH - t*innerH;
+      ctx.fillText(ms.toFixed(0)+' ms', 8, y+3);
+      ctx.strokeStyle = '#eef1f5';
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL+innerW, y); ctx.stroke();
+    }
+    // axis labels
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('bucket size (MB, log scale)', padL + innerW/2 - 80, H - 6);
+    ctx.save();
+    ctx.translate(14, padT + innerH/2 + 30);
+    ctx.rotate(-Math.PI/2);
+    ctx.fillText('step time (ms)', 0, 0);
+    ctx.restore();
+
+    // Curve
+    ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i=0; i<xs.length; i++){
+      const x = xToPx(xs[i]); const y = yToPx(ys[i]);
+      if (i===0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    // fill under
+    ctx.fillStyle = 'rgba(106,169,255,0.15)';
+    ctx.lineTo(padL+innerW, padT+innerH);
+    ctx.lineTo(padL, padT+innerH);
+    ctx.closePath(); ctx.fill();
+
+    // Minimum marker
+    const xm = xToPx(minX), ym = yToPx(minY);
+    ctx.fillStyle = '#16a34a';
+    ctx.beginPath(); ctx.arc(xm, ym, 6, 0, 2*Math.PI); ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#16a34a'; ctx.font = 'bold 11px monospace';
+    ctx.fillText('min ≈ '+minX.toFixed(0)+' MB · '+minY.toFixed(1)+' ms', xm + 10, ym - 8);
+
+    // 25 MB default marker
+    const xD = xToPx(25);
+    ctx.strokeStyle = '#d97706'; ctx.setLineDash([4,3]); ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(xD, padT); ctx.lineTo(xD, padT+innerH); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#d97706'; ctx.font = '11px monospace';
+    ctx.fillText('25 MB default', xD + 4, padT + 14);
+
+    // KPIs
+    const tDef = stepTime(25);
+    $('sw-opt').textContent = minX.toFixed(0) + ' MB';
+    $('sw-tmin').textContent = minY.toFixed(2) + ' ms';
+    $('sw-tdef').textContent = tDef.toFixed(2) + ' ms';
+    const gap = ((tDef - minY) / minY * 100);
+    $('sw-gap').textContent = gap < 0.5 ? '~optimal' : '+' + gap.toFixed(1) + '%';
+    $('sw-gap').style.color = gap < 5 ? '#16a34a' : '#d97706';
+  }
+
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

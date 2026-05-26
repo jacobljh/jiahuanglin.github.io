@@ -1,0 +1,862 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>16 · Custom kernels &amp; fusion</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">16 · kernels &amp; fusion</span>
+    <span class="step-pill">lesson 16 / 19</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Custom kernels &amp; fusion</h1>
+<p class="subtitle">Every kernel reads from HBM and writes to HBM. If two ops can share one HBM round-trip, you've doubled the effective bandwidth. The whole point of "custom kernels" is to find those pairs.</p>
+
+<h2>The kernel-call cost, expanded</h2>
+
+<p>From lesson 13 we know the framework pays a few microseconds of Python overhead per op. The <em>kernel</em> itself adds its own fixed costs on the GPU:</p>
+
+<ul>
+  <li><strong>Launch latency.</strong> Submitting work to the GPU takes ~1–2 μs on the device side, separate from the host-side Python tax. CUDA Graphs (lesson 19) is the cure.</li>
+  <li><strong>Input read.</strong> The kernel must read every input element from HBM into SRAM/registers.</li>
+  <li><strong>The compute.</strong> The actual arithmetic.</li>
+  <li><strong>Output write.</strong> The result goes back to HBM.</li>
+</ul>
+
+<p>For elementwise ops (add, ReLU, GELU, scaling), the compute is trivial: a few flops per element. Almost all the time is the HBM read + write. That's the <em>memory-bound regime</em> of the roofline (lesson 01). An elementwise op on a 1 GB tensor at H100 HBM bandwidth 3.35 TB/s takes ~0.3 ms just for input + output traffic.</p>
+
+<h2>Where fusion comes from</h2>
+
+<p>Now consider three ops in a row — say <code>y = (x + bias) * scale; z = relu(y)</code>. Eager mode runs this as three kernels:</p>
+
+<pre><code>kernel 1:  read x, read bias                      → write (x + bias)        ─ HBM round-trip 1
+kernel 2:  read (x + bias), read scale            → write y                  ─ HBM round-trip 2
+kernel 3:  read y                                 → write z                  ─ HBM round-trip 3
+</code></pre>
+
+<p>For an <span class="math">N</span>-element tensor, that's <span class="math">3 · 2 · N · dtype_bytes</span> of HBM traffic. But the <em>actual</em> arithmetic only needs <span class="math">N</span> reads of x, bias, scale, and one write of z. The intermediate buffers are pure overhead — written to HBM only to be re-read by the next kernel.</p>
+
+<p>A <strong>fused kernel</strong> does all three ops in one pass: read each input element once, do the whole compute chain in registers, write the final result. HBM traffic drops by ~3×; on memory-bound ops, wall-clock drops by ~3×. The "compute" in the middle was already free.</p>
+
+<h2>Animated · HBM round-trip, unfused vs fused</h2>
+
+<p>Both timelines compute the same thing: <code>y = sigmoid(softmax(x) · W)</code>. Top: three separate kernels, each pays its own HBM round-trip on the intermediate. Bottom: one fused kernel reads x once, keeps the intermediate in registers, writes y once. The "HBM bytes" counter on the right adds up as each kernel runs — watch the unfused total balloon.</p>
+
+<div class="widget" id="hf-widget">
+  <div class="title">HBM round-trip · unfused vs fused, same math</div>
+  <div class="hint">Each kernel's bar shows its phases: read inputs from HBM, compute, write output to HBM. Fused merges the three into one read + one write; intermediates live in registers/SRAM.</div>
+
+  <div class="controls">
+    <button id="hf-play">▶ play</button>
+    <button id="hf-reset">⟲ reset</button>
+    <label class="inline">speed: <input type="range" id="hf-spd" min="1" max="8" step="1" value="3"> <span class="val" id="hf-spd-v">3×</span></label>
+    <label class="inline">tensor (M elements): <input type="range" id="hf-n" min="1" max="200" step="1" value="64"> <span class="val" id="hf-n-v">64</span></label>
+  </div>
+
+  <canvas id="hf-canvas" width="760" height="340" style="width:100%; height:340px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">unfused HBM</div><div class="v" id="hf-ub">—</div></div>
+    <div class="kpi"><div class="k">fused HBM</div><div class="v" id="hf-fb">—</div></div>
+    <div class="kpi"><div class="k">HBM reduction</div><div class="v" id="hf-rd">—</div></div>
+    <div class="kpi"><div class="k">speedup</div><div class="v" id="hf-sp">—</div></div>
+  </div>
+</div>
+
+<div class="callout">
+  <div class="label">The slogan for the rest of this lesson</div>
+  <em>Memory-bound</em> ops are bottlenecked by HBM. Fusing them removes HBM round-trips, which is the only knob that matters in that regime. <em>Compute-bound</em> ops are bottlenecked by FLOPs — fusion doesn't help (you'd still do the same arithmetic). Most fusion wins come from fusing memory-bound epilogues onto a compute-bound matmul.
+</div>
+
+<h2>Three flavours of fusion</h2>
+
+<table>
+  <thead><tr><th>Pattern</th><th>What's fused</th><th>Win</th><th>Example</th></tr></thead>
+  <tbody>
+    <tr><td>Elementwise chain</td><td>N elementwise ops in a row</td><td>~N× HBM traffic reduction</td><td>add → mul → ReLU</td></tr>
+    <tr><td>Matmul + elementwise epilogue</td><td>GEMM + bias + activation + dropout</td><td>~2× HBM (the activation tensor is never written to HBM)</td><td>cuBLAS epilogues, <code>aten::addmm</code> + ReLU</td></tr>
+    <tr><td>Reduction + elementwise</td><td>LayerNorm = mean + var + normalize + scale + bias</td><td>~5× HBM reduction</td><td>fused <code>LayerNorm</code> kernels</td></tr>
+  </tbody>
+</table>
+
+<p>The most-fused operator in modern training is <strong>FlashAttention</strong>, which we touch on next.</p>
+
+<h2>FlashAttention as a fusion masterclass</h2>
+
+<p>Attention is the canonical case where fusion matters most. Standard ("vanilla") attention is three kernels:</p>
+
+<ol>
+  <li><span class="math">S = Q K^T / √d_k</span> — produces an <span class="math">N × N</span> matrix; writes <span class="math">O(N²)</span> bytes to HBM.</li>
+  <li><span class="math">P = softmax(S)</span> — reads and writes the <span class="math">N × N</span> matrix.</li>
+  <li><span class="math">O = P V</span> — reads <span class="math">P</span> and <span class="math">V</span>, writes <span class="math">O</span>.</li>
+</ol>
+
+<p>For <span class="math">N = 8192</span> in bf16, the <span class="math">N × N</span> matrix is <strong>128 MB per head per batch element</strong>. Across 64 heads and batch 4, that's 32 GB of HBM round-tripping per attention layer. At 80 layers, attention <em>alone</em> reads/writes ~2.5 TB of HBM per training step. Most of which is the materialised attention matrix that we don't actually need to keep.</p>
+
+<p>FlashAttention (Dao et al. 2022) fuses all three ops by exploiting an algebraic identity: the softmax can be computed <strong>online</strong> as <span class="math">S V</span> is being formed, tile-by-tile, never materialising the <span class="math">N × N</span> intermediate. The kernel:</p>
+
+<ol>
+  <li>Tiles <span class="math">Q</span> into row blocks and <span class="math">K, V</span> into column blocks.</li>
+  <li>For each <span class="math">Q</span> block: load it into SRAM. For each <span class="math">K, V</span> tile in turn: load it into SRAM, compute the partial attention contribution, accumulate into a running output buffer in SRAM (plus a running max and normaliser for the online softmax).</li>
+  <li>At the end, write the final output row block back to HBM. The <span class="math">N × N</span> matrix never appears in HBM.</li>
+</ol>
+
+<p>HBM traffic per attention: <span class="math">O(N · d)</span> instead of <span class="math">O(N²)</span>. For <span class="math">N = 8192, d = 128</span>, that's <span class="math">N · d / N² = d / N = 1.6%</span> of the original — a 60× HBM reduction. Wall-clock speedup is 2–4× because attention isn't <em>quite</em> memory-bound (the matmul has high arithmetic intensity), but the freed bandwidth lets other parts of the model breathe too.</p>
+
+<p>For more depth: see <a href="../../vllm/lessons/03_flash_attention.html">vLLM lesson 03</a>, which derives the online-softmax recurrence in detail and walks the tile schedule. The reason FlashAttention is a fusion case study and not just a "kernel" is that it's <em>only</em> a win in fusion terms — the underlying arithmetic is identical to vanilla attention.</p>
+
+<h2>2D · FlashAttention tile schedule</h2>
+
+<p>The Q rows are tiled (rows along the left), K/V columns are tiled (columns along the top). One Q tile sweeps across all K/V column tiles; per tile, the kernel computes the local attention contribution, updates a running max <code>m</code> and normaliser <code>ℓ</code>, and accumulates into the output buffer in SRAM. The <span class="math">N×N</span> attention matrix is never materialised in HBM.</p>
+
+<div class="widget" id="fa-widget">
+  <div class="title">FlashAttention · tile-by-tile sweep with online softmax</div>
+  <div class="hint">Yellow cell = active <span class="math">(Q_i, K_j)</span> tile being computed. Right panel: the running softmax state <code>(m, ℓ)</code> for the current Q row tile, updating as more K columns are folded in.</div>
+
+  <div class="controls">
+    <button id="fa2-play">▶ play</button>
+    <button id="fa2-step">step ▷</button>
+    <button id="fa2-reset">⟲</button>
+    <label class="inline">speed: <input type="range" id="fa2-spd" min="1" max="8" step="1" value="3"> <span class="val" id="fa2-spd-v">3×</span></label>
+    <label class="inline">Q tiles: <input type="range" id="fa2-q" min="2" max="8" step="1" value="4"> <span class="val" id="fa2-q-v">4</span></label>
+    <label class="inline">K tiles: <input type="range" id="fa2-k" min="2" max="10" step="1" value="6"> <span class="val" id="fa2-k-v">6</span></label>
+  </div>
+
+  <canvas id="fa2-canvas" width="760" height="360" style="width:100%; height:360px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">Q tile (row)</div><div class="v" id="fa2-qi">—</div></div>
+    <div class="kpi"><div class="k">K tile (col)</div><div class="v" id="fa2-kj">—</div></div>
+    <div class="kpi"><div class="k">running m (max)</div><div class="v" id="fa2-m" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">running ℓ (norm)</div><div class="v" id="fa2-l" style="font-size:14px;">—</div></div>
+  </div>
+</div>
+
+<h2>What fusion gives back at backward time</h2>
+
+<p>A fused kernel that doesn't materialise its intermediates also can't <em>store</em> them for backward — backward will need to recompute them. This is the same tradeoff as activation checkpointing (lesson 05): forward saves HBM traffic, backward pays in extra FLOPs.</p>
+
+<p>FlashAttention's backward indeed recomputes the attention block-by-block on the fly during backward. Net wall-clock effect: ~30% faster total (forward + backward) compared to vanilla, because the FLOP overhead is small compared to the HBM saving.</p>
+
+<h2>When fusion <em>doesn't</em> help</h2>
+
+<ul>
+  <li><strong>Already-compute-bound ops.</strong> A large matmul is on the right side of the roofline; cuBLAS is already saturating tensor cores. Fusing a dropout into it shaves the tail traffic but doesn't double throughput.</li>
+  <li><strong>When the intermediate is needed elsewhere.</strong> If a tensor is consumed by multiple downstream ops, the compiler has to choose between (a) materialising the intermediate once and reading it from HBM twice, or (b) duplicating the producer into each consumer's fused kernel (recomputing it). Inductor and XLA do both — duplication for cheap producers, materialisation for expensive ones — so "single consumer" is the easy case, not a hard rule.</li>
+  <li><strong>When the fused kernel doesn't fit in SRAM.</strong> Each SM has tens to hundreds of KB of SRAM. Larger fusions need to spill to HBM, defeating the point. FlashAttention's block sizes are tuned exactly for the H100's 228 KB SMEM-per-SM budget.</li>
+</ul>
+
+<h2>Animated · GEMM with elementwise epilogue, fused vs trailing</h2>
+
+<p>A GEMM that produces <span class="math">C = A · B</span>, immediately followed by <code>D = GELU(C + bias)</code>. Top: GEMM writes C to HBM, then a separate elementwise kernel reads C back, does the activation, writes D. Bottom: cuBLAS-style "epilogue" — the elementwise math is done in the GEMM's epilogue stage on each output tile, before anything is written to HBM. C never appears in HBM.</p>
+
+<div class="widget" id="ep-widget">
+  <div class="title">Epilogue fusion · the GEMM saves one whole HBM round-trip</div>
+  <div class="hint">Animated: GEMM tiles complete one by one. Top track writes C to HBM and reads it back (orange dashed = wasted round-trip). Bottom track applies GELU+bias inside the tile's epilogue, writes D directly.</div>
+
+  <div class="controls">
+    <button id="ep-play">▶ play</button>
+    <button id="ep-reset">⟲</button>
+    <label class="inline">speed: <input type="range" id="ep-spd" min="1" max="8" step="1" value="3"> <span class="val" id="ep-spd-v">3×</span></label>
+    <label class="inline">output tiles: <input type="range" id="ep-n" min="3" max="12" step="1" value="6"> <span class="val" id="ep-n-v">6</span></label>
+    <label class="inline">epilogue:
+      <select id="ep-op" style="background:var(--code-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px;font-family:var(--mono);font-size:12px;">
+        <option value="bias_gelu" selected>+ bias, GELU</option>
+        <option value="bias_relu">+ bias, ReLU</option>
+        <option value="dropout">+ bias, dropout</option>
+      </select>
+    </label>
+  </div>
+
+  <canvas id="ep-canvas" width="760" height="320" style="width:100%; height:320px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">unfused HBM</div><div class="v" id="ep-ub">—</div></div>
+    <div class="kpi"><div class="k">fused HBM</div><div class="v" id="ep-fb">—</div></div>
+    <div class="kpi"><div class="k">C tensor written</div><div class="v" id="ep-c" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">speedup (mem-bound part)</div><div class="v" id="ep-sp">—</div></div>
+  </div>
+</div>
+
+<h2>How custom kernels get written today</h2>
+
+<ol>
+  <li><strong>cuBLAS / cuDNN epilogue API.</strong> The "I want a matmul + bias + GELU" use case. NVIDIA provides this directly.</li>
+  <li><strong>Hand-written CUDA C++.</strong> The hardest path, used for performance-critical kernels (FlashAttention, paged attention). Months of work to outperform a tuned library.</li>
+  <li><strong>Triton (lesson 17).</strong> The DSL that landed somewhere between CUDA and Python — block-level operations, automatic SRAM management, good autotuning.</li>
+  <li><strong>torch.compile / Inductor (lesson 18).</strong> Generates Triton kernels from PyTorch code. Automatic fusion of elementwise chains, decent at reductions, not great at matmul-class kernels.</li>
+  <li><strong>CUTLASS.</strong> A C++ template library for matmul-like kernels. Production-grade serving stacks (TensorRT-LLM, vLLM) use this for custom GEMM patterns like multi-LoRA.</li>
+</ol>
+
+<h2>Interactive · the fusion accountant</h2>
+
+<p>Stack any number of elementwise ops between (or after) a matmul. The widget computes HBM traffic with and without fusion, and shows the speedup ceiling. Add a softmax + matmul + bias combo and watch the unfused traffic blow past the fused traffic.</p>
+
+<div class="widget" id="fus-widget">
+  <div class="title">HBM traffic · unfused vs fused</div>
+  <div class="hint">Each op reads its inputs (R) and writes its output (W). Fused: all ops share one R/W. Unfused: each op pays separately.</div>
+
+  <div class="controls">
+    <label class="inline">tensor size N (M elements): <input type="range" id="fus-N" min="1" max="500" step="1" value="64"> <span class="val" id="fus-N-v">64</span></label>
+    <label class="inline">elementwise ops in chain: <input type="range" id="fus-K" min="1" max="10" step="1" value="3"> <span class="val" id="fus-K-v">3</span></label>
+    <label class="inline">HBM BW (GB/s): <input type="range" id="fus-bw" min="500" max="5000" step="100" value="3350"> <span class="val" id="fus-bw-v">3350</span></label>
+    <label class="inline">include matmul (1 GB read + 1 GB write)?
+      <input type="checkbox" id="fus-mm">
+    </label>
+  </div>
+
+  <canvas class="dist-canvas" id="fus-canvas" width="760" height="220" style="height: 220px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">unfused HBM</div><div class="v" id="fus-unb">—</div></div>
+    <div class="kpi"><div class="k">fused HBM</div><div class="v" id="fus-fb">—</div></div>
+    <div class="kpi"><div class="k">unfused time</div><div class="v" id="fus-unt">—</div></div>
+    <div class="kpi"><div class="k">fused speedup</div><div class="v" id="fus-sp">—</div></div>
+  </div>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Fusion is HBM-traffic accounting. Memory-bound op chains benefit linearly with the number of ops fused. Compute-bound ops barely care. FlashAttention is the headline example because it changes attention from <span class="math">O(N²)</span> HBM traffic to <span class="math">O(N · d)</span>. The next two lessons (Triton, torch.compile) are the tools that let mortals write fused kernels without spending a year on CUDA C++.
+</div>
+
+<footer class="lesson-nav">
+  <a href="15_caching_allocator.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">15 · Caching allocator</span>
+  </a>
+  <a class="next" href="17_triton.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">17 · Triton</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const get = id => document.getElementById(id);
+  const els = {
+    N:get('fus-N'),Nv:get('fus-N-v'),K:get('fus-K'),Kv:get('fus-K-v'),
+    bw:get('fus-bw'),bwv:get('fus-bw-v'),mm:get('fus-mm'),
+    canvas:get('fus-canvas'),
+    unb:get('fus-unb'),fb:get('fus-fb'),unt:get('fus-unt'),sp:get('fus-sp')
+  };
+  const ctx = els.canvas.getContext('2d');
+
+  function compute(){
+    const Nm = parseInt(els.N.value);
+    const K = parseInt(els.K.value);
+    const bw = parseInt(els.bw.value) * 1e9;
+    const mm = els.mm.checked;
+    els.Nv.textContent = Nm; els.Kv.textContent = K; els.bwv.textContent = parseInt(els.bw.value);
+
+    const N = Nm * 1e6;
+    const bytes = N * 2;
+    const mm_bytes = mm ? 2e9 : 0;
+    const unfused = K * 2 * bytes + mm_bytes;
+    const fused = 2 * bytes + mm_bytes;
+    const tU = unfused / bw;
+    const tF = fused / bw;
+    els.unb.textContent = (unfused/1e9).toFixed(2) + ' GB';
+    els.fb.textContent  = (fused/1e9).toFixed(2) + ' GB';
+    els.unt.textContent = (tU*1000).toFixed(2) + ' ms';
+    els.sp.textContent  = (tU/tF).toFixed(2) + '×';
+
+    return { unfused, fused, tU, tF };
+  }
+
+  function render(){
+    const r = compute();
+    const dpr = window.devicePixelRatio || 1;
+    const W = els.canvas.clientWidth, H = els.canvas.clientHeight;
+    if (els.canvas.width !== Math.round(W*dpr)){
+      els.canvas.width = Math.round(W*dpr); els.canvas.height = Math.round(H*dpr);
+    }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 100, padR = 30, padT = 30, padB = 26;
+    const innerW = W - padL - padR;
+    const max = Math.max(r.unfused, r.fused) * 1.1;
+    const rows = [
+      { name:'unfused', v: r.unfused, c:'#dc2626' },
+      { name:'fused',   v: r.fused,   c:'#16a34a' },
+    ];
+    const rowH = 44;
+    rows.forEach((row, i) => {
+      const y = padT + i*(rowH + 14);
+      ctx.fillStyle = '#1f2430'; ctx.font = '13px monospace';
+      ctx.fillText(row.name, 8, y + 26);
+      const w = (row.v / max) * innerW;
+      ctx.fillStyle = row.c;
+      ctx.fillRect(padL, y, Math.max(1, w), rowH);
+      ctx.fillStyle = '#1f2430'; ctx.font = '12px monospace';
+      ctx.fillText((row.v/1e9).toFixed(2) + ' GB', padL + w + 4, y + 26);
+    });
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('HBM bytes per chain · lower is faster', padL, padT - 8);
+  }
+
+  ['input','change'].forEach(ev=>{
+    [els.N,els.K,els.bw,els.mm].forEach(el=>el.addEventListener(ev,render));
+  });
+  window.addEventListener('resize',render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: animated HBM round-trip ─── */
+(function(){
+  const C = document.getElementById('hf-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = { play:$('hf-play'), reset:$('hf-reset'), spd:$('hf-spd'), spdv:$('hf-spd-v'),
+                n:$('hf-n'), nv:$('hf-n-v'),
+                ub:$('hf-ub'), fb:$('hf-fb'), rd:$('hf-rd'), sp:$('hf-sp') };
+
+  let t = 0; let playing = false; let lastT = 0;
+
+  // Three ops: softmax(x), then  * W, then sigmoid.
+  // Unfused: each kernel has phases [read][compute][write] of length 1 unit each.
+  // Fused: one kernel [read][compute][write].
+  // Total length is set so unfused has 3 kernels (9 units) vs fused (3 units).
+  const UNFUSED_LEN = 9;
+  const FUSED_LEN = 3;
+
+  function tensorBytes(){ return parseInt(els.n.value) * 1e6 * 2; }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    els.spdv.textContent = els.spd.value + '×';
+    els.nv.textContent = els.n.value;
+
+    const padL = 100, padR = 30, padT = 24;
+    const trackH = 80;
+    const gap = 22;
+    const trackW = W - padL - padR;
+    const unitW = trackW / UNFUSED_LEN; // both tracks share same time scale; fused track is shorter
+
+    // labels
+    ctx.fillStyle = '#5b6573'; ctx.font='11.5px monospace';
+    ctx.fillText('unfused (3 kernels)', 8, padT + 16);
+    ctx.fillText('fused (1 kernel)', 8, padT + trackH + gap + 16);
+    ctx.fillStyle = '#94a3b8'; ctx.font='10px monospace';
+    ctx.fillText('y = sigmoid(softmax(x) · W)', padL, padT - 4);
+
+    // HBM lane indicators
+    function hbmLane(y){
+      ctx.fillStyle = '#eef1f5';
+      ctx.fillRect(padL, y, trackW, trackH);
+      ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+      ctx.strokeRect(padL, y, trackW, trackH);
+      ctx.fillStyle = '#94a3b8'; ctx.font='10px monospace';
+      ctx.fillText('HBM', padL - 32, y + 16);
+      ctx.fillText('SRAM', padL - 32, y + 36);
+      ctx.fillText('reg', padL - 32, y + 56);
+    }
+    const y1 = padT + 22, y2 = padT + trackH + gap + 22;
+    hbmLane(y1); hbmLane(y2);
+
+    // Helper to draw a single kernel block with phases R, C, W
+    function drawKernel(yTop, t0, opName, color, isActive, drawIntermediate){
+      const phases = [
+        { name:'R',  start: t0, len: 1, kind:'read' },
+        { name:'C',  start: t0+1, len: 1, kind:'compute' },
+        { name:'W',  start: t0+2, len: 1, kind:'write' },
+      ];
+      phases.forEach(p => {
+        const x = padL + p.start * unitW;
+        const w = p.len * unitW - 2;
+        let fill = color;
+        let lane;
+        if (p.kind === 'read') lane = 0;
+        else if (p.kind === 'compute') lane = 2;
+        else lane = 0;
+        const ly = yTop + (lane === 0 ? 4 : 44);
+        const lh = lane === 0 ? 20 : 32;
+        const opacity = isActive ? 1 : 0.85;
+        ctx.fillStyle = fill;
+        ctx.globalAlpha = opacity;
+        ctx.fillRect(x, ly, Math.max(1, w), lh);
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = '#ffffff'; ctx.font='bold 10px monospace';
+        ctx.fillText(p.name, x + 4, ly + lh - 6);
+      });
+      // kernel name underneath
+      ctx.fillStyle = '#1f2430'; ctx.font='10px monospace';
+      ctx.fillText(opName, padL + (t0 + 0.3) * unitW, yTop + trackH + 10);
+      // intermediate hop: a curve from this kernel's W to next kernel's R (in HBM lane)
+      if (drawIntermediate){
+        const x1 = padL + (t0+2.7) * unitW;
+        const x2 = padL + (t0+3.0) * unitW;
+        ctx.strokeStyle = '#dc2626'; ctx.setLineDash([3,3]); ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        ctx.moveTo(x1, yTop + 14); ctx.bezierCurveTo(x1+10, yTop-6, x2-10, yTop-6, x2, yTop+14);
+        ctx.stroke(); ctx.setLineDash([]);
+        ctx.fillStyle = '#dc2626'; ctx.font='9px monospace';
+        ctx.fillText('HBM round-trip', (x1+x2)/2 - 32, yTop - 4);
+      }
+    }
+
+    const opNames = ['softmax(x)', 'mul(·, W)', 'sigmoid(·)'];
+    const opColors = ['#2563eb', '#d97706', '#16a34a'];
+    // unfused: three kernels starting at 0, 3, 6
+    for (let i=0; i<3; i++){
+      drawKernel(y1, i*3, opNames[i], opColors[i], (i*3 <= t && t < i*3+3), i<2);
+    }
+    // fused: one kernel; we stretch it to use 3 units but extend compute lane visually
+    function drawFusedKernel(yTop){
+      // Read x (lane HBM)
+      ctx.fillStyle = '#2563eb';
+      ctx.fillRect(padL, yTop + 4, unitW - 2, 20);
+      ctx.fillStyle = '#ffffff'; ctx.font='bold 10px monospace';
+      ctx.fillText('R x', padL + 4, yTop + 18);
+      // Compute spans the middle
+      const cStart = padL + unitW;
+      const cWidth = unitW;
+      // Show compute as a colorful stripe with all three sub-stages
+      ctx.fillStyle = '#2563eb'; ctx.fillRect(cStart, yTop + 44, cWidth/3 - 1, 32);
+      ctx.fillStyle = '#d97706'; ctx.fillRect(cStart + cWidth/3, yTop + 44, cWidth/3 - 1, 32);
+      ctx.fillStyle = '#16a34a'; ctx.fillRect(cStart + 2*cWidth/3, yTop + 44, cWidth/3 - 1, 32);
+      ctx.fillStyle = '#ffffff'; ctx.font='bold 9px monospace';
+      ctx.fillText('sm', cStart + 4, yTop + 64);
+      ctx.fillText('·W', cStart + cWidth/3 + 4, yTop + 64);
+      ctx.fillText('σ', cStart + 2*cWidth/3 + 4, yTop + 64);
+      // Write y
+      ctx.fillStyle = '#16a34a';
+      ctx.fillRect(padL + 2*unitW, yTop + 4, unitW - 2, 20);
+      ctx.fillStyle = '#ffffff'; ctx.font='bold 10px monospace';
+      ctx.fillText('W y', padL + 2*unitW + 4, yTop + 18);
+
+      // arrows from R to compute lane and compute to W (in-register dataflow, not HBM)
+      ctx.strokeStyle = '#16a34a'; ctx.lineWidth=1.5;
+      ctx.beginPath(); ctx.moveTo(padL + unitW/2, yTop + 24); ctx.lineTo(cStart + 4, yTop + 44); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(cStart + cWidth - 4, yTop + 44); ctx.lineTo(padL + 2*unitW + unitW/2, yTop + 24); ctx.stroke();
+      ctx.fillStyle = '#16a34a'; ctx.font='9px monospace';
+      ctx.fillText('in-register dataflow', cStart + 4, yTop - 4);
+
+      // op label
+      ctx.fillStyle = '#1f2430'; ctx.font='10px monospace';
+      ctx.fillText('fused softmax+mul+sigmoid', padL + 4, yTop + trackH + 10);
+    }
+    drawFusedKernel(y2);
+
+    // Time cursor
+    const cursorX = padL + t * unitW;
+    ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2;
+    ctx.setLineDash([4,4]);
+    ctx.beginPath(); ctx.moveTo(cursorX, padT); ctx.lineTo(cursorX, y2 + trackH + 4); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // HBM bytes counters (right side)
+    const bytes = tensorBytes();
+    const unfBytes = (Math.floor(Math.min(t,8)/3) + 1) * 2 * bytes; // each kernel = R+W
+    const fusedBytes = t >= 0 ? 2 * bytes : 0;
+    const totalUnfBytes = 3 * 2 * bytes;
+    const totalFusedBytes = 2 * bytes;
+    els.ub.textContent = (totalUnfBytes / 1e9).toFixed(2) + ' GB';
+    els.fb.textContent = (totalFusedBytes / 1e9).toFixed(2) + ' GB';
+    els.rd.textContent = (totalUnfBytes / totalFusedBytes).toFixed(1) + '×';
+    els.sp.textContent = (UNFUSED_LEN / FUSED_LEN).toFixed(2) + '×';
+
+    // Bottom: progress bar showing HBM bytes accumulating
+    const barY = H - 32;
+    ctx.fillStyle = '#f1f3f7';
+    ctx.fillRect(padL, barY, trackW, 12);
+    ctx.fillStyle = '#dc2626';
+    ctx.fillRect(padL, barY, (unfBytes / totalUnfBytes) * trackW, 12);
+    ctx.fillStyle = '#1f2430'; ctx.font='10px monospace';
+    ctx.fillText('HBM bytes traffic (unfused): ' + (unfBytes / 1e9).toFixed(2) + ' / ' + (totalUnfBytes/1e9).toFixed(2) + ' GB',
+                  padL, barY - 4);
+
+    // legend
+    ctx.fillStyle = '#94a3b8'; ctx.font='10px monospace';
+    ctx.fillText('R = read input from HBM   C = compute (SRAM/registers)   W = write output to HBM', padL, H - 8);
+  }
+
+  function tick(ts){
+    if (!playing) return;
+    const spd = parseInt(els.spd.value);
+    const dt = (ts - lastT); lastT = ts;
+    t += dt * 0.003 * spd;
+    if (t > UNFUSED_LEN) t = 0;
+    els.tv && (els.tv.textContent = t.toFixed(1));
+    render();
+    requestAnimationFrame(tick);
+  }
+  els.play.addEventListener('click', () => {
+    playing = !playing;
+    els.play.textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastT = performance.now(); requestAnimationFrame(tick); }
+  });
+  els.reset.addEventListener('click', () => { t=0; playing=false; els.play.textContent='▶ play'; render(); });
+  [els.n, els.spd].forEach(el => el.addEventListener('input', render));
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: FlashAttention tile schedule ─── */
+(function(){
+  const C = document.getElementById('fa2-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    play:$('fa2-play'), step:$('fa2-step'), reset:$('fa2-reset'),
+    spd:$('fa2-spd'), spdv:$('fa2-spd-v'),
+    q:$('fa2-q'), qv:$('fa2-q-v'),
+    k:$('fa2-k'), kv:$('fa2-k-v'),
+  };
+  let qi = 0, kj = 0, playing = false, lastT = 0;
+  // Per Q tile: maintain a running m and ℓ.
+  let runM = []; // per-q
+  let runL = []; // per-q
+
+  // Synthetic per-tile "logit max" for visualisation
+  function tileLogitMax(qi, kj){
+    return Math.sin((qi*1.7 + kj*0.9)) * 1.5;
+  }
+
+  function resetStats(){
+    const Q = parseInt(els.q.value);
+    runM = Array(Q).fill(-Infinity);
+    runL = Array(Q).fill(0);
+  }
+  resetStats();
+
+  function step(){
+    const Q = parseInt(els.q.value), K = parseInt(els.k.value);
+    // process current (qi, kj)
+    const mij = tileLogitMax(qi, kj);
+    const oldM = runM[qi];
+    const newM = Math.max(oldM, mij);
+    // online softmax update: ℓ_new = e^{m_old - m_new} * ℓ_old + sum exp(s - m_new)
+    const oldL = runL[qi];
+    const oldFactor = isFinite(oldM) ? Math.exp(oldM - newM) : 0;
+    // simulate "tile sum" of softmax weights
+    const tileSum = 0.3 + 0.5 * Math.abs(Math.cos(qi*0.7 + kj*0.4));
+    runM[qi] = newM;
+    runL[qi] = oldFactor * oldL + tileSum;
+
+    kj++;
+    if (kj >= K){ kj = 0; qi++; }
+    if (qi >= Q){ qi = 0; resetStats(); }
+    render();
+  }
+
+  function render(){
+    const Q = parseInt(els.q.value), K = parseInt(els.k.value);
+    if (runM.length !== Q){ resetStats(); }
+    els.spdv.textContent = els.spd.value + '×';
+    els.qv.textContent = Q; els.kv.textContent = K;
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padT = 30, padL = 90, padR = 220, padB = 40;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+    const cellW = innerW / K;
+    const cellH = innerH / Q;
+
+    // Q × K grid (the N × N attention matrix, schematically tiled)
+    ctx.fillStyle = '#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('K, V tiles (columns) →', padL, padT - 10);
+    ctx.save();
+    ctx.translate(padL - 24, padT + innerH/2);
+    ctx.rotate(-Math.PI/2);
+    ctx.fillText('Q tiles (rows) →', -50, 0);
+    ctx.restore();
+
+    // Draw row labels (Q_i)
+    for (let i=0; i<Q; i++){
+      ctx.fillStyle = i===qi ? '#f59e0b' : '#94a3b8';
+      ctx.font = (i===qi?'bold ':'') + '11px monospace';
+      ctx.fillText('Q' + i, padL - 22, padT + i*cellH + cellH/2 + 4);
+    }
+    // Column labels (K_j)
+    for (let j=0; j<K; j++){
+      ctx.fillStyle = (j===kj && true) ? '#f59e0b' : '#94a3b8';
+      ctx.font = (j===kj?'bold ':'') + '11px monospace';
+      ctx.fillText('K'+j, padL + j*cellW + cellW/2 - 8, padT - 4);
+    }
+
+    // Draw all tiles
+    for (let i=0; i<Q; i++){
+      for (let j=0; j<K; j++){
+        const x = padL + j*cellW;
+        const y = padT + i*cellH;
+        const isCur = (i===qi && j===kj);
+        const isDone = (i < qi) || (i === qi && j < kj);
+        const isCurRow = (i === qi);
+        let fill;
+        if (isCur) fill = '#f59e0b';
+        else if (isDone) fill = '#16a34a';
+        else if (isCurRow) fill = '#1e2435';
+        else fill = '#f1f3f7';
+        ctx.fillStyle = fill;
+        ctx.fillRect(x+1, y+1, cellW-2, cellH-2);
+        ctx.strokeStyle = isCur ? '#fff' : '#dde2ea';
+        ctx.lineWidth = isCur ? 2 : 1;
+        ctx.strokeRect(x+1, y+1, cellW-2, cellH-2);
+        // Tile label
+        if (cellW > 30 && cellH > 22){
+          ctx.fillStyle = isCur || isDone ? '#ffffff' : '#cbd5e1';
+          ctx.font = '10px monospace';
+          ctx.fillText('S'+i+','+j, x + 4, y + cellH/2 + 4);
+        }
+      }
+    }
+
+    // Right panel: running softmax state for the current Q row
+    const rx = padL + innerW + 30;
+    const rw = padR - 30;
+    ctx.fillStyle = '#f1f3f7';
+    ctx.fillRect(rx, padT, rw, innerH);
+    ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+    ctx.strokeRect(rx, padT, rw, innerH);
+    ctx.fillStyle = '#f59e0b'; ctx.font='bold 11px monospace';
+    ctx.fillText('online softmax state', rx + 6, padT + 16);
+    ctx.fillStyle = '#5b6573'; ctx.font='10px monospace';
+    ctx.fillText('for Q' + qi + ', K cols 0..' + kj, rx + 6, padT + 30);
+
+    // Show the (m, ℓ) per Q row
+    runM.forEach((m, i) => {
+      const y = padT + 50 + i * 30;
+      ctx.fillStyle = i===qi ? '#f59e0b' : '#94a3b8';
+      ctx.font = (i===qi ? 'bold ':'') + '10.5px monospace';
+      ctx.fillText('Q'+i+':', rx + 6, y);
+      ctx.fillStyle = i===qi ? '#1f2430' : '#94a3b8';
+      ctx.font='10px monospace';
+      const mTxt = isFinite(m) ? m.toFixed(2) : '-∞';
+      ctx.fillText('m=' + mTxt, rx + 36, y);
+      ctx.fillText('ℓ=' + runL[i].toFixed(2), rx + 36, y + 12);
+    });
+
+    // Bytes counter
+    ctx.fillStyle = '#94a3b8'; ctx.font='10px monospace';
+    ctx.fillText('HBM out:', rx + 6, padT + innerH - 36);
+    ctx.fillStyle = '#16a34a'; ctx.font='bold 12px monospace';
+    ctx.fillText('O(N·d) only', rx + 6, padT + innerH - 20);
+    ctx.fillStyle = '#dc2626'; ctx.font='10px monospace';
+    ctx.fillText('vanilla: O(N²) in HBM', rx + 6, padT + innerH - 6);
+
+    // KPIs
+    $('fa2-qi').textContent = qi;
+    $('fa2-kj').textContent = kj;
+    $('fa2-m').textContent = isFinite(runM[qi]) ? runM[qi].toFixed(3) : '-∞';
+    $('fa2-l').textContent = runL[qi].toFixed(3);
+
+    // Legend
+    const legY = H - 22;
+    ctx.fillStyle = '#f59e0b'; ctx.fillRect(padL, legY-9, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.font='10.5px monospace';
+    ctx.fillText('current tile', padL+14, legY);
+    ctx.fillStyle = '#16a34a'; ctx.fillRect(padL+110, legY-9, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('completed', padL+124, legY);
+    ctx.fillStyle = '#1e2435'; ctx.strokeStyle='#dde2ea'; ctx.lineWidth=1;
+    ctx.fillRect(padL+220, legY-9, 10, 10); ctx.strokeRect(padL+220, legY-9, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('current row, not yet done', padL+234, legY);
+  }
+
+  function tick(ts){
+    if (!playing) return;
+    const spd = parseInt(els.spd.value);
+    const period = 320 / spd;
+    if (ts - lastT > period){ step(); lastT = ts; }
+    requestAnimationFrame(tick);
+  }
+  els.play.addEventListener('click', () => {
+    playing = !playing;
+    els.play.textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastT = performance.now(); requestAnimationFrame(tick); }
+  });
+  els.step.addEventListener('click', step);
+  els.reset.addEventListener('click', () => { qi=0; kj=0; resetStats(); playing=false; els.play.textContent='▶ play'; render(); });
+  [els.q, els.k].forEach(el => el.addEventListener('input', () => { qi=0; kj=0; resetStats(); render(); }));
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: GEMM + elementwise epilogue ─── */
+(function(){
+  const C = document.getElementById('ep-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    play:$('ep-play'), reset:$('ep-reset'),
+    spd:$('ep-spd'), spdv:$('ep-spd-v'),
+    n:$('ep-n'), nv:$('ep-n-v'), op:$('ep-op'),
+    ub:$('ep-ub'), fb:$('ep-fb'), c:$('ep-c'), sp:$('ep-sp')
+  };
+  let t = 0; // progress 0..1
+  let playing = false; let lastT = 0;
+
+  function compute(){
+    const N = parseInt(els.n.value);
+    els.nv.textContent = N; els.spdv.textContent = els.spd.value + '×';
+    // Assume each tile produces some output bytes; for visualisation, say tile = 32 MB
+    const tileMB = 32;
+    const C_total = N * tileMB; // C tensor size in MB
+    // Unfused: GEMM writes C (1×C) + elementwise reads C (1×C) + writes D (1×C) → 3×C traffic
+    const unfusedMB = 3 * C_total /* write C + read C + write D (A,B reads shared by both, omitted) */;
+    // Fused: GEMM streams C through registers and writes D only → 1×C traffic
+    const fusedMB = C_total;
+    return { N, tileMB, C_total, unfusedMB, fusedMB };
+  }
+
+  function render(){
+    const r = compute();
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 90, padR = 30, padT = 26;
+    const innerW = W - padL - padR;
+    const tileW = innerW / r.N;
+    const trackH = 60;
+    const gap = 30;
+    const y1 = padT + 14, y2 = y1 + trackH + gap;
+
+    ctx.fillStyle = '#5b6573'; ctx.font='11px monospace';
+    const opName = els.op.value === 'bias_gelu' ? 'D = GELU(C + bias)'
+                : els.op.value === 'bias_relu' ? 'D = ReLU(C + bias)'
+                : 'D = dropout(C + bias)';
+    ctx.fillText('GEMM produces C tile-by-tile, then  ' + opName, padL, padT - 6);
+
+    // Track labels
+    ctx.fillStyle = '#1f2430'; ctx.font='11px monospace';
+    ctx.fillText('unfused', 8, y1 + 24);
+    ctx.fillStyle = '#94a3b8'; ctx.font='10px monospace';
+    ctx.fillText('(2 kernels)', 8, y1 + 38);
+    ctx.fillStyle = '#1f2430'; ctx.font='11px monospace';
+    ctx.fillText('epilogue', 8, y2 + 18);
+    ctx.fillText('fused', 8, y2 + 32);
+    ctx.fillStyle = '#94a3b8'; ctx.font='10px monospace';
+    ctx.fillText('(1 kernel)', 8, y2 + 46);
+
+    const tilesDone = Math.floor(t * r.N);
+
+    // ── Top track: GEMM tiles writing C, then elementwise reading C and writing D ──
+    // Phase 1: GEMM produces all C tiles (left half of track)
+    // Phase 2: elementwise reads C tiles, writes D (right half)
+    const halfW = innerW / 2;
+    // Phase 1
+    for (let i=0; i<r.N; i++){
+      const x = padL + i * (halfW / r.N);
+      const w = (halfW / r.N) - 2;
+      const done = i < tilesDone;
+      ctx.fillStyle = done ? '#2563eb' : '#eef1f5';
+      ctx.fillRect(x, y1 + 6, w, 26);
+      ctx.strokeStyle = '#dde2ea'; ctx.strokeRect(x, y1 + 6, w, 26);
+      if (done){
+        ctx.fillStyle = '#ffffff'; ctx.font='9px monospace';
+        if (w > 20) ctx.fillText('C'+i, x + 2, y1 + 22);
+      }
+    }
+    // HBM write annotation
+    ctx.fillStyle = '#dc2626'; ctx.font='10px monospace';
+    ctx.fillText('→ write C to HBM (' + r.C_total + ' MB wasted)', padL, y1 + 50);
+
+    // Phase 2 (right half)
+    for (let i=0; i<r.N; i++){
+      const x = padL + halfW + i * (halfW / r.N);
+      const w = (halfW / r.N) - 2;
+      const done = i < tilesDone;
+      ctx.fillStyle = done ? '#d97706' : '#eef1f5';
+      ctx.fillRect(x, y1 + 6, w, 26);
+      ctx.strokeStyle = '#dde2ea'; ctx.strokeRect(x, y1 + 6, w, 26);
+    }
+    ctx.fillStyle = '#dc2626'; ctx.font='10px monospace';
+    ctx.fillText('← read C, apply epilogue, write D', padL + halfW, y1 + 50);
+
+    // Round trip dashed arrow showing wasted HBM
+    const aStart = padL + halfW - 20;
+    const aEnd = padL + halfW + 20;
+    ctx.strokeStyle = '#dc2626'; ctx.setLineDash([4,4]); ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(aStart, y1 + 6); ctx.bezierCurveTo(aStart, y1 - 10, aEnd, y1 - 10, aEnd, y1 + 6);
+    ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle='#dc2626'; ctx.font='9px monospace';
+    ctx.fillText('HBM round-trip', padL + halfW - 35, y1 - 12);
+
+    // ── Bottom track: fused, one kernel ──
+    for (let i=0; i<r.N; i++){
+      const x = padL + i * tileW;
+      const w = tileW - 2;
+      const done = i < tilesDone;
+      ctx.fillStyle = done ? '#16a34a' : '#eef1f5';
+      ctx.fillRect(x, y2 + 6, w, 40);
+      ctx.strokeStyle = '#dde2ea'; ctx.strokeRect(x, y2 + 6, w, 40);
+      if (done){
+        ctx.fillStyle = '#ffffff'; ctx.font='9px monospace';
+        if (w > 30){
+          ctx.fillText('GEMM', x + 2, y2 + 18);
+          ctx.fillText('+epi', x + 2, y2 + 30);
+          ctx.fillText('→D', x + 2, y2 + 42);
+        }
+      }
+    }
+    ctx.fillStyle = '#16a34a'; ctx.font='10px monospace';
+    ctx.fillText('produces D directly · C stays in registers', padL, y2 + 64);
+
+    // KPIs
+    els.ub.textContent = (r.unfusedMB / 1024).toFixed(2) + ' GB';
+    els.fb.textContent = (r.fusedMB / 1024).toFixed(2) + ' GB';
+    els.c.textContent = r.C_total + ' MB skipped';
+    els.sp.textContent = (r.unfusedMB / r.fusedMB).toFixed(2) + '×';
+
+    // Bottom legend
+    ctx.fillStyle = '#94a3b8'; ctx.font='10px monospace';
+    ctx.fillText('blue = GEMM tile · orange = elementwise tile · green = fused', padL, H - 8);
+  }
+
+  function tick(ts){
+    if (!playing) return;
+    const spd = parseInt(els.spd.value);
+    t += (ts - lastT) * 0.0008 * spd; lastT = ts;
+    if (t > 1) t = 0;
+    render();
+    requestAnimationFrame(tick);
+  }
+  els.play.addEventListener('click', () => {
+    playing = !playing;
+    els.play.textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastT = performance.now(); requestAnimationFrame(tick); }
+  });
+  els.reset.addEventListener('click', () => { t=0; playing=false; els.play.textContent='▶ play'; render(); });
+  [els.n, els.op].forEach(el => el.addEventListener('input', render));
+  els.op.addEventListener('change', render);
+  els.spd.addEventListener('input', () => { els.spdv.textContent = els.spd.value + '×'; });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>05 · Optimization catalog</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">vllm_lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">05 · optimization catalog</span>
+    <span class="step-pill">lesson 5 / 12</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Optimization catalog</h1>
+<p class="subtitle">The remaining levers, derived from first principles. Each one targets one of the two consequences from lesson 01 — bytes per token, or bytes moved per step.</p>
+
+<h2>How to read this lesson</h2>
+
+<p>The previous four lessons have done the heavy lifting. The KV cache (01), paging it (02), reading it efficiently (03), and scheduling around it (04) are <em>most</em> of the throughput story. What's left is a catalog of additional levers — none of them on the scale of paged KV + continuous batching, but each one buys you a measurable factor. We cover the ones that don't have a dedicated lesson elsewhere:</p>
+
+<ul>
+  <li><strong>Automatic Prefix Caching (APC)</strong> — share KV blocks across requests with common prefixes.</li>
+  <li><strong>Quantization</strong> — fewer bytes per parameter, fewer bytes per KV slot.</li>
+  <li><strong>Tensor parallelism</strong> — split each matmul across N GPUs.</li>
+  <li><strong>CUDA graph capture</strong> — remove Python from the steady-state path.</li>
+  <li><strong>Speculative decoding (teaser)</strong> — see it derived in full at <a href="07_speculative_decoding.html">lesson 07</a>.</li>
+</ul>
+
+<p>Forward references: <a href="07_speculative_decoding.html">speculative decoding (07)</a>, <a href="08_pd_disaggregation.html">prefill/decode disaggregation (08)</a>, <a href="10_chunked_prefill.html">chunked prefill (10)</a> each get their own lesson.</p>
+
+<h2>1 · Automatic Prefix Caching</h2>
+
+<p>Almost every serving workload has shared prefixes. A system prompt that's identical for every user. A few-shot example block reused across calls. A RAG context document that backs hundreds of queries. With a naive cache, every request prefills its prompt from scratch, producing bit-for-bit identical KV blocks that you immediately overwrite when the request finishes.</p>
+
+<p>The block manager from <a href="02_paged_attention.html">lesson 02</a> gave us refcounted blocks and copy-on-write. APC asks: when we're about to allocate a new block for a request, can we check whether some <em>other</em> request already computed the same one and just point at it?</p>
+
+<h3>The hash chain</h3>
+
+<p>For two blocks to be interchangeable, they need to encode the same KV — which means they need to contain the same token IDs <em>and</em> have been produced after the same earlier sequence of tokens (because every K and V depends on the full context to the left through attention). So the cache key for block <em>i</em> can't just be the 16 token IDs in that block. It has to be the 16 tokens <em>plus</em> the identity of the chain that led to it.</p>
+
+<p>The trick is a chained hash:</p>
+
+<div class="math block">
+  h<sub>i</sub> &nbsp;=&nbsp; hash( tokens<sub>i</sub>  ||  h<sub>i&minus;1</sub> )
+</div>
+
+<p>where <span class="math">h<sub>0</sub></span> is a fixed sentinel for the empty prefix. Now <span class="math">h<sub>i</sub></span> uniquely identifies a complete (token, position, predecessor) tuple. Two sequences whose third block happens to contain the same 16 tokens get the <em>same</em> h<sub>3</sub> only if their first two blocks also matched. This is exactly what correctness demands — and it costs one SHA per block boundary, amortized over hundreds of attention FLOPs.</p>
+
+<p>The cache is a hash map: <code>h → block_id, refcount</code>. On allocation we check; if h is present we just bump its refcount (this is the same fork-on-share mechanism from lesson 02). If not, we allocate a fresh block, compute its KV during prefill, and insert it.</p>
+
+<div class="callout">
+  <div class="label">Why tail blocks are never cached</div>
+  A request whose total prompt is 97 tokens produces 6 full blocks (96 tokens) + one tail block with 1 token in it. We never cache the tail. Its hash would change the moment the next token is generated and appended — every decode step would invalidate the entry. Caching only happens at full-block boundaries; the cost is at most BLOCK_SIZE&nbsp;&minus;&nbsp;1 redundantly-computed tail tokens per request, which is noise.
+</div>
+
+<h3>The numbers</h3>
+
+<p>Take a system prompt of 2000 tokens, a user query of 100 tokens, block size 16. The first request prefills:</p>
+
+<div class="math block">
+  ⌈2000 / 16⌉ + ⌈100 / 16⌉ &nbsp;=&nbsp; 125 + 7 &nbsp;=&nbsp; 132 blocks
+</div>
+
+<p>Of those, 125 are blocks of the (shared) system prompt — they hash deterministically given the prompt's token IDs. The next request, with the same system prompt and a different user query, will find those 125 blocks already in the cache and only need to compute the 7 user-query blocks itself. That's</p>
+
+<div class="math block">
+  125 / 132 &nbsp;≈&nbsp; 94.7%
+</div>
+
+<p>of its prefill compute that <em>never happens</em>. The first request pays full freight; every subsequent request with the same system prompt pays for its query only. For a server fielding thousands of requests against one system prompt, the amortized prefill cost goes to the cost of the user query, which is usually a tiny fraction.</p>
+
+<div class="callout warn">
+  <div class="label">What can defeat APC</div>
+  Any per-request variation that lands <em>before</em> the shared portion. Examples: prepending a user-specific timestamp, an A/B-test token, a session UUID. The very first token shifts every subsequent hash, and your hit rate goes to zero. Move per-request data to the end of the prompt.
+</div>
+
+<h3>Interactive · the hit grid</h3>
+
+<p>Configure a system prompt and user query length, pick how many requests share the prompt, and see the per-block hit grid. Each cell is one 16-token block. The first request misses every block (it's populating the cache). Subsequent requests hit on the system-prompt blocks and miss on their own unique query tail. Push "shared prompt length" up and watch the green region of the grid widen at the expense of the blue stripe on the right.</p>
+
+<div class="widget" id="apc-widget">
+  <div class="title">APC hit-rate explorer</div>
+  <div class="hint">Each cell is one 16-token block. Green = cache hit (already computed by a prior request). Blue = miss (this request computes it, populates the cache). The KPIs sum across all requests. Note: the "reuse rate" KPI is token-weighted (tokens saved / tokens total); the "cached hits = X / Y blocks" line at the bottom is block-count-weighted, so the two percentages can differ when tail blocks are present.</div>
+
+  <div class="controls">
+    <label class="inline">scenario:
+      <select id="apc-scenario">
+        <option value="default" selected>96 sys + 32 query · 2 reqs</option>
+        <option value="big">2000 sys + 100 query · 8 reqs</option>
+        <option value="rag">512 RAG ctx + 64 query · 16 reqs</option>
+        <option value="cold">no shared prompt · 8 reqs</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="controls">
+    <label class="inline">system prompt tokens: <input type="range" id="apc-sys" min="0" max="2048" step="16" value="96"> <span class="val" id="apc-sys-val">96</span></label>
+    <label class="inline">user query tokens: <input type="range" id="apc-usr" min="16" max="256" step="16" value="32"> <span class="val" id="apc-usr-val">32</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline">requests: <input type="range" id="apc-req" min="1" max="32" step="1" value="2"> <span class="val" id="apc-req-val">2</span></label>
+    <label class="inline">block size: <input type="range" id="apc-bs" min="8" max="32" step="8" value="16"> <span class="val" id="apc-bs-val">16</span></label>
+  </div>
+
+  <canvas class="dist-canvas" id="apc-canvas" width="760" height="280" style="height: 280px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">total prefill tokens · no APC</div><div class="v" id="apc-no">—</div></div>
+    <div class="kpi"><div class="k">total prefill tokens · with APC</div><div class="v" id="apc-yes">—</div></div>
+    <div class="kpi"><div class="k">reuse rate</div><div class="v" id="apc-reuse">—</div></div>
+    <div class="kpi"><div class="k">compute saved</div><div class="v" id="apc-saved">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">show the hash-chain logic this widget uses</summary>
+<pre><code>// One hash entry per (block-index, parent_hash, token_ids_of_block).
+parent_hash = ""
+for each full block i in request:
+    h = hash(tokens[i], parent_hash)
+    if h in by_hash:  cache_hits   += 1     // fork existing block, ref++
+    else:             cache_misses += 1     // allocate, compute, insert
+                      by_hash[h]    = block_id
+    parent_hash = h
+// Tail block (less than BLOCK_SIZE tokens) is NEVER cached.</code></pre>
+  </details>
+</div>
+
+<h2>2 · Quantization</h2>
+
+<p>Decode is memory-bound (<a href="01_kv_cache.html">lesson 01, consequence B</a>). The kernel's wall-clock is set by how many bytes leave HBM per step, not by how many FLOPs the SMs do. So if you halve the bytes per element, you roughly halve the decode latency. Two targets:</p>
+
+<h3>Weight-only quantization (AWQ, GPTQ)</h3>
+
+<p>Store W in int8 or int4. Dequantize on the fly inside the matmul kernel — the activations stay in fp16 / bf16. Total weight-load traffic per step drops by 2× (int8) or 4× (int4). The arithmetic happens at fp16 precision, so accuracy stays surprisingly close to baseline: typical perplexity hit is &lt;1% for int4 on 7B+ models with a good calibration scheme.</p>
+
+<p>The catch is in choosing the per-channel scale factors:</p>
+<ul>
+  <li><strong>GPTQ</strong>: layer-wise second-order optimization. Run a calibration set through the layer, solve for scales that minimize the layer's output MSE. Slow to compute, runs once.</li>
+  <li><strong>AWQ</strong>: identify the 1% of weight channels that handle the activation outliers, give those higher-resolution scales. Cheaper calibration, comparable quality.</li>
+</ul>
+
+<h3>KV cache quantization (fp8)</h3>
+
+<p>The KV cache is the <em>other</em> big consumer of HBM traffic per decode step (the kernel reads <em>all</em> of it per step — that's exactly why decode is memory-bound). Store K and V in fp8 (E4M3 or E5M2) instead of fp16 and the per-token cache is halved:</p>
+
+<div class="math block">
+  bytes_per_token<sub>fp8</sub> &nbsp;=&nbsp; ½ · bytes_per_token<sub>fp16</sub>
+</div>
+
+<p>Two downstream effects, both linear: (a) decode HBM traffic halves → decode is ~2× faster (in the bandwidth-bound regime), and (b) for a fixed HBM budget, the cache holds 2× as many tokens → 2× the concurrent sequences. The two combine.</p>
+
+<p>Quality cost: small but nonzero. fp8 E4M3 has 3 mantissa bits, so each individual K/V element rounds to one of 256 values. Attention is a weighted average so the rounding noise mostly cancels, but very long contexts (32k+) start to show it. vLLM exposes <code>--kv-cache-dtype fp8</code>.</p>
+
+<h3>Why activation quantization is the hard one</h3>
+
+<p>Activations have outliers — a handful of channels carry magnitudes 10–100× the median. Naive int8 quantization with a single tensor-wide scale wastes 95% of the range on the outlier channels, leaving everyone else with 2–3 bits of effective resolution. Solutions exist (SmoothQuant migrates outlier scale into the weights; per-channel scaling) but the headline number is smaller than weight + KV quant. There's also a compounding problem: quantization error from layer ℓ becomes the input to layer ℓ+1's quantizer. Cascading 80 layers of small errors is what limits how aggressive you can get.</p>
+
+<h2>3 · Tensor parallelism (Megatron-style)</h2>
+
+<p>One GPU isn't big enough for a 70B model in fp16 (140 GB of weights, vs 80 GB of HBM). The two strategies are tensor parallelism (split each layer's matmul across N GPUs) and pipeline parallelism (give each GPU consecutive layers). vLLM is built around tensor parallelism.</p>
+
+<h3>The split, in one MLP block</h3>
+
+<p>A transformer MLP is <span class="math">y = W<sub>2</sub> · σ(W<sub>1</sub> · x)</span>, with <span class="math">W<sub>1</sub> ∈ ℝ<sup>d × 4d</sup></span> and <span class="math">W<sub>2</sub> ∈ ℝ<sup>4d × d</sup></span>. Split across N GPUs:</p>
+
+<ul>
+  <li>Column-split <span class="math">W<sub>1</sub></span>: each GPU holds <span class="math">d × (4d/N)</span>. Each GPU computes <span class="math">z<sub>k</sub> = σ(W<sub>1,k</sub> · x)</span> independently. No communication needed; activations <span class="math">x</span> are replicated.</li>
+  <li>Row-split <span class="math">W<sub>2</sub></span>: each GPU holds <span class="math">(4d/N) × d</span>. GPU k computes its partial output <span class="math">y<sub>k</sub> = W<sub>2,k</sub> · z<sub>k</sub></span>. The full y is <span class="math">Σ<sub>k</sub> y<sub>k</sub></span> — one all-reduce.</li>
+</ul>
+
+<p>Attention is sharded by heads: each GPU gets <span class="math">h / N</span> heads, computes its slice of the output independently, then one all-reduce to recombine into the residual stream. Net communication per transformer layer: 2 all-reduces (MLP + attention), each carrying <span class="math">batch · seq · d</span> activations.</p>
+
+<h3>Why it scales within a node but not across</h3>
+
+<p>Per-layer all-reduce cost is <span class="math">~ (batch · seq · d · bytes) / bandwidth</span>. NVLink on H100 is ~900 GB/s; PCIe is ~64 GB/s; cross-node InfiniBand is ~50 GB/s. The same all-reduce that takes ~50 μs on NVLink takes ~700 μs on PCIe. With 80 layers per pass that's <em>50 ms</em> of pure communication per token on PCIe — completely dominating the compute. So TP works inside a DGX-style node with NVLink; across nodes you switch to pipeline parallelism, which only sends activations once per pipeline stage rather than per layer.</p>
+
+<h2>4 · CUDA graph capture</h2>
+
+<p>A decode step launches a few hundred small CUDA kernels: attention, two matmuls per MLP, layer-norms, activation functions, residual adds, all per layer for L = 32–80 layers. Each kernel launch incurs ~10 μs of Python + driver overhead. At L = 80 layers and ~6 ops per layer that's:</p>
+
+<div class="math block">
+  80 × 6 × 10 μs &nbsp;=&nbsp; 4.8 ms of launch overhead
+</div>
+
+<p>A 70B decode step on H100 takes ~5–10 ms of actual GPU work. So the Python overhead is genuinely 30–50% of step time. The fix is CUDA graphs: record the whole sequence of launches once (with placeholder inputs), then on every subsequent decode step submit the recorded graph with one API call. Python is out of the loop entirely.</p>
+
+<p>The catch is that the graph shape is fixed at capture time — the batch dimension, the active set, the block-table strides are all baked in. vLLM handles this by capturing graphs at a small set of common batch sizes at startup (1, 2, 4, 8, 16, 32, …) and dispatching to the smallest one that fits the current step. If your active set is 6, you replay the captured-for-8 graph and waste two slots — still a big win vs. uncaptured.</p>
+
+<h2>5 · Speculative decoding — teaser</h2>
+
+<p>The idea, in two lines: a small "draft" model proposes K tokens. The big "target" model evaluates all K in one parallel forward pass (which costs ~the same as evaluating one token, because both are memory-bound and the K-token pass amortizes the KV read). A clever rejection-sampling rule decides which proposals to accept.</p>
+
+<div class="callout">
+  <div class="label">The unbiasedness claim</div>
+  Speculative decoding is an <em>exact</em> sampler of the target model's distribution, not an approximation. The acceptance rule (Leviathan et al. 2023) — accept token x with probability <span class="math">min(1, p<sub>target</sub>(x) / p<sub>draft</sub>(x))</span> and, on first rejection, sample from the residual <span class="math">max(0, p<sub>target</sub> &minus; p<sub>draft</sub>)</span> renormalized — preserves the target's marginal distribution at every position.
+</div>
+
+<p>The speedup is <span class="math">a + 1</span> tokens per target step, where a is the average number of accepted draft tokens (typically 2–4). The derivation, the failure modes, and the Medusa / EAGLE / Lookahead variants are <a href="07_speculative_decoding.html">lesson 07</a>.</p>
+
+<h2>6 · Prefill/decode disaggregation — sketch</h2>
+
+<p>From lesson 01 we know prefill is compute-bound and decode is memory-bound. They're best served by different hardware: prefill wants high-FLOP / lower-HBM (think H100 SXM), decode wants high-bandwidth-per-dollar (or simply more cards). Disaggregation runs them on separate pools, with the prefill pool handing off the KV cache to the decode pool over fast interconnect. Done right, it eliminates the interference between phases inside one server and lets each pool be sized independently. Full treatment in <a href="08_pd_disaggregation.html">lesson 08</a>.</p>
+
+<h2>Where each lever sits</h2>
+
+<table>
+  <thead><tr><th>Technique</th><th>What it pushes</th><th>Typical factor</th></tr></thead>
+  <tbody>
+    <tr><td>APC</td><td>Prefill cost on shared prompts</td><td>up to 95% prefill skipped</td></tr>
+    <tr><td>fp8 KV</td><td>HBM bytes/step · cache capacity</td><td>2× / 2×</td></tr>
+    <tr><td>int4 weights</td><td>HBM bytes/step on weight load</td><td>~4× decode</td></tr>
+    <tr><td>TP (within node)</td><td>Fits a model that doesn't fit</td><td>N× memory headroom, ~linear throughput</td></tr>
+    <tr><td>CUDA graphs</td><td>Python overhead in decode loop</td><td>10–50% step time, model-dependent</td></tr>
+    <tr><td>Spec decoding</td><td>Tokens/target step</td><td>2–3× (workload-dependent)</td></tr>
+  </tbody>
+</table>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Every item in this catalog is one of the two consequences from lesson 01 wearing a different hat. APC, fp8 KV, weight quant, TP, CUDA graphs — each one reduces either bytes-per-token or bytes-moved-per-step, just at a different layer (data, dtype, sharding, dispatch). The first-principles question for any new "vLLM optimization" you encounter: which of those two does it move?
+</div>
+
+<footer class="lesson-nav">
+  <a href="04_continuous_batching.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">04 · Continuous batching</span>
+  </a>
+  <a class="next" href="06_serving_architecture.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">06 · Serving architecture</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const canvas = document.getElementById('apc-canvas');
+  const ctx = canvas.getContext('2d');
+  const rSys = document.getElementById('apc-sys');
+  const rUsr = document.getElementById('apc-usr');
+  const rReq = document.getElementById('apc-req');
+  const rBs  = document.getElementById('apc-bs');
+  const vSys = document.getElementById('apc-sys-val');
+  const vUsr = document.getElementById('apc-usr-val');
+  const vReq = document.getElementById('apc-req-val');
+  const vBs  = document.getElementById('apc-bs-val');
+  const selScenario = document.getElementById('apc-scenario');
+
+  const SCENARIOS = {
+    default: { sys: 96,   usr: 32, req: 2,  bs: 16 },
+    big:     { sys: 2000, usr: 96, req: 8,  bs: 16 },
+    rag:     { sys: 512,  usr: 64, req: 16, bs: 16 },
+    cold:    { sys: 0,    usr: 96, req: 8,  bs: 16 },
+  };
+
+  selScenario.addEventListener('change', () => {
+    const s = SCENARIOS[selScenario.value];
+    rSys.value = s.sys; rUsr.value = s.usr; rReq.value = s.req; rBs.value = s.bs;
+    render();
+  });
+
+  function setupCanvas(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)){
+      canvas.width = Math.round(W * dpr);
+      canvas.height = Math.round(H * dpr);
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+  }
+
+  function render(){
+    const sysT = parseInt(rSys.value);
+    const usrT = parseInt(rUsr.value);
+    const reqs = parseInt(rReq.value);
+    const bs   = parseInt(rBs.value);
+    vSys.textContent = sysT;
+    vUsr.textContent = usrT;
+    vReq.textContent = reqs;
+    vBs.textContent  = bs;
+
+    // Full blocks per region. Tail blocks of either region are never cached
+    // (the model still computes them, but they never go in by_hash).
+    const sysFull   = Math.floor(sysT / bs);
+    const sysTail   = sysT - sysFull * bs;        // tail of system prompt
+    const usrFull   = Math.floor(usrT / bs);
+    const usrTail   = usrT - usrFull * bs;        // tail of user query
+    // For the chained-hash rule, user-query blocks differ across requests
+    // (because the query tokens themselves are unique), so they never hit
+    // the cache. Only the system-prompt full blocks are shareable.
+
+    // Per request:
+    //   - sys full blocks: first request misses all, subsequent requests hit all.
+    //   - sys tail (if any): always recomputed per request (incomplete block).
+    //     We count its tokens toward "compute" but never cache.
+    //     For widget clarity we lump the tail tokens into a partial block at the
+    //     end of the sys section.
+    //   - usr full + tail: always unique per request → miss.
+
+    // Build grid: rows = requests, cols = blocks (full + tails treated as 1 partial cell).
+    const sysCols = sysFull + (sysTail > 0 ? 1 : 0);
+    const usrCols = usrFull + (usrTail > 0 ? 1 : 0);
+    const totalCols = sysCols + usrCols;
+
+    // KPIs.
+    let withAPC = 0, noAPC = 0;
+    // Without APC: every request computes the whole prompt.
+    noAPC = reqs * (sysT + usrT);
+    // With APC: first request computes everything; subsequent requests
+    // skip the cached sys-full blocks (and recompute sys-tail + usr).
+    if (reqs >= 1){
+      withAPC += (sysT + usrT);                          // first request: full
+      const skip = sysFull * bs;
+      const perSub = (sysT + usrT) - skip;
+      withAPC += Math.max(0, reqs - 1) * perSub;
+    }
+    const reuseRate = noAPC === 0 ? 0 : (noAPC - withAPC) / noAPC;
+    document.getElementById('apc-no').textContent    = noAPC.toLocaleString();
+    document.getElementById('apc-yes').textContent   = withAPC.toLocaleString();
+    document.getElementById('apc-reuse').textContent = (reuseRate * 100).toFixed(1) + '%';
+    document.getElementById('apc-saved').textContent = (noAPC - withAPC).toLocaleString() + ' tok';
+
+    // Render grid.
+    setupCanvas();
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    const padL = 70, padR = 14, padT = 28, padB = 56;
+    const gridW = W - padL - padR;
+    const gridH = H - padT - padB;
+    if (totalCols === 0 || reqs === 0) return;
+    const cellW = Math.max(2, Math.min(28, gridW / totalCols));
+    const cellH = Math.max(3, Math.min(20, gridH / reqs));
+
+    // Header labels for the two regions.
+    ctx.fillStyle = '#1f2430';
+    ctx.font = '12px ' + getComputedStyle(document.body).fontFamily;
+    ctx.fillText('system prompt · ' + sysCols + ' blocks (' + sysT + ' tok)', padL, padT - 10);
+    if (usrCols > 0){
+      const ux = padL + sysCols * cellW + 6;
+      ctx.fillText('user query · ' + usrCols + ' blocks (' + usrT + ' tok)', ux, padT - 10);
+    }
+
+    // Row labels.
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '10px monospace';
+    for (let r = 0; r < reqs; r++){
+      const y = padT + r * cellH + cellH * 0.7;
+      if (cellH >= 10 || r === 0 || r === reqs - 1 || r === Math.floor(reqs / 2)){
+        ctx.fillText('req ' + r, 8, y);
+      }
+    }
+
+    // Cells.
+    for (let r = 0; r < reqs; r++){
+      for (let c = 0; c < totalCols; c++){
+        const x = padL + c * cellW;
+        const y = padT + r * cellH;
+        const isSys = c < sysCols;
+        const isSysTail = isSys && sysTail > 0 && c === sysCols - 1;
+        const isUsrTail = !isSys && usrTail > 0 && c === totalCols - 1;
+        let fill = '#eef1f5', stroke = '#dde2ea';
+        if (isSys && !isSysTail){
+          // shareable full block of system prompt.
+          if (r === 0){ fill = '#2563eb'; stroke = '#3a7ad8'; }       // miss (populates)
+          else        { fill = '#16a34a'; stroke = '#3a8d63'; }       // hit
+        } else if (isSysTail){
+          // incomplete sys tail: never cached, recomputed every request.
+          fill = '#cbd5e1'; stroke = '#4a546a';
+        } else if (!isSys && !isUsrTail){
+          fill = '#2563eb'; stroke = '#3a7ad8';                       // unique → miss
+        } else if (isUsrTail){
+          fill = '#cbd5e1'; stroke = '#4a546a';                       // tail, never cached
+        }
+        ctx.fillStyle = fill;
+        ctx.fillRect(x + 0.5, y + 0.5, cellW - 1.5, cellH - 1.5);
+        if (cellW > 4){
+          ctx.strokeStyle = stroke;
+          ctx.lineWidth = 0.8;
+          ctx.strokeRect(x + 0.5, y + 0.5, cellW - 1.5, cellH - 1.5);
+        }
+      }
+    }
+
+    // Vertical divider between sys / usr.
+    if (sysCols > 0 && usrCols > 0){
+      const xd = padL + sysCols * cellW;
+      ctx.strokeStyle = '#d97706';
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(xd, padT - 4);
+      ctx.lineTo(xd, padT + reqs * cellH + 4);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // Legend at the bottom.
+    const ly = H - 28;
+    const items = [
+      ['#2563eb', 'miss · this request computes & populates'],
+      ['#16a34a', 'hit · already in cache, fork existing block'],
+      ['#cbd5e1', 'tail block · never cached (incomplete)'],
+    ];
+    let lx = padL;
+    ctx.font = '11px ' + getComputedStyle(document.body).fontFamily;
+    items.forEach(([c, t]) => {
+      ctx.fillStyle = c;
+      ctx.fillRect(lx, ly, 11, 11);
+      ctx.fillStyle = '#1f2430';
+      ctx.fillText(t, lx + 16, ly + 9);
+      lx += ctx.measureText(t).width + 36;
+    });
+
+    // Per-block summary line.
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '11px monospace';
+    const fullSys = sysFull;
+    const cachedSys = (reqs - 1) * fullSys;
+    const totalBlocks = reqs * totalCols;
+    ctx.fillText(
+      'cached hits = ' + Math.max(0, cachedSys) + ' / ' + totalBlocks + ' blocks  ('
+        + (totalBlocks ? (cachedSys * 100 / totalBlocks).toFixed(0) : 0) + '%)',
+      padL, H - 6
+    );
+  }
+
+  [rSys, rUsr, rReq, rBs].forEach(el => el.addEventListener('input', () => {
+    selScenario.value = 'default'; // user took control — break the scenario lock visually
+    // (we don't reset values; just don't keep the dropdown showing a stale label)
+    render();
+  }));
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

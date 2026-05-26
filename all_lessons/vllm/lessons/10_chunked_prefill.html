@@ -1,0 +1,793 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>10 · Chunked prefill</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">vllm_lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">10 · chunked prefill</span>
+    <span class="step-pill">lesson 10 / 12</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Chunked prefill</h1>
+<p class="subtitle">Prefill is compute-bound; decode is memory-bound. Serialize them and you saturate one bottleneck at a time. Pack them in one fused pass and you fire both engines simultaneously.</p>
+
+<h2>The bottleneck table you already know</h2>
+
+<p>Lesson 01 noted, and lesson 08 dramatized, that the two phases of inference have opposite limits:</p>
+
+<table>
+  <thead><tr><th>phase</th><th>FLOPs / step</th><th>HBM bytes / step</th><th>bottleneck</th></tr></thead>
+  <tbody>
+    <tr><td>prefill (T tokens)</td><td>O(T<sup>2</sup>) per layer</td><td>O(T) for weights + activations</td><td>compute</td></tr>
+    <tr><td>decode (1 token)</td><td>O(t) per layer</td><td>O(t) — full KV read</td><td>memory</td></tr>
+  </tbody>
+</table>
+
+<p>Run them on the <em>same</em> GPU back-to-back: while prefill is grinding through matmuls, the HBM bandwidth lane is sitting at 10% utilization. While the in-flight decoders are streaming KV out of HBM, the tensor cores are sitting at 5% utilization. You bought the GPU; you're using half of it.</p>
+
+<h2>The idea</h2>
+
+<p>Two moves:</p>
+
+<ol>
+  <li>Break each prefill into fixed-size <em>chunks</em> (say 512 tokens). The math is unchanged — attention still attends within the prompt — but the work is now in 512-token bites instead of one 4096-token block.</li>
+  <li>Within a single fused forward pass, pack a mix of (decode-step tokens, prefill-chunk tokens) up to a <strong>token budget</strong>. One step, one kernel launch, two workloads.</li>
+</ol>
+
+<p>Because prefill chunks are FLOP-heavy and decode steps are HBM-heavy, batching them <em>complements</em> the GPU's two scarce resources. The two phases hide each other's latency in the same step.</p>
+
+<h2>Why this works · the arithmetic</h2>
+
+<p>Let a step process <span class="math">N</span> tokens total. The kernel's wall time is roughly:</p>
+
+<div class="math block">
+  t<sub>step</sub> &nbsp;≈&nbsp; max(N · c<sub>compute</sub>, &nbsp; KV_bytes_read · c<sub>HBM</sub>) &nbsp;+&nbsp; launch_overhead
+</div>
+
+<p>For a pure decode step: <span class="math">N</span> is small (1 per active sequence), the right term dominates. For a pure prefill of a long prompt: <span class="math">N</span> is large, the left term dominates. Stack a prefill chunk on top of N<sub>decode</sub> decode tokens in <em>one</em> step: HBM bandwidth runs at near 100% on behalf of the decoders, and the same tensor cores run at near 100% on behalf of the prefill chunk. The two costs are added in a max, not a sum.</p>
+
+<h2>Scheduler, in 12 lines</h2>
+
+<pre><code>budget_left = TOKEN_BUDGET           # e.g. 2048
+
+# 1. Decodes go first — each needs exactly 1 slot, none can be split.
+tasks = []
+for r in active_decoders:
+    tasks.append(DecodeTask(r, 1))
+    budget_left -= 1
+
+# 2. Fill remaining budget with chunks from waiting prefills.
+for r in waiting_prefills:
+    if budget_left == 0: break
+    chunk = min(budget_left, r.prefill_left)
+    tasks.append(PrefillTask(r, chunk))
+    r.prefill_left -= chunk
+    budget_left -= chunk
+    if r.prefill_left == 0:
+        r.move_to_decoding()       # next step, this request joins active_decoders
+
+run_fused_forward(tasks)</code></pre>
+
+<p>That's the entire algorithm. Real vLLM adds priorities, SLO awareness, and per-sequence limits, but the skeleton is right.</p>
+
+<h2>The fused kernel shape</h2>
+
+<p>Tasks are concatenated along a flat token dim:</p>
+
+<pre><code>X:           (sum_of_task_tokens, d)        # packed input embeddings
+
+# Per-task metadata, length = n_tasks
+seq_start:   (n_tasks,)                     # where each task starts in X
+seq_len:     (n_tasks,)                     # how many tokens this task owns
+block_table: list of block-id arrays        # paged KV (see lesson 02)</code></pre>
+
+<p>Inside the attention op each task dispatches its tokens against its own KV: past blocks for ongoing decodes, past chunks + current chunk for in-progress prefills. Attention math is unchanged — only the gather pattern differs, and the paged-KV block table makes that trivial.</p>
+
+<h2>Interactive · zoom into one fused step</h2>
+
+<p>The picture below is <em>one</em> kernel launch. The wide bar is the token budget; each cell is a token. Blue cells are decode tokens — one per active decoder, each reading its own full KV cache from HBM. Colored stretches are prefill chunks, sliced off waiting requests. The dim tail is wasted budget.</p>
+
+<p>Move the sliders: see how the compute lane (filled by the <em>count</em> of tokens) and the HBM lane (filled mostly by the count of <em>active decoders</em> reading their full KV) both light up only when the step is packed with both kinds of work.</p>
+
+<div class="widget" id="cp-pack-widget">
+  <div class="title">A single fused-forward step · token packing</div>
+  <div class="hint">Decode = 1 cell per active sequence (HBM-heavy). Prefill chunk = many cells from one request (compute-heavy). Goal: fill both lanes.</div>
+
+  <div class="controls">
+    <label class="inline">budget: <input type="range" id="pk-budget" min="256" max="4096" step="128" value="2048"> <span class="val" id="pk-budget-val">2048</span></label>
+    <label class="inline">active decoders: <input type="range" id="pk-dec" min="0" max="128" step="1" value="32"> <span class="val" id="pk-dec-val">32</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline">prefill reqs queued: <input type="range" id="pk-pre" min="0" max="4" step="1" value="2"> <span class="val" id="pk-pre-val">2</span></label>
+    <label class="inline">chunk size each: <input type="range" id="pk-chk" min="64" max="1024" step="64" value="512"> <span class="val" id="pk-chk-val">512</span></label>
+  </div>
+
+  <canvas id="pk-canvas" width="760" height="280" style="width:100%; height:280px; background: var(--code-bg); border:1px solid var(--border); border-radius:8px; display:block;"></canvas>
+
+  <div class="kpi-grid" style="margin-top: 12px;">
+    <div class="kpi"><div class="k">tokens packed</div><div class="v" id="pk-used">—</div></div>
+    <div class="kpi"><div class="k">budget remaining</div><div class="v" id="pk-rem">—</div></div>
+    <div class="kpi"><div class="k">compute lane</div><div class="v" id="pk-comp">—</div></div>
+    <div class="kpi"><div class="k">HBM lane</div><div class="v" id="pk-hbm">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">show the packing rule</summary>
+<pre><code>// One step:
+budget_left = TOKEN_BUDGET
+batch = []                       # what the kernel sees
+
+# decodes first — each owns exactly one slot
+for r in active_decoders:
+    batch.append((r, "decode", 1))
+    budget_left -= 1
+
+# fill remainder with prefill chunks, in order
+for r in waiting_prefills:
+    if budget_left == 0: break
+    n = min(chunk_size, r.prefill_left, budget_left)
+    batch.append((r, "prefill", n))
+    budget_left -= n
+return run_fused_forward(batch)   # one kernel call</code></pre>
+  </details>
+</div>
+
+<h2>The budget tradeoff</h2>
+
+<p>The single tunable is <code>max_num_batched_tokens</code>. Two failure modes:</p>
+
+<div class="callout warn">
+  <div class="label">Budget too small (&lt; 512)</div>
+  Per-step wall time is dominated by the kernel launch / Python overhead, not the per-token work. Throughput tanks because you spend more time launching kernels than computing. Same disease as static batching at batch=1.
+</div>
+
+<div class="callout warn">
+  <div class="label">Budget too large (&gt; 16k)</div>
+  Each step takes long enough that ongoing decodes see a TTBT (time-between-tokens) spike during a step that contains a huge prefill chunk. Tail latency goes up; mean throughput doesn't improve because you're already compute-saturated. Visible to users as "the stream jitters".
+</div>
+
+<p>Empirical sweet spot: 2048–8192 on H100/A100 for 7B–70B models. The widget below lets you feel the cliff.</p>
+
+<h2>TTFT impact · why this is a big deal for long prompts</h2>
+
+<p>Time to first token, by definition, is "how long after I send the request do I get token 1". In the plain regime:</p>
+
+<div class="math block">
+  TTFT<sub>plain</sub> &nbsp;=&nbsp; (queue wait) &nbsp;+&nbsp; prefill_time(P) &nbsp;+&nbsp; one decode step
+</div>
+
+<p>For <span class="math">P = 4096</span> on a 7B at ~10 GB/s prefill: prefill_time ≈ 100 ms. The new request waits the full 100 ms before seeing anything.</p>
+
+<p>With chunked prefill at budget 512:</p>
+
+<div class="math block">
+  TTFT<sub>chunked</sub> &nbsp;≈&nbsp; queue wait &nbsp;+&nbsp; one chunk_time &nbsp;+&nbsp; one decode step
+</div>
+
+<p>That's ~13 ms for the chunk vs the 100 ms full prefill — an ~8× TTFT win on a 4096-tok prompt. For short prompts (P ≤ chunk_size) it's a wash; the chunk <em>is</em> the prefill.</p>
+
+<h2>Caveats and what doesn't change</h2>
+
+<ul>
+  <li><strong>Position IDs.</strong> The request tracks its logical position across chunks. Chunk 2 of an 8-chunk prefill knows it's tokens 512–1023, not 0–511.</li>
+  <li><strong>KV allocation.</strong> Blocks are allocated <em>as the chunks land</em>, not up front. Paged KV (lesson 02) makes this a free win — without it you'd need contiguous allocation for an unknown prefill length.</li>
+  <li><strong>Causal mask across chunks.</strong> Chunk 2's token at logical position 600 attends back to KV that was written in chunk 1. The block table looks it up transparently; there's no special-case code.</li>
+  <li><strong>Not free at low load.</strong> If your GPU is idle and one request shows up, chunking just adds launch overhead. Plain prefill is fine. The win is when you have a steady stream of decoders to interleave with.</li>
+</ul>
+
+<h2>Interactive · pack the budget</h2>
+
+<p>Animate the scheduler for 20 steps on a workload of mixed prompt lengths. Each step is a horizontal bar showing how that step's <span class="math">budget</span> tokens were spent: <span style="color:#2563eb">blue</span> for decode tokens (one per active decoder), <span style="color:#d97706">orange</span> for prefill chunks, dim for unused budget. In plain mode prefills consume the entire budget in one step; in chunked mode the bars fill consistently.</p>
+
+<div class="widget" id="cp-widget">
+  <div class="title">Per-step budget filler</div>
+  <div class="hint">Watch what happens to the blue decode lane when a long prefill arrives in plain mode. With chunked mode the same prefill spreads across many steps, leaving room for decodes every step.</div>
+
+  <div class="controls">
+    <label class="inline">mode:
+      <select id="cp-mode">
+        <option value="plain">plain (full prefill, then decode)</option>
+        <option value="chunked" selected>chunked prefill</option>
+      </select>
+    </label>
+    <label class="inline">budget: <input type="range" id="cp-budget" min="256" max="8192" step="256" value="2048"> <span class="val" id="cp-budget-val">2048</span></label>
+    <label class="inline">arrivals/step: <input type="range" id="cp-arr" min="0" max="3" step="1" value="1"> <span class="val" id="cp-arr-val">1</span></label>
+  </div>
+
+  <div class="controls">
+    <button id="cp-run">run 20 steps</button>
+    <button id="cp-reset">reset</button>
+    <span style="color: var(--text-mute); font-size: 12px;">tip: try plain mode with budget=2048 and a long-prompt arrival pattern — watch the blue lane vanish for a whole step</span>
+  </div>
+
+  <canvas class="dist-canvas" id="cp-canvas" width="760" height="320" style="height: 320px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">mean TTFT</div><div class="v" id="cp-ttft">—</div></div>
+    <div class="kpi"><div class="k">total wall time</div><div class="v" id="cp-total">—</div></div>
+    <div class="kpi"><div class="k">GPU util (filled/budget)</div><div class="v" id="cp-util">—</div></div>
+    <div class="kpi"><div class="k">decodes served</div><div class="v" id="cp-dec">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">show the scheduler this widget simulates</summary>
+<pre><code>// At each step:
+//   budget_left = TOKEN_BUDGET
+//   for each active decoder: spend 1 token, budget_left -= 1
+//   for each waiting prefill (mode=chunked):
+//     chunk = min(prefill_left, budget_left)
+//     budget_left -= chunk
+//     if prefill_left == 0: promote to decoder
+//
+//   plain mode: budget gets eaten whole by ONE waiting prefill,
+//   and the active decoders sit idle for that step.</code></pre>
+  </details>
+</div>
+
+<h2>Putting it together</h2>
+
+<table>
+  <thead><tr><th>regime</th><th>compute lane</th><th>HBM lane</th><th>GPU util</th><th>TTFT for new long-prompt req</th></tr></thead>
+  <tbody>
+    <tr><td>serialized (plain)</td><td>full during prefill, idle during decode</td><td>idle during prefill, full during decode</td><td>~50%</td><td>prefill_time</td></tr>
+    <tr><td>chunked + co-batched</td><td>full each step (chunk fills FLOPs)</td><td>full each step (decoders fill bandwidth)</td><td>~85%</td><td>1 chunk_time</td></tr>
+  </tbody>
+</table>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Chunked prefill is the scheduling primitive that turns "two phases with opposite bottlenecks" from a problem into an asset. Same kernel, same model — every step now uses both halves of the GPU. Net throughput gain on mixed workloads is 1.5–2×; TTFT on long prompts improves linearly with the chunk count.
+</div>
+
+<footer class="lesson-nav">
+  <a href="09_gqa_mqa.html">
+    <span class="dir">← Prev</span>
+    <span class="ttl">09 · GQA / MQA</span>
+  </a>
+  <a class="next" href="11_preemption_swap.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">11 · Preemption and swap</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const canvas = document.getElementById('cp-canvas');
+  const ctx = canvas.getContext('2d');
+  const modeSel = document.getElementById('cp-mode');
+  const rBud = document.getElementById('cp-budget');
+  const rArr = document.getElementById('cp-arr');
+  const vBud = document.getElementById('cp-budget-val');
+  const vArr = document.getElementById('cp-arr-val');
+  const btnRun = document.getElementById('cp-run');
+  const btnReset = document.getElementById('cp-reset');
+
+  // Synthetic workload: every step, `arrivals/step` new requests come in.
+  // A request has prompt_len and output_len. Prompt mix: 60% short, 40% long.
+  const N_STEPS = 20;
+  let stepLog = [];  // per-step record for drawing
+
+  function makeReq(id, t, rng) {
+    const u = rng();
+    const P = (u < 0.6) ? 50 + Math.floor(rng() * 200) : 1500 + Math.floor(rng() * 3000);
+    const L = 20 + Math.floor(rng() * 40);
+    return { id, arrive_step: t, P, L, prefill_left: P, tokens: 0, first_step: null };
+  }
+
+  // Simple seeded RNG so the workload is reproducible across runs.
+  function mulberry32(a) {
+    return function() {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      let t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+
+  function simulate() {
+    stepLog = [];
+    const budget = parseInt(rBud.value);
+    const arrPer = parseInt(rArr.value);
+    const mode = modeSel.value;
+    const rng = mulberry32(1234);
+
+    let waiting = [];          // prefill-not-done
+    let decoders = [];         // prefill done, generating
+    let nextId = 0;
+
+    for (let step = 0; step < N_STEPS; step++) {
+      // Arrivals.
+      for (let a = 0; a < arrPer; a++) {
+        waiting.push(makeReq(nextId++, step, rng));
+      }
+
+      // Build the step.
+      let budgetLeft = budget;
+      let decTok = 0;     // decode tokens served this step
+      let prefBars = [];  // [{reqId, tokens}]
+
+      if (mode === 'plain') {
+        // Plain rule: if any request is waiting, we do its FULL prefill this step.
+        // The decoders are blocked.
+        if (waiting.length > 0) {
+          const r = waiting.shift();
+          const spent = Math.min(r.prefill_left, budget);
+          prefBars.push({ id: r.id, tokens: spent });
+          r.prefill_left -= spent;
+          // If prompt is huge (>budget) we might not finish it; spill — but
+          // for the widget we keep prefill atomic to make the contrast visible.
+          // If it didn't finish, push back to front.
+          if (r.prefill_left > 0) {
+            waiting.unshift(r);
+          } else {
+            decoders.push(r);
+            r.first_step = step;
+          }
+        } else if (decoders.length > 0) {
+          // No prefill waiting → run a decode step.
+          decTok = Math.min(decoders.length, budget);
+          for (let i = 0; i < decTok; i++) {
+            decoders[i].tokens++;
+          }
+        }
+      } else {
+        // Chunked: decodes first, then fill with prefill chunks.
+        decTok = Math.min(decoders.length, budgetLeft);
+        budgetLeft -= decTok;
+        for (let i = 0; i < decTok; i++) {
+          decoders[i].tokens++;
+        }
+        let still = [];
+        for (const r of waiting) {
+          if (budgetLeft <= 0) { still.push(r); continue; }
+          const chunk = Math.min(r.prefill_left, budgetLeft);
+          if (chunk > 0) {
+            prefBars.push({ id: r.id, tokens: chunk });
+            r.prefill_left -= chunk;
+            budgetLeft -= chunk;
+          }
+          if (r.prefill_left === 0) {
+            decoders.push(r);
+            r.first_step = step + 1;   // first decode happens next step
+          } else {
+            still.push(r);
+          }
+        }
+        waiting = still;
+      }
+
+      // Reap finished decoders.
+      decoders = decoders.filter(r => r.tokens < r.L);
+
+      const used = decTok + prefBars.reduce((s, p) => s + p.tokens, 0);
+      stepLog.push({
+        step,
+        budget,
+        decTok,
+        prefBars,
+        used,
+        n_waiting: waiting.length,
+        n_decoders: decoders.length,
+      });
+    }
+
+    // Stats — TTFT measured as steps from arrival to first decode.
+    const allReqs = stepLog.flatMap(s => s.prefBars.map(p => p.id));
+    // Actually, easier: re-simulate light to count TTFT.
+    // For widget purposes, we approximate from the live state we kept.
+    // We didn't keep per-req TTFT records here; let's recount from a second pass.
+    const ttftStats = recountTTFT(parseInt(rBud.value), parseInt(rArr.value), modeSel.value);
+
+    // KPIs
+    const totalUsed = stepLog.reduce((s, r) => s + r.used, 0);
+    const totalBudget = N_STEPS * budget;
+    document.getElementById('cp-util').textContent =
+      (100 * totalUsed / totalBudget).toFixed(0) + "%";
+    document.getElementById('cp-total').textContent = N_STEPS + " steps";
+    document.getElementById('cp-ttft').textContent =
+      ttftStats.mean_ttft === null ? "—" : ttftStats.mean_ttft.toFixed(2) + " steps";
+    document.getElementById('cp-dec').textContent =
+      stepLog.reduce((s, r) => s + r.decTok, 0).toString();
+
+    render();
+  }
+
+  function recountTTFT(budget, arrPer, mode) {
+    // Same simulation as above but tracking per-request TTFT.
+    const rng = mulberry32(1234);
+    let waiting = [];
+    let decoders = [];
+    const ttfts = [];
+    let nextId = 0;
+    for (let step = 0; step < N_STEPS; step++) {
+      for (let a = 0; a < arrPer; a++) waiting.push(makeReq(nextId++, step, rng));
+
+      let budgetLeft = budget;
+      if (mode === 'plain') {
+        if (waiting.length > 0) {
+          const r = waiting.shift();
+          const spent = Math.min(r.prefill_left, budget);
+          r.prefill_left -= spent;
+          if (r.prefill_left > 0) {
+            waiting.unshift(r);
+          } else {
+            decoders.push(r);
+            // Plain emits first token on the FIRST decode step AFTER prefill completes.
+            // So TTFT = (step + 1) - arrive_step.
+            ttfts.push((step + 1) - r.arrive_step);
+          }
+        } else if (decoders.length > 0) {
+          for (const r of decoders) r.tokens++;
+        }
+      } else {
+        const decTok = Math.min(decoders.length, budgetLeft);
+        budgetLeft -= decTok;
+        for (let i = 0; i < decTok; i++) decoders[i].tokens++;
+        let still = [];
+        for (const r of waiting) {
+          if (budgetLeft <= 0) { still.push(r); continue; }
+          const chunk = Math.min(r.prefill_left, budgetLeft);
+          r.prefill_left -= chunk;
+          budgetLeft -= chunk;
+          if (r.prefill_left === 0) {
+            decoders.push(r);
+            ttfts.push((step + 1) - r.arrive_step);
+          } else {
+            still.push(r);
+          }
+        }
+        waiting = still;
+      }
+      decoders = decoders.filter(r => r.tokens < r.L);
+    }
+    if (ttfts.length === 0) return { mean_ttft: null };
+    return { mean_ttft: ttfts.reduce((s, x) => s + x, 0) / ttfts.length };
+  }
+
+  function colorForReq(id) {
+    return `hsl(${(id * 47) % 360} 70% 60%)`;
+  }
+
+  function render() {
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    if (stepLog.length === 0) {
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '13px monospace';
+      ctx.fillText('press "run 20 steps" to simulate', 20, 30);
+      return;
+    }
+
+    const padX = 50, padY = 18;
+    const rowH = (H - 2*padY) / N_STEPS;
+    const barH = Math.max(6, rowH - 2);
+    const usableW = W - padX - 16;
+    const maxBudget = stepLog[0].budget;
+
+    // step axis labels
+    ctx.font = '10px monospace';
+    ctx.fillStyle = '#94a3b8';
+    for (let s = 0; s < N_STEPS; s++) {
+      const y = padY + s * rowH + barH * 0.7;
+      ctx.fillText("t=" + s.toString().padStart(2, ' '), 6, y);
+    }
+
+    // Per step bar
+    for (const r of stepLog) {
+      const y = padY + r.step * rowH;
+      let x = padX;
+      // unused-budget background
+      ctx.fillStyle = '#f1f3f7';
+      ctx.fillRect(x, y, usableW, barH);
+      ctx.strokeStyle = '#dde2ea';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x, y, usableW, barH);
+
+      // decode segment (blue)
+      const decW = usableW * r.decTok / maxBudget;
+      ctx.fillStyle = '#2563eb';
+      ctx.fillRect(x, y, decW, barH);
+      x += decW;
+
+      // prefill chunks (each its own color)
+      for (const p of r.prefBars) {
+        const w = usableW * p.tokens / maxBudget;
+        ctx.fillStyle = colorForReq(p.id);
+        ctx.fillRect(x, y, w, barH);
+        // tiny letter to identify the request
+        if (w > 16 && barH > 9) {
+          ctx.fillStyle = '#ffffff';
+          ctx.font = 'bold 9px monospace';
+          ctx.fillText('r' + p.id, x + 2, y + barH - 2);
+        }
+        x += w;
+      }
+
+      // util text on the right
+      ctx.font = '10px monospace';
+      ctx.fillStyle = '#5b6573';
+      const pct = Math.round(100 * r.used / maxBudget);
+      ctx.fillText(pct + "%", padX + usableW + 4, y + barH * 0.75);
+    }
+
+    // Header
+    ctx.font = '11px monospace';
+    ctx.fillStyle = '#1f2430';
+    ctx.fillText("step", 6, 12);
+    ctx.fillText("budget split → blue = decode, colored = prefill chunks (per request)", padX, 12);
+  }
+
+  function reset() {
+    stepLog = [];
+    document.getElementById('cp-util').textContent = "—";
+    document.getElementById('cp-total').textContent = "—";
+    document.getElementById('cp-ttft').textContent = "—";
+    document.getElementById('cp-dec').textContent = "—";
+    render();
+  }
+
+  [modeSel, rBud, rArr].forEach(el => el.addEventListener('input', () => {
+    vBud.textContent = rBud.value;
+    vArr.textContent = rArr.value;
+  }));
+  btnRun.addEventListener('click', simulate);
+  btnReset.addEventListener('click', reset);
+  window.addEventListener('resize', render);
+
+  vBud.textContent = rBud.value;
+  vArr.textContent = rArr.value;
+  reset();
+})();
+</script>
+
+<script>
+/* ── Lesson 10 · single-step token packing visual ───────────────────────── */
+(function(){
+  const canvas = document.getElementById('pk-canvas');
+  const ctx = canvas.getContext('2d');
+  const rBud  = document.getElementById('pk-budget');
+  const rDec  = document.getElementById('pk-dec');
+  const rPre  = document.getElementById('pk-pre');
+  const rChk  = document.getElementById('pk-chk');
+  const vBud  = document.getElementById('pk-budget-val');
+  const vDec  = document.getElementById('pk-dec-val');
+  const vPre  = document.getElementById('pk-pre-val');
+  const vChk  = document.getElementById('pk-chk-val');
+
+  function colorForReq(id) {
+    return `hsl(${(id * 53 + 28) % 360} 70% 60%)`;
+  }
+
+  // Saturation curves — soft sigmoids so the lanes glow toward 100% but never overshoot the bar.
+  function sat(x, half) {
+    // x ≥ 0, returns in [0, 1), reaches 0.5 at x = half
+    return x / (x + half);
+  }
+
+  function render() {
+    const budget   = parseInt(rBud.value);
+    const decoders = parseInt(rDec.value);
+    const prefReqs = parseInt(rPre.value);
+    const chunk    = parseInt(rChk.value);
+    vBud.textContent = budget; vDec.textContent = decoders;
+    vPre.textContent = prefReqs; vChk.textContent = chunk;
+
+    // Pack
+    let budgetLeft = budget;
+    const placedDec = Math.min(decoders, budgetLeft);
+    budgetLeft -= placedDec;
+    const chunks = [];     // {reqId, tokens}
+    for (let i = 0; i < prefReqs && budgetLeft > 0; i++) {
+      const n = Math.min(chunk, budgetLeft);
+      chunks.push({ reqId: i, tokens: n });
+      budgetLeft -= n;
+    }
+    const used = budget - budgetLeft;
+
+    // KPIs
+    document.getElementById('pk-used').textContent = used + " / " + budget;
+    document.getElementById('pk-rem') .textContent = budgetLeft.toString();
+    // Compute lane: ~saturated when total batch tokens ~= a "FLOP-saturating" amount.
+    // Calibrated so 2048 tokens ≈ 95% (2048 / (2048 + 108)).
+    const compFrac = sat(used, 108);
+    // HBM lane: dominated by # active decoders (each pulls its full KV cache once).
+    // Calibrated so 32 decoders ≈ 80% (32 / (32 + 8)).
+    const hbmFrac  = sat(placedDec, 8);
+    document.getElementById('pk-comp').textContent = (compFrac * 100).toFixed(0) + "%";
+    document.getElementById('pk-hbm') .textContent = (hbmFrac  * 100).toFixed(0) + "%";
+
+    // Canvas
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    const padL = 16, padR = 16;
+    const barX = padL;
+    const barW = W - padL - padR;
+
+    // ── Section 1: the packed budget bar
+    const barY = 50, barH = 64;
+    ctx.fillStyle = '#f1f3f7';
+    ctx.fillRect(barX, barY, barW, barH);
+    ctx.strokeStyle = '#dde2ea';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(barX + 0.5, barY + 0.5, barW - 1, barH - 1);
+
+    // Header
+    ctx.font = 'bold 11px var(--mono), monospace';
+    ctx.fillStyle = '#1f2430';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText('one kernel batch · ' + budget + '-token budget', barX, 12);
+
+    ctx.font = '10px var(--mono), monospace';
+    ctx.fillStyle = '#5b6573';
+    ctx.textAlign = 'right';
+    ctx.fillText('cells are individual tokens fed to the kernel', barX + barW, 14);
+
+    // Per-token cells — pixel-resolution: 1 token = barW / budget pixels.
+    const pxPerTok = barW / budget;
+
+    // Decode cells (blue) — one per decoder
+    let cursor = 0;
+    if (placedDec > 0) {
+      const segW = pxPerTok * placedDec;
+      // Draw as solid blue with thin separators (only if cells are wide enough)
+      ctx.fillStyle = '#2563eb';
+      ctx.fillRect(barX, barY, segW, barH);
+      if (pxPerTok >= 3) {
+        ctx.strokeStyle = 'rgba(12, 17, 28, 0.55)';
+        ctx.lineWidth = 1;
+        for (let i = 1; i < placedDec; i++) {
+          const x = barX + pxPerTok * i;
+          ctx.beginPath(); ctx.moveTo(x, barY); ctx.lineTo(x, barY + barH); ctx.stroke();
+        }
+      }
+      // Section label above the bar
+      ctx.fillStyle = '#2563eb';
+      ctx.font = '11px var(--mono), monospace';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText('decodes × ' + placedDec, barX + 2, barY - 4);
+
+      // mini sub-label inside (count under each token if there's room)
+      if (segW > 32 && barH > 24) {
+        ctx.fillStyle = 'rgba(12, 17, 28, 0.8)';
+        ctx.font = '9px var(--mono), monospace';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'top';
+        ctx.fillText('1 tok / seq  ·  HBM-heavy', barX + 4, barY + 6);
+      }
+      cursor += segW;
+    }
+
+    // Prefill chunks
+    for (const c of chunks) {
+      const segW = pxPerTok * c.tokens;
+      const x = barX + cursor;
+      ctx.fillStyle = colorForReq(c.reqId);
+      ctx.fillRect(x, barY, segW, barH);
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(x, barY); ctx.lineTo(x, barY + barH); ctx.stroke();
+      ctx.lineWidth = 1;
+
+      // Section label above
+      ctx.fillStyle = colorForReq(c.reqId);
+      ctx.font = '11px var(--mono), monospace';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText('prefill r' + c.reqId + ' chunk · ' + c.tokens, x + 2, barY - 4);
+
+      // sub-label inside
+      if (segW > 80 && barH > 24) {
+        ctx.fillStyle = 'rgba(12, 17, 28, 0.85)';
+        ctx.font = '9px var(--mono), monospace';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'top';
+        ctx.fillText(c.tokens + ' tok · compute-heavy', x + 4, barY + 6);
+      }
+      cursor += segW;
+    }
+
+    // Unused tail
+    if (budgetLeft > 0) {
+      const x = barX + cursor;
+      const w = barW - cursor;
+      ctx.fillStyle = 'rgba(95, 104, 120, 0.18)';
+      ctx.fillRect(x, barY, w, barH);
+      // hatched stripes
+      ctx.strokeStyle = 'rgba(95, 104, 120, 0.30)';
+      ctx.lineWidth = 1;
+      for (let dx = 6; dx < w; dx += 7) {
+        ctx.beginPath();
+        ctx.moveTo(x + dx, barY);
+        ctx.lineTo(x + dx - 6, barY + barH);
+        ctx.stroke();
+      }
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '11px var(--mono), monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      if (w > 60) ctx.fillText('unused · ' + budgetLeft + ' tok', x + w / 2, barY + barH / 2);
+    }
+
+    // Budget boundary tick
+    ctx.strokeStyle = '#d97706';
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(barX + barW, barY - 6);
+    ctx.lineTo(barX + barW, barY + barH + 6);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#d97706';
+    ctx.font = '10px var(--mono), monospace';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'top';
+    ctx.fillText('budget = ' + budget, barX + barW - 2, barY + barH + 6);
+
+    // ── Section 2: the two lanes
+    const laneY = barY + barH + 50;
+    const laneH = 14;
+    const laneGap = 28;
+
+    function drawLane(yy, label, frac, fill) {
+      ctx.fillStyle = '#1f2430';
+      ctx.font = '12px var(--mono), monospace';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, barX, yy + laneH / 2);
+      const lx = barX + 110, lw = barW - 110 - 60;
+      ctx.fillStyle = '#f1f3f7';
+      ctx.fillRect(lx, yy, lw, laneH);
+      ctx.strokeStyle = '#dde2ea';
+      ctx.strokeRect(lx + 0.5, yy + 0.5, lw - 1, laneH - 1);
+      ctx.fillStyle = fill;
+      ctx.fillRect(lx, yy, lw * frac, laneH);
+
+      ctx.fillStyle = '#5b6573';
+      ctx.font = '11px var(--mono), monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText((frac * 100).toFixed(0) + '%', lx + lw + 6, yy + laneH / 2);
+    }
+    drawLane(laneY,                  'compute lane', compFrac, '#16a34a');
+    drawLane(laneY + laneGap,        'HBM lane',     hbmFrac,  '#d97706');
+
+    // Lane caption
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '10px var(--mono), monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText('compute saturates with batch tokens.   HBM saturates with active decoders (each pulls its full KV).',
+                 barX, laneY + 2*laneGap + 4);
+    ctx.fillText('ideal regime: both lanes near 100% in the same step  ⟶  chunked prefill mixes them.',
+                 barX, laneY + 2*laneGap + 20);
+  }
+
+  [rBud, rDec, rPre, rChk].forEach(el => el.addEventListener('input', render));
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

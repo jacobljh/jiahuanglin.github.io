@@ -1,0 +1,885 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>03 · FlashAttention</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">vllm_lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">03 · FlashAttention</span>
+    <span class="step-pill">lesson 3 / 12</span>
+  </div>
+</header>
+
+<main>
+
+<h1>FlashAttention</h1>
+<p class="subtitle">Same math, different schedule. Stream attention as a fused tile-loop with running softmax stats — never write the T×T score matrix to HBM.</p>
+
+<h2>Different paper, different problem</h2>
+
+<p>Before any math: PagedAttention (lesson 02) is about <em>memory management</em> of the KV cache across requests — a block table, an allocator, copy-on-write. FlashAttention is about the <em>arithmetic kernel</em> inside a single attention op. Different paper (Dao et al., NeurIPS 2022), different group (Stanford, not UC Berkeley), different problem.</p>
+
+<p>They compose. vLLM ships a kernel that does Flash-style tiling over a Paged-style block layout. Confusing them is the most common mistake in vLLM conversations.</p>
+
+<div class="callout">
+  <div class="label">Orthogonality, summarized</div>
+  <table style="margin: 0;">
+    <thead><tr><th></th><th>PagedAttention</th><th>FlashAttention</th></tr></thead>
+    <tbody>
+      <tr><td>concern</td><td>where in HBM the KV lives</td><td>how the attention op reads/writes HBM</td></tr>
+      <tr><td>changes</td><td>memory layout</td><td>kernel schedule</td></tr>
+      <tr><td>numerics</td><td>identical to contiguous</td><td>identical to naive (up to float noise)</td></tr>
+      <tr><td>buys you</td><td>fewer wasted KV bytes</td><td>fewer HBM bytes moved per op</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h2>The pain of naive attention</h2>
+
+<p>Textbook attention computes three tensors and feeds them through one another:</p>
+
+<div class="math block">
+  S = QK<sup>T</sup>/√d &nbsp;&nbsp; P = softmax(S) &nbsp;&nbsp; O = PV
+</div>
+
+<p>For a batch of <span class="math">B</span>, <span class="math">h</span> heads, sequence length <span class="math">T</span>, head dim <span class="math">d</span>, fp16: <span class="math">S</span> and <span class="math">P</span> each have shape <span class="math">(B, h, T, T)</span>. At <span class="math">T = 8192</span>, <span class="math">B = 1</span>, <span class="math">h = 32</span>, fp16:</p>
+
+<div class="math block">
+  |P| = 32 · 8192<sup>2</sup> · 2 bytes &nbsp;=&nbsp; 4.3 GB
+</div>
+
+<p>Four gigabytes for <em>one tensor in one layer of one request</em>. Two things break:</p>
+
+<ul>
+  <li><strong>You can't fit it.</strong> Even before you compute <span class="math">O</span>, the activation memory has blown past what HBM can spare.</li>
+  <li><strong>You can't move it fast enough.</strong> Each of <span class="math">S</span>, <span class="math">P</span> gets written to HBM and read back. That's <em>~17 GB of HBM traffic for the score+prob tensors alone, per layer</em>. On an H100 at 3 TB/s, that's ~6 ms per layer of pure memory traffic — and the math takes microseconds.</li>
+</ul>
+
+<div class="callout warn">
+  <div class="label">The bottleneck flipped</div>
+  Naive attention is memory-bound: the GPU spends most of its time waiting on HBM, not multiplying. Doing <em>less HBM I/O</em> directly buys wall-clock — see lesson 01, consequence B.
+</div>
+
+<h2>The insight: you never need the whole P</h2>
+
+<p>Look at any one row of <span class="math">O</span>:</p>
+
+<div class="math block">
+  O<sub>i</sub> = Σ<sub>j</sub> softmax(S<sub>i,:</sub>)<sub>j</sub> · V<sub>j</sub>
+</div>
+
+<p>To compute it, the only thing you need from the full row of <span class="math">S</span> is the softmax denominator <span class="math">Σ<sub>j</sub> exp(S<sub>i,j</sub> − max<sub>j</sub> S<sub>i,j</sub>)</span> and a running weighted sum. If we can compute those <em>incrementally</em> as we scan across the row in chunks, we never have to materialize the row.</p>
+
+<h3>The online-softmax trick</h3>
+
+<p>Suppose we've already processed the first chunk of a row and tracked two scalars per row:</p>
+
+<div class="math block">
+  m<sub>1</sub> = max of logits so far &nbsp;&nbsp;&nbsp; ℓ<sub>1</sub> = Σ exp(logit − m<sub>1</sub>)
+</div>
+
+<p>A new chunk arrives with its own stats <span class="math">(m<sub>2</sub>, ℓ<sub>2</sub>)</span>. Combine them:</p>
+
+<div class="math block">
+  m = max(m<sub>1</sub>, m<sub>2</sub>)<br>
+  ℓ = exp(m<sub>1</sub> − m) · ℓ<sub>1</sub> + exp(m<sub>2</sub> − m) · ℓ<sub>2</sub>
+</div>
+
+<p>This is just the identity <span class="math">exp(x − m<sub>1</sub>) = exp(x − m) · exp(m<sub>1</sub> − m)</span> applied to both partial sums and rebased to the new shared max. It's <em>exact</em>, not an approximation. Recurse over all chunks and you get the true softmax denominator over the full row, without ever having looked at more than one chunk at a time.</p>
+
+<p>The same rescaling factor <span class="math">exp(m<sub>old</sub> − m<sub>new</sub>)</span> fixes the running unnormalized output:</p>
+
+<div class="math block">
+  O' ← exp(m<sub>old</sub> − m<sub>new</sub>) · O' + Σ<sub>j ∈ new chunk</sub> exp(S<sub>i,j</sub> − m<sub>new</sub>) · V<sub>j</sub>
+</div>
+
+<p>At the end, divide by <span class="math">ℓ</span> once. That's the whole algorithm.</p>
+
+<h2>The tile schedule</h2>
+
+<p>FlashAttention-2's loop structure (Q on the outer loop, the version vLLM uses):</p>
+
+<pre><code>for each Q-block (rows):                # outer loop, parallel across heads / batch
+    init  (m, ℓ, O') = (-inf, 0, 0)  in SRAM    # per-row, for this Q-block
+    load  Q-block                    into SRAM
+    for each (K, V)-block (cols):   # inner loop, streams across all of K, V
+        load K-block, V-block        into SRAM
+        S_tile  = Q-block @ K-block^T / sqrt(d)             # in SRAM
+        m_new   = max(m, max-of-S_tile-per-row)
+        alpha   = exp(m - m_new)                            # rescale factor
+        P_tile  = exp(S_tile - m_new)                       # unnormalized probs
+        ℓ      = alpha * ℓ + sum(P_tile)
+        O'     = alpha * O' + P_tile @ V-block              # streaming weighted sum
+        m      = m_new
+    O[Q-block] = O' / ℓ              # finalize: one division per row</code></pre>
+
+<p>Three things to notice:</p>
+
+<ol>
+  <li><strong>Nothing intermediate touches HBM.</strong> <code>S_tile</code> and <code>P_tile</code> live in registers/SRAM, sized to fit (~100 KB per SM). The full <span class="math">T×T</span> matrix is never instantiated anywhere.</li>
+  <li><strong>HBM I/O is exactly Q, K, V, O.</strong> Q is read once per Q-block (one block load). K and V are each read once per inner iteration — that's still <em>once each across the whole op</em> if you stream them. O is written once at the end. That's it.</li>
+  <li><strong>The math is unchanged.</strong> See the rescaling derivation — every running update is algebraically equal to the corresponding term in the naive computation. The output matches naive attention to within float rounding (~1e-5 in fp32).</li>
+</ol>
+
+<div class="callout ok">
+  <div class="label">It's exact</div>
+  FlashAttention is not a different model, not a different attention, not an approximation. It computes the same tensor as naive attention. The wins are entirely from changing <em>when</em> bytes move between HBM and SRAM.
+</div>
+
+<h2>Interactive · watch the online softmax tile by tile</h2>
+
+<p>The hardest part of FlashAttention to internalize is the running rescale. Below is the inner loop executed on one query row against four <span class="math">K, V</span> tiles. Step through one tile at a time and watch <strong>m</strong>, <strong>ℓ</strong>, <strong>O'</strong> evolve — the <em>only</em> state the kernel keeps. The full row of scores is never materialized; the full <span class="math">T×T</span> matrix is never imagined.</p>
+
+<ul>
+  <li>The synthetic data is chosen so a bigger max shows up in <strong>tile #2</strong> — watch the running <em>α</em> shrink the old <strong>O'</strong> and <strong>ℓ</strong> on that step. That rescale is the entire trick.</li>
+  <li>Hit <em>auto-step</em>, then watch the <strong>O'</strong> bars walk. At the very end one division by <strong>ℓ</strong> finalizes the output.</li>
+  <li>The "in HBM" / "in SRAM" badges are the point: only <em>Q row, K tile, V tile, m, ℓ, O'</em> ever sit in SRAM, and only <em>O</em> ever leaves at the end.</li>
+</ul>
+
+<div class="widget" id="fa-os-widget">
+  <div class="title">Online softmax · one Q row · 4 K/V tiles of 8 · d = 8</div>
+  <div class="hint">The orange tile is loaded into SRAM <em>right now</em>. Blue tiles are already integrated into the running stats and discarded. Grey tiles haven't been touched.</div>
+
+  <div class="controls">
+    <button id="fa-os-prev">◀ step</button>
+    <button id="fa-os-next" class="primary">step ▶</button>
+    <button id="fa-os-auto">▶ auto</button>
+    <button id="fa-os-reset">reset</button>
+    <label class="inline" style="margin-left: 12px;">speed: <input type="range" id="fa-os-speed" min="200" max="1600" step="100" value="900"> <span class="val" id="fa-os-speed-val">900 ms</span></label>
+  </div>
+
+  <canvas id="fa-os-canvas" width="760" height="500" style="width:100%; height:500px; background: var(--code-bg); border:1px solid var(--border); border-radius:8px; display:block;"></canvas>
+
+  <div class="kpi-grid" style="margin-top: 12px;">
+    <div class="kpi"><div class="k">step</div><div class="v" id="fa-os-step">0 / 5</div></div>
+    <div class="kpi"><div class="k">running m</div><div class="v" id="fa-os-m">—</div></div>
+    <div class="kpi"><div class="k">running ℓ</div><div class="v" id="fa-os-l">—</div></div>
+    <div class="kpi"><div class="k">α (rescale)</div><div class="v" id="fa-os-alpha">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">show the algorithm this widget runs</summary>
+<pre><code>// One query row q; iterate over K, V in tiles of TILE rows.
+m, l, O' = -inf, 0, zeros(d)       // running stats, live in SRAM
+for t in tiles:
+    S      = q @ K_t.T              // 1 × TILE,  in SRAM only
+    m_new  = max(m, max(S))
+    alpha  = exp(m - m_new)         // rescale factor for the old stats
+    P      = exp(S - m_new)         // 1 × TILE,  in SRAM only
+    l      = alpha * l + sum(P)
+    O'     = alpha * O' + P @ V_t   // 1 × d,     in SRAM
+    m      = m_new
+return O' / l                       // one division per row at the end → O</code></pre>
+  </details>
+</div>
+
+<h2>How much HBM does each version move?</h2>
+
+<p>The numbers below assume one attention layer, fp16, <span class="math">B = 1</span>. We'll count bytes that cross the HBM ↔ SRAM boundary.</p>
+
+<h3>Naive</h3>
+
+<div class="math block">
+  Q, K, V, O reads/writes : 4 · h · T · d · 2 B<br>
+  S write + read &nbsp;: 2 · h · T<sup>2</sup> · 2 B<br>
+  P write + read &nbsp;: 2 · h · T<sup>2</sup> · 2 B<br>
+  total ≈ 4hT<sup>2</sup> · 2 B &nbsp;+&nbsp; 8hTd B
+</div>
+
+<p>The <span class="math">T<sup>2</sup></span> term dominates as soon as <span class="math">T &gt; 2d</span> (which is always).</p>
+
+<h3>Flash</h3>
+
+<div class="math block">
+  Q, K, V, O reads/writes : 4 · h · T · d · 2 B<br>
+  (no S, no P in HBM)<br>
+  total ≈ 8hTd B
+</div>
+
+<p>The ratio at <span class="math">T = 8192, h = 32, d = 128, fp16</span>:</p>
+
+<div class="math block">
+  naive ≈ 4 · 32 · 8192<sup>2</sup> · 2 B &nbsp;+&nbsp; 8 · 32 · 8192 · 128 B &nbsp;=&nbsp; 17.6 GB + 0.27 GB ≈ <strong>17.8 GB</strong><br>
+  flash ≈ 8 · 32 · 8192 · 128 B &nbsp;=&nbsp; <strong>0.27 GB</strong> = 270 MB<br>
+  reduction ≈ <strong>~65×</strong>
+</div>
+
+<p>Round numbers: naive ~20 GB, flash ~270 MB, ~75× less I/O. Translates to ~2–4× wall-clock speedup on an A100/H100 at long context. Not 75× wall-clock — HBM bandwidth isn't the <em>only</em> cost, and at long T the matmul FLOPs themselves become non-trivial — but it's the dominant axis.</p>
+
+<h2>The surprise: at short T, Flash doesn't help</h2>
+
+<p>Look at the formula again. Naive total is dominated by <span class="math">4hT<sup>2</sup></span> bytes only when that term beats the <span class="math">8hTd</span> constant. Solve:</p>
+
+<div class="math block">
+  4hT<sup>2</sup> &gt; 8hTd &nbsp;⇒&nbsp; T &gt; 2d
+</div>
+
+<p>At <span class="math">d = 128</span>, the crossover where the quadratic term starts to matter is <span class="math">T ≈ 256</span>. But the <em>practical</em> win opens up later — you need the quadratic term to dominate the constant by a healthy multiple before kernel-launch and SRAM-management overhead pay back. Empirically that's around <span class="math">T ≈ 1024–2048</span>. At <span class="math">T = 128</span> (small chat), Flash and naive move nearly identical HBM bytes; the kernel just has more bookkeeping.</p>
+
+<p>Convince yourself with the widget below.</p>
+
+<h2>Interactive · HBM-traffic calculator</h2>
+
+<p>Sliders set the workload; bars show naive vs flash HBM traffic per attention layer (one forward pass, fp16, <span class="math">B = 1</span>). Try:</p>
+
+<ul>
+  <li>Default (<span class="math">T = 8192, h = 32, d = 128</span>): see the ~70× gap that justifies every Flash deployment.</li>
+  <li>Drop <span class="math">T</span> to 256: Flash is barely ahead. Note which term dominates the naive bar — it's no longer <span class="math">P</span>+<span class="math">S</span>.</li>
+  <li>Push <span class="math">T</span> to 16384: the <span class="math">T<sup>2</sup></span> term in naive explodes; Flash grows linearly.</li>
+  <li>Bump <span class="math">d</span> to 256: the QKVO constant doubles. Flash's floor rises; the crossover moves out.</li>
+</ul>
+
+<div class="widget" id="fa-widget">
+  <div class="title">HBM traffic per attention layer — naive vs flash</div>
+  <div class="hint">fp16, batch=1, single forward pass. Bars on a log scale because the gap can span four orders of magnitude.</div>
+
+  <div class="controls">
+    <label class="inline">T (seq len): <input type="range" id="fa-T" min="128" max="16384" step="128" value="8192"> <span class="val" id="fa-T-val">8192</span></label>
+    <label class="inline">h (heads): <input type="range" id="fa-h" min="4" max="64" step="4" value="32"> <span class="val" id="fa-h-val">32</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline">d (head dim): <input type="range" id="fa-d" min="32" max="256" step="16" value="128"> <span class="val" id="fa-d-val">128</span></label>
+    <label class="inline">block_q: <input type="range" id="fa-bq" min="16" max="128" step="16" value="64"> <span class="val" id="fa-bq-val">64</span></label>
+    <label class="inline">block_kv: <input type="range" id="fa-bk" min="16" max="128" step="16" value="64"> <span class="val" id="fa-bk-val">64</span></label>
+  </div>
+
+  <canvas id="fa-canvas" width="760" height="260" style="width:100%; height:260px; background: var(--code-bg); border:1px solid var(--border); border-radius:8px; display:block;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">naive HBM</div><div class="v" id="fa-naive">—</div></div>
+    <div class="kpi"><div class="k">flash HBM</div><div class="v" id="fa-flash">—</div></div>
+    <div class="kpi"><div class="k">reduction</div><div class="v" id="fa-ratio">—</div></div>
+    <div class="kpi"><div class="k">dominant term (naive)</div><div class="v" id="fa-dom">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">show the formulas this widget uses</summary>
+<pre><code>// Per attention layer, fp16 (2 B), batch 1.
+// Naive moves: Q, K, V, O (each once) + S and P (each written and read).
+const qkvo  = 4 * h * T * d * 2;          // bytes
+const s_io  = 2 * h * T * T * 2;          // write + read
+const p_io  = 2 * h * T * T * 2;
+const naive = qkvo + s_io + p_io;
+
+// Flash keeps S, P in SRAM; moves only Q, K, V, O across HBM.
+// (block_q, block_kv don't change the asymptote — they only affect SRAM
+//  pressure and inner-loop count. We display them so you can see they
+//  don't move the bars on the right.)
+const flash = 4 * h * T * d * 2;</code></pre>
+  </details>
+</div>
+
+<h2>Composition with PagedAttention</h2>
+
+<p>In production vLLM, the attention kernel does both at once:</p>
+
+<ol>
+  <li>For each Q-block (Flash's outer loop)…</li>
+  <li>…iterate over the sequence's <em>logical</em> K, V positions in K-block-sized chunks…</li>
+  <li>…look up each K-block's <em>physical</em> location via the block table (Paged's indirection)…</li>
+  <li>…load that physical block into SRAM and run the Flash inner update.</li>
+</ol>
+
+<p>The two ideas are perfectly compatible: Flash doesn't care where in HBM the K, V tile came from, and Paged doesn't care what arithmetic you do on the tile once you have it. The vLLM kernel just happens to do both.</p>
+
+<h2>Where the speedup goes (and doesn't)</h2>
+
+<table>
+<thead><tr><th>regime</th><th>bottleneck</th><th>flash helps?</th></tr></thead>
+<tbody>
+<tr><td>prefill, long context (T ≫ 1k)</td><td>HBM traffic for S, P</td><td>yes, 2–4× wall-clock</td></tr>
+<tr><td>decode, long context</td><td>KV cache read</td><td>yes, same mechanism</td></tr>
+<tr><td>prefill, short context (T ≲ 256)</td><td>QKVO I/O + launch overhead</td><td>marginal</td></tr>
+<tr><td>training (backward)</td><td>same as fwd + recompute</td><td>even more (Flash-2 handles backward specifically)</td></tr>
+</tbody>
+</table>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Naive attention writes a tensor it doesn't need to keep — the T×T scores — to HBM and reads it back. Flash never writes it. The math is identical; the byte movement is ~75× less at long T, giving ~2–4× wall-clock. The win is real only past <span class="math">T ≈ 1024</span>; below that, you're paying overhead for a number that's already small.
+</div>
+
+<p>Next: <a href="04_continuous_batching.html">continuous batching</a> — the scheduling-side win that fixes the other half of vLLM's 24× throughput claim. It requires paged KV (lesson 02) to work, which is why we did paging first.</p>
+
+<footer class="lesson-nav">
+  <a href="02_paged_attention.html">
+    <span class="dir">← Prev</span>
+    <span class="ttl">02 · PagedAttention</span>
+  </a>
+  <a class="next" href="04_continuous_batching.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">04 · Continuous batching</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const fp16 = 2;
+  const canvas = document.getElementById('fa-canvas');
+  const ctx = canvas.getContext('2d');
+
+  const ctrl = {
+    T:  document.getElementById('fa-T'),
+    h:  document.getElementById('fa-h'),
+    d:  document.getElementById('fa-d'),
+    bq: document.getElementById('fa-bq'),
+    bk: document.getElementById('fa-bk'),
+  };
+  const vals = {
+    T:  document.getElementById('fa-T-val'),
+    h:  document.getElementById('fa-h-val'),
+    d:  document.getElementById('fa-d-val'),
+    bq: document.getElementById('fa-bq-val'),
+    bk: document.getElementById('fa-bk-val'),
+  };
+
+  function fmt(bytes) {
+    if (bytes < 1024) return bytes.toFixed(0) + " B";
+    if (bytes < 1024**2) return (bytes/1024).toFixed(1) + " KB";
+    if (bytes < 1024**3) return (bytes/1024**2).toFixed(1) + " MB";
+    return (bytes/1024**3).toFixed(2) + " GB";
+  }
+
+  function compute() {
+    const T = +ctrl.T.value, h = +ctrl.h.value, d = +ctrl.d.value;
+    const qkvo = 4 * h * T * d * fp16;
+    const s_io = 2 * h * T * T * fp16;
+    const p_io = 2 * h * T * T * fp16;
+    const naive = qkvo + s_io + p_io;
+    const flash = qkvo;
+    return { T, h, d, qkvo, s_io, p_io, naive, flash };
+  }
+
+  function render() {
+    for (const k of Object.keys(ctrl)) vals[k].textContent = ctrl[k].value;
+
+    const r = compute();
+
+    document.getElementById('fa-naive').textContent = fmt(r.naive);
+    document.getElementById('fa-flash').textContent = fmt(r.flash);
+    document.getElementById('fa-ratio').textContent = (r.naive / r.flash).toFixed(1) + '×';
+    const sp = r.s_io + r.p_io;
+    const dom = sp > r.qkvo
+      ? `S+P  (${(100 * sp / r.naive).toFixed(0)}%)`
+      : `QKVO (${(100 * r.qkvo / r.naive).toFixed(0)}%)`;
+    document.getElementById('fa-dom').textContent = dom;
+
+    // Render bars (log scale).
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    const padL = 90, padR = 30, padT = 30, padB = 60;
+    const plotW = W - padL - padR;
+    const plotH = H - padT - padB;
+
+    // Log scale: from 1 MB to 100 GB.
+    const minLog = Math.log10(1 * 1024 * 1024);
+    const maxLog = Math.log10(100 * 1024 * 1024 * 1024);
+    function xFor(bytes) {
+      const lg = Math.log10(Math.max(bytes, 10));
+      const f = (lg - minLog) / (maxLog - minLog);
+      return padL + Math.max(0, Math.min(1, f)) * plotW;
+    }
+
+    // Gridlines: 10 MB, 100 MB, 1 GB, 10 GB
+    ctx.font = '10px var(--mono), monospace';
+    ctx.strokeStyle = '#222a38';
+    ctx.fillStyle = '#94a3b8';
+    ctx.lineWidth = 1;
+    const gridVals = [
+      [10*1024**2,   '10 MB'],
+      [100*1024**2,  '100 MB'],
+      [1*1024**3,    '1 GB'],
+      [10*1024**3,   '10 GB'],
+      [100*1024**3,  '100 GB'],
+    ];
+    for (const [v, lbl] of gridVals) {
+      const x = xFor(v);
+      ctx.beginPath();
+      ctx.moveTo(x, padT);
+      ctx.lineTo(x, padT + plotH);
+      ctx.stroke();
+      ctx.textAlign = 'center';
+      ctx.fillText(lbl, x, padT + plotH + 14);
+    }
+
+    // Two bars: naive and flash.
+    const barH = 44;
+    const gap = 24;
+
+    function drawBar(y, label, segments, total) {
+      ctx.fillStyle = '#1f2430';
+      ctx.font = '12px var(--mono), monospace';
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, padL - 10, y + barH / 2);
+
+      let cumX = padL;
+      const startX = padL;
+      const endX = xFor(total);
+      // Background bar
+      ctx.fillStyle = '#f1f3f7';
+      ctx.fillRect(padL, y, plotW, barH);
+      ctx.strokeStyle = '#dde2ea';
+      ctx.strokeRect(padL + 0.5, y + 0.5, plotW - 1, barH - 1);
+
+      // Filled portion up to total (segments are stacked proportionally within the linear extent).
+      const filledW = endX - startX;
+      let used = 0;
+      for (const seg of segments) {
+        const frac = seg.bytes / total;
+        const w = filledW * frac;
+        ctx.fillStyle = seg.color;
+        ctx.fillRect(startX + used, y, w, barH);
+        used += w;
+      }
+
+      // Total annotation at the right edge of the bar.
+      ctx.fillStyle = '#1f2430';
+      ctx.font = '12px var(--mono), monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText(' ' + fmt(total), endX + 4, y + barH / 2);
+    }
+
+    drawBar(padT, 'naive', [
+      { color: '#2563eb', bytes: r.qkvo, label: 'QKVO' },
+      { color: '#dc2626', bytes: r.s_io, label: 'S' },
+      { color: '#d97706', bytes: r.p_io, label: 'P' },
+    ], r.naive);
+
+    drawBar(padT + barH + gap, 'flash', [
+      { color: '#2563eb', bytes: r.flash, label: 'QKVO' },
+    ], r.flash);
+
+    // Legend
+    ctx.font = '11px var(--mono), monospace';
+    ctx.textBaseline = 'middle';
+    const ly = padT + plotH + 38;
+    const items = [
+      ['#2563eb', 'QKVO I/O'],
+      ['#dc2626', 'S (scores) write+read'],
+      ['#d97706', 'P (probs) write+read'],
+    ];
+    let lx = padL;
+    for (const [c, t] of items) {
+      ctx.fillStyle = c;
+      ctx.fillRect(lx, ly - 5, 10, 10);
+      ctx.fillStyle = '#5b6573';
+      ctx.textAlign = 'left';
+      ctx.fillText(t, lx + 14, ly);
+      lx += ctx.measureText(t).width + 36;
+    }
+  }
+
+  for (const k of Object.keys(ctrl)) ctrl[k].addEventListener('input', render);
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ── Lesson 03 · online-softmax tile animator ───────────────────────────── */
+(function(){
+  const D = 8;            // head dim
+  const TILE = 8;         // tokens per K/V tile
+  const NUM_TILES = 4;
+
+  // Pre-baked logits (q · K_t^T) per tile. The story: tile #2 has the global max.
+  const S_TILES = [
+    [0.5, 0.8, 0.3, 0.6, 0.2, 0.7, 0.4, 0.5],   // m_local = 0.8
+    [1.2, 0.9, 1.0, 1.1, 0.7, 1.3, 0.8, 0.9],   // m_local = 1.3  → rescale 1
+    [2.5, 0.5, 2.0, 1.5, 2.8, 1.0, 2.2, 1.8],   // m_local = 2.8  → rescale 2 (big!)
+    [0.8, 1.1, 0.6, 0.9, 1.0, 0.7, 1.2, 0.5],   // m_local = 1.2  → no rescale
+  ];
+  // V tiles (TILE × D), deterministic, in [0, 1].
+  const V_TILES = (function(){
+    const out = [];
+    for (let t = 0; t < NUM_TILES; t++) {
+      const v = [];
+      for (let i = 0; i < TILE; i++) {
+        const row = [];
+        for (let j = 0; j < D; j++) {
+          row.push(0.5 + 0.35 * Math.sin(0.7 + t*0.9 + i*0.55 + j*0.42));
+        }
+        v.push(row);
+      }
+      out.push(v);
+    }
+    return out;
+  })();
+
+  // Build the full trace ahead of time (so prev/next are cheap).
+  function buildTrace() {
+    const trace = [];
+    let m = -Infinity, l = 0, O = new Array(D).fill(0);
+    trace.push({stage:'init', m, l, O:[...O]});
+    for (let t = 0; t < NUM_TILES; t++) {
+      const S = S_TILES[t];
+      const tileMax = Math.max(...S);
+      const m_old = m;
+      const m_new = Math.max(m, tileMax);
+      const alpha = (m_old === -Infinity) ? 0 : Math.exp(m_old - m_new);
+      const P = S.map(s => Math.exp(s - m_new));
+      const sumP = P.reduce((a,b) => a+b, 0);
+      const l_old = l;
+      const l_new = alpha * l + sumP;
+      const O_old = [...O];
+      const O_new = new Array(D).fill(0);
+      for (let j = 0; j < D; j++) {
+        let pv = 0;
+        for (let i = 0; i < TILE; i++) pv += P[i] * V_TILES[t][i][j];
+        O_new[j] = alpha * O[j] + pv;
+      }
+      trace.push({stage:'tile', t, S, tileMax, m_old, m_new, alpha, P, sumP,
+                  l_old, l_new, O_old, O_new});
+      m = m_new; l = l_new; O = O_new;
+    }
+    trace.push({stage:'final', m, l, O:[...O], O_final: O.map(o => o/l)});
+    return trace;
+  }
+  const TRACE = buildTrace();
+
+  // Find global O' max for normalised bar scales.
+  let O_MAX = 0;
+  for (const fr of TRACE) {
+    if (fr.O_new)   for (const v of fr.O_new)   O_MAX = Math.max(O_MAX, v);
+    if (fr.O_old)   for (const v of fr.O_old)   O_MAX = Math.max(O_MAX, v);
+    if (fr.O)       for (const v of fr.O)       O_MAX = Math.max(O_MAX, v);
+    if (fr.O_final) for (const v of fr.O_final) O_MAX = Math.max(O_MAX, v);
+  }
+  const L_MAX = Math.max(...TRACE.filter(f=>f.l_new!==undefined).map(f=>f.l_new), 1);
+  const S_MAX = 3.0;   // logits scale ceiling for bar heights
+  const P_MAX = 1.0;   // exp(S - m_new) is ≤ 1 by construction
+
+  // ── DOM
+  const canvas = document.getElementById('fa-os-canvas');
+  const ctx = canvas.getContext('2d');
+  const btnPrev = document.getElementById('fa-os-prev');
+  const btnNext = document.getElementById('fa-os-next');
+  const btnAuto = document.getElementById('fa-os-auto');
+  const btnReset= document.getElementById('fa-os-reset');
+  const spd     = document.getElementById('fa-os-speed');
+  const spdVal  = document.getElementById('fa-os-speed-val');
+
+  let step = 0;
+  let autoTimer = null;
+
+  function setStep(s) {
+    step = Math.max(0, Math.min(TRACE.length - 1, s));
+    render();
+  }
+  btnPrev.addEventListener('click', () => { stopAuto(); setStep(step - 1); });
+  btnNext.addEventListener('click', () => { stopAuto(); setStep(step + 1); });
+  btnReset.addEventListener('click',() => { stopAuto(); setStep(0); });
+  function startAuto() {
+    btnAuto.textContent = '⏸ pause';
+    autoTimer = setInterval(() => {
+      if (step >= TRACE.length - 1) { stopAuto(); return; }
+      setStep(step + 1);
+    }, +spd.value);
+  }
+  function stopAuto() {
+    if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+    btnAuto.textContent = '▶ auto';
+  }
+  btnAuto.addEventListener('click', () => autoTimer ? stopAuto() : startAuto());
+  spd.addEventListener('input', () => {
+    spdVal.textContent = spd.value + ' ms';
+    if (autoTimer) { stopAuto(); startAuto(); }
+  });
+
+  // ── Render helpers
+  function lerpColor(t) {           // 0..1  →  hsl gradient blue→cyan→warm
+    const h = 220 - 200 * t;
+    return `hsl(${h}, 65%, ${42 + 18*t}%)`;
+  }
+  function barColor(v, max, accent) {
+    const t = Math.max(0, Math.min(1, v / max));
+    return accent ? `rgba(255, 184, 106, ${0.35 + 0.6*t})`
+                  : `rgba(106, 169, 255, ${0.35 + 0.6*t})`;
+  }
+
+  function render() {
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    const fr = TRACE[step];
+    const activeT = (fr.stage === 'tile') ? fr.t : null;
+
+    // ── (1) K/V tile strip ──────────────────────────────────────────────
+    const padL = 18, padR = 18;
+    const stripY = 14, stripH = 92;
+    const gridW = W - padL - padR;
+    const tileGap = 12;
+    const tileW = (gridW - tileGap * (NUM_TILES - 1)) / NUM_TILES;
+
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '11px var(--mono), monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText('K, V tiles in HBM  →  one loaded into SRAM per step', padL, 0);
+
+    for (let t = 0; t < NUM_TILES; t++) {
+      const x = padL + t * (tileW + tileGap);
+      let state;
+      if (activeT === null) {
+        state = (fr.stage === 'final') ? 'done' : 'future';
+      } else {
+        state = (t < activeT) ? 'done' : (t === activeT) ? 'active' : 'future';
+      }
+      const stroke = state === 'active' ? '#d97706'
+                    : state === 'done'  ? '#3a5e9c'
+                    : '#dde2ea';
+      const fill   = state === 'active' ? '#241e10'
+                    : state === 'done'  ? '#f1f3f7'
+                    : '#0c0f15';
+      ctx.fillStyle = fill;
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = state === 'active' ? 2.2 : 1;
+      ctx.fillRect(x, stripY, tileW, stripH);
+      ctx.strokeRect(x + 0.5, stripY + 0.5, tileW - 1, stripH - 1);
+
+      // mini K/V cells (8 rows × 8 cols, shrunk)
+      const cellPadX = 8, cellPadY = 24;
+      const innerW = tileW - 2*cellPadX, innerH = stripH - cellPadY - 8;
+      const cw = innerW / D, ch = innerH / TILE;
+      for (let i = 0; i < TILE; i++) {
+        for (let j = 0; j < D; j++) {
+          const v = V_TILES[t][i][j];
+          ctx.fillStyle = state === 'future' ? `rgba(60,68,90,${0.3 + 0.4*v})`
+                                              : lerpColor(v);
+          if (state !== 'active') ctx.globalAlpha = state === 'done' ? 0.45 : 0.55;
+          ctx.fillRect(x + cellPadX + j*cw + 0.5, stripY + cellPadY + i*ch + 0.5,
+                       cw - 1, ch - 1);
+          ctx.globalAlpha = 1;
+        }
+      }
+
+      // tile label
+      ctx.fillStyle = state === 'active' ? '#d97706'
+                     : state === 'done'  ? '#2563eb' : '#94a3b8';
+      ctx.font = '11px var(--mono), monospace';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      const lbl = state === 'active' ? `K,V tile #${t}  ▸ in SRAM`
+                : state === 'done'   ? `tile #${t}  ✓ folded into stats`
+                                     :  `tile #${t}  ⋯ HBM`;
+      ctx.fillText(lbl, x + 6, stripY + 6);
+    }
+
+    // ── (2) Current-tile computation ─────────────────────────────────────
+    const midY = stripY + stripH + 22;
+    const midH = 168;
+    ctx.fillStyle = '#0e1118';
+    ctx.strokeStyle = '#dde2ea';
+    ctx.fillRect(padL, midY, gridW, midH);
+    ctx.strokeRect(padL + 0.5, midY + 0.5, gridW - 1, midH - 1);
+
+    if (fr.stage === 'tile') {
+      // S_tile bars (top half)
+      const colW = (gridW - 40) / 2;
+      const colSx = padL + 20;
+      const colPx = padL + 20 + colW + 0;
+
+      const barAreaH = 60;
+      const barAreaY = midY + 30;
+
+      ctx.fillStyle = '#1f2430';
+      ctx.font = '12px var(--mono), monospace';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      ctx.fillText('S_tile  =  q · Kᵀ', colSx, midY + 10);
+      ctx.fillStyle = '#5b6573';
+      ctx.font = '11px var(--mono), monospace';
+      ctx.fillText('local max = ' + fr.tileMax.toFixed(2), colSx + 140, midY + 12);
+
+      const bw = (colW - 20) / TILE - 4;
+      for (let i = 0; i < TILE; i++) {
+        const v = fr.S[i];
+        const h = (v / S_MAX) * barAreaH;
+        const x = colSx + i * (bw + 4);
+        const isMax = (Math.abs(v - fr.tileMax) < 1e-9);
+        ctx.fillStyle = isMax ? '#d97706' : '#2563eb';
+        ctx.fillRect(x, barAreaY + barAreaH - h, bw, h);
+        ctx.strokeStyle = '#dde2ea';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x + 0.5, barAreaY + 0.5, bw - 1, barAreaH - 1);
+        ctx.fillStyle = isMax ? '#d97706' : '#94a3b8';
+        ctx.font = '9px var(--mono), monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(v.toFixed(1), x + bw/2, barAreaY + barAreaH + 12);
+      }
+
+      // P_tile bars (right half)
+      ctx.fillStyle = '#1f2430';
+      ctx.font = '12px var(--mono), monospace';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      ctx.fillText('P_tile  =  exp(S − m_new)', colPx, midY + 10);
+      ctx.fillStyle = '#5b6573';
+      ctx.font = '11px var(--mono), monospace';
+      ctx.fillText('sum = ' + fr.sumP.toFixed(2), colPx + 180, midY + 12);
+
+      for (let i = 0; i < TILE; i++) {
+        const v = fr.P[i];
+        const h = (v / P_MAX) * barAreaH;
+        const x = colPx + i * (bw + 4);
+        ctx.fillStyle = '#16a34a';
+        ctx.fillRect(x, barAreaY + barAreaH - h, bw, h);
+        ctx.strokeStyle = '#dde2ea';
+        ctx.strokeRect(x + 0.5, barAreaY + 0.5, bw - 1, barAreaH - 1);
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '9px var(--mono), monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(v.toFixed(2), x + bw/2, barAreaY + barAreaH + 12);
+      }
+
+      // rescale annotation strip
+      const annY = barAreaY + barAreaH + 36;
+      ctx.font = '12px var(--mono), monospace';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      const m_oldS = (fr.m_old === -Infinity) ? '−∞' : fr.m_old.toFixed(2);
+      const annLeft = `m: ${m_oldS}  →  ${fr.m_new.toFixed(2)}`;
+      ctx.fillStyle = (fr.m_new > fr.m_old) ? '#d97706' : '#5b6573';
+      ctx.fillText(annLeft, padL + 20, annY);
+
+      const alphaStr = (fr.alpha === 0) ? '0  (first tile)' : 'α = exp(m_old − m_new) = ' + fr.alpha.toFixed(3);
+      ctx.fillStyle = (fr.alpha > 0 && fr.alpha < 0.999) ? '#d97706' : '#5b6573';
+      ctx.fillText(alphaStr, padL + 20 + colW, annY);
+
+      if (fr.alpha > 0 && fr.alpha < 0.999) {
+        ctx.fillStyle = '#dc2626';
+        ctx.font = '11px var(--mono), monospace';
+        ctx.fillText('  ↓ rescales the running ℓ, O\' by α', padL + 20 + colW + 250, annY);
+      }
+    } else if (fr.stage === 'init') {
+      ctx.fillStyle = '#5b6573';
+      ctx.font = '13px var(--mono), monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('init  ·  m = −∞,  ℓ = 0,  O\' = 0     (running stats only — no HBM writes)',
+                   padL + gridW/2, midY + midH/2);
+    } else {
+      ctx.fillStyle = '#16a34a';
+      ctx.font = '13px var(--mono), monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('done  ·  O = O\' / ℓ     (one division per row, written to HBM)',
+                   padL + gridW/2, midY + midH/2);
+    }
+
+    // ── (3) Running stats panel ──────────────────────────────────────────
+    const botY = midY + midH + 22;
+    const botH = H - botY - 18;
+    ctx.fillStyle = '#0e1118';
+    ctx.strokeStyle = '#3a5e9c';
+    ctx.lineWidth = 1;
+    ctx.fillRect(padL, botY, gridW, botH);
+    ctx.strokeRect(padL + 0.5, botY + 0.5, gridW - 1, botH - 1);
+
+    ctx.fillStyle = '#2563eb';
+    ctx.font = 'bold 12px var(--mono), monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText('SRAM  ·  running stats (m, ℓ, O\')', padL + 10, botY + 8);
+
+    // current values
+    let m_cur, l_cur, O_cur;
+    if (fr.stage === 'init') { m_cur = -Infinity; l_cur = 0; O_cur = fr.O; }
+    else if (fr.stage === 'tile') { m_cur = fr.m_new; l_cur = fr.l_new; O_cur = fr.O_new; }
+    else { m_cur = fr.m; l_cur = fr.l; O_cur = fr.O; }
+
+    const cur_O_display = (fr.stage === 'final') ? fr.O_final : O_cur;
+    const cur_O_label = (fr.stage === 'final') ? 'O = O\' / ℓ' : 'O\'';
+
+    // m
+    const labelX = padL + 20, valX = padL + 70;
+    ctx.fillStyle = '#1f2430';
+    ctx.font = '12px var(--mono), monospace';
+    ctx.fillText('m =', labelX, botY + 36);
+    ctx.fillStyle = '#d97706';
+    ctx.font = 'bold 16px var(--mono), monospace';
+    ctx.fillText(m_cur === -Infinity ? '−∞' : m_cur.toFixed(3), valX, botY + 34);
+
+    // ℓ bar
+    ctx.fillStyle = '#1f2430';
+    ctx.font = '12px var(--mono), monospace';
+    ctx.fillText('ℓ =', labelX, botY + 70);
+    ctx.fillStyle = '#16a34a';
+    ctx.font = 'bold 14px var(--mono), monospace';
+    ctx.fillText(l_cur.toFixed(3), valX, botY + 70);
+
+    const lbarX = valX + 80, lbarY = botY + 64, lbarW = 220, lbarH = 14;
+    ctx.fillStyle = '#f1f3f7';
+    ctx.fillRect(lbarX, lbarY, lbarW, lbarH);
+    ctx.strokeStyle = '#dde2ea';
+    ctx.strokeRect(lbarX + 0.5, lbarY + 0.5, lbarW - 1, lbarH - 1);
+    ctx.fillStyle = '#16a34a';
+    ctx.fillRect(lbarX, lbarY, lbarW * Math.min(1, l_cur / L_MAX), lbarH);
+
+    // O' bars (length D)
+    ctx.fillStyle = '#1f2430';
+    ctx.font = '12px var(--mono), monospace';
+    ctx.fillText(cur_O_label + ' =', labelX, botY + 102);
+
+    const obX = valX + 50, obY = botY + 92, obAreaW = gridW - (obX - padL) - 24, obH = 36;
+    const obw = (obAreaW - 4 * (D - 1)) / D;
+    // Always use the global O_MAX so the visible shrink on "O ← O' / ℓ" is preserved.
+    const obMax = O_MAX;
+    for (let j = 0; j < D; j++) {
+      const v = cur_O_display[j];
+      const h = Math.max(0, (v / obMax) * obH);
+      const x = obX + j * (obw + 4);
+      ctx.fillStyle = (fr.stage === 'final') ? '#16a34a' : '#2563eb';
+      ctx.fillRect(x, obY + obH - h, obw, h);
+      ctx.strokeStyle = '#dde2ea';
+      ctx.strokeRect(x + 0.5, obY + 0.5, obw - 1, obH - 1);
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '9px var(--mono), monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(v.toFixed(2), x + obw/2, obY + obH + 10);
+    }
+
+    // little caption under O' bars
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '10px var(--mono), monospace';
+    ctx.textAlign = 'left';
+    const cap = (fr.stage === 'final')
+      ? 'final O — the only thing this kernel writes to HBM'
+      : 'unnormalized O\', still in SRAM';
+    ctx.fillText(cap, obX, obY + obH + 26);
+
+    // ── KPIs ─────────────────────────────────────────────────────────────
+    document.getElementById('fa-os-step').textContent =
+      (fr.stage === 'init' ? '0' : fr.stage === 'final' ? String(NUM_TILES + 1) : String(fr.t + 1))
+      + ' / ' + (NUM_TILES + 1);
+    document.getElementById('fa-os-m').textContent =
+      (m_cur === -Infinity) ? '−∞' : m_cur.toFixed(3);
+    document.getElementById('fa-os-l').textContent = l_cur.toFixed(3);
+    document.getElementById('fa-os-alpha').textContent =
+      (fr.stage === 'tile') ? (fr.alpha === 0 ? '0 (first tile)' : fr.alpha.toFixed(3)) : '—';
+  }
+
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

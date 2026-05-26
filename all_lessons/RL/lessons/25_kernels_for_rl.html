@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>24 · Kernels for RL — what an RL infra engineer actually writes</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">RL / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">25 · kernels for RL</span>
+    <span class="step-pill">lesson 2 / 2 · part IV</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Kernels for RL — what an RL infra engineer actually writes</h1>
+<p class="subtitle">"New kernels for rollout and training" is shorthand for six distinct kernel surfaces, each with its own bottleneck physics. This lesson maps every surface, derives why it matters, and names the kernels that pay back for the engineer who writes them.</p>
+
+<h2>The first-principles map</h2>
+
+<p>RL post-training is forward-heavy. From <a href="24_engineer_role.html">lesson 24</a>: a single step does ~1M forward passes for rollout, one forward + backward for training, one forward for the reference model, and a parameter broadcast for weight sync. <em>Each of these is a distinct kernel optimization surface.</em> Listing them honestly:</p>
+
+<table>
+  <thead><tr><th>#</th><th>Surface</th><th>Workload shape</th><th>Compute / memory regime</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td><strong>Rollout / inference</strong></td><td>Autoregressive decode + occasional prefill</td><td>Decode is HBM-bound (load full weights + KV per token). Prefill is compute-bound.</td></tr>
+    <tr><td>2</td><td><strong>Log-prob matching</strong></td><td>Single forward over completed trajectories</td><td>Bandwidth on LM head; numerics on softmax.</td></tr>
+    <tr><td>3</td><td><strong>Training (policy update)</strong></td><td>Forward + backward over packed trajectories</td><td>FFN/attention matmuls (compute-bound), CE loss (memory-bound), KL/PPO surrogate.</td></tr>
+    <tr><td>4</td><td><strong>Weight sync</strong></td><td>Broadcast / cast / reshape of parameters</td><td>Network bandwidth (NCCL) + HBM bandwidth for cast.</td></tr>
+    <tr><td>5</td><td><strong>Memory &amp; scheduling</strong></td><td>KV cache allocator, activation offload, gradient accumulation</td><td>HBM allocator + PCIe overlap.</td></tr>
+    <tr><td>6</td><td><strong>Agentic primitives</strong></td><td>Multi-turn KV reuse, varlen masking, tool-output masking</td><td>Mixed: kernel + control flow.</td></tr>
+  </tbody>
+</table>
+
+<p>Now drill into each.</p>
+
+<h2>Surface 1 — rollout / inference kernels (the ~60% of step time)</h2>
+
+<p>Decode is memory-bound: one token at a time, you load the entire model's weights from HBM, plus the entire KV cache so far, to emit one new token. The compute is trivial; the bandwidth dominates. So all rollout kernel work targets either reducing bytes moved or hiding the cost.</p>
+
+<table>
+  <thead><tr><th>Kernel</th><th>What it does</th><th>Why it's an RL engineer's problem</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>FlashAttention 2/3, FlashInfer</strong></td>
+      <td>Tiled attention with online softmax — O(N) HBM traffic instead of O(N²). FA3 adds asynchronous Hopper TMA pipelining.</td>
+      <td>You'll choose the version, port between vLLM and SGLang, and patch when sliding-window or per-head dropout breaks something. <a href="../../gpu_kernel_serving/12_vllm_kernel_stack.html">gpu_kernel_serving/12</a>.</td>
+    </tr>
+    <tr>
+      <td><strong>PagedAttention</strong></td>
+      <td>KV cache stored as paged blocks (like OS virtual memory) so non-contiguous KV reads work and fragmentation drops to ~zero. Block table in HBM.</td>
+      <td>Variable-length trajectories in RL fragment a contiguous KV allocator badly. PagedAttention is non-optional once you have &gt;2 concurrent rollouts.</td>
+    </tr>
+    <tr>
+      <td><strong>Prefix caching / RadixAttention</strong></td>
+      <td>Detect shared prefixes across requests (system prompt, few-shot, task header) and reuse the KV cache. RadixAttention organizes prefixes in a radix tree.</td>
+      <td><strong>The single highest-leverage RL-specific kernel.</strong> K-rollout sampling means K trajectories share the same prompt prefix. Without prefix caching: K full prefills. With: 1 prefill + K decodes. Speedup is 3–10× on math-style benchmarks.</td>
+    </tr>
+    <tr>
+      <td><strong>Continuous batching</strong></td>
+      <td>Dynamically add / remove sequences from the running batch each step, so completed sequences don't waste compute on padding.</td>
+      <td>RL trajectories have wildly different lengths (200 to 10000 tokens). Static batching wastes 50%+ of compute.</td>
+    </tr>
+    <tr>
+      <td><strong>Chunked prefill</strong></td>
+      <td>Split a long prefill into chunks, interleaved with decode steps from other sequences. Reduces decode TTFT latency.</td>
+      <td>In K-rollouts-per-prompt RL, you want decode and prefill from <em>different</em> rollouts to overlap. Chunked prefill makes the scheduler symmetric.</td>
+    </tr>
+    <tr>
+      <td><strong>GQA / MQA attention</strong></td>
+      <td>Multiple query heads share K, V → smaller KV cache, smaller HBM read per decode step.</td>
+      <td>You don't write the kernel often (models ship with their head layout), but you'll choose GQA-aware kernels and verify the inference engine respects the K-head grouping correctly.</td>
+    </tr>
+    <tr>
+      <td><strong>Speculative decoding (EAGLE-2/3, Medusa, lookahead)</strong></td>
+      <td>A draft proposer (small model, or a learned head like EAGLE/Medusa) proposes K tokens; the target verifies all K in one forward pass; accepted tokens emit "for free". <a href="../../vllm/lessons/07_speculative_decoding.html">vllm/07</a>.</td>
+      <td>For greedy or low-T rollouts, ~2× throughput. For high-T exploration (typical RL), naive draft-model speculation degrades; EAGLE-style proposers (which condition on target's hidden state) hold up better because they bias toward what the target would sample.</td>
+    </tr>
+    <tr>
+      <td><strong>KV cache quantization (int8 / fp8)</strong></td>
+      <td>Quantize K, V tensors in the cache → half the HBM traffic per decode token.</td>
+      <td>Decode is HBM-bound — int8 KV cache is a near-2× decode speedup. Affects log-prob match: if rollout uses int8 KV but trainer uses bf16, the logprobs differ. You decide whether to mirror in trainer or recompute.</td>
+    </tr>
+    <tr>
+      <td><strong>CUDA-graph re-capture under shape change</strong></td>
+      <td>CUDA graphs themselves are table-stakes in 2026 — vLLM, SGLang, TensorRT-LLM all default-on them. The engineering work is invalidating &amp; re-capturing graphs when batch shape, KV layout, or paged-block count change — which happens constantly under continuous batching.</td>
+      <td>Without careful re-capture, you either re-graph every step (kills the win) or fall off the graph path (kills the win the other way). Production frameworks have hundreds of cached graph variants keyed on shape.</td>
+    </tr>
+    <tr>
+      <td><strong>Fused sampling</strong></td>
+      <td>top-k / top-p / temperature / penalties fused into one kernel after the logits step.</td>
+      <td>For RL, you often sample with temperature ≠ 1 and need exact reproducibility. A fused sampler that uses a deterministic Philox RNG is necessary for replay-debug.</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <div class="label">The first kernel you write for RL</div>
+  Almost always: <strong>prefix-aware paged attention</strong>. The math: K rollouts share a P-token prompt; without sharing, K·P prefill work; with sharing, P prefill + K·G decode work (G = generation length). The ratio is <span class="math">K · P / (P + K·G) = K / (1 + K·G/P)</span> — for K=16 and G/P=0.1, the prefill savings are ~6×; for K=64, ~8.6×. (Total step-time wins are smaller because decode is unchanged, but prefill is the compute-bound phase, so this lands as 3–10× rollout speedup depending on the regime.) SGLang's RadixAttention handles sub-block prefixes via a radix tree; vLLM's APC (Automatic Prefix Caching) is a block-trie variant that's coarser-grained. On a fresh framework you integrate one — you do not write paged attention from scratch in 2026.
+</div>
+
+<h2>Surface 2 — log-prob matching kernels (the silent bug surface)</h2>
+
+<p>Recall the PPO surrogate:</p>
+
+<div class="math block">L_PPO = E[ min( ρ · A, clip(ρ, 1−ε, 1+ε) · A ) ]
+ρ = π_θ(a|s) / π_old(a|s)         &nbsp;&nbsp; — importance ratio</div>
+
+<p>The ratio's numerator is the trainer's current policy log-prob. The denominator is "the policy that produced the rollout", i.e., the rollout engine's log-prob at sample time. If those two engines compute slightly different logprobs for the <em>same</em> (model, token sequence), <span class="math">ρ</span> is biased — even at the moment of the rollout.</p>
+
+<table>
+  <thead><tr><th>Where mismatch comes from</th><th>Numerical magnitude</th></tr></thead>
+  <tbody>
+    <tr><td>Different attention kernels (FlashAttention vs vLLM's paged variant)</td><td>~1e-4 in logprob ⟶ <span class="math">ρ ≈ 1.0001</span> per token. PPO is per-token, so the failure mode isn't a multiplicative blow-up across the sequence; it's that a slowly accumulating systematic bias pushes more and more per-token ratios outside the clip range <span class="math">[1−ε, 1+ε]</span>, zeroing gradients on those tokens and biasing the surviving ones.</td></tr>
+    <tr><td>Mixed precision: rollout in fp16 / int8, trainer in bf16</td><td>~1e-3 in logprob → catastrophic over long sequences.</td></tr>
+    <tr><td>Different reduction order in softmax</td><td>~1e-6, usually OK.</td></tr>
+    <tr><td>Tokenizer asymmetry (extra BOS, different whitespace)</td><td>Categorical — wrong tokens entirely.</td></tr>
+    <tr><td>Sampling temperature applied differently</td><td>logprob computed at the post-temperature distribution must match.</td></tr>
+  </tbody>
+</table>
+
+<p>So the engineer's responsibilities here:</p>
+
+<ol>
+  <li><strong>Decide the match policy.</strong> Two choices:
+    <ul>
+      <li><em>Strict-recompute</em>: have the trainer recompute logprobs for the rollout sequences. Adds one trainer forward per step (10–15% time cost). Simple, correct.</li>
+      <li><em>Numerically-equivalent engines</em>: guarantee the rollout and trainer produce byte-identical logprobs. No extra forward, but every engine change is a potential regression.</li>
+    </ul>
+    Modern frameworks (verl, OpenRLHF, TRL) default to strict-recompute. Frontier labs sometimes use equivalent engines for the throughput.</li>
+  <li><strong>Write the recompute kernel.</strong> It's a packed-sequence forward over completed trajectories, plus a gather to select the sampled token's logit, plus log_softmax. Standard shape:
+    <div class="math block">logits[B, T, V] → gather(token_ids[B, T]) → log_softmax → logπ[B, T]</div>
+    The naive implementation materialises the (B, T, V) logits tensor. Packed across a step (B·T = 32k tokens, V=128k, bf16): ~8 GB just for logits, plus another 8 GB for softmax intermediates, plus the full backward-pass gradients on that tensor. The peak hits ≥ 30 GB on a 32k packed batch — competing for the same HBM as the rest of the activation set. Hence:</li>
+  <li><strong>Chunked / fused log-prob kernel.</strong> Compute log_softmax over <em>chunks of V</em> and reduce to logπ[B, T] without ever materialising the full logits tensor. Hugging Face's <code>liger-kernel</code>, vLLM's <code>flash_attention_with_logits</code>, and Megatron's <code>vocab_parallel_cross_entropy</code> are different production answers. Writing this kernel saves ~30–50% of trainer-forward memory.</li>
+  <li><strong>Reference-model logprob fusion.</strong> The KL anchor needs logπ_ref. If ref runs in the same forward sweep (shared model on colocated GPUs), you fuse a "gather both ref and policy logπ in one pass". If ref runs separately, you orchestrate the two streams' outputs into the loss kernel.</li>
+</ol>
+
+<div class="callout warn">
+  <div class="label">The bug worth a week</div>
+  Rollout engine computed logprobs with sampling temperature applied (so <span class="math">logπ = log softmax(z/T)</span>); trainer recomputed at temperature 1 (<span class="math">logπ = log softmax(z)</span>). Importance ratio looked fine on average but was systematically biased high for tokens far from the mode. Symptom: clipping fraction climbing slowly; rewards flat. Fix: 1 line. Cost: 6 days of training thrown away. Always log <span class="math">ρ</span>'s histogram per step.
+</div>
+
+<h2>Surface 3 — training kernels (policy update)</h2>
+
+<p>Once you have packed trajectories, advantages, and logprobs, the actual policy-update step is "forward + loss + backward". Three RL-specific kernel needs:</p>
+
+<table>
+  <thead><tr><th>Kernel</th><th>What it does</th><th>Win</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>Sequence-packed varlen attention</strong></td>
+      <td>Pack many variable-length trajectories into a single (B=1, T_total) tensor with a cu_seqlens table, then run FlashAttention with the varlen flag.</td>
+      <td>30–60% fewer FLOPs vs padded batches (real ratio depends on length variance).</td>
+    </tr>
+    <tr>
+      <td><strong>Chunked cross-entropy / Liger CE</strong></td>
+      <td>Compute log_softmax + gather + NLL in chunks over the vocab dimension. Memory: O(B·T) instead of O(B·T·V).</td>
+      <td>Reduces peak memory by ~30–50%. Enables larger sequence lengths.</td>
+    </tr>
+    <tr>
+      <td><strong>Fused PPO ratio + clip</strong></td>
+      <td>One kernel: ρ = exp(logπ − logπ_old); clipped_ρ = clamp(ρ, 1−ε, 1+ε); loss = -min(ρ·A, clipped_ρ·A); reduce.</td>
+      <td>Saves a few intermediate tensors and one HBM round-trip per token. ~5% step time.</td>
+    </tr>
+    <tr>
+      <td><strong>Fused KL estimator</strong></td>
+      <td>One kernel for the k3 estimator: kl = exp(logπ_ref − logπ) − (logπ_ref − logπ) − 1. Combined with policy gradient as a single backward target.</td>
+      <td>Removes a separate forward over reference logprobs. Numerical stability: k3 stays positive by construction.</td>
+    </tr>
+    <tr>
+      <td><strong>Loss-mask aware reduction</strong></td>
+      <td>Reduce the per-token loss with a mask that zeros prompt and tool-output positions before any normalization (Dr.GRPO style).</td>
+      <td>Correctness — bias-free per-token average over only model-generated tokens.</td>
+    </tr>
+    <tr>
+      <td><strong>Activation checkpointing decision</strong></td>
+      <td>For long trajectories, decide which activations to save (attention output, FFN intermediate) vs recompute. Selective checkpointing of attention only saves ~60% activation memory at ~10% extra compute.</td>
+      <td>Enables longer trajectories at same memory budget. Key for agentic RL (10k-token trajectories).</td>
+    </tr>
+    <tr>
+      <td><strong>Grouped advantage normalization</strong></td>
+      <td>For GRPO/RLOO: compute group statistics (mean, std) of advantages per prompt, then normalize. Custom kernel because the grouping is data-dependent.</td>
+      <td>Numerical stability + correct gradient through normalization (or stop-grad through the stats).</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <div class="label">The trainer's heaviest line</div>
+  For a typical RL step, the single most memory-expensive line is the language-model head's cross-entropy. With vocab=128k, packed sequence T=32k, bf16: 8 GB of logits before any activation. Chunked CE (process 1k vocab tokens at a time, accumulating loss + grad scalar) brings this to ~64 MB. Every RL framework worth using has this kernel. If yours doesn't, write it first.
+</div>
+
+<h2>Surface 4 — weight-sync kernels (the often-forgotten one)</h2>
+
+<p>After every training step, new policy weights must move to the rollout engine. The kernels here are unglamorous but their cost is real.</p>
+
+<table>
+  <thead><tr><th>Kernel</th><th>What it does</th><th>Cost / win</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>NCCL broadcast / all-gather</strong></td>
+      <td>Move parameter shards (FSDP-sharded fp32 master → bf16) from the trainer rank to all rollout ranks.</td>
+      <td>Network-bandwidth bound. For 70B bf16: 140 GB over NVLink (≤ 1s) or IB (~5–20s depending on fabric).</td>
+    </tr>
+    <tr>
+      <td><strong>In-place dequant / cast</strong></td>
+      <td>Convert master fp32 weights to the inference dtype (bf16, fp8, int8) without a roundtrip to HBM.</td>
+      <td>Saves 1× HBM read/write of the whole model. For 70B: ~140 GB · (1/3.35 TB/s) ≈ 40 ms. Per sync.</td>
+    </tr>
+    <tr>
+      <td><strong>FSDP-shard → TP-shard layout conversion</strong></td>
+      <td>Trainer shards along FSDP's row-wise dim; rollout uses TP shards along a different axis. Kernel reshuffles tensors during the broadcast.</td>
+      <td>Avoids an explicit gather + scatter. Fuses with the broadcast collective.</td>
+    </tr>
+    <tr>
+      <td><strong>IPC weight handoff (colocated)</strong></td>
+      <td>In colocated mode, trainer and rollout share GPU memory. The "sync" is a CUDA IPC handle exchange + pointer swap.</td>
+      <td>~zero copy. Synchronization overhead only.</td>
+    </tr>
+    <tr>
+      <td><strong>Sharded checkpoint write/read</strong></td>
+      <td>For async architectures: write a sharded checkpoint to a fast tier (e.g. shared NVMe), rollout reads it asynchronously.</td>
+      <td>Decouples sync from rollout step boundary.</td>
+    </tr>
+    <tr>
+      <td><strong>Overlap of sync with next-step rollout</strong></td>
+      <td>While the next rollout begins on stale weights, sync the new weights in a background CUDA stream. Swap mid-step at a layer boundary.</td>
+      <td>Hides sync entirely. Requires extreme care: a mid-step swap mid-forward gives inconsistent activations.</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <div class="label">The sync regression</div>
+  Frameworks often start with a "stop everything, broadcast, resume" sync. Throughput is fine at small scale, terrible at multi-node. The path to async is: (1) shard the broadcast (now it's an all-gather, not a serial broadcast), (2) fuse the dtype cast, (3) overlap with the next rollout's prefill. Each step is a kernel + scheduler change worth weeks. Many production frameworks haven't done (3).
+</div>
+
+<h2>Surface 5 — memory &amp; scheduling kernels</h2>
+
+<p>RL has unique memory pressure because it juggles multiple roles (rollout, trainer, ref) on the same hardware. Several kernels live in the allocator / scheduler layer rather than in the model.</p>
+
+<ul>
+  <li><strong>Paged KV allocator.</strong> Block-granularity allocation of KV cache pages. Production: vLLM, SGLang, Triton's <code>flash-attn-paged</code>.</li>
+  <li><strong>KV cache eviction / swap.</strong> When KV exceeds budget, evict low-priority rollouts to CPU pinned memory; swap back when scheduled. Trade-off: PCIe latency (50 GB/s, ~50× HBM).</li>
+  <li><strong>Activation offloading.</strong> Async copy activations to CPU during forward; bring back during backward. Overlap via two CUDA streams.</li>
+  <li><strong>Gradient accumulation kernel.</strong> Accumulate per-microbatch gradients in fp32 (master) even when forward is bf16. Without this, accumulation drift dominates training noise.</li>
+  <li><strong>Reference-model HBM management.</strong> If ref runs on same GPUs as trainer, every layer's params occupy double HBM. Layer-by-layer ref pass with prefetching → fits twice the trainable size.</li>
+  <li><strong>Per-rollout request scheduler.</strong> Decide which sequences to admit, preempt, or finish at each step. Maximizes GPU utilisation under SLO constraints.</li>
+</ul>
+
+<div class="callout">
+  <div class="label">The allocator quietly dominates</div>
+  Most rollout slowdowns reported as "the engine is slow" are actually KV allocator pressure: fragmentation, repeated alloc/free, or page-table cache misses. The first 30 minutes of any rollout perf investigation should be in the allocator: <code>nvidia-smi --query-gpu=memory.free</code> over time, plus the engine's KV page stats.
+</div>
+
+<h2>Surface 6 — agentic kernels (the new frontier)</h2>
+
+<p>Multi-turn, tool-using, branchy RL has spawned a new class of kernels that didn't exist for single-turn pretraining or even single-turn RLHF. The engineer building agentic RL infra writes these:</p>
+
+<table>
+  <thead><tr><th>Kernel / primitive</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>Multi-turn KV cache reuse</strong></td>
+      <td>Within a trajectory, keep the KV cache alive across turns; append tool-output tokens to the cache without re-prefilling. The cache layout must respect the agent's interleaving of assistant / user / tool tokens.</td>
+    </tr>
+    <tr>
+      <td><strong>Tool-output mask construction</strong></td>
+      <td>Per-token mask (1 for assistant-generated, 0 for everything else) computed alongside generation. Must be byte-identical between rollout and trainer to avoid the loss-mask bug from <a href="24_engineer_role.html">lesson 24</a>.</td>
+    </tr>
+    <tr>
+      <td><strong>Branchy rollout scheduling</strong></td>
+      <td>K-sampling at intermediate turns (e.g. self-consistency or PRM scoring) requires forking KV caches at a turn boundary. The "fork" is a refcount bump on the shared KV blocks (in SGLang's radix tree implementation) — physically copied only on write to the diverging suffix. The kernel work is the bookkeeping, not the data movement.</td>
+    </tr>
+    <tr>
+      <td><strong>Async tool dispatch</strong></td>
+      <td>Issue tool calls (code execution, search) on a CPU pool while GPU continues generating <em>other</em> trajectories. The kernel is the queue + completion handler; the GPU never blocks on a tool.</td>
+    </tr>
+    <tr>
+      <td><strong>Per-turn reward broadcasting</strong></td>
+      <td>For dense rewards (PRM-style), broadcast per-turn rewards across the corresponding tokens with the right attribution. The kernel is a scatter from (B, num_turns) to (B, T) using turn-boundary indices.</td>
+    </tr>
+    <tr>
+      <td><strong>Per-trajectory tensor co-packing</strong></td>
+      <td>(Same kernel as surface 3's varlen packing, but with the extra constraint that loss mask, advantage tensor, KL tensor, and reward tensor all share the trajectory layout. The bookkeeping is where bugs live: an off-by-one between the cu_seqlens table and the advantage tensor silently shifts gradient to the wrong tokens.)</td>
+    </tr>
+    <tr>
+      <td><strong>Verifier dispatcher</strong></td>
+      <td>Batched evaluation of verifiers (math grader, code runner) on GPU/CPU pool. Often the longest tail in step time; needs care to not block rollout.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>How a real RL engineer prioritizes</h2>
+
+<p>A first-week heuristic, in order of return-on-investment:</p>
+
+<ol>
+  <li><strong>Profile first.</strong> Use the per-component breakdown from lesson 24. Anything that's not 60–75% rollout means the profiler is wrong or your setup is unusual.</li>
+  <li><strong>Prefix caching.</strong> If you don't have it, integrate it. Single biggest win for K-rollout RL.</li>
+  <li><strong>Continuous batching + chunked prefill.</strong> Pad-free, decode-prefill mix. Easy 2× rollout throughput.</li>
+  <li><strong>Chunked CE on the trainer.</strong> Memory-only win; enables longer sequences.</li>
+  <li><strong>Log-prob match.</strong> Audit, fix, monitor. Save weeks of training before you save days of throughput.</li>
+  <li><strong>Speculative decoding for low-temperature rollouts.</strong> Conditional 1.5–2× decode.</li>
+  <li><strong>KV cache quantization (int8).</strong> 1.5–2× decode if your log-prob match story can tolerate it.</li>
+  <li><strong>Async weight sync overlap.</strong> Hide sync latency; multi-node win only.</li>
+  <li><strong>Custom fused PPO / KL kernel.</strong> Marginal; do last.</li>
+</ol>
+
+<div class="callout">
+  <div class="label">What "develop new kernels" really means in 2026</div>
+  Almost nobody writes a from-scratch attention kernel anymore. The 2026 reality of "developing new kernels" is:
+  <ul>
+    <li><strong>Composing</strong> existing kernels (FlashAttention varlen + custom mask + custom output reduction) via Triton.</li>
+    <li><strong>Porting</strong> kernels between frameworks (CUTLASS → Triton, vLLM → SGLang).</li>
+    <li><strong>Fusing</strong> small custom logic into existing kernels (RL-specific log-prob gather, fused PPO ratio).</li>
+    <li><strong>Tuning</strong> existing kernels for new shapes (varlen sequences, GQA-8, fp8) via autotune.</li>
+    <li><strong>Replacing</strong> with torch.compile-generated kernels where the hand-tuned version is no longer state-of-the-art.</li>
+  </ul>
+  The job title "kernel engineer" in 2026 is closer to "kernel composer + perf engineer" than to "CUTLASS author".
+</div>
+
+<h2>The kernels we'll see next</h2>
+
+<p>RL-specific kernel R&amp;D in 2026 is concentrated around four areas:</p>
+
+<ol>
+  <li><strong>Cache-aware speculative decoding for agentic rollouts.</strong> Standard speculative decoding doesn't compose with mid-trajectory tool calls. New work makes the draft proposer tool-aware.</li>
+  <li><strong>Selective recompute for very long trajectories.</strong> Activation memory dominates for 32k+ token trajectories; finer-grained recompute strategies (per-operation, not per-layer) are emerging.</li>
+  <li><strong>Cross-engine numerics standardization.</strong> A push to make rollout engines and trainers produce byte-identical logprobs, eliminating the strict-recompute tax. Requires shared kernel implementations or a verified numerical contract.</li>
+  <li><strong>MoE-routing kernels for RL.</strong> Sparse MoE models (DeepSeek-V3, Mixtral, Qwen-MoE) need router + AllToAll dispatch on both rollout and trainer sides, with the same load-balance behaviour. RL adds two new headaches: (a) the load-balance auxiliary loss interacts with the policy-gradient loss in non-obvious ways; (b) async setups can see the router weights drift across engines, biasing which experts a token reaches. Active area of frontier-lab engineering.</li>
+</ol>
+
+<h2>Interview prompts you should be ready for</h2>
+
+<div class="callout">
+  <ol style="margin: 4px 0;">
+    <li>"You're given a 7B RL run with 60% rollout / 15% train forward / 10% ref / 10% backward / 5% sync. Where do you start?" <em>(Rollout. Specifically: is prefix caching on? If yes, is K-rollout sharing being detected? Then continuous batching status, then KV-cache fragmentation. Don't touch the train kernels until rollout is at theoretical bandwidth limit.)</em></li>
+    <li>"Chunked CE — derive the memory saving." <em>(Naive CE materialises (B, T, V) logits and (B, T, V) softmax intermediates. Chunked CE computes log_softmax + gather + NLL on chunks of V, keeping only (B, T, V_chunk). For V=128k, V_chunk=4k: 32× peak memory reduction on logits — typically 50%+ peak trainer-forward memory.)</em></li>
+    <li>"Walk through the log-prob match problem and how you'd fix it." <em>(Rollout and trainer compute logπ on the same model but with different kernels → small numerical drift → biased PPO ratio. Two fixes: strict-recompute on trainer (default; adds 10–15% step time) or kernel parity guarantee (hard). Always log ρ histogram per step.)</em></li>
+    <li>"What's the difference between paged attention and radix attention?" <em>(Paged: KV stored in non-contiguous blocks via a block table — for variable-length / preempted sequences. Radix: a radix tree on top of the KV blocks indexes shared prefixes across requests — for K-rollout sampling. The two are orthogonal; SGLang combines them.)</em></li>
+    <li>"Speculative decoding — why does it not always help in RL?" <em>(Acceptance rate depends on the draft model agreeing with the target on each token. At high sampling temperature (typical RL exploration), the target's next-token distribution is wide, so acceptance is low and the K-token-verify overhead doesn't pay back. Helps most at T ≤ 0.5; barely helps at T = 1.)</em></li>
+    <li>"You see KV cache fragmentation in production. What do you do?" <em>(Either: implement paged allocator if not yet, or compact (move blocks to defragment, expensive), or restart the engine on a schedule. Production fix is paged; restart is the band-aid.)</em></li>
+    <li>"Design a kernel to compute the PPO loss + KL anchor in one fused pass." <em>(Inputs: logπ[B,T], logπ_old[B,T], logπ_ref[B,T], advantage[B,T], mask[B,T], clip_eps. One pass: ρ = exp(logπ-logπ_old); kl = exp(logπ_ref-logπ) - (logπ_ref-logπ) - 1; ppo_loss = -min(ρ·A, clamp(ρ,1-eps,1+eps)·A); total = (ppo_loss + β·kl) · mask; reduce. Backward: chain-rule through exp and clamp; clamp's grad is 0 outside the clip range.)</em></li>
+  </ol>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway — the two duties, reframed</div>
+  "Improve RL infra for agentic use" and "develop new kernels for rollout + training" are both core duties. They cover surfaces 1, 3, and 6 above. The complete kernel surface area for a modern post-train RL engineer is six surfaces: rollout/inference, log-prob match, training, weight sync, memory/scheduling, agentic primitives. The first kernel to write is almost always prefix caching. The second is chunked cross-entropy. The hardest one to get right is the log-prob match. The job is not "writing kernels in isolation" — it's identifying which kernel surface dominates this week's profile and shipping a composition or fusion that moves the needle. Kernels are the last 30% of speed but the most measurable; they're how individual engineers are visibly fast.
+</div>
+
+<footer class="lesson-nav">
+  <a href="24_engineer_role.html">
+    <span class="dir">← Prev</span>
+    <span class="ttl">24 · Engineer role</span>
+  </a>
+  <a class="next" href="26_why_rl_today.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">26 · Why RL today</span>
+  </a>
+</footer>
+
+</main>
+
+</body>
+</html>

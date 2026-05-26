@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>04 · Pointers, masks, and boundaries</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">Triton kernels / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">04 · pointers + masks</span>
+    <span class="step-pill">lesson 04 / 14</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Pointers, masks, and boundaries</h1>
+<p class="subtitle"><code>tl.load</code> and <code>tl.store</code> are how a tile talks to HBM. Two ideas dominate: <strong>strides as the address calculator</strong>, and <strong>masks as the boundary handler</strong>. Get them right and the kernel reads from the right places without segfaulting on irregular sizes.</p>
+
+<h2>A pointer in Triton is a vector of addresses</h2>
+
+<p>When you pass a PyTorch tensor to a Triton kernel, what arrives is a pointer to the first element. To read element <code>i</code>, you add <code>i</code> to the pointer (and the compiler scales by dtype size). To read a whole tile, you add a <em>tile of offsets</em>:</p>
+
+<pre><code>pid  = tl.program_id(0)
+offs = pid*BLOCK + tl.arange(0, BLOCK)   # tile of BLOCK indices
+x    = tl.load(a_ptr + offs)             # tile of BLOCK values</code></pre>
+
+<p>So <code>a_ptr + offs</code> is itself a tile — a vector of pointers, one per lane. <code>tl.load</code> reads all BLOCK addresses in one call. The compiler will turn this into the right number of coalesced 32-wide loads.</p>
+
+<h2>Strides — when memory is not contiguous</h2>
+
+<p>For 1D arrays, indexing is just <code>ptr + i</code>. For 2D arrays, the row stride may not equal the column count: a view, a transpose, a sliced tensor can all give non-trivial strides. You must compute addresses with strides explicitly:</p>
+
+<pre><code># For x of shape (M, K), the (i, j) element is at:
+#     x_ptr + i * stride_M + j * stride_K
+offs_m = pid_m * BM + tl.arange(0, BM)        # (BM,)
+offs_k =          tl.arange(0, BK)            # (BK,)
+addrs  = x_ptr + offs_m[:, None] * stride_M \
+              + offs_k[None, :] * stride_K     # (BM, BK)
+x_tile = tl.load(addrs)                        # (BM, BK)</code></pre>
+
+<p>The <code>[:, None]</code> / <code>[None, :]</code> dance is broadcasting — same as NumPy. The result is a 2D tile of addresses. <code>tl.load</code> turns it into a 2D tile of values.</p>
+
+<div class="callout warn">
+  <div class="label">Common bug — stride order</div>
+  PyTorch's <code>tensor.stride(0), tensor.stride(1)</code> are in <em>element count</em>, not bytes. Pass them in the same order your kernel multiplies. A row-major <code>(M, K)</code> tensor has <code>stride(0) = K, stride(1) = 1</code>; for a transposed view this is reversed. Garbage output for non-contiguous tensors almost always traces here.
+</div>
+
+<h2>The boundary problem — and why every load needs a mask</h2>
+
+<p>The grid is <code>cdiv(N, BLOCK)</code>. When <em>N</em> isn't a multiple of <em>BLOCK</em>, the last program's tile spills past the end of the array:</p>
+
+<svg viewBox="0 0 720 200" class="diagram" role="img" aria-label="Last tile spills past N, mask shuts off out-of-bounds lanes">
+  <g font-size="11" fill="var(--text-mute)">
+    <text x="20" y="28" font-weight="700" fill="var(--text)">N = 1000, BLOCK = 256 → 4 programs, last tile covers indices 768..1023</text>
+    <g transform="translate(20,52)">
+      <rect width="600" height="32" fill="#dbeafe" stroke="#bfdbfe"/>
+      <rect x="450" width="150" height="32" fill="#fee2e2" stroke="#fecaca"/>
+      <line x1="150" x2="150" y1="0" y2="32" stroke="#94a3b8"/>
+      <line x1="300" x2="300" y1="0" y2="32" stroke="#94a3b8"/>
+      <line x1="450" x2="450" y1="0" y2="32" stroke="#94a3b8"/>
+      <line x1="540" x2="540" y1="0" y2="32" stroke="#dc2626" stroke-width="2" stroke-dasharray="4,3"/>
+      <text x="65"  y="20" font-family="var(--mono)">pid 0 (0..255)</text>
+      <text x="215" y="20" font-family="var(--mono)">pid 1 (256..511)</text>
+      <text x="365" y="20" font-family="var(--mono)">pid 2 (512..767)</text>
+      <text x="475" y="20" font-family="var(--mono)">pid 3 (768..1023)</text>
+      <text x="540" y="55" fill="var(--bad)">N = 1000  ← addresses past here are out of bounds</text>
+    </g>
+  </g>
+</svg>
+
+<p>If you load <code>pid 3</code>'s 256 addresses without a mask, the last 24 of them read past the tensor's allocation. Best case: silently load garbage that contaminates the rest of the tile. Worst case: segfault.</p>
+
+<p>The fix is the <code>mask</code> argument:</p>
+
+<pre><code>offs = pid * BLOCK + tl.arange(0, BLOCK)
+m    = offs &lt; N
+x    = tl.load(a_ptr + offs, mask=m, other=0.0)
+# lanes where m is False return `other`, no HBM access
+tl.store(c_ptr + offs, y, mask=m)
+# lanes where m is False are dropped on store</code></pre>
+
+<p>The mask is a tile of bools (same shape as the offsets). Lanes where <code>mask=False</code> become no-ops for the load (returning <code>other</code>) or store (no write at all). No branch divergence — the hardware predicates these per-lane.</p>
+
+<div class="callout">
+  <div class="label">The rule</div>
+  Every <code>tl.load</code> on the boundary axis needs a mask. Every <code>tl.store</code> on the boundary axis needs a mask. If you forget one, irregular shapes will produce wrong outputs or crash, but the tests on power-of-two shapes will pass and you'll merge the bug.
+</div>
+
+<h2>Picking <code>other</code> correctly</h2>
+
+<p>The <code>other</code> argument is what masked-off lanes read. The right choice depends on what you do with the value next:</p>
+
+<table>
+  <thead><tr><th>Operation after load</th><th>Use <code>other =</code></th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Sum / addition</td><td><code>0.0</code></td><td>Identity of +</td></tr>
+    <tr><td>Product / multiplication</td><td><code>1.0</code></td><td>Identity of ×</td></tr>
+    <tr><td>Max reduction</td><td><code>-float('inf')</code></td><td>Identity of max</td></tr>
+    <tr><td>Min reduction</td><td><code>+float('inf')</code></td><td>Identity of min</td></tr>
+    <tr><td>Matmul accumulation</td><td><code>0.0</code></td><td>Identity of dot product</td></tr>
+  </tbody>
+</table>
+
+<p>Forgetting this is the second-most-common silent correctness bug. The <code>other=0.0</code> default works for sum/matmul. For softmax (which does a max reduction first), you need <code>other=-inf</code> on the boundary tile or you'll get a spurious "0" winner.</p>
+
+<h2>Coalesced vs strided — what the compiler can do for you</h2>
+
+<p>A load is <em>coalesced</em> when consecutive lanes in a warp read consecutive addresses. The hardware combines them into a single 128-byte transaction. If lanes read strided or scattered addresses, you get multiple transactions and the kernel becomes bandwidth-starved.</p>
+
+<svg viewBox="0 0 720 220" class="diagram" role="img" aria-label="Coalesced vs strided access patterns">
+  <g font-size="11" fill="var(--text-mute)">
+    <text x="20" y="24" font-weight="700" fill="var(--text)">Coalesced — 32 lanes, 32 consecutive addresses → 1 transaction</text>
+    <g transform="translate(20,40)">
+      <rect width="640" height="22" fill="#dbeafe" stroke="#bfdbfe"/>
+      <text x="320" y="15" text-anchor="middle" font-family="var(--mono)">addr  0  1  2  3 ... 31</text>
+    </g>
+    <text x="20" y="100" font-weight="700" fill="var(--text)">Strided (stride=N) — 32 lanes, 32 scattered addresses → 32 transactions</text>
+    <g transform="translate(20,116)">
+      <rect width="640" height="22" fill="#fee2e2" stroke="#fecaca"/>
+      <text x="320" y="15" text-anchor="middle" font-family="var(--mono)">addr  0  N  2N  3N ...</text>
+    </g>
+    <text x="20" y="172" font-weight="700" fill="var(--text)">Triton emits coalesced loads when consecutive lanes of the inner dimension</text>
+    <text x="20" y="190">access consecutive memory. Make sure your tile's inner axis aligns with the contiguous axis of the tensor.</text>
+  </g>
+</svg>
+
+<p>Concretely: for a row-major matrix <code>x[M, K]</code> where K is contiguous, the tile</p>
+
+<pre><code>x_ptr + offs_m[:, None]*stride_M + offs_k[None, :]*stride_K</code></pre>
+
+<p>is coalesced when <code>stride_K=1</code> (the K axis is contiguous). Iteration across the BK lanes of one row hits consecutive bytes. If you accidentally transpose the strides — pass <code>x.t()</code>'s strides without realising — you read strided memory and bandwidth craters.</p>
+
+<h2>What about writes?</h2>
+
+<p><code>tl.store</code> takes the same <code>mask</code> argument. Masked-off lanes simply don't write. There's no <code>other</code> for stores — masked lanes are silently dropped, which is exactly what you want for the boundary tile.</p>
+
+<pre><code>tl.store(c_ptr + offs, x + y, mask=offs &lt; N)</code></pre>
+
+<h2>Interactive · the mask in action</h2>
+<p>Set <em>N</em> and the BLOCK size. See which lanes of the last program's tile are masked off, and what happens if you forget the mask.</p>
+
+<div class="widget"><div class="title">Boundary masking</div><p class="hint">A red lane is "off the end of the array". With a mask, it becomes a no-op. Without a mask, it reads garbage (or segfaults).</p><div class="controls">
+<label class="inline">N <input id="t4-N" type="range" min="100" max="2048" step="1" value="1000"><span class="val" id="t4-N-v">1000</span></label>
+<label class="inline">BLOCK <input id="t4-block" type="range" min="32" max="512" step="32" value="256"><span class="val" id="t4-block-v">256</span></label>
+<label class="inline">use mask? <input type="checkbox" id="t4-mask" checked></label>
+</div><canvas id="t4-canvas" class="dist-canvas" height="220"></canvas><p class="hint" id="t4-note"></p></div>
+
+<h2>The full pattern, all together</h2>
+
+<pre><code>@triton.jit
+def safe_kernel(x_ptr, y_ptr, out_ptr, N, BLOCK: tl.constexpr):
+    pid  = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m    = offs &lt; N
+    x    = tl.load(x_ptr + offs, mask=m, other=0.0)
+    y    = tl.load(y_ptr + offs, mask=m, other=0.0)
+    z    = x + y
+    tl.store(out_ptr + offs, z, mask=m)</code></pre>
+
+<p>Three masks (one per access), one <code>other=0.0</code>, and one comparison. This is the safe skeleton of every 1D Triton kernel.</p>
+
+<h2>What's next</h2>
+
+<p>You can move bytes correctly. Lesson 05 introduces the op you're moving them <em>for</em>: <code>tl.dot</code>, the tile-level matmul that drops to tensor cores. The lesson sets up exactly when that lowering happens and what dtypes the hardware requires.</p>
+
+<footer class="lesson-nav">
+  <a href="03_execution_model.html"><span class="dir">Previous</span><span class="ttl">03 · Execution model</span></a>
+  <a class="next" href="05_dot_tensor_cores.html"><span class="dir">Next</span><span class="ttl">05 · tl.dot and tensor cores</span></a>
+</footer>
+
+<script>
+(function(){
+  const e={N:document.getElementById('t4-N'),block:document.getElementById('t4-block'),mask:document.getElementById('t4-mask')};
+  const c=document.getElementById('t4-canvas'),ctx=c.getContext('2d'),note=document.getElementById('t4-note');
+  function draw(){
+    document.getElementById('t4-N-v').textContent=e.N.value;
+    document.getElementById('t4-block-v').textContent=e.block.value;
+    const N=+e.N.value, BLOCK=+e.block.value, useMask=e.mask.checked;
+    const nProg = Math.ceil(N/BLOCK);
+    c.width=c.clientWidth*devicePixelRatio;c.height=220*devicePixelRatio;ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.clearRect(0,0,c.clientWidth,220);
+    const padL=10, padR=10, top=30;
+    ctx.fillStyle='#1f2430'; ctx.font='12px sans-serif';
+    ctx.fillText(nProg+' programs × BLOCK='+BLOCK+' = '+(nProg*BLOCK)+' addresses; '+N+' valid', padL, top-8);
+    // draw each program's tile as a bar
+    const useW = c.clientWidth - padL - padR;
+    const rowH = 22, gap = 4;
+    for(let p=0;p<nProg;p++){
+      const y = top + p*(rowH+gap);
+      const tileStart = p*BLOCK;
+      const tileEnd   = tileStart + BLOCK;
+      const wTotal = useW;
+      const segW = wTotal/(nProg*BLOCK);
+      const validEnd = Math.min(tileEnd, N);
+      // valid portion
+      ctx.fillStyle='#dbeafe';
+      ctx.fillRect(padL + tileStart*segW, y, (validEnd - tileStart)*segW, rowH);
+      // oob portion
+      if (tileEnd > N) {
+        ctx.fillStyle = useMask ? '#e5e7eb' : '#fee2e2';
+        ctx.fillRect(padL + N*segW, y, (tileEnd - N)*segW, rowH);
+      }
+      ctx.strokeStyle='#94a3b8';
+      ctx.strokeRect(padL + tileStart*segW, y, BLOCK*segW, rowH);
+      ctx.fillStyle='#1f2430'; ctx.font='11px var(--mono)';
+      ctx.fillText('pid '+p, padL + tileStart*segW + 4, y + 15);
+    }
+    // marker for N
+    const xN = padL + (N/(nProg*BLOCK))*useW;
+    ctx.strokeStyle='#dc2626'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(xN, top - 4); ctx.lineTo(xN, top + nProg*(rowH+gap)); ctx.stroke();
+    ctx.lineWidth=1; ctx.fillStyle='#dc2626'; ctx.fillText('N='+N, xN+4, top - 6);
+    const tail = nProg*BLOCK - N;
+    let m;
+    if (tail === 0) m = 'N is a multiple of BLOCK — no boundary tile, but you should still keep the mask for portability.';
+    else if (useMask) m = 'Last tile has '+tail+' masked lanes. tl.load returns `other`, tl.store skips. Safe.';
+    else m = '⚠ Last tile has '+tail+' unmasked lanes reading past the array. Wrong output or segfault.';
+    note.textContent = m;
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

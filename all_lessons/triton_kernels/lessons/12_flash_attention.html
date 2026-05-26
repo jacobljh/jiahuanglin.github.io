@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>12 · Flash Attention — block-tiled attention</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">Triton kernels / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">12 · flash attention</span>
+    <span class="step-pill">lesson 12 / 14</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Flash Attention — block-tiled attention</h1>
+<p class="subtitle">The flagship Triton kernel. It composes <strong>every primitive from lessons 04–11</strong> in service of one idea: <em>never materialise the O(N²) attention matrix in HBM</em>. Block the queries, stream the keys/values, carry the online (m, ℓ) recurrence, save 10× the bandwidth.</p>
+
+<h2>The problem in one diagram</h2>
+
+<svg viewBox="0 0 760 240" class="diagram" role="img" aria-label="Naive attention materialises N×N S then N×N P, both in HBM">
+  <g font-size="11" fill="var(--text-mute)">
+    <text x="20" y="24" font-weight="700" fill="var(--text)">Naive attention — three kernels, N² intermediates in HBM</text>
+    <g transform="translate(20,42)">
+      <rect width="120" height="50" fill="#dbeafe" stroke="#bfdbfe"/>
+      <text x="60" y="20" text-anchor="middle" font-weight="600">Q·Kᵀ</text>
+      <text x="60" y="38" text-anchor="middle" font-family="var(--mono)">→ S (N×N)</text>
+    </g>
+    <text x="150" y="73" font-family="var(--mono)" fill="var(--text)">S (HBM)</text>
+    <g transform="translate(220,42)">
+      <rect width="120" height="50" fill="#dcfce7" stroke="#86efac"/>
+      <text x="60" y="20" text-anchor="middle" font-weight="600">softmax</text>
+      <text x="60" y="38" text-anchor="middle" font-family="var(--mono)">→ P (N×N)</text>
+    </g>
+    <text x="350" y="73" font-family="var(--mono)" fill="var(--text)">P (HBM)</text>
+    <g transform="translate(420,42)">
+      <rect width="120" height="50" fill="#fef3c7" stroke="#fcd34d"/>
+      <text x="60" y="20" text-anchor="middle" font-weight="600">P·V</text>
+      <text x="60" y="38" text-anchor="middle" font-family="var(--mono)">→ O (N×d)</text>
+    </g>
+    <text x="20" y="130" fill="var(--text-mute)">HBM traffic at N = 8192, d = 128, bf16:</text>
+    <text x="20" y="148" font-family="var(--mono)" fill="var(--text)">  Q, K, V reads:  3 × 8192 × 128 × 2 =  6 MB</text>
+    <text x="20" y="166" font-family="var(--mono)" fill="var(--bad)">  S write:        8192 × 8192 × 2     = 128 MB   ← scales as N²!</text>
+    <text x="20" y="184" font-family="var(--mono)" fill="var(--bad)">  P write + read: 8192 × 8192 × 2 × 2 = 256 MB</text>
+    <text x="20" y="202" font-family="var(--mono)" fill="var(--text)">  O write:        8192 × 128 × 2       = 2 MB</text>
+    <text x="20" y="220" font-weight="700" fill="var(--bad)">  Total: ~390 MB. At N=16K it's 1.5 GB. The N² intermediates dominate.</text>
+  </g>
+</svg>
+
+<p>The math is bandwidth-bound by S and P, which scale as <em>N²</em>. Compute, by comparison, only doubles when <em>N</em> doubles (more correctly: the matmul flops scale as <em>N²d</em>). At long context, we're entirely waiting on HBM, doing the wrong amount of moving for the amount of math.</p>
+
+<h2>The Flash Attention idea</h2>
+
+<p>Three observations:</p>
+
+<ol>
+  <li><strong>Output <em>O</em> is small (<em>N × d</em>, with <em>d</em> ≪ <em>N</em>).</strong> We never need the full <em>S</em> or <em>P</em>; we only need to produce <em>O</em>.</li>
+  <li><strong>Softmax can be done online</strong> (lesson 10's recurrence). We can update the per-row (m, ℓ) one chunk of S at a time without ever writing S.</li>
+  <li><strong>P · V can also be done online.</strong> Since P is exp(S − m) / ℓ and we hold (m, ℓ) per row, we can stream PV and rescale as we go — same trick as the ℓ rescale.</li>
+</ol>
+
+<p>Putting them together: <strong>block the Q rows, stream the K/V columns</strong>. For each block of queries:</p>
+
+<ol>
+  <li>Initialise <em>O</em> tile = 0, <em>m</em> = −∞, ℓ = 0 — all in registers.</li>
+  <li>For each block of (K, V): compute the partial scores <em>S</em><sub>block</sub>, update the online (m, ℓ), update <em>O</em> with the rescale.</li>
+  <li>At the end, divide <em>O</em> by ℓ and write it out.</li>
+</ol>
+
+<p>No <em>S</em> or <em>P</em> ever leaves the registers. HBM traffic drops to just Q, K, V, O — that 6 + 2 = 8 MB instead of 390 MB at N = 8192.</p>
+
+<h2>The complete kernel — annotated</h2>
+
+<p>Here is a minimal Flash Attention forward (causal mask omitted for clarity; lesson 14 adds it):</p>
+
+<pre><code>@triton.jit
+def flash_attn_fwd(
+    Q, K, V, O,
+    sqz, sqh, sqm, sqd,                       # Q strides (Z=batch, H=head, M=seq, D=head_dim)
+    skz, skh, skn, skd,
+    svz, svh, svn, svd,
+    soz, soh, som, sod,
+    Z, H, N_CTX,
+    BM: tl.constexpr, BN: tl.constexpr, D: tl.constexpr,
+):
+    # 1 · which Q block am I, and which (batch, head)?
+    pid_m = tl.program_id(0)
+    bh    = tl.program_id(1)
+    z = bh // H; h = bh % H
+
+    # 2 · pointers for this (z, h)
+    Q += z*sqz + h*sqh
+    K += z*skz + h*skh
+    V += z*svz + h*svh
+    O += z*soz + h*soh
+
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_d = tl.arange(0, D)
+
+    # 3 · load my Q block into registers (stays there for the whole K/V loop)
+    q = tl.load(Q + offs_m[:, None]*sqm + offs_d[None, :]*sqd,
+                mask=offs_m[:, None] &lt; N_CTX, other=0.0)
+
+    # 4 · online state in registers
+    m   = tl.full([BM], -float('inf'), dtype=tl.float32)        # running max per row
+    l   = tl.zeros([BM], dtype=tl.float32)                       # running ℓ per row
+    acc = tl.zeros([BM, D], dtype=tl.float32)                    # running O per row
+
+    # 5 · sliding window over K and V columns
+    softmax_scale = 1.0 / tl.sqrt(D.to(tl.float32))
+    for j in range(0, N_CTX, BN):
+        offs_n = j + tl.arange(0, BN)
+        k = tl.load(K + offs_n[:, None]*skn + offs_d[None, :]*skd,
+                    mask=offs_n[:, None] &lt; N_CTX, other=0.0)
+        v = tl.load(V + offs_n[:, None]*svn + offs_d[None, :]*svd,
+                    mask=offs_n[:, None] &lt; N_CTX, other=0.0)
+
+        # 5a · partial scores  S_block = q · kᵀ  (BM × BN)
+        s = tl.dot(q, tl.trans(k)) * softmax_scale
+
+        # 5b · ONLINE SOFTMAX UPDATE
+        m_new = tl.maximum(m, tl.max(s, axis=1))                  # new row max
+        alpha = tl.exp(m - m_new)                                  # rescale factor for old state
+        p     = tl.exp(s - m_new[:, None])                         # P_block w.r.t. new max
+        l     = l*alpha + tl.sum(p, axis=1)                        # new ℓ
+        acc   = acc*alpha[:, None] + tl.dot(p.to(v.dtype), v)      # new O (rescaled then add this block)
+        m     = m_new
+
+    # 6 · final normalise: O = acc / ℓ
+    acc = acc / l[:, None]
+    tl.store(O + offs_m[:, None]*som + offs_d[None, :]*sod,
+             acc.to(tl.bfloat16),
+             mask=offs_m[:, None] &lt; N_CTX)</code></pre>
+
+<h2>Reading the kernel: what each piece is doing</h2>
+
+<table>
+  <thead><tr><th>Line</th><th>Lesson it uses</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>pid_m = tl.program_id(0)</code></td><td>03</td><td>One program per BM-block of queries; second axis indexes (batch × head).</td></tr>
+    <tr><td><code>q = tl.load(... mask=...)</code></td><td>04</td><td>Load the Q tile; mask the M boundary.</td></tr>
+    <tr><td><code>m, l, acc = ...</code></td><td>06, 10</td><td>The online state. <code>m</code> is the running max, <code>l</code> is ℓ, <code>acc</code> is the running output <em>before normalising</em>.</td></tr>
+    <tr><td><code>s = tl.dot(q, tl.trans(k))</code></td><td>05, 09</td><td>The partial attention scores — a tile matmul, lowered to tensor cores.</td></tr>
+    <tr><td><code>m_new, alpha, l, acc = ...</code></td><td>10</td><td>The online softmax update. <code>alpha = exp(m - m_new)</code> is the rescale factor. Both <code>l</code> and <code>acc</code> get multiplied by α — that's the line that <em>retroactively corrects</em> previous blocks for the new running max.</td></tr>
+    <tr><td><code>acc = acc / l[:, None]</code></td><td>10</td><td>Final divide. Now <code>acc</code> is the true softmax(QKᵀ)·V row.</td></tr>
+  </tbody>
+</table>
+
+<h2>Why the rescale is exact</h2>
+
+<p>After block <em>j</em> we want <code>acc[i, :] = Σ<sub>n ≤ j</sub> P[i, n] · V[n, :]</code>, where <code>P[i, n] = exp(S[i, n] − m_final) / ℓ_final</code>. We don't know <em>m</em><sub>final</sub> yet, so we use the current running max <em>m</em> as a stand-in. When <em>m</em> grows to <em>m</em><sub>new</sub>, every previous block's exp(S − m) needs to become exp(S − m<sub>new</sub>) = exp(S − m) · exp(m − m<sub>new</sub>) = previous · α. So we multiply the accumulated acc and ℓ by α. The new block contributes P<sub>new</sub> · V at the new max already.</p>
+
+<svg viewBox="0 0 760 280" class="diagram" role="img" aria-label="One program: BM Q rows, streaming over BN K/V columns, online state in registers">
+  <g font-size="11" fill="var(--text-mute)">
+    <text x="20" y="24" font-weight="700" fill="var(--text)">One program: BM Q rows · slides over BN K/V columns</text>
+    <g transform="translate(20,40)">
+      <rect width="140" height="80" fill="#dbeafe" stroke="#bfdbfe"/>
+      <text x="70" y="-6" text-anchor="middle" font-weight="700" fill="var(--text)">Q tile</text>
+      <text x="70" y="48" text-anchor="middle" font-family="var(--mono)">BM × D</text>
+      <text x="70" y="100" text-anchor="middle">held in registers</text>
+    </g>
+    <g transform="translate(190,40)">
+      <text x="0" y="-6" font-weight="700" fill="var(--text)">K/V blocks streamed in</text>
+      <rect width="100" height="80" fill="#dcfce7" stroke="#86efac"/>
+      <text x="50" y="48" text-anchor="middle" font-family="var(--mono)">BN × D</text>
+      <rect x="120" width="100" height="80" fill="#dcfce7" stroke="#86efac"/>
+      <text x="170" y="48" text-anchor="middle" font-family="var(--mono)">BN × D</text>
+      <rect x="240" width="100" height="80" fill="#dcfce7" stroke="#86efac"/>
+      <text x="290" y="48" text-anchor="middle" font-family="var(--mono)">BN × D</text>
+      <text x="360" y="48" font-family="var(--mono)">…</text>
+    </g>
+    <g transform="translate(580,40)">
+      <rect width="160" height="80" fill="#fef3c7" stroke="#fcd34d"/>
+      <text x="80" y="-6" text-anchor="middle" font-weight="700" fill="var(--text)">acc + (m, ℓ)</text>
+      <text x="80" y="48" text-anchor="middle" font-family="var(--mono)">BM × D + BM + BM</text>
+      <text x="80" y="100" text-anchor="middle">registers only</text>
+    </g>
+    <text x="20" y="170" fill="var(--text-mute)">For each (K, V) block:</text>
+    <text x="40" y="190" font-family="var(--mono)" fill="var(--text)">  S = Q · Kᵀ      (tl.dot)</text>
+    <text x="40" y="208" font-family="var(--mono)" fill="var(--text)">  m_new = max(m, rowmax S);   α = exp(m − m_new)</text>
+    <text x="40" y="226" font-family="var(--mono)" fill="var(--text)">  P = exp(S − m_new)</text>
+    <text x="40" y="244" font-family="var(--mono)" fill="var(--text)">  ℓ ← α · ℓ + rowsum P</text>
+    <text x="40" y="262" font-family="var(--mono)" fill="var(--text)">  acc ← α · acc + P · V        (tl.dot again)</text>
+  </g>
+</svg>
+
+<h2>The bandwidth saving, quantified</h2>
+
+<table>
+  <thead><tr><th>Quantity</th><th>Naive</th><th>Flash Attention</th></tr></thead>
+  <tbody>
+    <tr><td>Reads of Q</td><td>1×</td><td>1× (once per program)</td></tr>
+    <tr><td>Reads of K</td><td>1×</td><td>~M/BM × (each K block read once per Q block)</td></tr>
+    <tr><td>Reads of V</td><td>1×</td><td>~M/BM × (same)</td></tr>
+    <tr><td>S / P writes &amp; reads</td><td>~3 N²</td><td>0</td></tr>
+    <tr><td>O writes</td><td>1×</td><td>1×</td></tr>
+  </tbody>
+</table>
+
+<p>The "K/V read M/BM times" looks bad, but at the actual numbers it isn't — <em>M/BM</em> is something like 64. The 64× re-read of K and V (a few MB) is far less than the eliminated N² write of S and P (hundreds of MB). The net is the famous 5–10× wall-clock speedup vs naive.</p>
+
+<h2>Causal masking — one extra line</h2>
+
+<p>For causal attention, mask scores where <code>offs_n &gt; offs_m</code> before the softmax:</p>
+
+<pre><code>s = tl.where(offs_n[None, :] &gt; offs_m[:, None], -float('inf'), s)</code></pre>
+
+<p>The −∞ entries contribute zero to <code>exp(s − m)</code> and zero to ℓ, so the recurrence still works. (Production kernels skip K/V blocks past the causal diagonal entirely — a 2× speedup on top of Flash Attention v1.)</p>
+
+<h2>What this kernel doesn't have (yet)</h2>
+
+<ul>
+  <li><strong>The backward pass.</strong> Flash Attention's backward needs to reconstruct <em>S</em> on the fly during gradient computation. The original paper has the algorithm; lesson 14 sketches the structure.</li>
+  <li><strong>Dropout.</strong> A random mask is applied before <em>P · V</em>. RNG state per program.</li>
+  <li><strong>Sliding window / ALiBi / position biases.</strong> Added in the score computation (line 5a).</li>
+  <li><strong>FP8.</strong> Hopper-specific. Requires careful per-row dequant.</li>
+</ul>
+
+<p>Production kernels like FlashAttention v3 and FlashInfer add all of these and more, plus warp specialisation (TMA producer warps + mma consumer warps). They beat hand-Triton by 20–40% on H100. Don't try to out-engineer them — when you can, just call FlashInfer.</p>
+
+<div class="callout">
+  <div class="label">When to write a Triton attention kernel</div>
+  When FlashInfer doesn't cover your variant: a custom mask, a learned position bias, fused with a downstream op, MLA's compressed-KV path, etc. For vanilla MHA / GQA, call FlashInfer.
+</div>
+
+<h2>Interactive · watch the tile sweep</h2>
+<p>Step through Q blocks and K/V blocks; see the online state update as each (K, V) block streams in.</p>
+
+<div class="widget"><div class="title">Flash Attention block sweep</div><p class="hint">One Q tile (highlighted) holds steady. K/V blocks slide left-to-right. The online (m, ℓ) pair updates after each.</p><div class="controls">
+<label class="inline">N_CTX <input id="t12-N" type="range" min="64" max="1024" step="64" value="512"><span class="val" id="t12-N-v">512</span></label>
+<label class="inline">BM <input id="t12-bm" type="range" min="32" max="256" step="32" value="64"><span class="val" id="t12-bm-v">64</span></label>
+<label class="inline">BN <input id="t12-bn" type="range" min="32" max="256" step="32" value="64"><span class="val" id="t12-bn-v">64</span></label>
+<label class="inline">step <input id="t12-step" type="range" min="0" max="32" step="1" value="0"><span class="val" id="t12-step-v">0</span></label>
+</div><canvas id="t12-canvas" class="dist-canvas" height="280"></canvas><p class="hint" id="t12-note"></p></div>
+
+<h2>What's next</h2>
+
+<p>The kernel exists. Two questions remain: <em>how fast is it</em> (lesson 13: autotune, num_stages, the full pitfall checklist) and <em>how do you ship it</em> (lesson 14: backward pass, profiling, the decision tree).</p>
+
+<footer class="lesson-nav">
+  <a href="11_rmsnorm.html"><span class="dir">Previous</span><span class="ttl">11 · RMSNorm</span></a>
+  <a class="next" href="13_autotune_pipeline.html"><span class="dir">Next</span><span class="ttl">13 · Autotune + pipeline</span></a>
+</footer>
+
+<script>
+(function(){
+  const e={N:document.getElementById('t12-N'),bm:document.getElementById('t12-bm'),bn:document.getElementById('t12-bn'),step:document.getElementById('t12-step')};
+  const c=document.getElementById('t12-canvas'),ctx=c.getContext('2d'),note=document.getElementById('t12-note');
+  function draw(){
+    document.getElementById('t12-N-v').textContent=e.N.value;
+    document.getElementById('t12-bm-v').textContent=e.bm.value;
+    document.getElementById('t12-bn-v').textContent=e.bn.value;
+    const N=+e.N.value, BM=+e.bm.value, BN=+e.bn.value;
+    const nQ = Math.ceil(N/BM), nKV = Math.ceil(N/BN);
+    e.step.max = nKV - 1;
+    if (+e.step.value > nKV-1) e.step.value = nKV-1;
+    document.getElementById('t12-step-v').textContent=e.step.value;
+    const step=+e.step.value;
+    c.width=c.clientWidth*devicePixelRatio;c.height=280*devicePixelRatio;ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.clearRect(0,0,c.clientWidth,280);
+    // attention matrix grid: rows = Q blocks, cols = K/V blocks
+    const padL=80, padR=20, padT=30, padB=40;
+    const W=c.clientWidth-padL-padR, H=280-padT-padB;
+    const cw = W/nKV, ch = H/nQ;
+    // grid
+    ctx.fillStyle='#1f2430'; ctx.font='12px sans-serif';
+    ctx.fillText('attention matrix (N × N), tiled BM × BN', padL, padT-8);
+    ctx.fillStyle='#5b6573'; ctx.font='11px var(--mono)';
+    ctx.fillText('Q blocks (M)', padL-72, padT+H/2);
+    ctx.fillText('K/V blocks (N) →', padL+W/2-50, padT+H+24);
+    // shade cells
+    for(let i=0;i<nQ;i++){
+      for(let j=0;j<nKV;j++){
+        let col='#f1f3f7';
+        if (i === Math.floor(nQ/2)) {
+          // active Q row
+          col = (j <= step) ? '#dbeafe' : '#f1f3f7';
+          if (j === step) col = '#86efac'; // current K/V block
+        }
+        ctx.fillStyle = col;
+        ctx.fillRect(padL+j*cw, padT+i*ch, cw-1, ch-1);
+      }
+    }
+    // outline active Q row
+    ctx.strokeStyle='#2563eb'; ctx.lineWidth=2;
+    ctx.strokeRect(padL, padT+Math.floor(nQ/2)*ch, W, ch);
+    ctx.lineWidth=1;
+    // state box
+    ctx.fillStyle='#fef3c7'; ctx.strokeStyle='#fcd34d';
+    ctx.fillRect(padL+W+8-100, padT-22, 100, 16);
+    ctx.fillStyle='#1f2430'; ctx.font='10px var(--mono)';
+    ctx.fillText('(m, ℓ, acc) in registers', padL+W+8-94, padT-10);
+    note.textContent = 'Q block '+Math.floor(nQ/2)+' (highlighted) is fixed. K/V block '+step+'/'+(nKV-1)+' is being processed. After this step: m updated, ℓ rescaled then added, acc rescaled then accumulated. No row of S written to HBM at any point.';
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

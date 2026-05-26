@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>09 · Tiled matmul — the canonical GEMM</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">Triton kernels / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">09 · matmul</span>
+    <span class="step-pill">lesson 09 / 14</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Tiled matmul — the canonical GEMM</h1>
+<p class="subtitle">Every transformer-shaped kernel you ever write has a tiled matmul at its core. This lesson is the one canonical pattern: <strong>output tile in registers, K-loop accumulates, boundary masked on three axes, cast on store.</strong> Once it's memorised, lessons 10–12 read as elaborations.</p>
+
+<h2>The math the kernel implements</h2>
+
+<p>For <em>C = A · B</em> with <em>A</em> ∈ ℝ<sup>M×K</sup>, <em>B</em> ∈ ℝ<sup>K×N</sup>:</p>
+
+<pre class="math block">C<sub>ij</sub> = Σ<sub>k</sub> A<sub>ik</sub> · B<sub>kj</sub></pre>
+
+<p>We tile the output. Each program owns a <em>BM × BN</em> tile of <em>C</em>, and computes it by streaming <em>BK</em>-wide vertical strips of <em>A</em> and horizontal strips of <em>B</em>:</p>
+
+<svg viewBox="0 0 760 280" class="diagram" role="img" aria-label="One program: BM×BN tile of C accumulated by sliding BK chunks across the K axis">
+  <g font-size="11" fill="var(--text-mute)">
+    <g transform="translate(20,40)">
+      <rect width="100" height="100" fill="#dbeafe" stroke="#bfdbfe"/>
+      <text x="50" y="-8" text-anchor="middle" font-weight="700" fill="var(--text)">A</text>
+      <text x="50" y="55" text-anchor="middle" font-family="var(--mono)">M × K</text>
+      <rect x="30" y="0" width="40" height="100" fill="none" stroke="#dc2626" stroke-width="2" stroke-dasharray="4,3"/>
+      <text x="50" y="120" text-anchor="middle" fill="var(--bad)">BK strip</text>
+    </g>
+    <text x="150" y="93" font-size="20" font-weight="700">·</text>
+    <g transform="translate(180,40)">
+      <rect width="200" height="100" fill="#dcfce7" stroke="#86efac"/>
+      <text x="100" y="-8" text-anchor="middle" font-weight="700" fill="var(--text)">B</text>
+      <text x="100" y="55" text-anchor="middle" font-family="var(--mono)">K × N</text>
+      <rect x="0" y="30" width="200" height="40" fill="none" stroke="#dc2626" stroke-width="2" stroke-dasharray="4,3"/>
+      <text x="100" y="120" text-anchor="middle" fill="var(--bad)">BK strip</text>
+    </g>
+    <text x="410" y="93" font-size="20" font-weight="700">=</text>
+    <g transform="translate(440,40)">
+      <rect width="200" height="100" fill="#fef3c7" stroke="#fcd34d"/>
+      <text x="100" y="-8" text-anchor="middle" font-weight="700" fill="var(--text)">C</text>
+      <text x="100" y="55" text-anchor="middle" font-family="var(--mono)">M × N</text>
+      <rect x="60" y="30" width="80" height="40" fill="#fcd34d" opacity="0.5" stroke="#d97706" stroke-width="2"/>
+      <text x="100" y="120" text-anchor="middle" fill="var(--warn)">BM × BN output tile</text>
+    </g>
+    <text x="20" y="195" font-weight="700" fill="var(--text)">The K-loop slides both strips along K</text>
+    <text x="20" y="216" fill="var(--text-mute)">acc += A_strip · B_strip      for k = 0, BK, 2·BK, …</text>
+    <text x="20" y="234" fill="var(--text-mute)">Each iteration is one tl.dot. Accumulator stays in registers.</text>
+    <text x="20" y="258" fill="var(--text-mute)">When the K-loop ends, acc is the final BM × BN output tile. Cast and store.</text>
+  </g>
+</svg>
+
+<h2>The kernel — annotated line by line</h2>
+
+<pre><code>@triton.jit
+def matmul_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    sam, sak, sbk, sbn, scm, scn,                    # element strides
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+):
+    # 1 · which output tile am I?
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # 2 · row/col indices for my tile of C, plus the K-loop indices
+    offs_m = pid_m * BM + tl.arange(0, BM)            # (BM,)
+    offs_n = pid_n * BN + tl.arange(0, BN)            # (BN,)
+    offs_k = tl.arange(0, BK)                         # (BK,)
+
+    # 3 · accumulator in registers — fp32 always
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+
+    # 4 · K-loop: stream BK-wide strips of A and B
+    for k in range(0, K, BK):
+        a = tl.load(
+            a_ptr + offs_m[:, None]*sam + (k + offs_k)[None, :]*sak,
+            mask=(offs_m[:, None] &lt; M) & ((k + offs_k)[None, :] &lt; K),
+            other=0.,
+        ).to(tl.bfloat16)
+        b = tl.load(
+            b_ptr + (k + offs_k)[:, None]*sbk + offs_n[None, :]*sbn,
+            mask=((k + offs_k)[:, None] &lt; K) & (offs_n[None, :] &lt; N),
+            other=0.,
+        ).to(tl.bfloat16)
+        # tensor cores fire here
+        acc = tl.dot(a, b, acc)
+
+    # 5 · store the BM × BN tile of C, cast to output dtype
+    tl.store(
+        c_ptr + offs_m[:, None]*scm + offs_n[None, :]*scn,
+        acc.to(tl.bfloat16),
+        mask=(offs_m[:, None] &lt; M) & (offs_n[None, :] &lt; N),
+    )</code></pre>
+
+<p>Five sections. Each line carries one idea. Memorise this shape — every fused-matmul kernel in the rest of the series starts from this skeleton.</p>
+
+<h2>Three boundary masks — one for each axis</h2>
+
+<p>M, N, and K can each be non-multiples of their tile size. Each load needs a 2D mask that covers both of its axes:</p>
+
+<table>
+  <thead><tr><th>Load</th><th>2D mask</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>A tile (BM × BK)</td><td><code>(offs_m &lt; M) &amp; (k + offs_k &lt; K)</code></td><td>M boundary on rows, K boundary on cols</td></tr>
+    <tr><td>B tile (BK × BN)</td><td><code>(k + offs_k &lt; K) &amp; (offs_n &lt; N)</code></td><td>K boundary on rows, N boundary on cols</td></tr>
+    <tr><td>C store (BM × BN)</td><td><code>(offs_m &lt; M) &amp; (offs_n &lt; N)</code></td><td>M boundary on rows, N boundary on cols</td></tr>
+  </tbody>
+</table>
+
+<p>And <code>other=0.</code> for the loads — the identity of accumulation. Lanes off the end of K contribute zero to the dot product, exactly what we want.</p>
+
+<h2>The wrapper</h2>
+
+<pre><code>def matmul(a, b):
+    M, K = a.shape; K2, N = b.shape
+    assert K == K2
+    c = torch.empty(M, N, device=a.device, dtype=torch.bfloat16)
+    grid = lambda meta: (triton.cdiv(M, meta['BM']), triton.cdiv(N, meta['BN']))
+    matmul_kernel[grid](
+        a, b, c, M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+    )
+    return c</code></pre>
+
+<h2>Autotune configurations that actually matter</h2>
+
+<pre><code>@triton.autotune(
+    configs=[
+        # small N, large M (e.g. attention output projection at low batch)
+        triton.Config({'BM':128,'BN':64, 'BK':64}, num_warps=4, num_stages=4),
+        # square mid-range
+        triton.Config({'BM':128,'BN':128,'BK':32}, num_warps=4, num_stages=3),
+        triton.Config({'BM':128,'BN':128,'BK':64}, num_warps=8, num_stages=3),
+        # large N (e.g. vocabulary projection)
+        triton.Config({'BM':64, 'BN':256,'BK':32}, num_warps=8, num_stages=4),
+        # tiny K, wide tiles
+        triton.Config({'BM':256,'BN':128,'BK':32}, num_warps=8, num_stages=3),
+    ],
+    key=['M','N','K'],
+)
+@triton.jit
+def matmul_kernel(...): ...</code></pre>
+
+<p>Five configurations cover most production shapes. The autotuner picks per (M, N, K) and caches.</p>
+
+<h2>Where cuBLAS still beats hand-Triton</h2>
+
+<p>For vanilla bf16/fp16 GEMM on contiguous tensors, expect cuBLAS to be 5–15% faster than this kernel. The reasons:</p>
+
+<ol>
+  <li><strong>Hand-scheduled mma sequences.</strong> CUTLASS templates choose the exact order to issue mma.sync instructions to keep the tensor cores fed; Triton's scheduler is good but not surgical.</li>
+  <li><strong>Tensor Memory Accelerator (TMA) on Hopper.</strong> cuBLASLt uses TMA descriptors for asynchronous block loads, overlapping with mma. Triton supports TMA but the lowering isn't always as tight.</li>
+  <li><strong>Warp specialisation.</strong> CUTLASS Hopper kernels use producer-warps that issue TMA and consumer-warps that do mma. Triton's warp-specialisation support is experimental.</li>
+</ol>
+
+<p>So when is Triton GEMM worth writing?</p>
+
+<ul>
+  <li><strong>Fused epilogue</strong> (lesson 08): the bias + activation fusion makes up for the 5–15%.</li>
+  <li><strong>Quantised inputs / weights</strong> (W4A16, NF4): cuBLAS doesn't cover these dequant-on-load patterns.</li>
+  <li><strong>Unusual layouts</strong> (block-sparse, low-rank): library kernels don't exist.</li>
+  <li><strong>Backward of a fused forward</strong>: you need a matching custom backward, which can't be cuBLAS.</li>
+</ul>
+
+<div class="callout">
+  <div class="label">A blunt rule</div>
+  Don't write a Triton matmul to replace <code>torch.matmul</code>. Write one when something else has to happen <em>inside</em> the kernel: a fused epilogue, a dequantised weight, an unusual layout. Otherwise call cuBLAS.
+</div>
+
+<h2>Pipeline tiles for HBM overlap — the M-major trick</h2>
+
+<p>The naive grid <code>(cdiv(M, BM), cdiv(N, BN))</code> visits output tiles in column-major order (program (0,0), (1,0), (2,0), …). Many adjacent programs read the same row of <em>A</em>, but the L2 cache isn't warm because the launches are interleaved.</p>
+
+<p>A common Triton trick is "swizzling" the grid into super-blocks so that adjacent programs share more <em>A</em> and <em>B</em> reads. We won't dwell here — the autotuner will pick whether to swizzle. The point: a grid is just a numbering of programs, and the numbering affects cache reuse.</p>
+
+<h2>Interactive · time vs cuBLAS</h2>
+<p>Pick shapes; see the predicted Triton time, cuBLAS time, and how much room is left.</p>
+
+<div class="widget"><div class="title">Triton vs cuBLAS</div><p class="hint">Approximation: cuBLAS runs at ~85% of bf16 peak; vanilla Triton at ~70–80%. Numbers are for H100 (bf16 peak ≈ 990 TFLOP/s).</p><div class="controls">
+<label class="inline">M <input id="t9-M" type="range" min="128" max="8192" step="128" value="2048"><span class="val" id="t9-M-v">2048</span></label>
+<label class="inline">N <input id="t9-N" type="range" min="128" max="8192" step="128" value="2048"><span class="val" id="t9-N-v">2048</span></label>
+<label class="inline">K <input id="t9-K" type="range" min="128" max="8192" step="128" value="2048"><span class="val" id="t9-K-v">2048</span></label>
+</div><div id="t9-out" class="kpi-grid"></div><p class="hint" id="t9-note"></p></div>
+
+<h2>What's next</h2>
+
+<p>You can multiply tiles. Lesson 10 takes the reduction skills from lesson 06 and builds a numerically stable softmax in Triton — and shows where the <em>online</em> recurrence comes in when one row doesn't fit a tile. That's the same recurrence that makes lesson 12 (Flash Attention) work.</p>
+
+<footer class="lesson-nav">
+  <a href="08_fused_activation.html"><span class="dir">Previous</span><span class="ttl">08 · Fused linear+GELU</span></a>
+  <a class="next" href="10_softmax.html"><span class="dir">Next</span><span class="ttl">10 · Softmax</span></a>
+</footer>
+
+<script>
+(function(){
+  const e={M:document.getElementById('t9-M'),N:document.getElementById('t9-N'),K:document.getElementById('t9-K')};
+  const out=document.getElementById('t9-out'),note=document.getElementById('t9-note');
+  function draw(){
+    document.getElementById('t9-M-v').textContent=e.M.value;
+    document.getElementById('t9-N-v').textContent=e.N.value;
+    document.getElementById('t9-K-v').textContent=e.K.value;
+    const M=+e.M.value, N=+e.N.value, K=+e.K.value;
+    const flops = 2*M*N*K;
+    const bf16_peak = 990e12;
+    const cublas_eff = 0.85, triton_eff = 0.75;
+    const cublas_ms = (flops/(bf16_peak*cublas_eff))*1000;
+    const triton_ms = (flops/(bf16_peak*triton_eff))*1000;
+    const hbm = 3e12;
+    const bytes = (M*K + K*N + M*N)*2;
+    const hbm_ms = (bytes/hbm)*1000;
+    const compute_bound = flops/bf16_peak*1000 > hbm_ms;
+    out.innerHTML='';
+    function kpi(k,v,col){const d=document.createElement('div');d.className='kpi';d.innerHTML='<div class="k">'+k+'</div><div class="v" style="color:'+(col||'#1f2430')+'">'+v+'</div>';out.appendChild(d);}
+    kpi('flops', (flops/1e9).toFixed(1)+' GFLOP','#1f2430');
+    kpi('cuBLAS (~85%)', cublas_ms.toFixed(3)+' ms','#16a34a');
+    kpi('Triton (~75%)', triton_ms.toFixed(3)+' ms','#d97706');
+    kpi('gap', ((triton_ms/cublas_ms-1)*100).toFixed(1)+'%','#d97706');
+    kpi('roofline', compute_bound ? 'compute-bound' : 'memory-bound','#1f2430');
+    note.textContent = compute_bound
+      ? 'These shapes are compute-bound; cuBLAS is ~'+((triton_ms/cublas_ms-1)*100).toFixed(0)+'% faster on raw GEMM. Add a fused epilogue (lesson 08) and Triton catches up or beats it.'
+      : 'These shapes are bandwidth-bound (small K) — the gap is smaller because compute headroom doesn’t matter as much.';
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

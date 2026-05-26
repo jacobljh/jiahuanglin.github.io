@@ -1,0 +1,868 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>07 · Pipeline parallel</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">07 · pipeline parallel</span>
+    <span class="step-pill">lesson 7 / 19</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Pipeline parallel — and the bubble</h1>
+<p class="subtitle">Shard the model across stages, send activations between them. The catch is the bubble: until the pipeline fills, some ranks have no work to do. The whole lesson is how to shrink that idle time.</p>
+
+<h2>The setup</h2>
+
+<p>TP splits a layer across ranks. PP splits the <em>layers themselves</em> across ranks. Stage 0 holds layers <span class="math">1..L/N</span>, stage 1 holds <span class="math">L/N+1..2L/N</span>, etc. A forward pass walks down the stages; backward walks back up.</p>
+
+<p>Per-stage comm is cheap — at the boundary between stages, you send the output activation of the last layer in stage <span class="math">i</span> to stage <span class="math">i+1</span> as its input. One Send/Recv per stage per micro-batch. The activation shape is just <span class="math">(B, T, d)</span>, regardless of how many layers are in the stage. This is point-to-point, not a collective: it doesn't scale poorly with <span class="math">N</span>. <strong>PP across nodes is fine.</strong></p>
+
+<h2>The naive picture — GPipe</h2>
+
+<p>The obvious thing: split a macro-batch into <span class="math">M</span> micro-batches. Stage 0 processes micro-batch 0, sends it to stage 1, processes micro-batch 1, … Then stage 1 takes them in turn, then stage 2, …, until stage <span class="math">N-1</span> has finished forward on all <span class="math">M</span> micro-batches. Then backward proceeds in reverse.</p>
+
+<pre><code> rank 0: F0 F1 F2 F3 . . . . . . . . . . B3 B2 B1 B0
+ rank 1:    F0 F1 F2 F3 . . . . . . B3 B2 B1 B0
+ rank 2:       F0 F1 F2 F3 . . . B3 B2 B1 B0
+ rank 3:          F0 F1 F2 F3 B3 B2 B1 B0
+</code></pre>
+
+<p>The <span class="math">.</span>'s are idle time. Ranks 1, 2, 3 sit doing nothing while stage 0 fills the pipeline, and again at the tail when the last micro-batch propagates back. This is the <strong>pipeline bubble</strong>.</p>
+
+<h3>The bubble formula</h3>
+
+<p>For <span class="math">N</span> stages and <span class="math">M</span> micro-batches per macro-batch, let each forward step take <span class="math">t_f</span> and each backward <span class="math">t_b</span>. Total wall-clock:</p>
+
+<div class="math block">
+  T_total &nbsp;=&nbsp; (M + N - 1) · (t_f + t_b)
+</div>
+
+<p>The ideal time, if pipelining were perfect, would be <span class="math">M · (t_f + t_b)</span>. So the bubble overhead is:</p>
+
+<div class="math block">
+  bubble_fraction &nbsp;=&nbsp; (N - 1) / (M + N - 1)
+</div>
+
+<p>Two practical readings:</p>
+<ul>
+  <li><strong>More micro-batches → smaller bubble.</strong> At <span class="math">M = 4N</span>, the bubble is ~20%. At <span class="math">M = 16N</span>, ~6%.</li>
+  <li><strong>More stages → bigger bubble.</strong> For fixed <span class="math">M</span>, doubling <span class="math">N</span> roughly doubles the bubble.</li>
+</ul>
+
+<p>So the tension is: PP gives you more parallelism (more stages → more GPUs share the model state), but more stages also waste more cycles in the bubble. The fix is to crank <span class="math">M</span> — but cranking <span class="math">M</span> requires storing the activations of <span class="math">M</span> in-flight micro-batches per stage. Activation memory grows with <span class="math">M</span>. Memory budget caps how big <span class="math">M</span> can be. This is where 1F1B helps.</p>
+
+<h2>Animated · the pipeline filling, GPipe vs 1F1B</h2>
+
+<p>Below is the same schedule but rendered cell-by-cell as the wall clock ticks. Press play to watch the diagonal "fill" at the start and the matching diagonal at the end — that's the bubble. Toggle between GPipe (all forwards, then all backwards) and 1F1B (forwards and backwards interleaved as soon as the last stage finishes). The bubble fraction is identical between the two — what changes is the <em>peak number of in-flight micro-batches</em> per stage, which is what determines activation memory.</p>
+
+<div class="widget" id="pp-anim">
+  <div class="title">Pipeline schedule · scrub through wall-clock</div>
+  <div class="hint">Rows = pipeline stages. Columns = time. Blue = forward, orange = backward, dark grey = idle (bubble). Watch the corner triangles — that's where the pipe is filling or draining.</div>
+
+  <div class="controls">
+    <button id="pa-play">▶ play</button>
+    <button id="pa-step">step ▷</button>
+    <button id="pa-reset">⟲ reset</button>
+    <label class="inline">time t: <input type="range" id="pa-t" min="0" max="60" step="1" value="60" style="width:280px"> <span class="val" id="pa-t-v">t=60</span></label>
+  </div>
+  <div class="controls">
+    <button id="pa-gpipe" class="primary">GPipe</button>
+    <button id="pa-1f1b">1F1B</button>
+    <label class="inline">stages N: <input type="range" id="pa-N" min="2" max="8" step="1" value="4"> <span class="val" id="pa-N-v">4</span></label>
+    <label class="inline">microbatches M: <input type="range" id="pa-M" min="2" max="16" step="1" value="6"> <span class="val" id="pa-M-v">6</span></label>
+    <label class="inline">speed: <input type="range" id="pa-spd" min="1" max="20" step="1" value="6"> <span class="val" id="pa-spd-v">6×</span></label>
+  </div>
+
+  <canvas id="pa-canvas" width="760" height="280" style="width:100%; height:280px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">bubble fraction</div><div class="v" id="pa-bf">—</div></div>
+    <div class="kpi"><div class="k">peak in-flight</div><div class="v" id="pa-pk">—</div></div>
+    <div class="kpi"><div class="k">activation memory</div><div class="v" id="pa-am" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">total slots</div><div class="v" id="pa-ts">—</div></div>
+  </div>
+</div>
+
+<h2>2D · bubble fraction (N - 1)/(M + N - 1)</h2>
+
+<p>The bubble fraction is a clean two-parameter function. The widget below plots both: (left) a 2D heatmap of bubble fraction over (N, M); (right) a stacked bar of "useful work" vs "wasted bubble" at your current settings. Cranking <span class="math">M</span> shrinks the wasted band; cranking <span class="math">N</span> grows it.</p>
+
+<div class="widget" id="pp-bub">
+  <div class="title">Bubble fraction explorer</div>
+  <div class="hint">Heat: red = high bubble, green = low. Black dot = your current (N, M). Right pane = compute breakdown.</div>
+
+  <div class="controls">
+    <label class="inline">stages N: <input type="range" id="pb-N" min="2" max="16" step="1" value="4"> <span class="val" id="pb-N-v">4</span></label>
+    <label class="inline">microbatches M: <input type="range" id="pb-M" min="1" max="64" step="1" value="8"> <span class="val" id="pb-M-v">8</span></label>
+    <label class="inline">virtual V: <input type="range" id="pb-V" min="1" max="4" step="1" value="1"> <span class="val" id="pb-V-v">1</span></label>
+  </div>
+
+  <canvas id="pb-canvas" width="760" height="240" style="width:100%; height:240px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">bubble (formula)</div><div class="v" id="pb-bf">—</div></div>
+    <div class="kpi"><div class="k">M/N ratio</div><div class="v" id="pb-rm">—</div></div>
+    <div class="kpi"><div class="k">recommended M</div><div class="v" id="pb-mr">—</div></div>
+    <div class="kpi"><div class="k">utilisation</div><div class="v" id="pb-ut">—</div></div>
+  </div>
+</div>
+
+<h2>3D · pipeline cube — stages × microbatches × direction</h2>
+
+<p>The schedule has three natural axes: pipeline stage (which GPU), micro-batch (which input), and direction (forward vs backward). Visualised as cells in a 3D cube, you can see the diagonal sweep of forward across stages, then backward sweeping back. Cells are colored by activity: compute-forward (blue), compute-backward (orange), idle/bubble (dark), communication (gold dot).</p>
+
+<div class="widget" id="pp-cube">
+  <div class="title">Pipeline schedule as a 3D cube</div>
+  <div class="hint">X = micro-batch index. Y = stage. Z = direction (forward in front, backward behind). Empty cells mean idle. Rotate to see the bubble corners.</div>
+
+  <div class="controls">
+    <label class="inline">stages N: <input type="range" id="pc-N" min="3" max="6" step="1" value="4"> <span class="val" id="pc-N-v">4</span></label>
+    <label class="inline">microbatches M: <input type="range" id="pc-M" min="3" max="10" step="1" value="6"> <span class="val" id="pc-M-v">6</span></label>
+    <label class="inline">rotation: <input type="range" id="pc-r" min="-40" max="40" step="1" value="0"> <span class="val" id="pc-r-v">0°</span></label>
+  </div>
+
+  <canvas id="pc-canvas" width="760" height="360" style="width:100%; height:360px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">total cells</div><div class="v" id="pc-tt">—</div></div>
+    <div class="kpi"><div class="k">forward cells</div><div class="v" id="pc-fw">—</div></div>
+    <div class="kpi"><div class="k">backward cells</div><div class="v" id="pc-bw">—</div></div>
+    <div class="kpi"><div class="k">activity</div><div class="v" id="pc-ac" style="font-size:13px;">2D projection</div></div>
+  </div>
+</div>
+
+<h2>1F1B — same bubble, less memory</h2>
+
+<p>The PipeDream / Megatron 1F1B schedule observes: once the pipeline is full, alternate one forward and one backward per stage. As soon as a micro-batch finishes its forward all the way to stage <span class="math">N-1</span>, its backward can start immediately:</p>
+
+<pre><code> rank 0: F0 F1 F2 F3 B0 F4 B1 F5 B2 F6 B3 F7 …
+ rank 1:    F0 F1 F2 F3 B0 F4 B1 F5 B2 F6 B3 …
+ rank 2:       F0 F1 F2 F3 B0 F4 B1 F5 B2 F6 …
+ rank 3:          F0 F1 F2 F3 B0 F4 B1 F5 B2 …
+</code></pre>
+
+<p>The bubble fraction is <strong>unchanged</strong> from GPipe — still <span class="math">(N-1)/(M+N-1)</span>. So why bother?</p>
+
+<p><strong>Memory.</strong> Under GPipe, each stage holds activations for up to <span class="math">M</span> in-flight forward micro-batches before the first backward starts. Under 1F1B, the steady state has at most <span class="math">N</span> in-flight micro-batches per stage (because as soon as one finishes forward, its backward starts and frees its activations). The peak memory per stage drops from <span class="math">M</span> to ~<span class="math">N</span>. So you can crank <span class="math">M</span> much higher under 1F1B without OOM — and that <em>does</em> shrink the bubble.</p>
+
+<p>The lesson: <strong>1F1B doesn't reduce the bubble directly; it lets you reduce the bubble indirectly by lifting the memory ceiling on <span class="math">M</span>.</strong></p>
+
+<h2>Interleaved 1F1B — actually reducing the bubble</h2>
+
+<p>Megatron-LM's interleaved schedule (Narayanan et al. 2021) goes further. Instead of each rank owning a <em>contiguous</em> chunk of layers, each rank owns multiple <em>non-contiguous</em> chunks. With <span class="math">V</span> "virtual stages" per physical rank, the pipeline has <span class="math">V · N</span> virtual stages on <span class="math">N</span> ranks. The bubble fraction becomes:</p>
+
+<div class="math block">
+  bubble_fraction_interleaved &nbsp;=&nbsp; (N - 1) / (V · M + N - 1)
+</div>
+
+<p>For <span class="math">V=2</span> and <span class="math">M = 8N</span>, the bubble drops from ~11% to ~6%. The cost: <span class="math">V</span> times as many activation Send/Recvs at stage boundaries (each rank now passes through the pipeline <span class="math">V</span> times). Smaller per-message size means lower bandwidth utilization, so there's a knee — past <span class="math">V=4</span> or so, returns diminish.</p>
+
+<h2>Zero-bubble pipeline (newer)</h2>
+
+<p>Subsequent work (Zero Bubble Pipeline Parallelism, Qi et al. 2023) further decomposes backward into its two halves: gradient w.r.t. <em>input</em> (needed by the previous stage) and gradient w.r.t. <em>weights</em> (only needed locally). The weight gradient can be deferred. Carefully scheduled, this asymptotically eliminates the bubble. The cost is complexity and a brief memory spike. Modern frameworks (e.g. NVIDIA NeMo, MegatronLM) ship this as an option.</p>
+
+<h2>Layer assignment — uneven is sometimes right</h2>
+
+<p>A surprising practical detail: layers aren't always evenly distributed across stages. The first stage has the embedding (often big — 200M params for a 32k vocab × 4096 d model), and the last stage has the LM head (same size). Stages 0 and <span class="math">N-1</span> are heavier than the middle stages if we just split layers evenly. Sometimes we move the LM head onto a separate stage, or pack fewer layers into stage 0 to compensate. Megatron and friends expose this as a per-stage layer count.</p>
+
+<h2>Cost summary</h2>
+
+<table>
+  <thead><tr><th>Quantity</th><th>Per-step cost</th></tr></thead>
+  <tbody>
+    <tr><td>Activation Send between stages</td><td><span class="math">(M + N - 1) · 2 · B · T · d</span> bytes per stage boundary, per step</td></tr>
+    <tr><td>Activation Recv at stages 1..N-1</td><td>Same as above</td></tr>
+    <tr><td>Gradient AllReduce</td><td>Zero — PP doesn't AllReduce gradients (each stage's params are unique to that stage)</td></tr>
+    <tr><td>Peak activation memory per stage</td><td>GPipe: <span class="math">~M · (B, T, d)</span>. 1F1B: <span class="math">~N · (B, T, d)</span></td></tr>
+    <tr><td>Bubble fraction</td><td><span class="math">(N - 1) / (M + N - 1)</span> · (or with <span class="math">V·M</span> for interleaved)</td></tr>
+  </tbody>
+</table>
+
+<h2>When PP is the right hammer</h2>
+
+<ul>
+  <li><strong>Across-node sharding of the model.</strong> Activation Send between stages is small, infrequent, and tolerates IB.</li>
+  <li><strong>Composed with TP intra-node.</strong> TP=8 within a node, PP across nodes. This is the canonical "3D parallelism" middle layer (lesson 10).</li>
+  <li><strong>Not at inference time.</strong> PP's bubble penalises single-request latency hard — for a single inference request, you pay a bubble equal to <span class="math">N - 1</span> stage times. Inference uses TP (lesson 11) or replication. PP for batch-inference of trillions of tokens? Sometimes; for low-latency chat, never.</li>
+</ul>
+
+<h2>Interactive · the bubble in motion</h2>
+
+<p>Drag <span class="math">N</span> (stages) and <span class="math">M</span> (micro-batches). The widget animates the GPipe and 1F1B schedules side by side, with the bubble fraction in the KPIs. Try <span class="math">M = N</span> — the bubble's nearly half the run. Now <span class="math">M = 4N</span>: better. <span class="math">M = 16N</span>: bubble is small but activation memory under GPipe is huge — that's the slider in real life.</p>
+
+<div class="widget" id="pp-widget">
+  <div class="title">GPipe vs 1F1B · bubble visualisation</div>
+  <div class="hint">Each row is a stage. Coloured cells: forward (blue) and backward (orange) micro-batches. Grey cells are idle (bubble). Toggle the schedule to compare.</div>
+
+  <div class="controls">
+    <label class="inline">stages N: <input type="range" id="pp-N" min="2" max="16" step="1" value="4"> <span class="val" id="pp-N-v">4</span></label>
+    <label class="inline">micro-batches M: <input type="range" id="pp-M" min="2" max="64" step="1" value="8"> <span class="val" id="pp-M-v">8</span></label>
+    <label class="inline">virtual stages V (interleaved): <input type="range" id="pp-V" min="1" max="4" step="1" value="1"> <span class="val" id="pp-V-v">1</span></label>
+    <label class="inline">schedule:
+      <select id="pp-sch">
+        <option value="gpipe">GPipe</option>
+        <option value="1f1b" selected>1F1B</option>
+      </select>
+    </label>
+  </div>
+
+  <canvas class="dist-canvas" id="pp-canvas" width="760" height="220" style="height: 220px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">bubble fraction</div><div class="v" id="pp-bb">—</div></div>
+    <div class="kpi"><div class="k">total slots</div><div class="v" id="pp-tt">—</div></div>
+    <div class="kpi"><div class="k">active slots</div><div class="v" id="pp-as">—</div></div>
+    <div class="kpi"><div class="k">memory class</div><div class="v" id="pp-me">—</div></div>
+  </div>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  PP's bubble is <span class="math">(N - 1) / (M + N - 1)</span>. To shrink it you crank <span class="math">M</span>. Cranking <span class="math">M</span> needs activation memory — which is exactly what 1F1B's reduced peak-memory unlocks. Interleaved 1F1B and zero-bubble schedules attack the formula directly. PP is cheap on comm — point-to-point only — which is why it lives across nodes in 3D parallelism.
+</div>
+
+<footer class="lesson-nav">
+  <a href="06_tensor_parallel.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">06 · Tensor parallel</span>
+  </a>
+  <a class="next" href="08_sequence_context_parallel.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">08 · Sequence / context parallel</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const get = id => document.getElementById(id);
+  const els = {
+    N:get('pp-N'),Nv:get('pp-N-v'),M:get('pp-M'),Mv:get('pp-M-v'),
+    V:get('pp-V'),Vv:get('pp-V-v'),sch:get('pp-sch'),
+    canvas:get('pp-canvas'),
+    bb:get('pp-bb'),tt:get('pp-tt'),as:get('pp-as'),me:get('pp-me')
+  };
+  const ctx = els.canvas.getContext('2d');
+
+  function buildGPipe(N, M){
+    const T = 2 * (M + N - 1);
+    const grid = Array.from({length: N}, () => new Array(T).fill(null));
+    for (let i = 0; i < N; i++){
+      for (let k = 0; k < M; k++){
+        grid[i][i + k] = { type:'F', k };
+      }
+    }
+    for (let k = M - 1; k >= 0; k--){
+      const startCol = (M + N - 1) + (M - 1 - k);
+      for (let j = 0; j < N; j++){
+        const stage = N - 1 - j;
+        grid[stage][startCol + j] = { type:'B', k };
+      }
+    }
+    return { grid, T };
+  }
+
+  function build1F1B(N, M){
+    const T_max = 4 * (M + N - 1);
+    const stageRow = Array.from({length: N}, () => new Array(T_max).fill(null));
+    const stagePend = Array.from({length: N}, () => ({ fwd:[], bwd:[] }));
+    for (let k = 0; k < M; k++) stagePend[0].fwd.push(k);
+    let t = 0;
+    let totalToDo = N * M * 2;
+    let done = 0;
+    while (done < totalToDo && t < T_max){
+      const choices = new Array(N).fill(null);
+      for (let s = 0; s < N; s++){
+        const pf = stagePend[s].fwd[0];
+        const pb = stagePend[s].bwd[0];
+        if (pb !== undefined){ choices[s] = { type:'B', k: pb }; }
+        else if (pf !== undefined){ choices[s] = { type:'F', k: pf }; }
+      }
+      for (let s = 0; s < N; s++){
+        const c = choices[s];
+        if (!c) continue;
+        stageRow[s][t] = c;
+        if (c.type === 'F'){
+          stagePend[s].fwd.shift();
+          if (s < N - 1){ stagePend[s+1].fwd.push(c.k); }
+          else { stagePend[s].bwd.push(c.k); }
+          done++;
+        } else {
+          stagePend[s].bwd.shift();
+          if (s > 0){ stagePend[s-1].bwd.push(c.k); }
+          done++;
+        }
+      }
+      t++;
+    }
+    let Tend = 0;
+    for (let s = 0; s < N; s++){
+      for (let i = stageRow[s].length - 1; i >= 0; i--){
+        if (stageRow[s][i]){ Tend = Math.max(Tend, i + 1); break; }
+      }
+    }
+    const grid2 = stageRow.map(row => row.slice(0, Tend));
+    return { grid: grid2, T: Tend };
+  }
+
+  function render(){
+    const N = parseInt(els.N.value), M = parseInt(els.M.value), V = parseInt(els.V.value);
+    els.Nv.textContent = N; els.Mv.textContent = M; els.Vv.textContent = V;
+    const sch = els.sch.value;
+    const built = sch === 'gpipe' ? buildGPipe(N, M) : build1F1B(N, M);
+    const { grid, T } = built;
+    const totalSlots = N * T;
+    let active = 0;
+    grid.forEach(row => row.forEach(c => { if (c) active++; }));
+    const bubble = 1 - active / totalSlots;
+    const bubble_formula = (N - 1) / (Math.max(1, V) * M + N - 1);
+    els.bb.textContent = (bubble*100).toFixed(0) + '% (formula: ' + (bubble_formula*100).toFixed(0) + '%)';
+    els.tt.textContent = totalSlots;
+    els.as.textContent = active;
+    els.me.textContent = sch === 'gpipe' ? 'O(M) per stage' : 'O(N) per stage';
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = els.canvas.clientWidth, H = els.canvas.clientHeight;
+    if (els.canvas.width !== Math.round(W*dpr)){
+      els.canvas.width = Math.round(W*dpr); els.canvas.height = Math.round(H*dpr);
+    }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 60, padR = 12, padT = 14, padB = 24;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+    const cellW = innerW / Math.max(1, T);
+    const rowH  = innerH / Math.max(1, N);
+
+    for (let s = 0; s < N; s++){
+      for (let t = 0; t < T; t++){
+        const cell = grid[s][t];
+        const x = padL + t * cellW;
+        const y = padT + s * rowH;
+        if (!cell){
+          ctx.fillStyle = '#eef1f5';
+        } else {
+          ctx.fillStyle = cell.type === 'F' ? '#2563eb' : '#d97706';
+        }
+        ctx.fillRect(x, y + 2, Math.max(1, cellW - 1), Math.max(1, rowH - 4));
+      }
+      ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+      ctx.fillText('S' + s, 12, padT + s * rowH + rowH/2 + 4);
+    }
+    ctx.fillStyle='#2563eb'; ctx.fillRect(padL, H-18, 10, 10);
+    ctx.fillStyle='#1f2430'; ctx.font='11px monospace';
+    ctx.fillText('forward', padL+14, H-9);
+    ctx.fillStyle='#d97706'; ctx.fillRect(padL+80, H-18, 10, 10);
+    ctx.fillStyle='#1f2430'; ctx.fillText('backward', padL+94, H-9);
+    ctx.fillStyle='#eef1f5'; ctx.fillRect(padL+180, H-18, 10, 10);
+    ctx.fillStyle='#1f2430'; ctx.fillText('idle (bubble)', padL+194, H-9);
+  }
+
+  ['input','change'].forEach(ev=>{
+    [els.N,els.M,els.V,els.sch].forEach(el=>el.addEventListener(ev,render));
+  });
+  window.addEventListener('resize',render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: animated pipeline schedule (GPipe vs 1F1B) ─── */
+(function(){
+  const C = document.getElementById('pa-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    play:$('pa-play'), step:$('pa-step'), reset:$('pa-reset'),
+    t:$('pa-t'), tv:$('pa-t-v'),
+    gpipe:$('pa-gpipe'), b1f1b:$('pa-1f1b'),
+    N:$('pa-N'), Nv:$('pa-N-v'),
+    M:$('pa-M'), Mv:$('pa-M-v'),
+    spd:$('pa-spd'), spdv:$('pa-spd-v'),
+    bf:$('pa-bf'), pk:$('pa-pk'), am:$('pa-am'), ts:$('pa-ts')
+  };
+  let sched = 'gpipe';
+  let playing = false, lastT = 0;
+
+  els.gpipe.addEventListener('click', ()=>{ sched='gpipe';
+    els.gpipe.classList.add('primary'); els.b1f1b.classList.remove('primary'); rebuild(); });
+  els.b1f1b.addEventListener('click', ()=>{ sched='1f1b';
+    els.b1f1b.classList.add('primary'); els.gpipe.classList.remove('primary'); rebuild(); });
+
+  function buildGPipe(N, M){
+    const T = 2*(M + N - 1);
+    const grid = Array.from({length:N}, ()=> new Array(T).fill(null));
+    for (let s=0; s<N; s++){
+      for (let k=0; k<M; k++) grid[s][s+k] = {type:'F', k};
+    }
+    for (let k=M-1; k>=0; k--){
+      const startCol = (M + N - 1) + (M - 1 - k);
+      for (let j=0; j<N; j++){
+        const stage = N - 1 - j;
+        grid[stage][startCol + j] = {type:'B', k};
+      }
+    }
+    return { grid, T };
+  }
+  function build1F1B(N, M){
+    const Tmax = 4*(M+N-1);
+    const grid = Array.from({length:N}, ()=> new Array(Tmax).fill(null));
+    const pend = Array.from({length:N}, ()=> ({fwd:[],bwd:[]}));
+    for (let k=0; k<M; k++) pend[0].fwd.push(k);
+    let t=0, done=0;
+    const target = N*M*2;
+    while (done < target && t < Tmax){
+      const choices = new Array(N).fill(null);
+      for (let s=0; s<N; s++){
+        const pb = pend[s].bwd[0], pf = pend[s].fwd[0];
+        if (pb !== undefined) choices[s] = {type:'B', k:pb};
+        else if (pf !== undefined) choices[s] = {type:'F', k:pf};
+      }
+      for (let s=0; s<N; s++){
+        const c = choices[s]; if (!c) continue;
+        grid[s][t] = c;
+        if (c.type === 'F'){
+          pend[s].fwd.shift();
+          if (s < N-1) pend[s+1].fwd.push(c.k);
+          else pend[s].bwd.push(c.k);
+          done++;
+        } else {
+          pend[s].bwd.shift();
+          if (s > 0) pend[s-1].bwd.push(c.k);
+          done++;
+        }
+      }
+      t++;
+    }
+    let Tend = 0;
+    for (let s=0; s<N; s++){
+      for (let i=grid[s].length-1; i>=0; i--){
+        if (grid[s][i]){ Tend = Math.max(Tend, i+1); break; }
+      }
+    }
+    const out = grid.map(r => r.slice(0, Tend));
+    return { grid: out, T: Tend };
+  }
+
+  let CACHE = null;
+  function rebuild(){
+    const N = +els.N.value, M = +els.M.value;
+    els.Nv.textContent = N; els.Mv.textContent = M;
+    CACHE = sched === 'gpipe' ? buildGPipe(N, M) : build1F1B(N, M);
+    els.t.max = CACHE.T;
+    if (+els.t.value > CACHE.T) els.t.value = CACHE.T;
+    render();
+  }
+
+  function render(){
+    if (!CACHE) rebuild();
+    const { grid, T } = CACHE;
+    const N = grid.length;
+    const tNow = +els.t.value;
+    els.tv.textContent = 't=' + tNow;
+    els.spdv.textContent = els.spd.value + '×';
+
+    // KPIs (full schedule — bubble fraction same for both)
+    const totalSlots = N * T;
+    let active = 0; let peak = 0;
+    // peak in-flight under both schedules: count active forwards not yet returned per stage at time t
+    for (let s=0; s<N; s++){
+      let inflight = 0;
+      for (let t=0; t<T; t++){
+        const c = grid[s][t]; if (!c) continue;
+        active++;
+        if (c.type === 'F') inflight++;
+        else inflight = Math.max(0, inflight-1);
+        peak = Math.max(peak, inflight);
+      }
+    }
+    const bubble = 1 - active/totalSlots;
+    els.bf.textContent = (bubble*100).toFixed(0) + '%';
+    els.pk.textContent = peak + ' (per stage)';
+    els.am.textContent = sched === 'gpipe' ? '~M · act' : '~N · act';
+    els.ts.textContent = totalSlots;
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width = Math.round(W*dpr); C.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 64, padR = 16, padT = 20, padB = 36;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+    const cellW = innerW / Math.max(1, T);
+    const rowH = innerH / Math.max(1, N);
+
+    // grid
+    for (let s=0; s<N; s++){
+      for (let t=0; t<T; t++){
+        const x = padL + t*cellW, y = padT + s*rowH;
+        const reveal = t <= tNow;
+        const cell = grid[s][t];
+        let color;
+        if (!cell){ color = '#eef1f5'; }
+        else if (cell.type === 'F'){ color = '#2563eb'; }
+        else { color = '#d97706'; }
+        ctx.fillStyle = color;
+        ctx.globalAlpha = reveal ? 1 : 0.18;
+        ctx.fillRect(x, y+1, Math.max(1, cellW-1), Math.max(1, rowH-2));
+        ctx.globalAlpha = 1;
+        if (reveal && cell && cellW > 18){
+          ctx.fillStyle = '#ffffff'; ctx.font = '10px monospace';
+          ctx.fillText(cell.type + cell.k, x+2, y + rowH/2 + 3);
+        }
+      }
+      ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+      ctx.fillText('S'+s, 10, padT + s*rowH + rowH/2 + 4);
+    }
+
+    // playhead line
+    const xH = padL + tNow*cellW;
+    ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(xH, padT-4); ctx.lineTo(xH, padT+innerH+4); ctx.stroke();
+
+    // legend
+    ctx.font = '11px monospace';
+    ctx.fillStyle = '#2563eb'; ctx.fillRect(padL, H-22, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('forward', padL+14, H-13);
+    ctx.fillStyle = '#d97706'; ctx.fillRect(padL+80, H-22, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('backward', padL+94, H-13);
+    ctx.fillStyle = '#eef1f5'; ctx.fillRect(padL+180, H-22, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('idle (bubble)', padL+194, H-13);
+    ctx.fillStyle = '#5b6573';
+    ctx.fillText('schedule: ' + (sched === 'gpipe' ? 'GPipe' : '1F1B'), padL + 320, H-13);
+  }
+
+  function step(){
+    if (!CACHE) rebuild();
+    let v = +els.t.value;
+    v = (v + 1) % (CACHE.T + 1);
+    els.t.value = v;
+    render();
+  }
+  function tick(ts){
+    if (!playing) return;
+    const spd = +els.spd.value;
+    if (ts - lastT > 400/spd){ step(); lastT = ts; }
+    requestAnimationFrame(tick);
+  }
+
+  els.play.addEventListener('click', ()=>{
+    playing = !playing;
+    els.play.textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastT = performance.now(); requestAnimationFrame(tick); }
+  });
+  els.step.addEventListener('click', step);
+  els.reset.addEventListener('click', ()=>{ els.t.value = 0; playing=false; els.play.textContent='▶ play'; render(); });
+  els.t.addEventListener('input', render);
+  els.spd.addEventListener('input', ()=>{ els.spdv.textContent = els.spd.value + '×'; });
+  els.N.addEventListener('input', rebuild);
+  els.M.addEventListener('input', rebuild);
+  window.addEventListener('resize', render);
+  rebuild();
+})();
+</script>
+
+<script>
+/* ─── Widget: bubble fraction heatmap ─── */
+(function(){
+  const C = document.getElementById('pb-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const sN = $('pb-N'), sM = $('pb-M'), sV = $('pb-V');
+  const sNv = $('pb-N-v'), sMv = $('pb-M-v'), sVv = $('pb-V-v');
+
+  function bubble(N, M, V){ return (N - 1) / (V*M + N - 1); }
+  function cmap(t){
+    // green → yellow → red
+    t = Math.max(0, Math.min(1, t));
+    if (t < 0.5){
+      const s = t/0.5;
+      const r = Math.round(111*(1-s) + 255*s);
+      const g = Math.round(207*(1-s) + 235*s);
+      const b = Math.round(151*(1-s) + 106*s);
+      return 'rgb('+r+','+g+','+b+')';
+    } else {
+      const s = (t-0.5)/0.5;
+      const r = Math.round(255*(1-s) + 255*s);
+      const g = Math.round(235*(1-s) + 122*s);
+      const b = Math.round(106*(1-s) + 144*s);
+      return 'rgb('+r+','+g+','+b+')';
+    }
+  }
+
+  function render(){
+    const N = +sN.value, M = +sM.value, V = +sV.value;
+    sNv.textContent = N; sMv.textContent = M; sVv.textContent = V;
+    const bf = bubble(N, M, V);
+    $('pb-bf').textContent = (bf*100).toFixed(1) + '%';
+    $('pb-rm').textContent = (M/N).toFixed(1) + '×';
+    const targetBF = 0.1;
+    const recM = Math.ceil(((N-1)/targetBF - (N-1))/V);
+    $('pb-mr').textContent = 'M ≥ ' + recM + ' for ≤10%';
+    $('pb-ut').textContent = ((1-bf)*100).toFixed(0) + '%';
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width = Math.round(W*dpr); C.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    // Left half — heatmap
+    const padL = 50, padT = 24, padB = 30;
+    const heatW = W * 0.55 - padL - 12;
+    const heatH = H - padT - padB;
+    const Nmax = 16, Mmax = 32;
+    const cellW = heatW / Mmax;
+    const cellH = heatH / (Nmax - 1);
+    for (let nn=2; nn<=Nmax; nn++){
+      for (let mm=1; mm<=Mmax; mm++){
+        const t = bubble(nn, mm, V);
+        ctx.fillStyle = cmap(t);
+        const x = padL + (mm-1)*cellW, y = padT + (Nmax - nn)*cellH;
+        ctx.fillRect(x, y, cellW-0.5, cellH-0.5);
+      }
+    }
+    // axis labels
+    ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+    ctx.fillText('M →', padL + heatW - 24, padT + heatH + 18);
+    ctx.save(); ctx.translate(12, padT + heatH/2); ctx.rotate(-Math.PI/2);
+    ctx.fillText('N stages →', 0, 0); ctx.restore();
+    // grid marks
+    ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+    for (let m of [1,8,16,24,32]){
+      const x = padL + (m-1)*cellW;
+      ctx.fillText(''+m, x-4, padT + heatH + 12);
+    }
+    for (let n of [2, 4, 8, 16]){
+      const y = padT + (Nmax - n)*cellH + 4;
+      ctx.fillText(''+n, padL - 18, y);
+    }
+
+    // marker
+    const mx = padL + (Math.min(Mmax, M)-1)*cellW + cellW/2;
+    const my = padT + (Nmax - Math.min(Nmax, N))*cellH + cellH/2;
+    ctx.fillStyle = '#000'; ctx.beginPath(); ctx.arc(mx, my, 6, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(mx, my, 3, 0, Math.PI*2); ctx.fill();
+
+    // title
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('bubble fraction (N - 1)/(V·M + N - 1)', padL, 16);
+
+    // Right half — stacked bar
+    const rx = W * 0.6 + 8, ry = padT + 10, rw = W - rx - 16, rh = heatH - 40;
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('per-step breakdown @ N='+N+', M='+M+', V='+V, rx, 16);
+
+    const useful = 1 - bf;
+    ctx.fillStyle = '#16a34a';
+    ctx.fillRect(rx, ry, rw, useful*rh);
+    ctx.fillStyle = '#dc2626';
+    ctx.fillRect(rx, ry + useful*rh, rw, bf*rh);
+
+    ctx.fillStyle = '#ffffff'; ctx.font = '12px monospace';
+    if (useful*rh > 14){
+      ctx.fillText('useful: ' + (useful*100).toFixed(0) + '%', rx + 8, ry + useful*rh/2 + 4);
+    }
+    if (bf*rh > 14){
+      ctx.fillText('bubble: ' + (bf*100).toFixed(0) + '%', rx + 8, ry + useful*rh + bf*rh/2 + 4);
+    }
+  }
+
+  ['input','change'].forEach(ev=>{
+    [sN,sM,sV].forEach(s=>s.addEventListener(ev, render));
+  });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: 3D pipeline cube ─── */
+(function(){
+  const C = document.getElementById('pc-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+
+  let N = 4, M = 6, rot = 0;
+  const sN = $('pc-N'), sM = $('pc-M'), sR = $('pc-r');
+  const sNv = $('pc-N-v'), sMv = $('pc-M-v'), sRv = $('pc-r-v');
+  [sN, sM, sR].forEach(s => s.addEventListener('input', ()=>{
+    N = +sN.value; M = +sM.value; rot = +sR.value;
+    sNv.textContent = N; sMv.textContent = M; sRv.textContent = rot+'°';
+    render();
+  }));
+
+  function proj(x, y, z, cx, cy){
+    const rad = rot * Math.PI/180;
+    const a = Math.PI/6 + rad;
+    const sx = (x - y) * Math.cos(a);
+    const sy = (x + y) * Math.sin(a) - z;
+    return [cx + sx, cy + sy];
+  }
+
+  function build1F1B(N, M){
+    const Tmax = 4*(M+N-1);
+    const grid = Array.from({length:N}, ()=> new Array(Tmax).fill(null));
+    const pend = Array.from({length:N}, ()=> ({fwd:[],bwd:[]}));
+    for (let k=0; k<M; k++) pend[0].fwd.push(k);
+    let t=0, done=0;
+    const target = N*M*2;
+    while (done < target && t < Tmax){
+      const choices = new Array(N).fill(null);
+      for (let s=0; s<N; s++){
+        const pb = pend[s].bwd[0], pf = pend[s].fwd[0];
+        if (pb !== undefined) choices[s] = {type:'B', k:pb};
+        else if (pf !== undefined) choices[s] = {type:'F', k:pf};
+      }
+      for (let s=0; s<N; s++){
+        const c = choices[s]; if (!c) continue;
+        grid[s][t] = c;
+        if (c.type === 'F'){
+          pend[s].fwd.shift();
+          if (s < N-1) pend[s+1].fwd.push(c.k);
+          else pend[s].bwd.push(c.k);
+          done++;
+        } else {
+          pend[s].bwd.shift();
+          if (s > 0) pend[s-1].bwd.push(c.k);
+          done++;
+        }
+      }
+      t++;
+    }
+    return grid;
+  }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width = Math.round(W*dpr); C.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    // For each (m, s, dir), is there a compute cell? We use the canonical 1F1B schedule.
+    const grid = build1F1B(N, M);
+    // Collect: per (s, k, dir) the time index of its compute; we'll derive activity based on whether activity ever happens.
+    const fwdMap = Array.from({length: N}, ()=> new Array(M).fill(null));
+    const bwdMap = Array.from({length: N}, ()=> new Array(M).fill(null));
+    let tMax = 0;
+    for (let s=0; s<N; s++){
+      for (let t=0; t<grid[s].length; t++){
+        const c = grid[s][t]; if (!c) continue;
+        if (c.type === 'F') fwdMap[s][c.k] = t;
+        else bwdMap[s][c.k] = t;
+        if (t > tMax) tMax = t;
+      }
+    }
+
+    const cellS = 32;
+    // Origin
+    const totalX = M * cellS;
+    const totalY = N * cellS;
+    const cx = W/2 - totalX*Math.cos(Math.PI/6)/2 + 20;
+    const cy = H/2 + 20;
+
+    // Draw two layers: backward (back) and forward (front), with bubble cells in dark
+    const draw = (dir, dz, lightFront) => {
+      // dir: 'F' or 'B'; dz = z-offset for that layer
+      // Painters algorithm: iterate from back to front in (x+y)
+      const cells = [];
+      for (let m=0; m<M; m++){
+        for (let s=0; s<N; s++){
+          cells.push({m, s});
+        }
+      }
+      cells.sort((a, b)=> ((a.m + a.s) - (b.m + b.s)));
+      for (const {m, s} of cells){
+        const t = dir === 'F' ? fwdMap[s][m] : bwdMap[s][m];
+        const active = t != null;
+        // Cube at (m*cellS, s*cellS, dz)
+        const x = m*cellS, y = s*cellS, z = dz;
+        const w = cellS - 2;
+        const hh = cellS - 2;
+        const p000 = proj(x, y, z, cx, cy);
+        const p100 = proj(x+w, y, z, cx, cy);
+        const p110 = proj(x+w, y+hh, z, cx, cy);
+        const p010 = proj(x, y+hh, z, cx, cy);
+        const p001 = proj(x, y, z+10, cx, cy);
+        const p101 = proj(x+w, y, z+10, cx, cy);
+        const p111 = proj(x+w, y+hh, z+10, cx, cy);
+        const p011 = proj(x, y+hh, z+10, cx, cy);
+
+        const color = active ? (dir === 'F' ? '#2563eb' : '#d97706') : '#eef1f5';
+        const shade = (c, f) => {
+          const m2 = c.replace('#','');
+          const r = parseInt(m2.substr(0,2),16);
+          const g = parseInt(m2.substr(2,2),16);
+          const b = parseInt(m2.substr(4,2),16);
+          return 'rgb('+Math.round(r*f)+','+Math.round(g*f)+','+Math.round(b*f)+')';
+        };
+
+        ctx.globalAlpha = active ? 1 : 0.45;
+        ctx.fillStyle = shade(color, 1.0);
+        ctx.beginPath(); ctx.moveTo(p001[0],p001[1]); ctx.lineTo(p101[0],p101[1]); ctx.lineTo(p111[0],p111[1]); ctx.lineTo(p011[0],p011[1]); ctx.closePath(); ctx.fill();
+        ctx.fillStyle = shade(color, 0.55);
+        ctx.beginPath(); ctx.moveTo(p001[0],p001[1]); ctx.lineTo(p011[0],p011[1]); ctx.lineTo(p010[0],p010[1]); ctx.lineTo(p000[0],p000[1]); ctx.closePath(); ctx.fill();
+        ctx.fillStyle = shade(color, 0.78);
+        ctx.beginPath(); ctx.moveTo(p011[0],p011[1]); ctx.lineTo(p111[0],p111[1]); ctx.lineTo(p110[0],p110[1]); ctx.lineTo(p010[0],p010[1]); ctx.closePath(); ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+    };
+
+    // backward layer first (further back in Z), then forward
+    draw('B', 24, false);
+    draw('F', 0, true);
+
+    // Axis labels
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    const ax1 = proj(M*cellS + 10, 0, 0, cx, cy);
+    ctx.fillText('micro-batch →', ax1[0], ax1[1]+4);
+    const ax2 = proj(0, N*cellS + 10, 0, cx, cy);
+    ctx.fillText('stage ↓', ax2[0]-20, ax2[1]+12);
+    const ax3 = proj(0, 0, 36, cx, cy);
+    ctx.fillText('direction (fwd front / bwd back)', ax3[0]-100, ax3[1]-4);
+
+    // Legend
+    ctx.fillStyle = '#2563eb'; ctx.fillRect(12, H-22, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.font='11px monospace'; ctx.fillText('forward (front layer)', 26, H-13);
+    ctx.fillStyle = '#d97706'; ctx.fillRect(170, H-22, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('backward (back layer)', 184, H-13);
+    ctx.fillStyle = '#eef1f5'; ctx.fillRect(340, H-22, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('idle (bubble corner)', 354, H-13);
+
+    // KPIs
+    let nf = 0, nb = 0;
+    for (let s=0; s<N; s++){
+      for (let m=0; m<M; m++){
+        if (fwdMap[s][m] != null) nf++;
+        if (bwdMap[s][m] != null) nb++;
+      }
+    }
+    $('pc-tt').textContent = (N*M*2);
+    $('pc-fw').textContent = nf;
+    $('pc-bw').textContent = nb;
+    $('pc-ac').textContent = '1F1B isometric';
+  }
+
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

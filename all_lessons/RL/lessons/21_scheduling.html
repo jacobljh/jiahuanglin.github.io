@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>21 · Scheduling tricks for the rollout engine</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">rl_lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">21 · scheduling tricks</span>
+    <span class="step-pill">lesson 7 / 9 · part III</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Scheduling tricks — continuous batching, prefix caching, chunked prefill, spec decode</h1>
+<p class="subtitle"><a href="20_kv_paged.html">Lesson 20</a> gave us a paged KV cache. This lesson is everything else the rollout engine does with that storage: how it admits and evicts sequences, how it shares prompts across K-rollout RL, how it interleaves prefill with decode, and how it asks a small model to do part of the work. Four mechanisms; each one independently a 1.5–3× throughput win.</p>
+
+<div class="callout">
+  <div class="label">Why this is its own lesson</div>
+  Paged storage (lesson 20) is the substrate. Continuous batching is the scheduler over it. Prefix caching is the indexing scheme that makes K-rollout RL practical. Chunked prefill is the interleaving rule that keeps prefill from blocking decode. Speculative decoding is the trick that hides decode's memory-bandwidth bottleneck. All four assume PagedAttention exists; none of them work the same way without it.
+</div>
+
+<h2>Trick 1 · Continuous batching</h2>
+
+<p>Naïve batched generation: pad N sequences to the length of the longest, decode them in lockstep, finish when the longest finishes. The shorter sequences sit emitting padding tokens for hundreds of steps after they've already produced an EOS. The compute is wasted; the KV slots are wasted; the throughput collapses to <em>length-of-longest</em>, not <em>average</em>.</p>
+
+<p><strong>Continuous (rolling) batching</strong>: at every step, evict any sequence that just emitted EOS, accept new sequences into the freed slots, and decode the current batch. No padding-to-longest, no idle slots. With PagedAttention as the underlying storage this is essentially free — block reclamation is O(1) — and the engine's batch is always the maximum the cache can hold.</p>
+
+<p>For RL specifically: you submit K rollouts per prompt × P prompts per step. The K rollouts for the same prompt have wildly different lengths (one finishes in 100 tokens, another runs to 2000). Continuous batching lets them execute concurrently and finish independently, and the rollout pool stays full until the last one returns. The published wins are <strong>2–20× over padded static batching</strong>, scaled by length variance — the more variable the trajectory lengths, the bigger the gap.</p>
+
+<h2>Trick 2 · Prefix caching</h2>
+
+<p>RL rollouts almost always share a prompt. K rollouts of the same problem differ only in their sampled completions; they have identical prefixes for the first <span class="math">|x|</span> tokens. Prefix caching detects this — by hashing token prefixes — and reuses the KV blocks computed during the first sequence's prefill for all subsequent ones.</p>
+
+<p>The win is large and RL-specific:</p>
+
+<div class="math block">
+without sharing:  K · P prefill work + K · G decode work
+with sharing:     P prefill work + K · G decode work
+</div>
+
+<p>where <em>P</em> is prompt length and <em>G</em> is generation length. For K=16 and a 1k-token math prompt with 200-token completions: 16 prefills (~480 ms total at 30 ms each) collapse to 1 prefill (~30 ms). Lesson 25's prefix-sharing kernel discussion calls this <em>the highest-leverage single optimization for RL post-training</em>; the speedup on K-rollout benchmarks is typically 3–10× on the rollout phase as a whole.</p>
+
+<div class="callout">
+  <div class="label">vLLM's APC vs SGLang's RadixAttention</div>
+  vLLM detects prefix sharing block-by-block: two requests share a prefix iff their token sequences are identical at every block boundary. SGLang's <strong>RadixAttention</strong> (lesson 20) generalizes to arbitrary subtrees of tokens — a multi-turn agent reusing the system prompt, several earlier turns, and a tool-call header all benefit. For single-turn math RL, the two are roughly equivalent. For multi-turn agentic RL, RadixAttention pulls ahead.
+</div>
+
+<h2>Trick 3 · Chunked prefill</h2>
+
+<p>If you submit a 32k-token prompt to a vanilla engine, prefill becomes a 32k-long matmul and blocks the engine from running any decode steps for hundreds of ms. Decoding clients see latency spikes. Worse: in an RL rollout pool, a single long-context tool-use trajectory can stall the other 100 short-context rollouts.</p>
+
+<p><strong>Chunked prefill</strong> breaks the prompt into pieces (say, 4k tokens each), interleaves them with decode steps, and amortizes the long prefill across many engine steps. The prompt's tokens are admitted to the KV cache one chunk at a time; decoding sequences continue uninterrupted between chunks.</p>
+
+<svg viewBox="0 0 720 200" class="diagram">
+  <text x="20" y="24" font-size="13" font-weight="600" fill="var(--text)">Without chunked prefill</text>
+  <rect x="20" y="36" width="240" height="28" fill="#fef3c7" stroke="#d97706"/>
+  <text x="140" y="55" text-anchor="middle" font-size="11" font-family="monospace">prefill (blocks engine 250 ms)</text>
+  <rect x="260" y="36" width="40" height="28" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="280" y="55" text-anchor="middle" font-size="11" font-family="monospace">decode</text>
+  <rect x="300" y="36" width="40" height="28" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="320" y="55" text-anchor="middle" font-size="11" font-family="monospace">decode</text>
+  <rect x="340" y="36" width="40" height="28" fill="#dbeafe" stroke="#2563eb"/>
+  <rect x="380" y="36" width="40" height="28" fill="#dbeafe" stroke="#2563eb"/>
+  <rect x="420" y="36" width="40" height="28" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="20" y="80" font-size="10" fill="var(--text-dim)" font-family="monospace">other sequences (decode-only) WAIT for prefill to finish</text>
+
+  <text x="20" y="120" font-size="13" font-weight="600" fill="var(--text)">With chunked prefill (4k chunks)</text>
+  <rect x="20" y="132" width="60" height="28" fill="#fef3c7" stroke="#d97706"/>
+  <text x="50" y="151" text-anchor="middle" font-size="10" font-family="monospace">chunk 1</text>
+  <rect x="80" y="132" width="30" height="28" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="95" y="151" text-anchor="middle" font-size="9" font-family="monospace">dec</text>
+  <rect x="110" y="132" width="60" height="28" fill="#fef3c7" stroke="#d97706"/>
+  <text x="140" y="151" text-anchor="middle" font-size="10" font-family="monospace">chunk 2</text>
+  <rect x="170" y="132" width="30" height="28" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="185" y="151" text-anchor="middle" font-size="9" font-family="monospace">dec</text>
+  <rect x="200" y="132" width="60" height="28" fill="#fef3c7" stroke="#d97706"/>
+  <text x="230" y="151" text-anchor="middle" font-size="10" font-family="monospace">chunk 3</text>
+  <rect x="260" y="132" width="30" height="28" fill="#dbeafe" stroke="#2563eb"/>
+  <rect x="290" y="132" width="60" height="28" fill="#fef3c7" stroke="#d97706"/>
+  <rect x="350" y="132" width="30" height="28" fill="#dbeafe" stroke="#2563eb"/>
+  <rect x="380" y="132" width="60" height="28" fill="#fef3c7" stroke="#d97706"/>
+  <rect x="440" y="132" width="30" height="28" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="20" y="178" font-size="10" fill="var(--text-dim)" font-family="monospace">other sequences make decode progress between chunks (no stall)</text>
+</svg>
+
+<p>The win is 10–20% on long-prompt workloads, and crucially it stabilizes tail latency. For RL: when one of your rollouts is a long-context tool-use trace, chunked prefill is what keeps the other 100 short-context rollouts from blocking on it.</p>
+
+<h2>Trick 4 · Speculative decoding</h2>
+
+<p>Decode is memory-bandwidth-bound (lesson 20): every token requires reading the full weight tensor and KV cache from HBM. The compute per token is trivial. Speculative decoding exploits this asymmetry: have a small <em>draft</em> model generate K tokens speculatively, then have the large <em>target</em> model verify all K in a single batched forward pass.</p>
+
+<p>The verification is mathematically careful: each draft token is accepted only with probability <span class="math">min(1, π<sub>target</sub>(y) / π<sub>draft</sub>(y))</span>, ensuring the final samples are exactly from the target distribution. If all K pass, you've gained ~K× decode throughput. If some fail, you've at least gained the position of the first failure.</p>
+
+<table>
+  <thead><tr><th>Variant</th><th>Draft mechanism</th><th>Best case</th></tr></thead>
+  <tbody>
+    <tr><td>Vanilla draft model</td><td>Separate small model (e.g. 1B) drafts for the 70B target</td><td>1.5–2.5× on greedy decode</td></tr>
+    <tr><td>Medusa</td><td>Extra prediction heads on the target itself; no separate model</td><td>1.5–2× with one model in memory</td></tr>
+    <tr><td>EAGLE-2 / EAGLE-3</td><td>Small head conditioned on target's last hidden state — much higher acceptance</td><td>2–3× even at moderate T</td></tr>
+    <tr><td>Lookahead decoding</td><td>Draft from the target itself by re-using past hidden states</td><td>1.3–1.8×; no auxiliary model</td></tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <div class="label">Speculative decoding + RL caveat</div>
+  Speculative decoding's correctness depends on faithfully sampling from the target policy. Sample-time numerical drift (e.g., kernel fusion that changes log-prob precision) can quietly make the rollout policy diverge from the trainer's policy — and then your <code>old_logp</code> for the rollout doesn't match what the trainer recomputes. Symptom: PPO ratio is unexpectedly skewed away from 1 at the very first iteration. Fix: turn off speculative decoding for RL, or ensure trainer and rollout use the same kernels.
+  <br><br>
+  Also: spec decoding helps <strong>most at low sampling temperature</strong>, where the draft model agrees often with the target. At T=1 (typical RL exploration), draft acceptance drops and the K-token-verify overhead doesn't pay back. Plan for ~1× at T=1, ~2× at T=0.5, ~3× at T=0.
+</div>
+
+<h2>Interactive · stacking the tricks</h2>
+
+<p>Below: a steady-state throughput model with each trick toggleable. The bar shows total tokens/sec at fixed concurrency; KPIs name the bottleneck (KV bandwidth / weight bandwidth / FLOPs). Toggle features in any order and watch how the bottleneck shifts.</p>
+
+<div class="widget" id="sched-widget">
+  <div class="title">Scheduling tricks · throughput simulator</div>
+  <div class="hint">Each trick multiplies an effective throughput term. Continuous batching reduces padding waste. Prefix caching cuts prefill cost (modelled as a 0.4× rollout-time multiplier for K-rollout-shaped traffic). Chunked prefill stabilizes throughput on long prompts. Spec decoding multiplies per-stream tokens/sec by ~2× when conditions are right.</div>
+
+  <div class="controls">
+    <label class="inline">Concurrency B: <input type="range" id="sc-b" min="1" max="256" step="1" value="32"><span class="val" id="sc-b-v">32</span></label>
+    <label class="inline">Avg seq len L: <input type="range" id="sc-l" min="128" max="32768" step="128" value="2048"><span class="val" id="sc-l-v">2048</span></label>
+    <label class="inline">Sampling T: <input type="range" id="sc-t" min="0" max="100" step="5" value="70"><span class="val" id="sc-t-v">0.70</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline"><input type="checkbox" id="sc-cb" checked> continuous batching</label>
+    <label class="inline"><input type="checkbox" id="sc-px" checked> prefix caching</label>
+    <label class="inline"><input type="checkbox" id="sc-cp"> chunked prefill</label>
+    <label class="inline"><input type="checkbox" id="sc-spec"> speculative decoding</label>
+  </div>
+
+  <canvas id="sc-canvas" class="dist-canvas" height="180"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">Tokens/sec (aggregate)</div><div class="v" id="sc-tps">—</div></div>
+    <div class="kpi"><div class="k">Per-stream tok/s</div><div class="v" id="sc-ps">—</div></div>
+    <div class="kpi"><div class="k">Bottleneck</div><div class="v" id="sc-bn" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">Speedup vs all-off</div><div class="v" id="sc-x">—</div></div>
+  </div>
+</div>
+
+<h2>vLLM vs SGLang · what's different</h2>
+
+<table>
+  <thead><tr><th></th><th>vLLM</th><th>SGLang</th></tr></thead>
+  <tbody>
+    <tr><td>Core data structure</td><td>PagedAttention block table</td><td>RadixAttention prefix tree (on paged storage)</td></tr>
+    <tr><td>Prefix sharing granularity</td><td>Block-aligned</td><td>Arbitrary subtree</td></tr>
+    <tr><td>Strong point</td><td>High throughput on independent requests</td><td>Tree-structured prompts; tool-use; complex prefixes</td></tr>
+    <tr><td>Programming model</td><td>OpenAI-compatible API</td><td>SGLang front-end DSL for structured generation</td></tr>
+    <tr><td>RL integration</td><td>verl, OpenRLHF default</td><td>SLIME default; first-class for agentic RL</td></tr>
+    <tr><td>Weight-update path</td><td>Custom <code>update_weights</code> NCCL hook</td><td>Built-in <code>resume_memory_occupation</code> for hot-swap</td></tr>
+  </tbody>
+</table>
+
+<p>For pure verifier-RL on single-turn tasks (math, code completion) either engine works well; vLLM has a slight edge on raw throughput. For multi-turn agentic tasks with branchy tool-use, SGLang's RadixAttention gives a real lift because the tool-call tree has substantial KV-reuse opportunities that vLLM's block-aligned prefix cache catches less aggressively.</p>
+
+<h2>Trade-offs you'll actually face</h2>
+
+<table>
+  <thead><tr><th>Knob</th><th>Up means…</th><th>Down means…</th></tr></thead>
+  <tbody>
+    <tr><td>Batch size (concurrent sequences)</td><td>Higher tokens/sec; bigger KV memory; longer time-to-first-token</td><td>Lower tokens/sec; smaller memory; faster first-token latency</td></tr>
+    <tr><td>Max generation length</td><td>Longer chains possible; KV memory grows linearly</td><td>Shorter chains; more concurrency at same memory</td></tr>
+    <tr><td>Chunk size (chunked prefill)</td><td>Lower prefill amortization; more decode interleaving</td><td>Prefill closer to one big matmul; potential decode stalls</td></tr>
+    <tr><td>Spec decode K</td><td>Higher per-stream tokens/sec; more wasted draft compute on miss</td><td>Lower per-stream; less waste on miss</td></tr>
+    <tr><td>Sampling temperature</td><td>More exploration; lower spec-decode acceptance; longer tails</td><td>More exploitation; spec decode shines; shorter tails</td></tr>
+  </tbody>
+</table>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Four orthogonal scheduling tricks on a paged storage substrate. <strong>Continuous batching</strong> kills padding waste; <strong>prefix caching</strong> kills prompt re-prefill (single biggest RL-specific win); <strong>chunked prefill</strong> kills long-prompt latency spikes; <strong>speculative decoding</strong> kills decode's bandwidth bottleneck when temperature is low enough. Real engines stack all four. The kernel-engineer's first job (lesson 25) is to make sure the scheduler exposes them correctly to the RL framework's K-rollout-shaped traffic.
+</div>
+
+<footer class="lesson-nav">
+  <a href="20_kv_paged.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">20 · KV cache &amp; paged attention</span>
+  </a>
+  <a class="next" href="22_memory.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">22 · Memory &amp; throughput math</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const bRng = document.getElementById('sc-b');
+  const lRng = document.getElementById('sc-l');
+  const tRng = document.getElementById('sc-t');
+  const cbBox = document.getElementById('sc-cb');
+  const pxBox = document.getElementById('sc-px');
+  const cpBox = document.getElementById('sc-cp');
+  const specBox = document.getElementById('sc-spec');
+  const canvas = document.getElementById('sc-canvas');
+  const ctx = canvas.getContext('2d');
+
+  // 7B on H100 baseline numbers
+  const WEIGHT_GB = 14;
+  const HBM_GBs = 3350;
+  const FLOPS_TFs = 800;
+  const KV_PER_TOK_MB = 0.13;  // GQA Llama-3-8B
+  const FLOPS_PER_TOK_GF = 28;
+
+  function compute(){
+    const B = parseInt(bRng.value);
+    const L = parseInt(lRng.value);
+    const T = parseInt(tRng.value) / 100;  // 0..1
+    const cb = cbBox.checked;
+    const px = pxBox.checked;
+    const cp = cpBox.checked;
+    const spec = specBox.checked;
+
+    document.getElementById('sc-b-v').textContent = B;
+    document.getElementById('sc-l-v').textContent = L;
+    document.getElementById('sc-t-v').textContent = T.toFixed(2);
+
+    // Continuous batching: effective B is full B with CB, 60% without
+    const Beff = cb ? B : B * 0.6;
+    // Prefix caching: roughly 30% of decode-step time is "redundant prefill cost" amortized in; PX cuts it.
+    const pxMul = px ? 1.0 : 1.4;
+    // Chunked prefill: smooths tail latency; minor throughput impact in steady state
+    const cpMul = cp ? 0.95 : 1.0;
+    // Spec decoding: acceptance depends on T (greedy ~0.9, T=1 ~0.3)
+    const specAccept = 1.0 - 0.7 * T;            // crude linear model
+    const specMul = spec ? (1 + 1.5 * specAccept) : 1.0;
+
+    // Per-step time
+    const wt = WEIGHT_GB / HBM_GBs;
+    const kvt = Beff * (KV_PER_TOK_MB / 1024) * L / HBM_GBs * pxMul;
+    const flopsT = Beff * FLOPS_PER_TOK_GF / FLOPS_TFs / 1000;
+    const tStep = Math.max(wt + kvt, flopsT) * cpMul;
+    const aggTps = Beff / tStep * specMul;
+    const perStream = aggTps / B;
+
+    // Baseline = all off
+    const tStepBase = Math.max(WEIGHT_GB / HBM_GBs + B*0.6 * (KV_PER_TOK_MB / 1024) * L / HBM_GBs * 1.4,
+                               B*0.6 * FLOPS_PER_TOK_GF / FLOPS_TFs / 1000);
+    const aggTpsBase = B*0.6 / tStepBase;
+    const speedup = aggTps / aggTpsBase;
+
+    let bn;
+    if (kvt > wt && kvt > flopsT) bn = 'KV bandwidth';
+    else if (wt > flopsT) bn = 'Weight bandwidth';
+    else bn = 'FLOPs';
+
+    document.getElementById('sc-tps').textContent = aggTps.toFixed(0);
+    document.getElementById('sc-ps').textContent = perStream.toFixed(1);
+    document.getElementById('sc-bn').textContent = bn;
+    document.getElementById('sc-x').textContent = speedup.toFixed(2) + '×';
+
+    draw(wt, kvt, flopsT, aggTps, aggTpsBase);
+  }
+
+  function draw(wt, kvt, flopsT, tps, base){
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W*dpr){ canvas.width = W*dpr; canvas.height = H*dpr; }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padX = 60, padY = 24;
+    const maxV = Math.max(wt + kvt, flopsT) * 1.2 || 1;
+    const scaleY = (H - 2*padY) / maxV;
+    const colW = 90;
+    const cols = [
+      {label: 'Bandwidth (W + KV)', segs: [{v: wt, c: '#2563eb', lab:'weights'},
+                                            {v: kvt, c: '#7c3aed', lab:'KV cache'}]},
+      {label: 'FLOPs', segs: [{v: flopsT, c: '#16a34a', lab:'compute'}]},
+    ];
+
+    cols.forEach((col, i) => {
+      const cx = padX + 140 + i * 200;
+      let yacc = H - padY;
+      col.segs.forEach(s => {
+        const h = s.v * scaleY;
+        ctx.fillStyle = s.c;
+        ctx.fillRect(cx - colW/2, yacc - h, colW, h);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '11px monospace';
+        ctx.textAlign = 'center';
+        if (h > 15) ctx.fillText(s.lab, cx, yacc - h/2 + 4);
+        yacc -= h;
+      });
+      ctx.fillStyle = '#1f2430';
+      ctx.font = '12px ' + (getComputedStyle(document.body).fontFamily || 'sans-serif');
+      ctx.textAlign = 'center';
+      ctx.fillText(col.label, cx, H-padY+18);
+    });
+
+    ctx.fillStyle = '#5b6573';
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('per-decode-step time (s); taller column = bottleneck', padX, padY-6);
+  }
+
+  [bRng, lRng, tRng].forEach(el => el.addEventListener('input', compute));
+  [cbBox, pxBox, cpBox, specBox].forEach(el => el.addEventListener('change', compute));
+  window.addEventListener('resize', compute);
+  compute();
+})();
+</script>
+
+</body>
+</html>

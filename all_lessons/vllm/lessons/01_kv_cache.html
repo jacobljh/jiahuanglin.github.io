@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>01 · The KV cache</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">vllm_lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">01 · the KV cache</span>
+    <span class="step-pill">lesson 1 / 12</span>
+  </div>
+</header>
+
+<main>
+
+<h1>The KV cache</h1>
+<p class="subtitle">Where every vLLM optimization is aimed. Get one formula in your head before reading anything else.</p>
+
+<h2>Why start here</h2>
+
+<p>vLLM is an inference engine, not a training framework. It exists to make <em>decode-time</em> generation cheaper. Every design choice in the project — paged memory, continuous batching, FlashAttention integration, FP8 KV, speculative decoding — is aimed at one object: <strong>the KV cache</strong>. Get its properties straight, and every later lesson reads as a direct consequence.</p>
+
+<h2>What the KV cache is, in one paragraph</h2>
+
+<p>An autoregressive transformer emits one token at a time. To produce token <code>t+1</code> we need its query <span class="math">q<sub>t+1</sub></span> to compare against all previous keys <span class="math">k<sub>1..t</sub></span>, and to pool the corresponding values <span class="math">v<sub>1..t</sub></span>:</p>
+
+<div class="math block">
+  attn<sub>t+1</sub> = softmax(q<sub>t+1</sub> · [k<sub>1</sub>, …, k<sub>t</sub>]<sup>T</sup> / √d) · [v<sub>1</sub>; …; v<sub>t</sub>]
+</div>
+
+<p>If we recomputed all <span class="math">k<sub>i</sub>, v<sub>i</sub></span> every step the projection cost would be O(t) per step → O(T²) over a generation of length T. So instead, after emitting token t we <em>append</em> (k<sub>t</sub>, v<sub>t</sub>) to per-layer buffers. Step t+1 then projects only the new token (O(1)) and does the unavoidable O(t) attention dot product. The KV cache is just that buffer — incremental state, nothing more.</p>
+
+<div class="callout">
+  <div class="label">The one formula</div>
+  Per token, per sequence, the KV cache stores:
+  <div class="math block">
+    <strong>bytes_per_token</strong> &nbsp;=&nbsp; 2 (K and V) × n_layers × n_heads × head_dim × bytes_per_dtype
+  </div>
+  Memorize this. It's the number you'll use to predict whether a workload fits in HBM, how many concurrent sequences you can serve, and whether GQA / FP8 will buy you what you need.
+</div>
+
+<h2>A concrete number</h2>
+
+<p>LLaMA-2 7B (32 layers, 32 heads, head_dim 128, fp16):</p>
+
+<div class="math block">
+  2 × 32 × 32 × 128 × 2 &nbsp;=&nbsp; 524,288 bytes &nbsp;≈&nbsp; 0.5 MB <em>per token</em>
+</div>
+
+<p>A single 2048-token sequence: <strong>~1 GB</strong> of KV cache. On an 80 GB H100, after weights (~14 GB) and activations (~6 GB activations + framework overhead), you have ~60 GB left — so the theoretical ceiling is ~60 concurrent 2048-token sequences. In practice you're nowhere near that, because the cache is <em>fragmented</em>. That's lesson 02.</p>
+
+<h2>The two consequences</h2>
+
+<p>Two facts follow directly from the formula and a touch of arithmetic. Almost everything in vLLM is one of these in disguise.</p>
+
+<div class="callout">
+  <div class="label">Consequence A · throughput ↔ HBM occupancy</div>
+  Inference throughput on a fixed model is roughly proportional to the number of sequences in flight, which is gated on how efficiently you pack KV into HBM. <strong>Less fragmentation = more concurrent sequences = more tokens per second.</strong> This is what <a href="02_paged_attention.html">PagedAttention (lesson 02)</a> attacks.
+</div>
+
+<div class="callout warn">
+  <div class="label">Consequence B · decode is memory-bound</div>
+  Each decode step reads the full KV cache once: one matmul against a buffer that grows with t. The compute is tiny (one token's worth of projections) — what limits you is HBM bandwidth. <strong>Fewer bytes moved per step = faster.</strong> This is what <a href="03_flash_attention.html">FlashAttention (lesson 03)</a> and <a href="05_optimizations.html">KV quantization (lesson 05)</a> attack.
+</div>
+
+<p>Prefill — processing the prompt — is the opposite: T tokens worth of math in one parallel pass. <em>Compute-bound</em>, matrix-matrix products, high arithmetic intensity. The two phases having opposite bottlenecks is why <a href="10_chunked_prefill.html">chunked prefill (lesson 10)</a> and <a href="08_pd_disaggregation.html">P/D disaggregation (lesson 08)</a> exist.</p>
+
+<h2>The fragmentation problem, made concrete</h2>
+
+<p>Textbook implementations of the KV cache pre-allocate <code>max_seq_len</code> slots per request, contiguously, up front. The reasoning is reasonable in isolation: you don't know how long the response will be, and you need contiguous memory so the attention kernel can stride through it cleanly. The cost shows up only across requests:</p>
+
+<pre><code>seq A: ████░░░░░░░░░░░░░░░░░░░░░░░░░░░░    (50/2048 used)
+seq B: ███░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    (40/2048 used)
+seq C: ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    (30/2048 used)
+       ─────────────────────────────────
+       useful: 5.9%   wasted: 94.1%   ← "internal fragmentation"</code></pre>
+
+<p>vLLM's fix is to allocate in fixed-size blocks (say 16 tokens) from a shared pool, on demand. Worst-case waste drops from ~<code>max_seq_len</code> bytes to at most <code>BLOCK_SIZE − 1</code> bytes per sequence. That's the lesson 02 jump.</p>
+
+<h2>Interactive · feel the bytes</h2>
+
+<p>Pick a model, a context length, and a concurrent-sequence count. The widget shows you how much HBM the KV cache would consume, side-by-side with the weights, on an 80 GB H100. Try a few:</p>
+
+<ul>
+  <li>LLaMA-1 7B (MHA) at 4096 ctx, 64 sequences — clearly impossible on one GPU. Where does the cliff hit?</li>
+  <li>Switch to LLaMA-2 70B (GQA) — note that the per-token KV is <em>smaller</em> than the 7B's, despite a much bigger model. That's <a href="09_gqa_mqa.html">lesson 09</a>.</li>
+  <li>Drop dtype to fp8 — your KV halves. That's the second knob in <a href="05_optimizations.html">lesson 05</a>.</li>
+</ul>
+
+<div class="widget" id="kv-widget">
+  <div class="title">KV cache budget on an 80 GB H100</div>
+  <div class="hint">All bars are on the same 80 GB scale. Red overflow means it doesn't fit; you'd need TP / quantization / fewer sequences.</div>
+
+  <div class="controls" style="margin-bottom: 10px;">
+    <label class="inline">model:
+      <select id="kv-model">
+        <option value="llama1-7b">LLaMA-1 7B (MHA)</option>
+        <option value="llama2-7b" selected>LLaMA-2 7B (MHA)</option>
+        <option value="llama2-70b">LLaMA-2 70B (GQA, h_kv=8)</option>
+        <option value="mistral-7b">Mistral 7B (GQA, h_kv=8)</option>
+        <option value="falcon-40b">Falcon-40B (MQA)</option>
+      </select>
+    </label>
+    <label class="inline">dtype:
+      <select id="kv-dtype">
+        <option value="2" selected>fp16 / bf16 (2 B)</option>
+        <option value="1">fp8 / int8 (1 B)</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="controls">
+    <label class="inline">ctx length: <input type="range" id="kv-ctx" min="128" max="32768" step="128" value="2048"> <span class="val" id="kv-ctx-val">2048</span></label>
+    <label class="inline">concurrent seqs: <input type="range" id="kv-seqs" min="1" max="256" step="1" value="16"> <span class="val" id="kv-seqs-val">16</span></label>
+  </div>
+
+  <canvas class="dist-canvas" id="kv-canvas" width="760" height="220" style="height: 220px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">per-token KV</div><div class="v" id="kv-pertok">—</div></div>
+    <div class="kpi"><div class="k">per-seq KV</div><div class="v" id="kv-perseq">—</div></div>
+    <div class="kpi"><div class="k">total KV</div><div class="v" id="kv-total">—</div></div>
+    <div class="kpi"><div class="k">fits?</div><div class="v" id="kv-fit">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">show the formula this widget uses (≈3 lines)</summary>
+<pre><code>// bytes_per_token = 2 (K and V) * n_layers * n_kv_heads * head_dim * dtype_bytes
+const per_token = 2 * cfg.n_layers * cfg.n_kv_heads * cfg.head_dim * dtype_bytes;
+const per_seq   = per_token * ctx_len;
+const total_kv  = per_seq   * n_sequences;</code></pre>
+  </details>
+</div>
+
+<h2>What the next four lessons do to this picture</h2>
+
+<table>
+  <thead><tr><th>Lesson</th><th>What it attacks</th><th>How much</th></tr></thead>
+  <tbody>
+    <tr><td><a href="02_paged_attention.html">02 PagedAttention</a></td><td>Fragmentation</td><td>Wasted KV: ~95% → ~6%</td></tr>
+    <tr><td><a href="03_flash_attention.html">03 FlashAttention</a></td><td>HBM traffic per attention op</td><td>O(T²) → O(T) intermediates</td></tr>
+    <tr><td><a href="04_continuous_batching.html">04 Continuous batching</a></td><td>Cycle-level wait for stragglers</td><td>Decode utilization 45% → 90%</td></tr>
+    <tr><td><a href="05_optimizations.html">05 APC + FP8 KV + …</a></td><td>Bytes per token, redundant prefill</td><td>2× cache, ~95% prefill savings on shared prompts</td></tr>
+  </tbody>
+</table>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Bytes per token = 2 · L · h_kv · d_head · dtype_bytes. Throughput is bounded by HBM occupancy; decode latency is bounded by HBM bandwidth. Every later lesson is a way to push one of those two numbers.
+</div>
+
+<footer class="lesson-nav">
+  <a href="index.html">
+    <span class="dir">← Index</span>
+    <span class="ttl">All lessons</span>
+  </a>
+  <a class="next" href="02_paged_attention.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">02 · PagedAttention</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const MODELS = {
+    "llama1-7b":  { name: "LLaMA-1 7B (MHA)",    n_layers: 32, n_kv_heads: 32, head_dim: 128, weights_gb_fp16: 14 },
+    "llama2-7b":  { name: "LLaMA-2 7B (MHA)",    n_layers: 32, n_kv_heads: 32, head_dim: 128, weights_gb_fp16: 14 },
+    "llama2-70b": { name: "LLaMA-2 70B (GQA)",   n_layers: 80, n_kv_heads: 8,  head_dim: 128, weights_gb_fp16: 140 },
+    "mistral-7b": { name: "Mistral 7B (GQA)",    n_layers: 32, n_kv_heads: 8,  head_dim: 128, weights_gb_fp16: 14 },
+    "falcon-40b": { name: "Falcon-40B (MQA)",    n_layers: 60, n_kv_heads: 1,  head_dim: 64,  weights_gb_fp16: 80 },
+  };
+
+  const HBM_GB = 80;
+  const canvas = document.getElementById('kv-canvas');
+  const ctx = canvas.getContext('2d');
+  const sel = document.getElementById('kv-model');
+  const sd  = document.getElementById('kv-dtype');
+  const rc  = document.getElementById('kv-ctx');
+  const rs  = document.getElementById('kv-seqs');
+  const rcv = document.getElementById('kv-ctx-val');
+  const rsv = document.getElementById('kv-seqs-val');
+
+  function fmtBytes(b) {
+    if (b < 1024) return b.toFixed(0) + " B";
+    if (b < 1024**2) return (b/1024).toFixed(1) + " KB";
+    if (b < 1024**3) return (b/1024**2).toFixed(1) + " MB";
+    return (b/1024**3).toFixed(2) + " GB";
+  }
+
+  function render() {
+    const cfg = MODELS[sel.value];
+    const dtype = parseInt(sd.value);
+    const ctxLen = parseInt(rc.value);
+    const seqs   = parseInt(rs.value);
+    rcv.textContent = ctxLen;
+    rsv.textContent = seqs;
+
+    const per_token = 2 * cfg.n_layers * cfg.n_kv_heads * cfg.head_dim * dtype;
+    const per_seq   = per_token * ctxLen;
+    const total_kv  = per_seq * seqs;
+    // Weights scale with dtype too (fp16=base, fp8=half, int4=quarter).
+    const weights = cfg.weights_gb_fp16 * (dtype / 2) * 1024**3;
+    // Activations + framework overhead — rough constant for the widget.
+    const overhead = 6 * 1024**3;
+    const total = weights + overhead + total_kv;
+
+    document.getElementById('kv-pertok').textContent = fmtBytes(per_token);
+    document.getElementById('kv-perseq').textContent = fmtBytes(per_seq);
+    document.getElementById('kv-total').textContent  = fmtBytes(total_kv);
+    const fit = total <= HBM_GB * 1024**3;
+    const fitEl = document.getElementById('kv-fit');
+    fitEl.textContent = fit ? "yes" : "no — overflow";
+    fitEl.style.color = fit ? "var(--ok)" : "var(--bad)";
+
+    // Render stacked bar.
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W * dpr){ canvas.width = W * dpr; canvas.height = H * dpr; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    const padX = 20, padY = 50, barH = 64;
+    const barW = W - 2*padX;
+    const cap = HBM_GB * 1024**3;
+    const w_w = barW * Math.min(1, weights / cap);
+    const w_o = barW * Math.min(1, overhead / cap);
+    const w_k = barW * Math.min(1, total_kv / cap);
+    let x = padX;
+
+    // segments
+    ctx.fillStyle = '#2563eb'; ctx.fillRect(x, padY, w_w, barH); x += w_w;
+    ctx.fillStyle = '#94a3b8'; ctx.fillRect(x, padY, w_o, barH); x += w_o;
+    ctx.fillStyle = '#16a34a'; ctx.fillRect(x, padY, Math.min(w_k, padX + barW - x), barH);
+    // overflow shading
+    const used = weights + overhead + total_kv;
+    if (used > cap) {
+      ctx.fillStyle = 'rgba(255, 122, 144, 0.55)';
+      const overflowW = barW * ((used - cap) / cap);
+      ctx.fillRect(padX + barW - 6, padY, 8, barH);  // overflow ear
+      ctx.fillStyle = 'var(--bad)';
+      ctx.font = '12px monospace';
+      ctx.fillText("+ " + fmtBytes(used - cap) + " over budget", padX, padY - 8);
+    } else {
+      ctx.font = '12px monospace';
+      ctx.fillStyle = '#5b6573';
+      ctx.fillText(((used)/(cap)*100).toFixed(0) + "% of 80 GB HBM used", padX, padY - 8);
+    }
+    // capacity line
+    ctx.strokeStyle = '#d97706';
+    ctx.setLineDash([4,3]);
+    ctx.beginPath();
+    ctx.moveTo(padX + barW, padY - 3);
+    ctx.lineTo(padX + barW, padY + barH + 3);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // legend
+    ctx.font = '12px ' + getComputedStyle(document.body).fontFamily;
+    ctx.fillStyle = '#1f2430';
+    const ly = padY + barH + 24;
+    const items = [
+      ['#2563eb', 'weights  ' + fmtBytes(weights)],
+      ['#94a3b8', 'activations + overhead  ' + fmtBytes(overhead)],
+      ['#16a34a', 'KV cache  ' + fmtBytes(total_kv) + '  (' + seqs + ' × ' + ctxLen + ' tok)'],
+    ];
+    let lx = padX;
+    items.forEach(([c, t]) => {
+      ctx.fillStyle = c; ctx.fillRect(lx, ly-9, 10, 10);
+      ctx.fillStyle = '#1f2430'; ctx.fillText(t, lx + 14, ly);
+      lx += ctx.measureText(t).width + 40;
+    });
+    // model line
+    ctx.fillStyle = '#5b6573';
+    ctx.font = '11px monospace';
+    ctx.fillText(
+      cfg.name + "   L=" + cfg.n_layers + "  h_kv=" + cfg.n_kv_heads + "  d_head=" + cfg.head_dim
+        + "   dtype=" + (dtype===2?"fp16":"fp8"),
+      padX, ly + 20
+    );
+  }
+
+  [sel, sd, rc, rs].forEach(el => el.addEventListener('input', render));
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

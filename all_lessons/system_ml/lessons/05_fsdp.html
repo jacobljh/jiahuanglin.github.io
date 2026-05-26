@@ -1,0 +1,954 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>05 · FSDP / ZeRO</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">05 · FSDP / ZeRO</span>
+    <span class="step-pill">lesson 5 / 19</span>
+  </div>
+</header>
+
+<main>
+
+<h1>FSDP / ZeRO — sharding what DDP replicates</h1>
+<p class="subtitle">Take the redundancy out of DDP. The three things every rank kept identical copies of — optimizer state, gradients, parameters — get sharded one at a time. Each stage trades a little more communication for a lot less memory.</p>
+
+<h2>The observation that starts it all</h2>
+
+<p>DDP makes <span class="math">N</span> copies of optimizer state, <span class="math">N</span> copies of gradients, and <span class="math">N</span> copies of parameters. After the gradient AllReduce, all <span class="math">N</span> ranks compute the <em>same</em> optimizer step on the <em>same</em> averaged gradient and arrive at the <em>same</em> new weights. <strong>That's redundant compute on identical data.</strong> If rank 0 does the optimizer step for the first 1/N of the weights, rank 1 does the next 1/N, …, every rank still ends up with its own slice of new weights — and if we agree to <em>share</em> those slices on demand, we never had to hold all <span class="math">N</span> copies in the first place.</p>
+
+<p>That's the entire idea. The "ZeRO" name is from Rajbhandari et al. (DeepSpeed, 2019); "FSDP" (PyTorch's name for the ZeRO-3 mechanic, plus a layer of usability) became the canonical implementation in production.</p>
+
+<h2>The three stages</h2>
+
+<p>State pieces, in increasing order of "how often you need them":</p>
+<ul>
+  <li><strong>Optimizer state</strong> (fp32 master weights + Adam m/v) — touched only at the <em>optimizer step</em>, once per training step.</li>
+  <li><strong>Gradients</strong> — touched at backward, once per training step.</li>
+  <li><strong>Parameters</strong> — touched at every forward and backward, once <em>per layer</em>.</li>
+</ul>
+
+<p>The optimizer state is the easiest to shard because you only need <em>your</em> shard to do <em>your</em> step. Gradients are next — you need the full grad to AllReduce, but if you ReduceScatter instead, every rank ends up with the slice of the summed gradient it needs. Parameters are the hardest, because every forward pass actually needs the full layer's weights — so we have to "reconstruct" the layer just-in-time and free it right after.</p>
+
+<table>
+  <thead><tr><th>Stage</th><th>Param</th><th>Grad</th><th>Opt</th><th>Memory / rank</th><th>Comm / step vs DDP</th></tr></thead>
+  <tbody>
+    <tr><td>0 (DDP)</td><td>full</td><td>full</td><td>full</td><td><span class="math">2P + 2P + 12P</span> = 16P</td><td>1.0× (one AllReduce)</td></tr>
+    <tr><td>1</td><td>full</td><td>full</td><td>1/N</td><td><span class="math">2P + 2P + 12P/N</span></td><td>~1.0× (still one AllReduce)</td></tr>
+    <tr><td>2</td><td>full</td><td>1/N</td><td>1/N</td><td><span class="math">2P + 2P/N + 12P/N</span></td><td>~1.0× (ReduceScatter + Broadcast ≡ AllReduce)</td></tr>
+    <tr><td>3 (FSDP)</td><td>1/N</td><td>1/N</td><td>1/N</td><td><span class="math">(2P + 2P + 12P)/N</span> = 16P/N</td><td>~1.5× (extra AllGather of params per layer)</td></tr>
+  </tbody>
+</table>
+
+<p><span class="math">P</span> = number of parameters. Bytes-per-param: 2 (bf16 weight) + 2 (bf16 grad) + 4 (fp32 master) + 8 (Adam m,v) = 16 in mixed precision (we packaged "master + m + v" as the 12-byte "opt state" above).</p>
+
+<h2>FSDP's mechanic — what one forward step actually does</h2>
+
+<p>For each layer, in order:</p>
+
+<ol>
+  <li><strong>AllGather the layer's parameters.</strong> Every rank holds 1/N of the layer's weights; before forward, they cooperatively reconstruct the full layer. Cost: <span class="math">|layer| · (N-1)/N</span> bytes per rank, asymptotically <span class="math">|layer|</span>.</li>
+  <li><strong>Compute the layer's forward.</strong> Local computation, output saved for backward (or recomputed via activation checkpointing).</li>
+  <li><strong>Free the AllGathered weights.</strong> We're done with the full layer; throw it away and reclaim HBM. We keep our 1/N shard.</li>
+</ol>
+
+<p>Backward, in reverse layer order:</p>
+
+<ol>
+  <li><strong>AllGather the layer's parameters again.</strong> We need the weights to compute the input-side gradient (the chain rule pulls the weights through the operation). Same cost as above.</li>
+  <li><strong>Compute the layer's backward.</strong> Produces a gradient tensor of the same shape as the full layer.</li>
+  <li><strong>ReduceScatter the gradient.</strong> Every rank ends up with the summed gradient of its 1/N slice. Same cost as AllReduce's two halves combined.</li>
+  <li><strong>Free the AllGathered weights.</strong> Same as in forward.</li>
+</ol>
+
+<p>So per layer: 2 AllGathers + 1 ReduceScatter. Versus DDP's 1 AllReduce (which is itself ≡ AllGather + ReduceScatter). FSDP is roughly <span class="math">1.5×</span> the communication. In exchange, each rank's memory drops from <span class="math">16P</span> to <span class="math">16P/N</span>.</p>
+
+<h2>Animated · one FSDP layer step, scrubbable</h2>
+
+<p>Below is a frame-by-frame view of what each of <span class="math">N=4</span> ranks holds across one forward+backward of a 4-layer transformer. The bottom strip is the per-rank HBM curve over time: notice the spikes at AllGather and the troughs after Free. The flat baseline is the permanent shard each rank keeps; everything above it is the AllGathered, transient full layer.</p>
+
+<div class="widget" id="fsdp-anim">
+  <div class="title">FSDP layer lifecycle · scrub the timeline</div>
+  <div class="hint">Each rank holds <em>1/4 of every layer's weights</em> permanently. To compute layer <span class="math">L</span>, ranks cooperatively AllGather the full <span class="math">L</span>, compute, then Free. Watch the HBM curve.</div>
+
+  <div class="controls">
+    <button id="fa-play">▶ play</button>
+    <button id="fa-step">step ▷</button>
+    <button id="fa-reset">⟲ reset</button>
+    <label class="inline">time: <input type="range" id="fa-t" min="0" max="100" step="1" value="0" style="width:300px"> <span class="val" id="fa-t-v">t=0</span></label>
+    <label class="inline">speed: <input type="range" id="fa-spd" min="1" max="10" step="1" value="4"> <span class="val" id="fa-spd-v">4×</span></label>
+  </div>
+
+  <canvas id="fa-canvas" width="760" height="380" style="width:100%; height:380px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">phase</div><div class="v" id="fa-phase" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">layer</div><div class="v" id="fa-layer">—</div></div>
+    <div class="kpi"><div class="k">collective</div><div class="v" id="fa-coll" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">HBM / rank</div><div class="v" id="fa-hbm">—</div></div>
+  </div>
+</div>
+
+<h2>2D · the four ZeRO stages laid out across ranks</h2>
+
+<p>The same model, the same <span class="math">N=8</span> ranks, four different ways to slice its training state. Toggle a stage. Solid squares = stored on this rank; faded squares = held by some other rank. The total colored area on a given row is what that rank actually pays for in HBM.</p>
+
+<div class="widget" id="zr-widget">
+  <div class="title">ZeRO shard explorer · pick a stage, see who holds what</div>
+  <div class="hint">Three rows: parameters (blue), gradients (orange), optimizer state (green, 6× wider per param because 4B master + 4B m + 4B v). Click a stage button.</div>
+
+  <div class="controls">
+    <button id="zr-s0">ZeRO-0 (DDP)</button>
+    <button id="zr-s1">ZeRO-1</button>
+    <button id="zr-s2">ZeRO-2</button>
+    <button id="zr-s3" class="primary">ZeRO-3 (FSDP)</button>
+    <label class="inline">ranks N: <input type="range" id="zr-N" min="2" max="16" step="1" value="8"> <span class="val" id="zr-N-v">8</span></label>
+  </div>
+
+  <canvas id="zr-canvas" width="760" height="300" style="width:100%; height:300px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">per-rank state (× P bytes)</div><div class="v" id="zr-mem">—</div></div>
+    <div class="kpi"><div class="k">params</div><div class="v" id="zr-pp" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">grads</div><div class="v" id="zr-gg" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">optimizer</div><div class="v" id="zr-oo" style="font-size:14px;">—</div></div>
+  </div>
+</div>
+
+<div class="callout">
+  <div class="label">Why is it only 1.5×, not 2× or 3×?</div>
+  Two reasons. First, the AllReduce that DDP "saves" is itself decomposable as AllGather + ReduceScatter — same bytes total. Second, FSDP's extra AllGather (the second one, during backward) only adds <em>one</em> additional collective; the other two are ZeRO-2-and-below's "normal" cost rewritten as primitives.
+</div>
+
+<h2>What the unit of sharding is</h2>
+
+<p>FSDP doesn't shard the model parameter-by-parameter. It shards at the granularity of a <strong>FSDP unit</strong>, which is typically a transformer block. The unit is the thing that gets AllGathered and freed as a whole. Choosing the unit is a knob:</p>
+
+<ul>
+  <li><strong>Bigger units</strong> (e.g. the whole model) → fewer collectives, but each unit must fit on one rank temporarily when AllGathered. Defeats the purpose of FSDP for very large models.</li>
+  <li><strong>Smaller units</strong> (every <code>nn.Linear</code>) → many tiny collectives, latency-dominated, low effective bandwidth.</li>
+  <li><strong>Per transformer block</strong> (the production default) → good balance. The unit is hundreds of MB to a few GB, large enough that AllGather is bandwidth-bound, small enough that you can free it after forward.</li>
+</ul>
+
+<h2>HSDP — the production compromise</h2>
+
+<p>Pure FSDP across all <span class="math">N</span> GPUs sends collectives across the slow inter-node link constantly. Recall from lesson 03: per-layer AllGather at 50 GB/s inter-node for a 7B model is ~5–10 ms; do 80 layers × 3 collectives = ~1.5 s. Useless.</p>
+
+<p>HSDP (Hybrid Sharded Data Parallel) shards within a node and replicates across nodes:</p>
+
+<ul>
+  <li><strong>Intra-node:</strong> FSDP across the 8 GPUs of a node. AllGathers use NVLink at 900 GB/s. Memory per GPU is <span class="math">16P/8 = 2P</span>.</li>
+  <li><strong>Inter-node:</strong> DDP replication across nodes. One AllReduce of gradients per step (across the <em>shards</em> — each rank only holds 1/8 of the gradient, so the inter-node AllReduce is 8× smaller too).</li>
+</ul>
+
+<p>HSDP gets ~80% of FSDP's memory savings with ~1.1× DDP's communication cost. It is the actual production layout used for most ≤ ~30B models.</p>
+
+<h2>3D · the HSDP topology, isometric</h2>
+
+<p>Four nodes, eight GPUs each — the canonical 32-GPU box. The eight GPUs <em>within</em> a node form an FSDP group (they cooperatively hold one full copy of the model, sharded 1/8). The four <em>nodes</em> form a DDP group (each node holds a complete replica). Click a GPU to highlight its FSDP group and its DDP peers across the other nodes; click a different shard color to walk through all eight slices.</p>
+
+<div class="widget" id="hsdp-widget">
+  <div class="title">HSDP topology · click a GPU</div>
+  <div class="hint">Within a node: NVLink (gold edges) connects the 8 FSDP shard-mates. Across nodes: IB (blue) connects DDP replicas at corresponding shard positions. The IB AllReduce only carries 1/8 of the gradient because each rank only owns 1/8.</div>
+
+  <div class="controls">
+    <label class="inline">nodes: <input type="range" id="h3-nodes" min="2" max="6" step="1" value="4"> <span class="val" id="h3-nodes-v">4</span></label>
+    <label class="inline">rotation: <input type="range" id="h3-rot" min="-30" max="30" step="1" value="0"> <span class="val" id="h3-rot-v">0°</span></label>
+    <label class="inline">show:
+      <select id="h3-show" style="background:var(--code-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px;font-family:var(--mono);font-size:12px;">
+        <option value="both">FSDP + DDP edges</option>
+        <option value="fsdp">FSDP only (NVLink)</option>
+        <option value="ddp">DDP only (IB)</option>
+        <option value="none">no edges</option>
+      </select>
+    </label>
+  </div>
+
+  <canvas id="h3-canvas" width="760" height="420" style="width:100%; height:420px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">selected GPU</div><div class="v" id="h3-sel" style="font-size:14px;">— click one —</div></div>
+    <div class="kpi"><div class="k">FSDP group size</div><div class="v" id="h3-fsz">—</div></div>
+    <div class="kpi"><div class="k">DDP group size</div><div class="v" id="h3-dsz">—</div></div>
+    <div class="kpi"><div class="k">grads/step on IB</div><div class="v" id="h3-ib" style="font-size:14px;">—</div></div>
+  </div>
+</div>
+
+<h2>Sharding vs activation checkpointing — orthogonal axes</h2>
+
+<p>Two memory-saving techniques, often confused, addressing two different sources:</p>
+
+<table>
+  <thead><tr><th>Technique</th><th>What it saves</th><th>What it costs</th></tr></thead>
+  <tbody>
+    <tr><td>FSDP / ZeRO</td><td>Parameter + gradient + optimizer state</td><td>~1.5× communication</td></tr>
+    <tr><td>Activation checkpointing</td><td>Activations stored for backward</td><td>~33% extra compute (recompute forward during backward)</td></tr>
+  </tbody>
+</table>
+
+<p>Production training of any large model uses <strong>both</strong>. FSDP-3 + activation checkpointing brings memory per rank to <span class="math">~16P/N + small</span>, which is what's been letting Llama-3 and friends fit on H100 clusters.</p>
+
+<h2>Compute–memory tradeoff, exactly</h2>
+
+<p>The right way to think about ZeRO stages is as a knob that smoothly converts memory pressure into communication pressure. Until the model fits, increasing ZeRO stage is free (the comm bound isn't hit). Once it fits, increasing the stage further is wasted communication — you'd be better off using the freed memory for a bigger batch or longer sequence.</p>
+
+<p>Rough decision tree:</p>
+<ol>
+  <li>Single-GPU training state fits → use DDP. No ZeRO needed.</li>
+  <li>Optimizer state pushes you over → ZeRO-1.</li>
+  <li>Gradients also too big → ZeRO-2.</li>
+  <li>Parameters themselves too big → ZeRO-3 / FSDP.</li>
+  <li>Activations also too big → add activation checkpointing.</li>
+  <li>A single transformer layer too big to AllGather even temporarily → composing with TP (lesson 06).</li>
+</ol>
+
+<h2>Interactive · ZeRO stage vs memory vs comm</h2>
+
+<p>Set the model size, optimizer, world size <span class="math">N</span>. The widget plots memory per rank and per-step communication across the four ZeRO stages, plus HSDP. The "you are here" marker on the memory axis is your chosen GPU's HBM budget. Watch the bars cross under the budget as you move up the stages.</p>
+
+<div class="widget" id="z-widget">
+  <div class="title">ZeRO stages · memory and comm per rank</div>
+  <div class="hint">Memory plot is linear in P/N · 16 bytes. Comm plot is per-step bytes touched, in units of |params|.</div>
+
+  <div class="controls">
+    <label class="inline">params (B): <input type="range" id="z-p" min="1" max="200" step="1" value="70"> <span class="val" id="z-p-v">70</span></label>
+    <label class="inline">world size N: <input type="range" id="z-n" min="2" max="512" step="2" value="64"> <span class="val" id="z-n-v">64</span></label>
+    <label class="inline">GPUs/node (for HSDP): <input type="range" id="z-pn" min="2" max="16" step="1" value="8"> <span class="val" id="z-pn-v">8</span></label>
+  </div>
+
+  <canvas class="dist-canvas" id="z-canvas" width="760" height="260" style="height: 260px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">memory @ ZeRO-3</div><div class="v" id="z-m3">—</div></div>
+    <div class="kpi"><div class="k">memory @ HSDP</div><div class="v" id="z-mh">—</div></div>
+    <div class="kpi"><div class="k">comm @ ZeRO-3 (× P)</div><div class="v" id="z-c3">—</div></div>
+    <div class="kpi"><div class="k">comm @ HSDP (× P)</div><div class="v" id="z-ch">—</div></div>
+  </div>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  ZeRO is a knob: at each click up, one more redundancy is shaved off in exchange for slightly more communication. FSDP (ZeRO-3) gives you <span class="math">N×</span> memory reduction at ~1.5× DDP's comm. HSDP gives ~80% of that memory win at near-DDP comm. <strong>Pure FSDP across nodes is wasteful; HSDP is the production default for everything that's not tensor-parallel.</strong>
+</div>
+
+<footer class="lesson-nav">
+  <a href="04_ddp.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">04 · DDP</span>
+  </a>
+  <a class="next" href="06_tensor_parallel.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">06 · Tensor parallel</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const get = id => document.getElementById(id);
+  const els = {
+    p:get('z-p'),pv:get('z-p-v'),n:get('z-n'),nv:get('z-n-v'),
+    pn:get('z-pn'),pnv:get('z-pn-v'),
+    canvas:get('z-canvas'),
+    m3:get('z-m3'),mh:get('z-mh'),c3:get('z-c3'),ch:get('z-ch')
+  };
+  const ctx = els.canvas.getContext('2d');
+
+  function compute(){
+    const P_B = parseInt(els.p.value);
+    const N   = parseInt(els.n.value);
+    const PN  = parseInt(els.pn.value);
+    els.pv.textContent = P_B + 'B'; els.nv.textContent = N; els.pnv.textContent = PN;
+    const P = P_B * 1e9;
+    const intraN = Math.min(PN, N);
+
+    const mem = (Pf, Gf, Of) => (Pf*2 + Gf*2 + Of*12) * P / 1e9;
+    const z0 = mem(1,1,1);
+    const z1 = mem(1,1,1/N);
+    const z2 = mem(1,1/N,1/N);
+    const z3 = mem(1/N,1/N,1/N);
+    const zH = mem(1/intraN, 1/intraN, 1/intraN);
+
+    const c0 = 4, c1 = 4, c2 = 4, c3 = 6, cH = 4.5;
+
+    return { rows: [
+      { name:'ZeRO-0 (DDP)',mem:z0, comm:c0, c:'#475569' },
+      { name:'ZeRO-1',      mem:z1, comm:c1, c:'#2563eb' },
+      { name:'ZeRO-2',      mem:z2, comm:c2, c:'#3b82f6' },
+      { name:'ZeRO-3 / FSDP',mem:z3,comm:c3, c:'#d97706' },
+      { name:'HSDP',        mem:zH, comm:cH, c:'#16a34a' },
+    ], P_B, els };
+  }
+
+  function render(){
+    const { rows, P_B } = compute();
+    const r3 = rows[3], rH = rows[4];
+    els.m3.textContent = r3.mem.toFixed(1) + ' GB';
+    els.mh.textContent = rH.mem.toFixed(1) + ' GB';
+    els.c3.textContent = r3.comm.toFixed(1) + '× P';
+    els.ch.textContent = rH.comm.toFixed(1) + '× P';
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = els.canvas.clientWidth, H = els.canvas.clientHeight;
+    if (els.canvas.width !== Math.round(W*dpr)){
+      els.canvas.width = Math.round(W*dpr); els.canvas.height = Math.round(H*dpr);
+    }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 130, padR = 20, padT = 14, padB = 14;
+    const innerW = (W - padL - padR) / 2 - 12;
+    const innerH = H - padT - padB - 24;
+    const rowH = innerH / rows.length;
+
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('memory per rank (GB)', padL, padT);
+    ctx.fillText('comm per step (× |params| bytes)', padL + innerW + 24, padT);
+
+    const memMax = Math.max(...rows.map(r=>r.mem));
+    const commMax = Math.max(...rows.map(r=>r.comm), 8);
+
+    rows.forEach((r,i)=>{
+      const y = padT + 12 + i*rowH;
+      ctx.fillStyle = '#1f2430'; ctx.font = '12px monospace';
+      ctx.fillText(r.name, 8, y + 16);
+      const wMem = (r.mem / memMax) * innerW;
+      ctx.fillStyle = r.c;
+      ctx.fillRect(padL, y + 4, Math.max(1, wMem), rowH - 12);
+      ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+      ctx.fillText(r.mem.toFixed(1)+'GB', padL + wMem + 4, y + 18);
+      const x2 = padL + innerW + 24;
+      const wC = (r.comm / commMax) * innerW;
+      ctx.fillStyle = r.c;
+      ctx.globalAlpha = 0.65;
+      ctx.fillRect(x2, y + 4, Math.max(1, wC), rowH - 12);
+      ctx.globalAlpha = 1.0;
+      ctx.fillStyle = '#1f2430';
+      ctx.fillText(r.comm.toFixed(1)+'×P', x2 + wC + 4, y + 18);
+    });
+  }
+
+  ['input','change'].forEach(ev=>{
+    [els.p,els.n,els.pn].forEach(el=>el.addEventListener(ev,render));
+  });
+  window.addEventListener('resize',render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: FSDP layer lifecycle animation ───
+ * Timeline over a fixed schedule of phases for a 4-layer model on N=4 ranks.
+ * Each layer contributes: AG → fwd → free  (forward) and  AG → bwd → RS → free (backward).
+ * Total phases per forward layer = 3, per backward layer = 4. 4 layers × (3+4) = 28 phases.
+ * Each phase = 1 time tick of length T_phase; we sample at 100 sub-ticks total via the slider.
+ */
+(function(){
+  const C  = document.getElementById('fa-canvas');
+  const ctx = C.getContext('2d');
+  const els = {
+    play:document.getElementById('fa-play'),
+    step:document.getElementById('fa-step'),
+    reset:document.getElementById('fa-reset'),
+    t:document.getElementById('fa-t'),tv:document.getElementById('fa-t-v'),
+    spd:document.getElementById('fa-spd'),spdv:document.getElementById('fa-spd-v'),
+    phase:document.getElementById('fa-phase'),
+    layer:document.getElementById('fa-layer'),
+    coll:document.getElementById('fa-coll'),
+    hbm:document.getElementById('fa-hbm'),
+  };
+
+  const N = 4;            // ranks
+  const L = 4;            // layers
+  const COLORS = ['#2563eb','#d97706','#16a34a','#7c3aed']; // one per layer
+
+  // Build schedule: each entry { phase: 'AG'|'FWD'|'FREE'|'BWD'|'RS', layer: i }
+  function buildSchedule(){
+    const out = [];
+    for (let l=0; l<L; l++){
+      out.push({p:'AG',l, dir:'f'});
+      out.push({p:'FWD',l});
+      out.push({p:'FREE',l, dir:'f'});
+    }
+    for (let l=L-1; l>=0; l--){
+      out.push({p:'AG',l, dir:'b'});
+      out.push({p:'BWD',l});
+      out.push({p:'RS',l});
+      out.push({p:'FREE',l, dir:'b'});
+    }
+    return out;
+  }
+  const SCHED = buildSchedule();
+  els.t.max = SCHED.length - 1;
+
+  // Each layer takes 1 "size unit" of memory per rank when fully gathered, 1/N when sharded.
+  // Per-rank baseline (shards of all layers) = L * (1/N).
+  function hbmAt(idx){
+    // Sharded layers permanently held + any layer currently gathered.
+    const gathered = new Set();
+    for (let i=0; i<=idx; i++){
+      const s = SCHED[i];
+      if (s.p==='AG') gathered.add(s.l);
+      if (s.p==='FREE') gathered.delete(s.l);
+    }
+    const shardMem = L * (1/N);
+    const gatherMem = gathered.size * (1 - 1/N);
+    return { total: shardMem + gatherMem, gathered, shardMem };
+  }
+
+  let playing = false;
+  let lastT = 0;
+
+  function fmtPhase(s){
+    return ({AG:'AllGather',FWD:'forward',FREE:'free',BWD:'backward',RS:'ReduceScatter'})[s.p];
+  }
+
+  function render(){
+    const idx = parseInt(els.t.value);
+    els.tv.textContent = 't='+idx+'/'+(SCHED.length-1);
+    els.spdv.textContent = els.spd.value+'×';
+
+    const s = SCHED[idx];
+    const { total, gathered, shardMem } = hbmAt(idx);
+    els.phase.textContent = s.p==='FWD'||s.p==='BWD'? (s.p==='FWD'?'forward compute':'backward compute') : fmtPhase(s);
+    els.layer.textContent = 'L'+s.l;
+    els.coll.textContent = s.p==='AG'?'AllGather':s.p==='RS'?'ReduceScatter':s.p==='FREE'?'free':'—';
+    els.hbm.textContent = total.toFixed(2)+'× P/N';
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    // Top half: rank columns showing what each rank holds.
+    const topH = 200;
+    const colW = (W - 40) / N;
+    const padL = 20;
+
+    // Per rank, each layer is one tile. The tile is "thin slice" if sharded, "full bar" if AllGathered.
+    for (let r=0; r<N; r++){
+      const cx = padL + colW*r + 10;
+      const cw = colW - 20;
+      // rank box
+      ctx.fillStyle = 'rgba(255,255,255,0.02)';
+      ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+      ctx.fillRect(cx, 30, cw, topH-40);
+      ctx.strokeRect(cx, 30, cw, topH-40);
+      ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+      ctx.fillText('rank '+r, cx+4, 24);
+
+      // stack layers L-1 (top) to 0 (bottom)
+      const rowH = (topH-40) / L;
+      for (let l=0; l<L; l++){
+        const y = 30 + (L-1-l)*rowH;
+        const c = COLORS[l];
+        const isGathered = gathered.has(l);
+        // baseline shard (1/N width on left)
+        ctx.fillStyle = c;
+        ctx.globalAlpha = 1;
+        ctx.fillRect(cx+2, y+rowH*0.15, (cw-4)/N, rowH*0.7);
+        // gathered overlay (rest of width, dashed/striped if currently being formed)
+        if (isGathered){
+          ctx.globalAlpha = 0.55;
+          ctx.fillRect(cx+2 + (cw-4)/N, y+rowH*0.15, (cw-4)*(N-1)/N, rowH*0.7);
+        }
+        // current-op highlight
+        if (l===s.l && (s.p==='AG'||s.p==='RS'||s.p==='FREE')){
+          ctx.globalAlpha = 1;
+          ctx.strokeStyle = s.p==='AG' ? '#fbbf24' : s.p==='RS' ? '#dc2626' : '#5b6573';
+          ctx.lineWidth = 2;
+          ctx.strokeRect(cx+1, y+rowH*0.12, cw-2, rowH*0.76);
+        }
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = '#94a3b8'; ctx.font='10px monospace';
+        ctx.fillText('L'+l, cx+cw-16, y+rowH*0.55);
+      }
+    }
+
+    // Communication arrows (between rank columns) when AG or RS is active
+    if (s.p === 'AG' || s.p === 'RS'){
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = s.p === 'AG' ? '#fbbf24' : '#dc2626';
+      const arrY = 30 + (L-1-s.l)*((topH-40)/L) + ((topH-40)/L)/2;
+      for (let r=0; r<N-1; r++){
+        const x1 = padL + colW*r + (colW/2);
+        const x2 = padL + colW*(r+1) + (colW/2);
+        ctx.beginPath();
+        ctx.moveTo(x1+10, arrY-12);
+        const dir = s.p === 'AG' ? 1 : -1;
+        ctx.lineTo(x2-10, arrY-12);
+        ctx.stroke();
+        // arrow head
+        const headX = dir>0 ? x2-10 : x1+10;
+        ctx.beginPath();
+        ctx.moveTo(headX, arrY-12);
+        ctx.lineTo(headX - 6*dir, arrY-16);
+        ctx.lineTo(headX - 6*dir, arrY-8);
+        ctx.fill();
+      }
+    }
+
+    // Bottom: HBM curve over time
+    const curveTop = topH + 30;
+    const curveH = H - curveTop - 12;
+    ctx.fillStyle = '#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('HBM per rank (× P/N units)', padL, curveTop - 8);
+
+    // compute curve values up to current idx
+    const xs = [], ys = [];
+    let maxHBM = 0;
+    for (let i=0; i<SCHED.length; i++){
+      const { total } = hbmAt(i);
+      maxHBM = Math.max(maxHBM, total);
+    }
+    const innerW = W - padL - 20;
+    for (let i=0; i<=idx; i++){
+      const { total } = hbmAt(i);
+      xs.push(padL + (i / (SCHED.length-1)) * innerW);
+      ys.push(curveTop + curveH - (total / maxHBM) * curveH);
+    }
+    // baseline shard line
+    const baseY = curveTop + curveH - ((L*1/N) / maxHBM) * curveH;
+    ctx.strokeStyle = '#dde2ea'; ctx.setLineDash([4,4]);
+    ctx.beginPath(); ctx.moveTo(padL, baseY); ctx.lineTo(padL+innerW, baseY); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#94a3b8'; ctx.font='10px monospace';
+    ctx.fillText('shard baseline', padL+innerW-90, baseY-4);
+
+    // draw curve
+    ctx.strokeStyle = '#d97706'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i=0; i<xs.length; i++){
+      if (i===0) ctx.moveTo(xs[i], ys[i]);
+      else { ctx.lineTo(xs[i-1], ys[i]); ctx.lineTo(xs[i], ys[i]); } // stepwise
+    }
+    ctx.stroke();
+    // fill under curve
+    if (xs.length > 1){
+      ctx.fillStyle = 'rgba(255, 184, 106, 0.15)';
+      ctx.beginPath();
+      ctx.moveTo(xs[0], curveTop+curveH);
+      for (let i=0; i<xs.length; i++){
+        if (i>0) ctx.lineTo(xs[i-1], ys[i]);
+        ctx.lineTo(xs[i], ys[i]);
+      }
+      ctx.lineTo(xs[xs.length-1], curveTop+curveH);
+      ctx.closePath(); ctx.fill();
+    }
+
+    // mark forward/backward boundary
+    const fwdEnd = L*3;
+    const xBound = padL + (fwdEnd / (SCHED.length-1)) * innerW;
+    ctx.strokeStyle = '#dde2ea'; ctx.setLineDash([2,3]);
+    ctx.beginPath(); ctx.moveTo(xBound, curveTop); ctx.lineTo(xBound, curveTop+curveH); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#94a3b8';
+    ctx.fillText('forward', padL+8, curveTop+12);
+    ctx.fillText('backward', xBound+8, curveTop+12);
+  }
+
+  function step(){
+    let v = parseInt(els.t.value);
+    v = (v + 1) % SCHED.length;
+    els.t.value = v;
+    render();
+  }
+
+  function tick(ts){
+    if (!playing) return;
+    const spd = parseInt(els.spd.value);
+    const dt = ts - lastT;
+    const period = 600 / spd; // ms per phase
+    if (dt > period){
+      step();
+      lastT = ts;
+    }
+    requestAnimationFrame(tick);
+  }
+
+  els.play.addEventListener('click', ()=>{
+    playing = !playing;
+    els.play.textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastT = performance.now(); requestAnimationFrame(tick); }
+  });
+  els.step.addEventListener('click', step);
+  els.reset.addEventListener('click', ()=>{ els.t.value=0; playing=false; els.play.textContent='▶ play'; render(); });
+  els.t.addEventListener('input', render);
+  els.spd.addEventListener('input', ()=>{ els.spdv.textContent=els.spd.value+'×'; });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: ZeRO shard explorer (2D) ───
+ * N ranks × 3 categories (params, grads, opt). Each row visualises which slice
+ * each rank actually holds (solid) vs. delegated elsewhere (faded).
+ */
+(function(){
+  const C = document.getElementById('zr-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  let stage = 3, N = 8;
+
+  const BTN = { 0:$('zr-s0'), 1:$('zr-s1'), 2:$('zr-s2'), 3:$('zr-s3') };
+  Object.entries(BTN).forEach(([k,b])=>{
+    b.addEventListener('click', ()=>{ stage = +k;
+      Object.values(BTN).forEach(x=>x.classList.remove('primary'));
+      b.classList.add('primary'); render();
+    });
+  });
+
+  const slN = $('zr-N'), slNv = $('zr-N-v');
+  slN.addEventListener('input', ()=>{ N = +slN.value; slNv.textContent = N; render(); });
+
+  // Per stage, sharding fraction for each [param, grad, opt]: 1 = full, 1/N = sharded.
+  function shardFracs(){
+    if (stage === 0) return [1, 1, 1];
+    if (stage === 1) return [1, 1, 1/N];
+    if (stage === 2) return [1, 1/N, 1/N];
+    return [1/N, 1/N, 1/N];
+  }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 90, padT = 30, padR = 12, padB = 12;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+    const rowH = innerH / N;
+    const cats = [
+      { name:'params (2B)', color:'#2563eb', bytes:2, frac: shardFracs()[0] },
+      { name:'grads (2B)',  color:'#d97706', bytes:2, frac: shardFracs()[1] },
+      { name:'opt (12B)',   color:'#16a34a', bytes:12, frac: shardFracs()[2] },
+    ];
+    const totalBytes = 16;
+    let xCursor = padL;
+    cats.forEach(cat => {
+      const catW = innerW * (cat.bytes / totalBytes);
+      // header
+      ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+      ctx.fillText(cat.name, xCursor + 4, 18);
+
+      // For each rank row, draw N cells
+      for (let r=0; r<N; r++){
+        const y = padT + r*rowH;
+        const cellW = (catW - 4) / N;
+        for (let s=0; s<N; s++){
+          const x = xCursor + 2 + s*cellW;
+          const owned = (cat.frac === 1) || (s === r);
+          ctx.fillStyle = cat.color;
+          ctx.globalAlpha = owned ? 1 : 0.12;
+          ctx.fillRect(x, y+2, Math.max(1, cellW-1), rowH-4);
+        }
+      }
+      ctx.globalAlpha = 1;
+      xCursor += catW;
+    });
+
+    // Rank labels
+    ctx.fillStyle = '#1f2430'; ctx.font='11px monospace';
+    for (let r=0; r<N; r++){
+      const y = padT + r*rowH + rowH/2 + 4;
+      ctx.fillText('rank '+r, 8, y);
+    }
+
+    // category separators
+    let cx = padL;
+    cats.forEach(cat => {
+      const cw = innerW * (cat.bytes / totalBytes);
+      ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(cx, padT); ctx.lineTo(cx, padT+innerH); ctx.stroke();
+      cx += cw;
+    });
+
+    // KPIs
+    const fr = shardFracs();
+    const mem = fr[0]*2 + fr[1]*2 + fr[2]*12;
+    $('zr-mem').textContent = mem.toFixed(2) + ' B/param';
+    $('zr-pp').textContent = fr[0]===1 ? 'full (2 B/p)' : '1/'+N+' (' + (2/N).toFixed(2) + ' B/p)';
+    $('zr-gg').textContent = fr[1]===1 ? 'full (2 B/p)' : '1/'+N+' (' + (2/N).toFixed(2) + ' B/p)';
+    $('zr-oo').textContent = fr[2]===1 ? 'full (12 B/p)' : '1/'+N+' (' + (12/N).toFixed(2) + ' B/p)';
+  }
+
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: HSDP topology (isometric pseudo-3D) ───
+ * Draw `nodes` boxes, each containing 8 GPUs (as small cubes) arranged in a 2×4 grid.
+ * Apply a tilted isometric projection. NVLink edges within a node, IB between
+ * corresponding GPU positions across nodes.
+ */
+(function(){
+  const C = document.getElementById('h3-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  let nodes = 4;
+  let rotDeg = 0;
+  let show = 'both';
+  let selected = null; // {n, g}
+
+  const GPER = 8;
+  const SHARD_COLORS = ['#2563eb','#d97706','#16a34a','#7c3aed','#dc2626','#3b82f6','#f59e0b','#16a34a'];
+
+  const slN = $('h3-nodes'), slNv = $('h3-nodes-v');
+  const slR = $('h3-rot'),   slRv = $('h3-rot-v');
+  const sel = $('h3-show');
+  slN.addEventListener('input', ()=>{ nodes = +slN.value; slNv.textContent = nodes; render(); });
+  slR.addEventListener('input', ()=>{ rotDeg = +slR.value; slRv.textContent = rotDeg+'°'; render(); });
+  sel.addEventListener('change', ()=>{ show = sel.value; render(); });
+
+  // Project a 3D point to 2D via simple isometric.
+  function proj(x, y, z, cx, cy){
+    const rot = (rotDeg) * Math.PI/180;
+    const cosA = Math.cos(Math.PI/6 + rot), sinA = Math.sin(Math.PI/6 + rot);
+    const cosB = Math.cos(Math.PI/12), sinB = Math.sin(Math.PI/12);
+    // x along node axis, y along gpu-row, z along gpu-col + node-height
+    const sx = (x - y) * cosA;
+    const sy = (x + y) * sinA - z;
+    return [cx + sx, cy + sy];
+  }
+
+  // gpu position in node-local coords: 2 rows × 4 cols
+  function gpuOffset(g){
+    const row = Math.floor(g / 4), col = g % 4;
+    return { dx: col * 24, dy: row * 24 };
+  }
+
+  // node origin (top-front-left of node footprint)
+  function nodeOrigin(n){
+    return { x: n * 140, y: 0 };
+  }
+
+  function gpuCenter(n, g){
+    const o = nodeOrigin(n);
+    const off = gpuOffset(g);
+    return { x: o.x + off.dx, y: o.y + off.dy, z: 0 };
+  }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    // Center the diagram
+    const totalW = nodes * 140;
+    const cx = (W - totalW * Math.cos(Math.PI/6)) / 2 + 40;
+    const cy = H / 2 - 20;
+
+    // 1. node platforms (floors): draw filled quads under each node
+    for (let n=0; n<nodes; n++){
+      const o = nodeOrigin(n);
+      const corners = [
+        proj(o.x - 12,        o.y - 12,        0, cx, cy),
+        proj(o.x + 3*24 + 12, o.y - 12,        0, cx, cy),
+        proj(o.x + 3*24 + 12, o.y + 1*24 + 12, 0, cx, cy),
+        proj(o.x - 12,        o.y + 1*24 + 12, 0, cx, cy),
+      ];
+      ctx.fillStyle = '#eef1f5';
+      ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(corners[0][0], corners[0][1]);
+      corners.slice(1).forEach(p => ctx.lineTo(p[0], p[1]));
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      // node label
+      const lbl = proj(o.x, o.y - 24, 0, cx, cy);
+      ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+      ctx.fillText('node '+n, lbl[0]-12, lbl[1]);
+    }
+
+    // 2. NVLink edges (within nodes) — drawn behind cubes
+    if (show === 'both' || show === 'fsdp'){
+      ctx.strokeStyle = '#d97706'; ctx.globalAlpha = 0.4; ctx.lineWidth = 1.2;
+      for (let n=0; n<nodes; n++){
+        // draw star-ish: connect each gpu to its 2 row/col neighbours
+        for (let g=0; g<GPER; g++){
+          const a = gpuCenter(n, g);
+          const pa = proj(a.x, a.y, a.z+4, cx, cy);
+          for (let g2=g+1; g2<GPER; g2++){
+            const ar = Math.floor(g/4), ac = g%4;
+            const br = Math.floor(g2/4), bc = g2%4;
+            if (Math.abs(ar-br) + Math.abs(ac-bc) === 1){
+              const b = gpuCenter(n, g2);
+              const pb = proj(b.x, b.y, b.z+4, cx, cy);
+              ctx.beginPath(); ctx.moveTo(pa[0], pa[1]); ctx.lineTo(pb[0], pb[1]); ctx.stroke();
+            }
+          }
+        }
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // 3. IB edges across nodes (between same shard position)
+    if (show === 'both' || show === 'ddp'){
+      ctx.strokeStyle = '#2563eb'; ctx.globalAlpha = 0.45; ctx.lineWidth = 1.3;
+      ctx.setLineDash([5,3]);
+      for (let g=0; g<GPER; g++){
+        for (let n=0; n<nodes-1; n++){
+          const a = gpuCenter(n, g);
+          const b = gpuCenter(n+1, g);
+          const pa = proj(a.x, a.y, a.z+10, cx, cy);
+          const pb = proj(b.x, b.y, b.z+10, cx, cy);
+          ctx.beginPath(); ctx.moveTo(pa[0], pa[1]); ctx.lineTo(pb[0], pb[1]); ctx.stroke();
+        }
+      }
+      ctx.setLineDash([]); ctx.globalAlpha = 1;
+    }
+
+    // 4. GPU cubes
+    const gpuList = [];
+    for (let n=0; n<nodes; n++){
+      for (let g=0; g<GPER; g++){
+        gpuList.push({n, g});
+      }
+    }
+    // Sort back to front for proper painters' draw: deeper y first
+    gpuList.sort((a,b) => {
+      const ga = gpuCenter(a.n, a.g), gb = gpuCenter(b.n, b.g);
+      return (ga.x + ga.y) - (gb.x + gb.y);
+    });
+    const cubeS = 16, cubeH = 14;
+    for (const {n,g} of gpuList){
+      const c = gpuCenter(n, g);
+      const baseColor = SHARD_COLORS[g % SHARD_COLORS.length];
+      const isSelGPU = selected && selected.n===n && selected.g===g;
+      const isFsdpMate = selected && selected.n===n && !isSelGPU;
+      const isDdpMate = selected && selected.g===g && selected.n!==n;
+      const isHighlighted = !selected || isSelGPU || isFsdpMate || isDdpMate;
+
+      // 3 visible faces: top (z+h), front (lower-y), right (higher-x)
+      const p000 = proj(c.x,        c.y,        c.z,         cx, cy);
+      const p100 = proj(c.x+cubeS,  c.y,        c.z,         cx, cy);
+      const p110 = proj(c.x+cubeS,  c.y+cubeS,  c.z,         cx, cy);
+      const p010 = proj(c.x,        c.y+cubeS,  c.z,         cx, cy);
+      const p001 = proj(c.x,        c.y,        c.z+cubeH,   cx, cy);
+      const p101 = proj(c.x+cubeS,  c.y,        c.z+cubeH,   cx, cy);
+      const p111 = proj(c.x+cubeS,  c.y+cubeS,  c.z+cubeH,   cx, cy);
+      const p011 = proj(c.x,        c.y+cubeS,  c.z+cubeH,   cx, cy);
+
+      function shade(col, factor){
+        // simple hex multiplier
+        const m = col.replace('#','');
+        const r = parseInt(m.substr(0,2),16);
+        const gg = parseInt(m.substr(2,2),16);
+        const bl = parseInt(m.substr(4,2),16);
+        return 'rgb('+Math.round(r*factor)+','+Math.round(gg*factor)+','+Math.round(bl*factor)+')';
+      }
+
+      ctx.globalAlpha = isHighlighted ? 1 : 0.18;
+
+      // top
+      ctx.fillStyle = shade(baseColor, 1.0);
+      ctx.beginPath(); ctx.moveTo(p001[0],p001[1]);
+      ctx.lineTo(p101[0],p101[1]); ctx.lineTo(p111[0],p111[1]); ctx.lineTo(p011[0],p011[1]);
+      ctx.closePath(); ctx.fill();
+
+      // left/front
+      ctx.fillStyle = shade(baseColor, 0.65);
+      ctx.beginPath(); ctx.moveTo(p001[0],p001[1]);
+      ctx.lineTo(p011[0],p011[1]); ctx.lineTo(p010[0],p010[1]); ctx.lineTo(p000[0],p000[1]);
+      ctx.closePath(); ctx.fill();
+
+      // right face
+      ctx.fillStyle = shade(baseColor, 0.82);
+      ctx.beginPath(); ctx.moveTo(p011[0],p011[1]);
+      ctx.lineTo(p111[0],p111[1]); ctx.lineTo(p110[0],p110[1]); ctx.lineTo(p010[0],p010[1]);
+      ctx.closePath(); ctx.fill();
+
+      // outline if selected
+      if (isSelGPU){
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+        ctx.beginPath();
+        [p001,p101,p111,p011].forEach((p,i)=>{ if(i) ctx.lineTo(p[0],p[1]); else ctx.moveTo(p[0],p[1]); });
+        ctx.closePath(); ctx.stroke();
+      } else if (isFsdpMate){
+        ctx.strokeStyle = '#d97706'; ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.moveTo(p001[0], p001[1]);
+        ctx.lineTo(p101[0], p101[1]);
+        ctx.lineTo(p111[0], p111[1]);
+        ctx.lineTo(p011[0], p011[1]);
+        ctx.closePath();
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+
+      // Store hit area
+      const hitX = (p000[0]+p110[0])/2, hitY = (p001[1]+p110[1])/2;
+      ctx.save();
+      ctx._hits = ctx._hits || [];
+      ctx._hits.push({n, g, hitX, hitY, radius: 14});
+      ctx.restore();
+    }
+
+    // Legend
+    ctx.fillStyle = '#5b6573'; ctx.font='10.5px monospace';
+    ctx.fillText('cube color = shard index (0–7); 8 colors repeat across nodes (same color = same shard, replicated)', 8, H-20);
+    ctx.fillStyle = '#d97706'; ctx.fillText('▬', 8, H-6); ctx.fillStyle='#5b6573'; ctx.fillText('NVLink (intra-node, FSDP)', 22, H-6);
+    ctx.fillStyle = '#2563eb'; ctx.fillText('┄', 200, H-6); ctx.fillStyle='#5b6573'; ctx.fillText('IB (inter-node, DDP)', 220, H-6);
+
+    // KPIs
+    if (selected){
+      $('h3-sel').textContent = 'node '+selected.n+' / GPU '+selected.g;
+      $('h3-fsz').textContent = GPER + ' GPUs (1 node)';
+      $('h3-dsz').textContent = nodes + ' GPUs (1 per node)';
+      $('h3-ib').textContent = '1/'+GPER+' of full grad';
+    } else {
+      $('h3-sel').textContent = '— click one —';
+      $('h3-fsz').textContent = '—';
+      $('h3-dsz').textContent = '—';
+      $('h3-ib').textContent = '—';
+    }
+  }
+
+  C.addEventListener('click', e => {
+    const rect = C.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    // re-derive positions: same projection as render
+    const W = C.clientWidth, H = C.clientHeight;
+    const totalW = nodes * 140;
+    const cx = (W - totalW * Math.cos(Math.PI/6)) / 2 + 40;
+    const cy = H / 2 - 20;
+    let best = null, bestD = 1e9;
+    for (let n=0; n<nodes; n++){
+      for (let g=0; g<GPER; g++){
+        const c = gpuCenter(n, g);
+        const p = proj(c.x+8, c.y+8, c.z+7, cx, cy);
+        const d = Math.hypot(p[0]-x, p[1]-y);
+        if (d < bestD){ bestD = d; best = {n, g}; }
+      }
+    }
+    if (best && bestD < 18){
+      if (selected && selected.n===best.n && selected.g===best.g) selected = null;
+      else selected = best;
+      render();
+    }
+  });
+
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

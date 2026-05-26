@@ -1,0 +1,801 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>08 · Sequence and context parallel</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">08 · sequence / context parallel</span>
+    <span class="step-pill">lesson 8 / 19</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Sequence and context parallel — sharding the time axis</h1>
+<p class="subtitle">TP shards the feature dim. PP shards the layer dim. Neither shards the sequence. As contexts grow past 32k tokens, the activations that scale with <span class="math">T</span> (not <span class="math">d</span>) become the bottleneck. Sequence parallel reclaims them cheaply; context parallel reclaims attention itself.</p>
+
+<h2>The activations TP doesn't reach</h2>
+
+<p>Inside a TP'd transformer block, the matmuls operate on <span class="math">(B, T, d)</span> tensors sharded along <span class="math">d</span>. After the AllReduce that closes each block, every rank has the full <span class="math">(B, T, d)</span> output. Then LayerNorm, dropout, and the residual connection happen on that full tensor — TP doesn't help, because those ops don't have a "feature dim to shard."</p>
+
+<p>Memory accounting per rank, around a TP block:</p>
+<ul>
+  <li>Inside the matmul: <span class="math">B · T · d / N</span> floats per rank — TP-sharded. Small.</li>
+  <li>Around LayerNorm / dropout: <span class="math">B · T · d</span> floats per rank — <em>not</em> sharded. Replicated.</li>
+</ul>
+
+<p>For <span class="math">B=4, T=8192, d=8192</span>, the unsharded chunk is ~537 MB per layer. Across 80 layers, even with activation checkpointing it sums to gigabytes that don't shrink as you add TP ranks. Sequence parallel (SP, Korthikanti et al. 2022) fixes this for free.</p>
+
+<h2>SP — shard along the sequence axis</h2>
+
+<p>The trick is: at the LayerNorm/dropout boundary, shard the activation along <span class="math">T</span> instead of <span class="math">d</span>. Each rank holds <span class="math">B · T/N · d</span> floats. To enter the next TP'd matmul (which needs the full <span class="math">d</span>), AllGather along <span class="math">T</span>. To exit a TP'd matmul, ReduceScatter along <span class="math">T</span>.</p>
+
+<p>Crucially, the combination <em>(AllGather along T)</em> + <em>(ReduceScatter along T)</em> moves exactly the same bytes as a plain AllReduce — the bandwidth cost is identical. SP doesn't add comm; it <strong>reshapes</strong> the existing AllReduce into two halves and puts the LayerNorm/dropout work inside the sharded region.</p>
+
+<svg viewBox="0 0 720 240" class="diagram">
+  <text x="40" y="20" font-size="12" font-family="monospace" fill="var(--text-mute)">activations around a TP block · SP variant</text>
+
+  <rect class="node-bg" x="40"  y="40" width="180" height="38" rx="8"/>
+  <text x="130" y="64" text-anchor="middle" font-size="12">LayerNorm  (B, T/N, d)</text>
+
+  <rect class="node-bg" x="260" y="40" width="180" height="38" rx="8"/>
+  <text x="350" y="64" text-anchor="middle" font-size="12">AllGather along T</text>
+
+  <rect class="node-bg" x="480" y="40" width="200" height="38" rx="8"/>
+  <text x="580" y="64" text-anchor="middle" font-size="12">TP matmul  (B, T, d/N)</text>
+
+  <rect class="node-bg" x="480" y="120" width="200" height="38" rx="8"/>
+  <text x="580" y="144" text-anchor="middle" font-size="12">TP matmul (output)</text>
+
+  <rect class="node-bg" x="260" y="120" width="180" height="38" rx="8"/>
+  <text x="350" y="144" text-anchor="middle" font-size="12">ReduceScatter along T</text>
+
+  <rect class="node-bg" x="40"  y="120" width="180" height="38" rx="8"/>
+  <text x="130" y="144" text-anchor="middle" font-size="12">Dropout  (B, T/N, d)</text>
+
+  <path class="edge" d="M220 60 L260 60"  marker-end="url(#arrow)"/>
+  <path class="edge" d="M440 60 L480 60"  marker-end="url(#arrow)"/>
+  <path class="edge" d="M580 80 L580 120"  marker-end="url(#arrow)"/>
+  <path class="edge" d="M480 140 L440 140" marker-end="url(#arrow)"/>
+  <path class="edge" d="M260 140 L220 140" marker-end="url(#arrow)"/>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/>
+    </marker>
+  </defs>
+
+  <text x="40"  y="186" font-size="11" font-family="monospace" fill="var(--text-mute)">memory shrinks by N for LayerNorm/Dropout regions · comm = same as plain AllReduce</text>
+</svg>
+
+<p>Equivalent in cost, free in memory. SP is almost always on in production TP setups.</p>
+
+<h2>The attention problem at long context</h2>
+
+<p>SP shrinks the LayerNorm/dropout activations — but the <em>attention</em> matmul itself stays as <span class="math">O(B · T · h · d_k)</span> activations per rank. For <span class="math">T = 1M</span> tokens that's hundreds of gigabytes. Even FlashAttention's tile-by-tile streaming computes the same final values — it just avoids materialising the <span class="math">T×T</span> attention matrix.</p>
+
+<p>What we need is to shard the <em>sequence</em> for attention itself: each rank holds <span class="math">T/N</span> tokens' worth of Q, K, V, and somehow computes the same full attention. The catch: each query at position <span class="math">i</span> attends to <em>all</em> positions <span class="math">j ≤ i</span> (causal), which lives on different ranks.</p>
+
+<h2>Ring Attention (Liu et al. 2023)</h2>
+
+<p>The insight: FlashAttention's online softmax accumulator (<span class="math">m, ℓ, O</span>) is associative — you can extend the partial result by feeding in another <em>chunk</em> of K, V at a time and stably update the running max <span class="math">m</span>, normaliser <span class="math">ℓ</span>, and output <span class="math">O</span>. So if rank <span class="math">i</span> holds Q chunk <span class="math">i</span> and K, V chunk <span class="math">i</span>, it can:</p>
+
+<ol>
+  <li>Compute its local <span class="math">Q_i · K_i^T</span> contribution to attention.</li>
+  <li><strong>Send K_i, V_i to the next rank in a ring.</strong></li>
+  <li><strong>Receive K_{i-1}, V_{i-1} from the previous rank</strong>, compute the cross contribution, fold it into the online accumulator.</li>
+  <li>Repeat for <span class="math">N - 1</span> rounds: at the end every rank has attended to <em>all</em> K, V.</li>
+</ol>
+
+<p>Communication: rank <span class="math">i</span> sends and receives <span class="math">N - 1</span> chunks of size <span class="math">B · T/N · h_kv · d_k · 2</span> bytes total. Crucially this is <strong>concurrent</strong> with compute — chunk <span class="math">i+1</span> can be transferring while chunk <span class="math">i</span> is being processed. As long as comm ≤ compute per chunk, the cost is hidden.</p>
+
+<div class="callout">
+  <div class="label">Why ring attention works only because of FlashAttention</div>
+  Plain attention computes <span class="math">softmax(QK<sup>T</sup>)V</span> — the softmax denominator <em>requires</em> the full row of <span class="math">QK<sup>T</sup></span> at once. Naïve sharding of K, V would force you to either materialise the full T×T matrix or recompute things. FlashAttention's online algorithm makes the softmax decomposable across K, V chunks: keep running statistics, fold in each new chunk. Ring Attention is exactly this online algorithm distributed across ranks. Lessons 03 in <a href="../../vllm/lessons/03_flash_attention.html">vllm</a> covers the online math.
+</div>
+
+<h2>Animated · Ring Attention, one rotation at a time</h2>
+
+<p>Below is the same algorithm but rendered as a literal ring of <span class="math">N = 4</span> ranks. Each rank starts owning <span class="math">(Q_i, K_i, V_i)</span> for its sequence chunk and an online-softmax state <span class="math">(m_i, ℓ_i, O_i)</span>. On each tick, every rank uses its current K/V chunk to update its accumulator, then passes K/V to its neighbour. After <span class="math">N - 1</span> rotations, every rank has seen every K/V chunk — without ever materialising the full attention matrix.</p>
+
+<div class="widget" id="ra-anim">
+  <div class="title">Ring Attention · scrub through one round</div>
+  <div class="hint">Solid arcs = ranks (Q stays put). Inner labels = which K/V chunk each rank is currently using. Watch the labels rotate. Every rank's accumulator updates each step.</div>
+
+  <div class="controls">
+    <button id="ra-play">▶ play</button>
+    <button id="ra-step">step ▷</button>
+    <button id="ra-reset">⟲ reset</button>
+    <label class="inline">step: <input type="range" id="ra-t" min="0" max="3" step="1" value="0" style="width:300px"> <span class="val" id="ra-t-v">0/3</span></label>
+    <label class="inline">ranks N: <input type="range" id="ra-N" min="3" max="6" step="1" value="4"> <span class="val" id="ra-N-v">4</span></label>
+    <label class="inline">speed: <input type="range" id="ra-spd" min="1" max="8" step="1" value="2"> <span class="val" id="ra-spd-v">2×</span></label>
+  </div>
+
+  <canvas id="ra-canvas" width="760" height="360" style="width:100%; height:360px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">round</div><div class="v" id="ra-rd">—</div></div>
+    <div class="kpi"><div class="k">rank 0 sees</div><div class="v" id="ra-rsees" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">comm per round</div><div class="v" id="ra-comm" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">overall progress</div><div class="v" id="ra-pr">—</div></div>
+  </div>
+</div>
+
+<h2>2D · the sequence, sharded</h2>
+
+<p>SP and CP both shard the sequence axis, but the <em>scope</em> of what they protect differs. SP shards only the activations around LayerNorm/dropout — the matmul rebuilds the full sequence first. CP shards the QKV and the attention math itself. Below is a long token strip; toggle SP vs CP and watch the colored ownership change. Hover the legend bars for what each rank actually computes.</p>
+
+<div class="widget" id="sp-map">
+  <div class="title">Sequence ownership map · SP vs CP</div>
+  <div class="hint">A 64-token sequence colored by rank. Rows below: per-block "what each rank holds" tableau.</div>
+
+  <div class="controls">
+    <button id="sm-sp" class="primary">Sequence parallel (SP)</button>
+    <button id="sm-cp">Context parallel (CP)</button>
+    <button id="sm-both">SP + CP composed</button>
+    <label class="inline">ranks N: <input type="range" id="sm-N" min="2" max="8" step="1" value="4"> <span class="val" id="sm-N-v">4</span></label>
+    <label class="inline">seq T: <input type="range" id="sm-T" min="32" max="128" step="8" value="64"> <span class="val" id="sm-T-v">64</span></label>
+  </div>
+
+  <canvas id="sm-canvas" width="760" height="280" style="width:100%; height:280px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">mode</div><div class="v" id="sm-mode" style="font-size:14px;">SP</div></div>
+    <div class="kpi"><div class="k">LN/dropout act</div><div class="v" id="sm-ln" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">attention act</div><div class="v" id="sm-at" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">extra comm</div><div class="v" id="sm-co" style="font-size:13px;">—</div></div>
+  </div>
+</div>
+
+<h2>Animated · online-softmax accumulator</h2>
+
+<p>The reason Ring Attention works at all is that FlashAttention's online softmax can ingest K/V <em>chunks</em> sequentially and still produce the exact same numerical result as a single pass. Below is that mechanic, isolated: drag through the chunks, watch the running statistics <span class="math">(m, ℓ, O)</span> rescale themselves stably as each chunk arrives.</p>
+
+<div class="widget" id="osa">
+  <div class="title">Online softmax · chunk-by-chunk update</div>
+  <div class="hint">Each rectangle is a K/V chunk's contribution; we fold it into <span class="math">m</span> (running max), <span class="math">ℓ</span> (running denom), and <span class="math">O</span> (running weighted sum), rescaling old values when a new max appears.</div>
+
+  <div class="controls">
+    <button id="os-play">▶ play</button>
+    <button id="os-step">step ▷</button>
+    <button id="os-reset">⟲ reset</button>
+    <label class="inline">chunk: <input type="range" id="os-t" min="0" max="5" step="1" value="0" style="width:280px"> <span class="val" id="os-t-v">0/5</span></label>
+    <label class="inline">speed: <input type="range" id="os-spd" min="1" max="8" step="1" value="2"> <span class="val" id="os-spd-v">2×</span></label>
+  </div>
+
+  <canvas id="os-canvas" width="760" height="320" style="width:100%; height:320px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">running max m</div><div class="v" id="os-m">—</div></div>
+    <div class="kpi"><div class="k">running denom ℓ</div><div class="v" id="os-l">—</div></div>
+    <div class="kpi"><div class="k">rescale factor</div><div class="v" id="os-r" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">final probability</div><div class="v" id="os-p" style="font-size:13px;">—</div></div>
+  </div>
+</div>
+
+<h2>Causal masking gets a free ride</h2>
+
+<p>For causal LMs, rank <span class="math">i</span> only needs to attend to K, V chunks <span class="math">j ≤ i</span>. The ring still rotates K, V through all <span class="math">N - 1</span> positions (every rank still has to <em>see</em> every other chunk), but ~half the matmuls are skipped because the upper-triangular contributions vanish. Naïve striping leaves later ranks doing more work than earlier ranks; zigzag and striped schedules (Liu et al., Megatron-LM) reorder chunks across ranks so each one ends up with roughly equal compute. Default Megatron-LM uses striped CP.</p>
+
+<h2>SP vs CP — different sizes, different problems</h2>
+
+<table>
+  <thead><tr><th>Strategy</th><th>What it shards</th><th>When it bites</th><th>Comm</th></tr></thead>
+  <tbody>
+    <tr><td>SP (sequence parallel)</td><td>LayerNorm/dropout activations</td><td>Whenever TP is used and <span class="math">T</span> &gt; ~2k</td><td>Free (replaces AllReduce with AllGather+ReduceScatter)</td></tr>
+    <tr><td>CP (context parallel)</td><td>Attention computation itself</td><td><span class="math">T</span> &gt; ~32k</td><td>1 ring rotation of K,V per attention block; comm volume <span class="math">~B · T · 2 · h_kv · d_k</span> per layer</td></tr>
+  </tbody>
+</table>
+
+<p>SP is on by default whenever TP &gt; 1 in modern frameworks (Megatron-LM, NeMo). CP is opt-in for long-context pretraining and fine-tuning. The two compose: a rank can be both TP=8 and CP=4, giving 32 ranks total for one layer's work — useful for 1M-token training.</p>
+
+<h2>Cost detail — when CP becomes profitable</h2>
+
+<p>FlashAttention's compute on one rank for <span class="math">T</span> tokens scales as <span class="math">O(B · T² · h · d_k)</span>. CP shards this across <span class="math">N</span> ranks so each rank does <span class="math">O(B · T² / N · h · d_k)</span> compute. The ring sends <span class="math">O(B · T · h_kv · d_k)</span> bytes per rank per round, <span class="math">N - 1</span> rounds, so total <span class="math">O(B · T · h_kv · d_k · N)</span> — which divides by NVLink bandwidth. Compute-to-comm ratio in CP:</p>
+
+<div class="math block">
+  compute / comm &nbsp;∝&nbsp; T · (h · d_k) / (h_kv · d_k · N · BW_per_FLOP)
+</div>
+
+<p>It's <em>linear in <span class="math">T</span></em>. The longer your context, the more compute per byte of K, V you move — so CP gets <strong>more efficient</strong> at longer contexts. This is the opposite of the bandwidth trap TP and FSDP have. CP is the only parallelism strategy in this series that <em>likes</em> long sequences.</p>
+
+<h2>Interactive · how much activation memory does SP/CP save?</h2>
+
+<p>Slide <span class="math">T</span> and the parallelism axes. The widget plots activation memory per rank for: no SP/CP, SP only, CP only, both. Watch the long-context regime: at <span class="math">T = 128k</span>, CP is the only thing that matters; below <span class="math">T = 4k</span>, SP alone is enough.</p>
+
+<div class="widget" id="sp-widget">
+  <div class="title">Activation memory per rank · which parallelism reaches?</div>
+  <div class="hint">Memory accounting for a Llama-style block (with activation checkpointing). Bars stacked: matmul activations (TP-sharded) + LN/dropout (SP-able) + attention internals (CP-able).</div>
+
+  <div class="controls">
+    <label class="inline">T (sequence): <input type="range" id="sp-T" min="2048" max="262144" step="1024" value="32768"> <span class="val" id="sp-T-v">32768</span></label>
+    <label class="inline">B (batch): <input type="range" id="sp-B" min="1" max="16" step="1" value="2"> <span class="val" id="sp-B-v">2</span></label>
+    <label class="inline">d (hidden): <input type="range" id="sp-d" min="2048" max="16384" step="512" value="8192"> <span class="val" id="sp-d-v">8192</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline">TP size: <input type="range" id="sp-tp" min="1" max="8" step="1" value="8"> <span class="val" id="sp-tp-v">8</span></label>
+    <label class="inline">CP size: <input type="range" id="sp-cp" min="1" max="8" step="1" value="1"> <span class="val" id="sp-cp-v">1</span></label>
+    <label class="inline">SP on
+      <input type="checkbox" id="sp-on" checked>
+    </label>
+  </div>
+
+  <canvas class="dist-canvas" id="sp-canvas" width="760" height="220" style="height: 220px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">no SP/CP</div><div class="v" id="sp-none">—</div></div>
+    <div class="kpi"><div class="k">SP only</div><div class="v" id="sp-sponly">—</div></div>
+    <div class="kpi"><div class="k">SP + CP</div><div class="v" id="sp-both">—</div></div>
+    <div class="kpi"><div class="k">savings</div><div class="v" id="sp-save">—</div></div>
+  </div>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  SP shards the activations TP can't reach, at no comm cost — turn it on whenever TP is on. CP shards the attention itself by passing K/V around a ring and reusing FlashAttention's online-softmax accumulator; comm is hidden behind compute and the ratio <em>improves</em> with sequence length. SP is universal; CP is the long-context lever.
+</div>
+
+<footer class="lesson-nav">
+  <a href="07_pipeline_parallel.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">07 · Pipeline parallel</span>
+  </a>
+  <a class="next" href="09_expert_parallel.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">09 · Expert parallel</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const get = id => document.getElementById(id);
+  const els = {
+    T:get('sp-T'),Tv:get('sp-T-v'),B:get('sp-B'),Bv:get('sp-B-v'),d:get('sp-d'),dv:get('sp-d-v'),
+    tp:get('sp-tp'),tpv:get('sp-tp-v'),cp:get('sp-cp'),cpv:get('sp-cp-v'),on:get('sp-on'),
+    canvas:get('sp-canvas'),
+    none:get('sp-none'),sponly:get('sp-sponly'),both:get('sp-both'),save:get('sp-save')
+  };
+  const ctx = els.canvas.getContext('2d');
+
+  function compute_all(){
+    const T = parseInt(els.T.value), B = parseInt(els.B.value), d = parseInt(els.d.value);
+    const tp = parseInt(els.tp.value), cp = parseInt(els.cp.value);
+    const v = (sp_on, cp_on) => {
+      const matmul = B * T * d / tp * 2;
+      const ln     = (sp_on ? B * T / tp : B * T) * d * 2;
+      const att    = B * (cp_on ? T / cp : T) * 8 * 128 * 4;
+      return matmul + ln + att;
+    };
+    return {
+      none:  v(false, false),
+      sp:    v(true, false),
+      cp:    v(false, true),
+      both:  v(true, true),
+    };
+  }
+
+  function fmt(b){
+    if (b < 1e6) return (b/1024).toFixed(1) + ' KB';
+    if (b < 1e9) return (b/1e6).toFixed(1) + ' MB';
+    return (b/1e9).toFixed(2) + ' GB';
+  }
+
+  function render(){
+    const T = parseInt(els.T.value), B = parseInt(els.B.value), d = parseInt(els.d.value);
+    const tp = parseInt(els.tp.value), cp = parseInt(els.cp.value);
+    els.Tv.textContent = T; els.Bv.textContent = B; els.dv.textContent = d;
+    els.tpv.textContent = tp; els.cpv.textContent = cp;
+
+    const variants = compute_all();
+    els.none.textContent = fmt(variants.none);
+    els.sponly.textContent = fmt(variants.sp);
+    els.both.textContent = fmt(variants.both);
+    els.save.textContent = ((1 - variants.both/variants.none)*100).toFixed(0) + '%';
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = els.canvas.clientWidth, H = els.canvas.clientHeight;
+    if (els.canvas.width !== Math.round(W*dpr)){
+      els.canvas.width = Math.round(W*dpr); els.canvas.height = Math.round(H*dpr);
+    }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const rows = [
+      { name:'no SP/CP', val: variants.none, breakdown: [variants.none*0.4, variants.none*0.55, variants.none*0.05] },
+      { name:'SP only',  val: variants.sp,   breakdown: [variants.sp*0.5, variants.sp*0.4, variants.sp*0.1] },
+      { name:'CP only',  val: variants.cp,   breakdown: [variants.cp*0.5, variants.cp*0.45, variants.cp*0.05] },
+      { name:'SP + CP',  val: variants.both, breakdown: [variants.both*0.7, variants.both*0.25, variants.both*0.05] },
+    ];
+
+    const padL = 110, padR = 30, padT = 14, padB = 16;
+    const innerW = W - padL - padR;
+    const max = Math.max(...rows.map(r=>r.val));
+    const rowH = (H - padT - padB) / rows.length;
+
+    rows.forEach((r, i) => {
+      const y = padT + i*rowH + 6;
+      ctx.fillStyle = '#1f2430'; ctx.font = '12px monospace';
+      ctx.fillText(r.name, 4, y + rowH/2 - 4);
+      const colors = ['#2563eb','#d97706','#16a34a'];
+      let xCur = padL;
+      for (let k = 0; k < r.breakdown.length; k++){
+        const w = (r.breakdown[k] / max) * innerW;
+        ctx.fillStyle = colors[k];
+        ctx.fillRect(xCur, y, Math.max(1, w), rowH - 16);
+        xCur += w;
+      }
+      ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+      ctx.fillText(fmt(r.val), xCur + 4, y + rowH/2 - 2);
+    });
+
+    const lx = padL, ly = H - 6;
+    ctx.font = '10px monospace';
+    ctx.fillStyle = '#2563eb'; ctx.fillRect(lx, ly - 10, 8, 8);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('matmul (TP)', lx + 12, ly - 2);
+    ctx.fillStyle = '#d97706'; ctx.fillRect(lx + 110, ly - 10, 8, 8);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('LN/dropout (SP)', lx + 122, ly - 2);
+    ctx.fillStyle = '#16a34a'; ctx.fillRect(lx + 240, ly - 10, 8, 8);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('attention (CP)', lx + 252, ly - 2);
+  }
+
+  ['input','change'].forEach(ev=>{
+    [els.T,els.B,els.d,els.tp,els.cp,els.on].forEach(el=>el.addEventListener(ev,render));
+  });
+  window.addEventListener('resize',render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: Ring Attention animation ─── */
+(function(){
+  const C = document.getElementById('ra-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const COLORS = ['#2563eb','#d97706','#16a34a','#7c3aed','#dc2626','#3b82f6'];
+  const els = {
+    play:$('ra-play'), step:$('ra-step'), reset:$('ra-reset'),
+    t:$('ra-t'), tv:$('ra-t-v'),
+    N:$('ra-N'), Nv:$('ra-N-v'),
+    spd:$('ra-spd'), spdv:$('ra-spd-v'),
+    rd:$('ra-rd'), rsees:$('ra-rsees'), comm:$('ra-comm'), pr:$('ra-pr'),
+  };
+  let N = 4, playing = false, lastT = 0;
+  els.N.addEventListener('input', ()=>{
+    N = +els.N.value; els.Nv.textContent = N;
+    els.t.max = N - 1;
+    if (+els.t.value > N - 1) els.t.value = N - 1;
+    render();
+  });
+
+  function render(){
+    const tStep = +els.t.value;
+    els.tv.textContent = tStep + '/' + (N-1);
+    els.spdv.textContent = els.spd.value + '×';
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width = Math.round(W*dpr); C.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const cx = W * 0.32, cy = H/2, R = Math.min(W*0.28, H*0.40);
+
+    // Inner ring (orbit of K/V chunks)
+    ctx.strokeStyle = '#dde2ea'; ctx.setLineDash([4,4]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(cx, cy, R*0.55, 0, Math.PI*2); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Ranks (outer circles holding Q_i)
+    for (let i=0; i<N; i++){
+      const ang = -Math.PI/2 + i*(2*Math.PI/N);
+      const rx = cx + R*Math.cos(ang);
+      const ry = cy + R*Math.sin(ang);
+      // rank disc
+      ctx.fillStyle = COLORS[i % COLORS.length];
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath(); ctx.arc(rx, ry, 30, 0, Math.PI*2); ctx.fill();
+      ctx.globalAlpha = 1;
+      // label
+      ctx.fillStyle = '#ffffff'; ctx.font = 'bold 12px monospace';
+      ctx.fillText('Q_'+i, rx-12, ry-2);
+      ctx.font = '10px monospace';
+      ctx.fillText('rank '+i, rx-14, ry+12);
+
+      // K/V chunk currently held by this rank (after tStep rotations from start)
+      const kvIdx = (i - tStep + N) % N;
+      const kx = cx + R*0.55 * Math.cos(ang);
+      const ky = cy + R*0.55 * Math.sin(ang);
+      ctx.fillStyle = COLORS[kvIdx % COLORS.length];
+      ctx.globalAlpha = 0.9;
+      ctx.beginPath(); ctx.arc(kx, ky, 18, 0, Math.PI*2); ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#ffffff'; ctx.font = 'bold 11px monospace';
+      ctx.fillText('KV_'+kvIdx, kx-14, ky+4);
+
+      // accumulator state (which chunks have been seen)
+      const seen = [];
+      for (let s=0; s<=tStep; s++) seen.push((i - s + N) % N);
+      const seenStr = seen.sort((a,b)=>a-b).join(',');
+      ctx.fillStyle = '#5b6573'; ctx.font = '9px monospace';
+      const lx = rx + (rx > cx ? 32 : -78), ly = ry;
+      ctx.fillText('seen: KV{' + seenStr + '}', lx, ly);
+    }
+
+    // Rotation arrows between adjacent ranks
+    if (tStep > 0 && tStep <= N-1){
+      ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 2; ctx.globalAlpha = 0.85;
+      for (let i=0; i<N; i++){
+        const a0 = -Math.PI/2 + i*(2*Math.PI/N);
+        const a1 = -Math.PI/2 + ((i+1)%N)*(2*Math.PI/N);
+        const r0 = R*0.55, r1 = R*0.55;
+        const x0 = cx + r0*Math.cos(a0 + 0.08), y0 = cy + r0*Math.sin(a0 + 0.08);
+        const x1 = cx + r1*Math.cos(a1 - 0.08), y1 = cy + r1*Math.sin(a1 - 0.08);
+        // curved arc segment
+        const mid_a = (a0 + a1) / 2;
+        const mx = cx + (R*0.55 + 6)*Math.cos(mid_a);
+        const my = cy + (R*0.55 + 6)*Math.sin(mid_a);
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.quadraticCurveTo(mx, my, x1, y1);
+        ctx.stroke();
+        // arrowhead at x1, y1
+        const ang = Math.atan2(y1 - my, x1 - mx);
+        ctx.fillStyle = '#fbbf24';
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x1 - 7*Math.cos(ang - 0.4), y1 - 7*Math.sin(ang - 0.4));
+        ctx.lineTo(x1 - 7*Math.cos(ang + 0.4), y1 - 7*Math.sin(ang + 0.4));
+        ctx.closePath(); ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#fbbf24'; ctx.font = '11px monospace';
+      ctx.fillText('K/V rotating →', cx - 50, cy + R + 26);
+    }
+
+    // Right panel — state tables
+    const px = W*0.62, py = 30;
+    ctx.fillStyle = '#1f2430'; ctx.font = '12px monospace';
+    ctx.fillText('per-rank online-softmax state', px, py);
+
+    const rowH = 50;
+    for (let i=0; i<N; i++){
+      const y = py + 12 + i*rowH;
+      ctx.fillStyle = COLORS[i % COLORS.length];
+      ctx.globalAlpha = 0.85;
+      ctx.fillRect(px, y, 14, rowH - 6);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#f1f3f7';
+      ctx.fillRect(px + 20, y, W - px - 32, rowH - 6);
+      ctx.strokeStyle = '#dde2ea'; ctx.strokeRect(px + 20, y, W - px - 32, rowH - 6);
+      ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+      ctx.fillText('rank ' + i, px + 26, y + 14);
+      ctx.fillStyle = '#5b6573'; ctx.font = '10px monospace';
+      ctx.fillText('m_'+i+' = max over seen', px + 26, y + 26);
+      ctx.fillText('ℓ_'+i+' = Σ exp(s - m_'+i+')', px + 26, y + 36);
+      // bar of how many chunks processed
+      const frac = (tStep + 1) / N;
+      const bw = (W - px - 40);
+      ctx.fillStyle = '#eef1f5'; ctx.fillRect(px + 24 + bw*0.55, y + 8, bw*0.4, 8);
+      ctx.fillStyle = COLORS[i % COLORS.length];
+      ctx.fillRect(px + 24 + bw*0.55, y + 8, bw*0.4*frac, 8);
+    }
+
+    // KPIs
+    els.rd.textContent = (tStep + 1) + ' of ' + N;
+    const seen0 = [];
+    for (let s=0; s<=tStep; s++) seen0.push((0 - s + N) % N);
+    els.rsees.textContent = 'KV{' + seen0.sort((a,b)=>a-b).join(',') + '}';
+    els.comm.textContent = tStep > 0 ? ('1 K/V chunk · '+N+' ranks') : '—';
+    els.pr.textContent = (((tStep + 1) / N) * 100).toFixed(0) + '%';
+  }
+
+  function step(){
+    let v = +els.t.value;
+    v = (v + 1) % N;
+    els.t.value = v;
+    render();
+  }
+  function tick(ts){
+    if (!playing) return;
+    const spd = +els.spd.value;
+    if (ts - lastT > 1000/spd){ step(); lastT = ts; }
+    requestAnimationFrame(tick);
+  }
+  els.play.addEventListener('click', ()=>{
+    playing = !playing;
+    els.play.textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastT = performance.now(); requestAnimationFrame(tick); }
+  });
+  els.step.addEventListener('click', step);
+  els.reset.addEventListener('click', ()=>{ els.t.value=0; playing=false; els.play.textContent='▶ play'; render(); });
+  els.t.addEventListener('input', render);
+  els.spd.addEventListener('input', ()=>{ els.spdv.textContent = els.spd.value+'×'; });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: SP vs CP sequence ownership map ─── */
+(function(){
+  const C = document.getElementById('sm-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const COLORS = ['#2563eb','#d97706','#16a34a','#7c3aed','#dc2626','#3b82f6','#f59e0b','#16a34a'];
+
+  let mode = 'sp', N = 4, T = 64;
+  const BTN = { sp:$('sm-sp'), cp:$('sm-cp'), both:$('sm-both') };
+  Object.entries(BTN).forEach(([k,b])=>{
+    b.addEventListener('click', ()=>{
+      mode = k;
+      Object.values(BTN).forEach(x=>x.classList.remove('primary'));
+      b.classList.add('primary'); render();
+    });
+  });
+  const sN = $('sm-N'), sNv = $('sm-N-v'),
+        sT = $('sm-T'), sTv = $('sm-T-v');
+  sN.addEventListener('input', ()=>{ N = +sN.value; sNv.textContent = N; render(); });
+  sT.addEventListener('input', ()=>{ T = +sT.value; sTv.textContent = T; render(); });
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width = Math.round(W*dpr); C.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 20, padR = 20, padT = 20;
+    const innerW = W - padL - padR;
+    const stripH = 32;
+
+    // Top strip — the sequence colored by rank ownership
+    ctx.fillStyle = '#1f2430'; ctx.font = '12px monospace';
+    ctx.fillText('sequence of T = ' + T + ' tokens — color = rank that owns the token', padL, padT - 6);
+    const tokenW = innerW / T;
+    for (let i=0; i<T; i++){
+      const owner = Math.floor(i / (T/N));
+      ctx.fillStyle = COLORS[owner % COLORS.length];
+      ctx.fillRect(padL + i*tokenW, padT, Math.max(1, tokenW-0.5), stripH);
+    }
+    // tick lines at rank boundaries
+    ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
+    for (let r=1; r<N; r++){
+      const x = padL + r*(T/N)*tokenW;
+      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT+stripH); ctx.stroke();
+    }
+
+    // Per-block accounting rows
+    const blocks = [
+      { name:'LayerNorm + Dropout',                spShard:true,  cpShard:false },
+      { name:'QKV projection (matmul)',            spShard:false, cpShard:true  },
+      { name:'attention compute',                  spShard:false, cpShard:true  },
+      { name:'output projection (matmul)',         spShard:false, cpShard:true  },
+    ];
+    const blockY = padT + stripH + 20;
+    const rowH = (H - blockY - 40) / blocks.length;
+    blocks.forEach((blk, bi) => {
+      const y = blockY + bi*rowH;
+      ctx.fillStyle = '#5b6573'; ctx.font = '12px monospace';
+      ctx.fillText(blk.name, padL, y + rowH/2 + 4);
+
+      // Draw token bar showing which tokens this rank holds — depends on mode
+      const sharded = (mode === 'sp' && blk.spShard) || (mode === 'cp' && blk.cpShard) || (mode === 'both' && (blk.spShard || blk.cpShard));
+      const barX = padL + 220, barW = innerW - 220;
+      ctx.fillStyle = '#f1f3f7'; ctx.fillRect(barX, y + 4, barW, rowH - 10);
+      ctx.strokeStyle = '#dde2ea'; ctx.strokeRect(barX, y + 4, barW, rowH - 10);
+      if (sharded){
+        // Each rank has only T/N tokens — drawn as N colored chunks side-by-side, smaller
+        const cw = barW / N;
+        for (let r=0; r<N; r++){
+          ctx.fillStyle = COLORS[r % COLORS.length];
+          ctx.globalAlpha = 0.85;
+          ctx.fillRect(barX + r*cw + 1, y + 6, cw - 2, rowH - 14);
+          ctx.globalAlpha = 1;
+        }
+        ctx.fillStyle = '#ffffff'; ctx.font = '10px monospace';
+        ctx.fillText('sharded · each rank holds T/N', barX + 6, y + rowH/2 + 4);
+      } else {
+        // replicated full sequence
+        for (let r=0; r<N; r++){
+          ctx.fillStyle = COLORS[r % COLORS.length];
+          ctx.globalAlpha = 0.45;
+          ctx.fillRect(barX + 2, y + 6 + r*1.2, barW - 4, 2);
+          ctx.globalAlpha = 1;
+        }
+        ctx.fillStyle = '#f1f3f7';
+        ctx.fillRect(barX + 2, y + 6, barW - 4, rowH - 14);
+        ctx.strokeStyle = '#cbd5e1'; ctx.strokeRect(barX + 2, y + 6, barW - 4, rowH - 14);
+        ctx.fillStyle = '#1f2430'; ctx.font = '10px monospace';
+        ctx.fillText('replicated · each rank holds full T (' + T + ')', barX + 6, y + rowH/2 + 4);
+      }
+    });
+
+    // KPIs
+    $('sm-mode').textContent = mode === 'sp' ? 'SP only' : mode === 'cp' ? 'CP only' : 'SP + CP';
+    $('sm-ln').textContent   = (mode === 'sp' || mode === 'both') ? '1/N of full' : 'full T (replicated)';
+    $('sm-at').textContent   = (mode === 'cp' || mode === 'both') ? '1/N of full' : 'full T (replicated)';
+    $('sm-co').textContent   = mode === 'sp' ? 'AG+RS = old AllReduce'
+                              : mode === 'cp' ? 'ring rotations of K/V'
+                              : 'both above';
+  }
+
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: online-softmax accumulator animation ─── */
+(function(){
+  const C = document.getElementById('os-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    play:$('os-play'), step:$('os-step'), reset:$('os-reset'),
+    t:$('os-t'), tv:$('os-t-v'),
+    spd:$('os-spd'), spdv:$('os-spd-v'),
+    m:$('os-m'), l:$('os-l'), r:$('os-r'), p:$('os-p')
+  };
+  // synthetic scores: 6 chunks × 4 entries each
+  const CHUNKS = [
+    [0.5, -0.2, 0.1, -0.5],
+    [1.4,  0.9, 0.3,  1.1],
+    [-0.8, 0.0, -0.3, 0.4],
+    [2.3,  1.7, 1.9,  1.2],
+    [0.6,  0.4, 0.2,  0.0],
+    [1.0,  0.5, 0.3,  0.8],
+  ];
+  els.t.max = CHUNKS.length - 1;
+  let playing = false, lastT = 0;
+
+  function compute(uptoIdx){
+    let m = -Infinity, l = 0, O = 0;
+    let lastRescale = 1;
+    const history = [];
+    for (let i=0; i<=uptoIdx; i++){
+      const chunk = CHUNKS[i];
+      const chunkMax = Math.max(...chunk);
+      const newM = Math.max(m, chunkMax);
+      const rescale = m === -Infinity ? 1 : Math.exp(m - newM);
+      let chunkL = 0, chunkO = 0;
+      for (const s of chunk){
+        const e = Math.exp(s - newM);
+        chunkL += e; chunkO += e * s;
+      }
+      const oldL = l, oldO = O;
+      l = l * rescale + chunkL;
+      O = O * rescale + chunkO;
+      history.push({ chunk, chunkMax, newM, rescale, l, O, oldL, oldO });
+      m = newM;
+      lastRescale = rescale;
+    }
+    return { m, l, O, history, lastRescale };
+  }
+
+  function render(){
+    const idx = +els.t.value;
+    els.tv.textContent = idx + '/' + (CHUNKS.length-1);
+    els.spdv.textContent = els.spd.value + '×';
+
+    const { m, l, O, history, lastRescale } = compute(idx);
+    els.m.textContent = m === -Infinity ? '—' : m.toFixed(3);
+    els.l.textContent = l.toFixed(3);
+    els.r.textContent = lastRescale.toFixed(3) + (lastRescale < 1 ? ' (shrink old)' : '');
+    const finalP = (Math.exp(CHUNKS[idx][0] - m) / l);
+    els.p.textContent = finalP.toFixed(3);
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width = Math.round(W*dpr); C.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 30, padT = 24;
+    const chunkW = (W - padL*2) / CHUNKS.length;
+    const chunkH = 80;
+
+    ctx.fillStyle = '#1f2430'; ctx.font = '12px monospace';
+    ctx.fillText('K/V chunks · each contains 4 scores (Q·K^T entries)', padL, padT - 6);
+
+    for (let i=0; i<CHUNKS.length; i++){
+      const x = padL + i*chunkW;
+      const y = padT + 4;
+      const active = i <= idx;
+      ctx.fillStyle = '#f1f3f7';
+      ctx.fillRect(x + 2, y, chunkW - 6, chunkH);
+      ctx.strokeStyle = active ? '#2563eb' : '#dde2ea';
+      ctx.lineWidth = active ? 2 : 1;
+      ctx.strokeRect(x + 2, y, chunkW - 6, chunkH);
+      ctx.fillStyle = '#5b6573'; ctx.font = '10px monospace';
+      ctx.fillText('chunk ' + i, x + 6, y + 12);
+      // draw the 4 entries as small bars
+      const cmax = Math.max(...CHUNKS[i]);
+      const cmin = Math.min(...CHUNKS[i]);
+      const rng = cmax - cmin + 0.01;
+      for (let j=0; j<4; j++){
+        const s = CHUNKS[i][j];
+        const t = (s - cmin) / rng;
+        const bw = (chunkW - 16) / 4;
+        const bx = x + 6 + j*bw;
+        const by = y + 24;
+        const bh = chunkH - 36;
+        ctx.fillStyle = active ? '#2563eb' : '#cbd5e1';
+        ctx.fillRect(bx, by + bh - t*bh, Math.max(2, bw - 2), t*bh);
+        ctx.fillStyle = '#94a3b8'; ctx.font = '9px monospace';
+        ctx.fillText(s.toFixed(1), bx, by + bh + 10);
+      }
+    }
+
+    // Accumulator state strip below
+    const accY = padT + chunkH + 30;
+    ctx.fillStyle = '#1f2430'; ctx.font = '12px monospace';
+    ctx.fillText('online-softmax state after chunk ' + idx + ':', padL, accY);
+
+    // Visual: running max m and denom l as bar plots
+    const barX = padL, barY = accY + 14, barW = W - padL*2, barH = 18;
+    ctx.fillStyle = '#f1f3f7'; ctx.fillRect(barX, barY, barW, barH);
+    ctx.strokeStyle = '#dde2ea'; ctx.strokeRect(barX, barY, barW, barH);
+    const allMax = Math.max(...CHUNKS.flat());
+    const mNorm = (m === -Infinity ? 0 : m) / allMax;
+    ctx.fillStyle = '#d97706';
+    ctx.fillRect(barX, barY, barW * Math.max(0, mNorm), barH);
+    ctx.fillStyle = '#ffffff'; ctx.font = '11px monospace';
+    ctx.fillText('m = ' + (m === -Infinity ? '—' : m.toFixed(3)), barX + 6, barY + 13);
+
+    const barY2 = barY + 30;
+    ctx.fillStyle = '#f1f3f7'; ctx.fillRect(barX, barY2, barW, barH);
+    ctx.strokeStyle = '#dde2ea'; ctx.strokeRect(barX, barY2, barW, barH);
+    // l grows over time; normalize against a heuristic max
+    const lMax = 30;
+    ctx.fillStyle = '#16a34a';
+    ctx.fillRect(barX, barY2, barW * Math.min(1, l / lMax), barH);
+    ctx.fillStyle = '#ffffff'; ctx.font = '11px monospace';
+    ctx.fillText('ℓ = ' + l.toFixed(3), barX + 6, barY2 + 13);
+
+    // Rescale annotation
+    if (idx > 0){
+      const h = history[idx];
+      const txt = h.rescale < 1
+        ? 'rescale: prior (m,ℓ,O) multiplied by exp('+(h.newM === h.chunkMax ? 'old m' : 'old m').slice(0,18)+'-new m) = ' + h.rescale.toFixed(3)
+        : 'no rescale needed';
+      ctx.fillStyle = '#dc2626'; ctx.font = '11px monospace';
+      ctx.fillText(txt, padL, barY2 + 36);
+    }
+  }
+
+  function step(){
+    let v = +els.t.value; v = (v + 1) % CHUNKS.length; els.t.value = v; render();
+  }
+  function tick(ts){
+    if (!playing) return;
+    const spd = +els.spd.value;
+    if (ts - lastT > 1000/spd){ step(); lastT = ts; }
+    requestAnimationFrame(tick);
+  }
+  els.play.addEventListener('click', ()=>{
+    playing = !playing;
+    els.play.textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastT = performance.now(); requestAnimationFrame(tick); }
+  });
+  els.step.addEventListener('click', step);
+  els.reset.addEventListener('click', ()=>{ els.t.value=0; playing=false; els.play.textContent='▶ play'; render(); });
+  els.t.addEventListener('input', render);
+  els.spd.addEventListener('input', ()=>{ els.spdv.textContent = els.spd.value+'×'; });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

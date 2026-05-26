@@ -1,0 +1,673 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>01 · Architecture — the shape under every stage</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">gpt_mini / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">01 · architecture</span>
+    <span class="step-pill">lesson 1 / 6</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Architecture — the shape under every stage</h1>
+<p class="subtitle">A line-by-line tour of <code>model.py</code>. The five post-training lessons that follow change the data and the loss, never this.</p>
+
+<h2>What we are modelling</h2>
+
+<p>An autoregressive language model factors a joint distribution over tokens as a product of conditionals:</p>
+
+<div class="math block">
+  p(x<sub>1</sub>, x<sub>2</sub>, …, x<sub>T</sub>) &nbsp;=&nbsp; ∏<sub>t = 1..T</sub> p(x<sub>t</sub> | x<sub>&lt;t</sub>)
+</div>
+
+<p>Maximum-likelihood training minimises the sum of per-token negative log-likelihoods — equivalently, cross-entropy with the next token as target. <em>That is the entire game.</em> Every architectural decision below exists so that one forward pass can compute the conditional <span class="math">p(x<sub>t</sub> | x<sub>&lt;t</sub>)</span> for <strong>every</strong> <span class="math">t</span> in parallel, and produce the gradients that lower the joint log-likelihood. If a design choice does not directly serve that, it has no business being in <code>model.py</code>.</p>
+
+<p>The remarkable thing — the reason this lesson exists once and the next five lessons reuse it verbatim — is that the same predictor <span class="math">p<sub>θ</sub>(x<sub>t</sub> | x<sub>&lt;t</sub>)</span> is what we need for pretraining, instruction-tuning (SFT), chain-of-thought, DPO, and RL-from-verifiable-rewards. The post-training pipeline does <em>not</em> add new neural machinery; it only shifts <em>which positions in a sequence count toward the loss</em> and <em>where the supervisory signal comes from</em>. Hold that thought — it is the single most freeing idea in the whole series.</p>
+
+<div class="callout">
+  <div class="label">Symbols, kept compact</div>
+  <ul>
+    <li><span class="math">B</span> — batch size.</li>
+    <li><span class="math">T</span> — sequence length in tokens. <span class="math">T<sub>max</sub></span> — the model's hard upper bound (position-embedding table size).</li>
+    <li><span class="math">V</span> — vocabulary size.</li>
+    <li><span class="math">d</span> — model dimension (residual stream width).</li>
+    <li><span class="math">h</span> — number of attention heads. <span class="math">k = d / h</span> — per-head dimension.</li>
+    <li><span class="math">L</span> — number of Transformer blocks.</li>
+  </ul>
+</div>
+
+<h2>One forward pass, exact shapes</h2>
+
+<p>Here is the entire forward pass with every intermediate tensor labelled. Read it once top-to-bottom; we will then walk each line.</p>
+
+<pre><code>idx         (B, T)              int64 token ids
+tok_emb     (B, T, d)           Wte[idx]                Wte: (V, d)
+pos_emb        (T, d)           Wpe[0:T]                Wpe: (T_max, d)
+x           (B, T, d)           tok_emb + pos_emb       broadcast over B
+--- repeat L times -----------------------------------------------------
+x           x + Attn(LN(x))                             pre-norm residual
+x           x + MLP (LN(x))                             pre-norm residual
+-----------------------------------------------------------------------
+x           LayerNorm(x)        (B, T, d)               final norm
+logits      x @ Wteᵀ            (B, T, V)               weight-tied head
+loss        CE(logits[:, :-1], idx[:, 1:])               scalar</code></pre>
+
+<p>Notice three things straight away. First, the residual stream is <span class="math">(B, T, d)</span> from start to finish — every block takes that shape in and returns the same shape. Second, the only places that touch the vocabulary are the embedding at the bottom and the head at the top — and those <em>share weights</em>. Third, the loss is built from logits at positions <span class="math">[0..T−2]</span> against targets at positions <span class="math">[1..T−1]</span>: we predict every token from its predecessors, all in one shot. That parallelism is what makes Transformers train faster than RNNs by orders of magnitude.</p>
+
+<h2>Embeddings: addition, not concatenation</h2>
+
+<p>The first non-trivial line of the forward pass is:</p>
+
+<pre><code>x = self.tok_emb(idx) + self.pos_emb(pos)              # (B, T, d)</code></pre>
+
+<p>Two embedding tables: token (<span class="math">V × d</span>) and position (<span class="math">T<sub>max</sub> × d</span>). The token vector says <em>what</em> this slot holds; the position vector says <em>where</em> in the sequence the slot is. Why <em>add</em> them instead of concatenating?</p>
+
+<ul>
+  <li><strong>Addition preserves <span class="math">d</span>.</strong> Concatenation would force every downstream layer to be wider; addition lets the same <span class="math">d</span>-wide attention and MLP operate on either channel of information. The model learns, per feature dimension, how much weight to put on identity vs. position.</li>
+  <li><strong>Linear layers can recover either component.</strong> If <span class="math">x = e<sub>tok</sub> + e<sub>pos</sub></span>, any linear projection of <span class="math">x</span> is a linear projection of <span class="math">e<sub>tok</sub></span> plus a linear projection of <span class="math">e<sub>pos</sub></span> — there is no information lost compared to concatenation, only a representational <em>preference</em> for low-rank mixing.</li>
+  <li><strong>Empirically it works.</strong> Concatenation has been tried; in pure-Transformer language models the gain does not justify the parameter bloat.</li>
+</ul>
+
+<p>GPT-2 uses <em>learned</em> position embeddings — one vector per slot, learned by gradient descent. The trade-off:</p>
+
+<table>
+  <thead><tr><th>scheme</th><th>extrapolation</th><th>fit in-distribution</th><th>cost</th></tr></thead>
+  <tbody>
+    <tr><td>learned</td><td>fails past T<sub>max</sub></td><td>slightly best</td><td>T<sub>max</sub>·d params</td></tr>
+    <tr><td>sinusoidal</td><td>works (formula)</td><td>slightly worse</td><td>0 params</td></tr>
+    <tr><td>RoPE</td><td>works, popular today</td><td>strong</td><td>0 params</td></tr>
+    <tr><td>ALiBi</td><td>works, simple bias</td><td>strong</td><td>O(h) params</td></tr>
+  </tbody>
+</table>
+
+<p>For this codebase the toy sequences fit comfortably under <span class="math">T<sub>max</sub></span>, so we accept the cap in exchange for one fewer concept. If you ever want to deploy outside the training length, replace <code>nn.Embedding(T_max, d)</code> with RoPE in the attention module — nothing else needs to change.</p>
+
+<h2>Causal self-attention, shape by shape</h2>
+
+<p>This is the part with the most moving pieces. Walk it with me, shape by shape.</p>
+
+<svg viewBox="0 0 820 320" class="diagram" aria-label="Attention shape pipeline">
+  <defs>
+    <marker id="arr1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/>
+    </marker>
+  </defs>
+
+  <g>
+    <rect class="node-bg" x="20"  y="20"  width="130" height="50" rx="8"/>
+    <text x="85"  y="42" text-anchor="middle" font-size="13" font-weight="600">x</text>
+    <text x="85"  y="60" text-anchor="middle" font-size="11" fill="var(--text-mute)">(B, T, d)</text>
+  </g>
+  <g>
+    <rect class="node-bg" x="200" y="20"  width="130" height="50" rx="8"/>
+    <text x="265" y="42" text-anchor="middle" font-size="13" font-weight="600">qkv  (one Linear)</text>
+    <text x="265" y="60" text-anchor="middle" font-size="11" fill="var(--text-mute)">(B, T, 3d)</text>
+  </g>
+  <g>
+    <rect class="node-bg" x="380" y="20"  width="180" height="50" rx="8"/>
+    <text x="470" y="42" text-anchor="middle" font-size="13" font-weight="600">q, k, v (chunk)</text>
+    <text x="470" y="60" text-anchor="middle" font-size="11" fill="var(--text-mute)">each (B, T, d)</text>
+  </g>
+  <g>
+    <rect class="node-bg" x="610" y="20"  width="190" height="50" rx="8"/>
+    <text x="705" y="42" text-anchor="middle" font-size="13" font-weight="600">split heads, transpose</text>
+    <text x="705" y="60" text-anchor="middle" font-size="11" fill="var(--text-mute)">(B, h, T, k)</text>
+  </g>
+
+  <g>
+    <rect class="node-bg" x="610" y="115" width="190" height="50" rx="8"/>
+    <text x="705" y="137" text-anchor="middle" font-size="13" font-weight="600">scores = q · kᵀ / √k</text>
+    <text x="705" y="155" text-anchor="middle" font-size="11" fill="var(--text-mute)">(B, h, T, T)</text>
+  </g>
+  <g>
+    <rect class="node-bg" x="380" y="115" width="180" height="50" rx="8"/>
+    <text x="470" y="137" text-anchor="middle" font-size="13" font-weight="600">+ causal mask, softmax</text>
+    <text x="470" y="155" text-anchor="middle" font-size="11" fill="var(--text-mute)">(B, h, T, T)</text>
+  </g>
+  <g>
+    <rect class="node-bg" x="200" y="115" width="130" height="50" rx="8"/>
+    <text x="265" y="137" text-anchor="middle" font-size="13" font-weight="600">attn · v</text>
+    <text x="265" y="155" text-anchor="middle" font-size="11" fill="var(--text-mute)">(B, h, T, k)</text>
+  </g>
+  <g>
+    <rect class="node-bg" x="20"  y="115" width="130" height="50" rx="8"/>
+    <text x="85"  y="137" text-anchor="middle" font-size="13" font-weight="600">merge heads</text>
+    <text x="85"  y="155" text-anchor="middle" font-size="11" fill="var(--text-mute)">(B, T, d)</text>
+  </g>
+
+  <g>
+    <rect class="node-bg" x="20"  y="210" width="130" height="50" rx="8"/>
+    <text x="85"  y="232" text-anchor="middle" font-size="13" font-weight="600">proj (Linear d → d)</text>
+    <text x="85"  y="250" text-anchor="middle" font-size="11" fill="var(--text-mute)">(B, T, d)</text>
+  </g>
+
+  <path class="edge" d="M150 45 L200 45" marker-end="url(#arr1)"/>
+  <path class="edge" d="M330 45 L380 45" marker-end="url(#arr1)"/>
+  <path class="edge" d="M560 45 L610 45" marker-end="url(#arr1)"/>
+  <path class="edge" d="M705 70  L705 115" marker-end="url(#arr1)"/>
+  <path class="edge" d="M610 140 L560 140" marker-end="url(#arr1)"/>
+  <path class="edge" d="M380 140 L330 140" marker-end="url(#arr1)"/>
+  <path class="edge" d="M200 140 L150 140" marker-end="url(#arr1)"/>
+  <path class="edge" d="M85  165 L85  210" marker-end="url(#arr1)"/>
+
+  <text x="265" y="290" font-size="11" fill="var(--text-mute)">Each arrow's annotation is the new shape after that step. Reading order: top-left → top-right → wraps left → ends bottom-left.</text>
+</svg>
+
+<p>Now the same flow in code. From <code>CausalSelfAttention.forward</code>:</p>
+
+<pre><code>qkv = self.qkv(x)                                      # (B, T, 3d)
+q, k, v = qkv.chunk(3, dim=-1)                         # each (B, T, d)
+
+q = q.view(B, T, self.h, self.k).transpose(1, 2)       # (B, h, T, k)
+k = k.view(B, T, self.h, self.k).transpose(1, 2)       # (B, h, T, k)
+v = v.view(B, T, self.h, self.k).transpose(1, 2)       # (B, h, T, k)
+
+scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.k) # (B, h, T, T)
+scores = scores.masked_fill(self.causal_mask[:, :, :T, :T] == 0, float("-inf"))
+
+attn = F.softmax(scores, dim=-1)                       # (B, h, T, T)
+out  = attn @ v                                        # (B, h, T, k)
+out  = out.transpose(1, 2).contiguous().view(B, T, d)  # (B, T, d)
+return self.proj(out)                                  # (B, T, d)</code></pre>
+
+<h3>Why one fused QKV linear instead of three</h3>
+
+<p>The line <code>self.qkv = nn.Linear(d, 3*d, bias=False)</code> is not a stylistic choice — it is a hardware one. Three separate Linears would issue three GEMM kernel launches and read <code>x</code> from HBM three times. The fused Linear is one GEMM, one read of <code>x</code>, one write of <code>(B, T, 3d)</code>. Arithmetic intensity goes up, kernel-launch overhead goes down. The math is identical because three independent linears stacked output-wise <em>is</em> a single Linear of triple width.</p>
+
+<h3>Why split heads and transpose</h3>
+
+<p>After <code>chunk</code> we have <span class="math">q, k, v</span> each of shape <span class="math">(B, T, d)</span>. We want to do <span class="math">h</span> independent attention computations, each on dim-<span class="math">k</span> queries and keys. The trick is to reshape <span class="math">(B, T, d) → (B, T, h, k)</span> — same memory, just a different view — then transpose to <span class="math">(B, h, T, k)</span> so that the leading dims <span class="math">(B, h)</span> get batched over by the matmul, and the <em>tail</em> dims <span class="math">(T, k)</span> become the actual matrix being multiplied. A single <code>q @ k.transpose(-2, -1)</code> then produces <span class="math">(B, h, T, T)</span> in one shot.</p>
+
+<p>The transpose is what makes that batching work. After the matmul we transpose back and call <code>.contiguous()</code> before <code>.view</code>, because PyTorch's <code>view</code> cannot reinterpret strides that have been permuted — you need a contiguous buffer.</p>
+
+<h3>Why divide by √k</h3>
+
+<p>Suppose the entries of <span class="math">q</span> and <span class="math">k</span> are roughly i.i.d. with mean 0 and variance 1. Then the dot product of two <span class="math">k</span>-vectors is a sum of <span class="math">k</span> independent products, each with variance 1. The variance of the sum is <span class="math">k</span>; its standard deviation is <span class="math">√k</span>. Without the scaling, raw scores would grow as <span class="math">√k</span> on average. Plug that into a softmax: as scores get large, softmax becomes one-hot, and one-hot softmax has zero gradient. Training stalls.</p>
+
+<p>Dividing by <span class="math">√k</span> standardises score variance to <span class="math">O(1)</span> regardless of head dimension. The softmax stays in its informative regime (gradients of order 1), and you can change <span class="math">h</span> and <span class="math">k</span> without re-tuning anything else. This is one of the very few places in the architecture where a derivation, not an experiment, picks the constant.</p>
+
+<div class="callout">
+  <div class="label">Quick check</div>
+  Try removing the <span class="math">√k</span> divisor in your head. With <span class="math">d = 128</span> and <span class="math">h = 4</span> we have <span class="math">k = 32</span>. Score std without scaling is <span class="math">√32 ≈ 5.7</span>. After softmax, a single dominant logit of 5.7 above the rest gives <span class="math">e<sup>5.7</sup> ≈ 300×</span> the mass — already nearly one-hot. With <span class="math">/√k</span> applied, the std is 1, and softmax spreads weight broadly enough for the gradient signal to pass.
+</div>
+
+<h3>The causal mask</h3>
+
+<p>The causal mask is a lower-triangular matrix of 1s, broadcast as <span class="math">(1, 1, T<sub>max</sub>, T<sub>max</sub>)</span> so it fits the <span class="math">(B, h, T, T)</span> score tensor. Positions in the upper triangle get set to <span class="math">−∞</span> before the softmax, which makes the corresponding probabilities exactly zero. The mask is the entire reason this architecture can train <span class="math">B · T</span> next-token predictions in parallel: at every position <span class="math">t</span>, the model sees only positions <span class="math">≤ t</span>, so the prediction for <span class="math">t+1</span> never "cheats" by reading future tokens that the inference-time model will not have.</p>
+
+<svg viewBox="0 0 520 200" class="diagram" aria-label="Causal mask grid">
+  <g font-family="var(--mono)" font-size="13">
+    <text x="10" y="22" fill="var(--text-mute)" font-size="12">A 4×4 causal-mask grid. Row = query position t; column = key position j. ✓ = attended, ✗ = masked to −∞.</text>
+
+    <g transform="translate(40, 50)">
+      <!-- column headers -->
+      <text x="42"  y="-6" text-anchor="middle" fill="var(--text-mute)">j=0</text>
+      <text x="92"  y="-6" text-anchor="middle" fill="var(--text-mute)">j=1</text>
+      <text x="142" y="-6" text-anchor="middle" fill="var(--text-mute)">j=2</text>
+      <text x="192" y="-6" text-anchor="middle" fill="var(--text-mute)">j=3</text>
+      <!-- row headers -->
+      <text x="0" y="22"  text-anchor="end" fill="var(--text-mute)">t=0 </text>
+      <text x="0" y="52"  text-anchor="end" fill="var(--text-mute)">t=1 </text>
+      <text x="0" y="82"  text-anchor="end" fill="var(--text-mute)">t=2 </text>
+      <text x="0" y="112" text-anchor="end" fill="var(--text-mute)">t=3 </text>
+
+      <!-- row 0 -->
+      <rect x="20"  y="6"  width="44" height="22" fill="#dcfce7" stroke="#86efac"/><text x="42"  y="22" text-anchor="middle" fill="var(--ok)">✓</text>
+      <rect x="70"  y="6"  width="44" height="22" fill="#2a1418" stroke="#4a2028"/><text x="92"  y="22" text-anchor="middle" fill="var(--bad)">✗</text>
+      <rect x="120" y="6"  width="44" height="22" fill="#2a1418" stroke="#4a2028"/><text x="142" y="22" text-anchor="middle" fill="var(--bad)">✗</text>
+      <rect x="170" y="6"  width="44" height="22" fill="#2a1418" stroke="#4a2028"/><text x="192" y="22" text-anchor="middle" fill="var(--bad)">✗</text>
+      <!-- row 1 -->
+      <rect x="20"  y="36" width="44" height="22" fill="#dcfce7" stroke="#86efac"/><text x="42"  y="52" text-anchor="middle" fill="var(--ok)">✓</text>
+      <rect x="70"  y="36" width="44" height="22" fill="#dcfce7" stroke="#86efac"/><text x="92"  y="52" text-anchor="middle" fill="var(--ok)">✓</text>
+      <rect x="120" y="36" width="44" height="22" fill="#2a1418" stroke="#4a2028"/><text x="142" y="52" text-anchor="middle" fill="var(--bad)">✗</text>
+      <rect x="170" y="36" width="44" height="22" fill="#2a1418" stroke="#4a2028"/><text x="192" y="52" text-anchor="middle" fill="var(--bad)">✗</text>
+      <!-- row 2 -->
+      <rect x="20"  y="66" width="44" height="22" fill="#dcfce7" stroke="#86efac"/><text x="42"  y="82" text-anchor="middle" fill="var(--ok)">✓</text>
+      <rect x="70"  y="66" width="44" height="22" fill="#dcfce7" stroke="#86efac"/><text x="92"  y="82" text-anchor="middle" fill="var(--ok)">✓</text>
+      <rect x="120" y="66" width="44" height="22" fill="#dcfce7" stroke="#86efac"/><text x="142" y="82" text-anchor="middle" fill="var(--ok)">✓</text>
+      <rect x="170" y="66" width="44" height="22" fill="#2a1418" stroke="#4a2028"/><text x="192" y="82" text-anchor="middle" fill="var(--bad)">✗</text>
+      <!-- row 3 -->
+      <rect x="20"  y="96" width="44" height="22" fill="#dcfce7" stroke="#86efac"/><text x="42"  y="112" text-anchor="middle" fill="var(--ok)">✓</text>
+      <rect x="70"  y="96" width="44" height="22" fill="#dcfce7" stroke="#86efac"/><text x="92"  y="112" text-anchor="middle" fill="var(--ok)">✓</text>
+      <rect x="120" y="96" width="44" height="22" fill="#dcfce7" stroke="#86efac"/><text x="142" y="112" text-anchor="middle" fill="var(--ok)">✓</text>
+      <rect x="170" y="96" width="44" height="22" fill="#dcfce7" stroke="#86efac"/><text x="192" y="112" text-anchor="middle" fill="var(--ok)">✓</text>
+
+      <text x="260" y="22"  fill="var(--text-mute)" font-size="12">Position 0 sees only itself.</text>
+      <text x="260" y="52"  fill="var(--text-mute)" font-size="12">Position 1 sees 0 and itself.</text>
+      <text x="260" y="82"  fill="var(--text-mute)" font-size="12">Position 2 sees 0, 1, and itself.</text>
+      <text x="260" y="112" fill="var(--text-mute)" font-size="12">Position 3 sees the whole prefix.</text>
+    </g>
+  </g>
+</svg>
+
+<p>Without the mask, predicting <span class="math">x<sub>t+1</sub></span> from a context that includes <span class="math">x<sub>t+1</sub></span> itself is trivial — train loss would crash to zero on the spot, and the model would be useless at inference time, where future tokens do not exist yet. The mask is what makes "one forward pass = <span class="math">T</span> supervised targets" honest.</p>
+
+<h2>Multi-head attention: why split <span class="math">d</span> into <span class="math">h</span> heads</h2>
+
+<p>A single attention head with width <span class="math">d</span> can attend in one way at a time: a single similarity geometry, a single set of features that count as "relevant." Splitting the same <span class="math">d</span> into <span class="math">h</span> heads of width <span class="math">k = d / h</span> gives the model <em>h independent attention patterns</em>, mixed back together by the output projection <code>self.proj</code>.</p>
+
+<p>Empirically, heads specialise without being told to. The classic catalog (from interpretability work on GPT-2) includes "previous-token" heads that always copy from <span class="math">t − 1</span>, "duplicate-token" heads that copy the most recent occurrence of the current token, "induction" heads that complete patterns, and various long-range positional heads. The output projection <span class="math">W<sub>o</sub></span> is then in charge of <em>combining</em> these specialised channels into the next residual update.</p>
+
+<p>The FLOP cost is essentially the same as a single big head, because the dominant cost is the <span class="math">q · k<sup>⊤</sup></span> and <span class="math">attn · v</span> matmuls, and those scale with the <em>total</em> hidden dimension. Splitting just rearranges where the bytes go; it does not add work. So you get <span class="math">h</span> different attention patterns for free — a bargain so good it has no real competitor.</p>
+
+<h2>MLP: 4× expansion and GELU</h2>
+
+<p>After attention has moved information <em>between</em> positions, the MLP transforms features <em>at</em> each position independently:</p>
+
+<pre><code>self.fc   = nn.Linear(d, 4 * d)
+self.proj = nn.Linear(4 * d, d)
+# forward: proj(gelu(fc(x)))</code></pre>
+
+<p>Three points worth being explicit about.</p>
+
+<ol>
+  <li><strong>Per-position.</strong> No mixing across the sequence — that has already happened in attention. The MLP is just a 2-layer feedforward applied identically at every <span class="math">t</span>.</li>
+  <li><strong>4× expansion.</strong> The historical Transformer ratio. Wide enough that the nonlinearity has room to do useful work; narrow enough that the MLP does not dominate the parameter budget completely. Per block: attention has <span class="math">4 d<sup>2</sup></span> params (QKV + proj), MLP has <span class="math">8 d<sup>2</sup></span> (two Linears of width <span class="math">4d</span>). The MLP holds about <strong>2/3 of every block's weights</strong> — a fact people often miss.</li>
+  <li><strong>GELU, not ReLU.</strong> GELU is a smooth ReLU-like function: <span class="math">x · Φ(x)</span>. Smoothness gives non-zero gradient for small negative inputs, which empirically trains a little better than the hard ReLU bend, with negligible compute cost.</li>
+</ol>
+
+<p>Alternatives exist: SwiGLU (used in LLaMA) replaces GELU with a gated variant and tweaks the expansion to 8/3 to preserve param count. For a teaching codebase, the plain GELU + 4× recipe is one fewer moving part and the qualitative behaviour is the same.</p>
+
+<h2>Pre-norm vs post-norm residuals</h2>
+
+<p>The Transformer block is:</p>
+
+<pre><code>x = x + self.attn(self.ln1(x))
+x = x + self.mlp (self.ln2(x))</code></pre>
+
+<p>Note where the LayerNorm sits: <em>inside</em> the residual branch, applied to the input of each sub-layer. This is <strong>pre-norm</strong>. The original "Attention Is All You Need" paper used <strong>post-norm</strong>: <span class="math">x = LN(x + Attn(x))</span>, with LN <em>outside</em>. Both are common in writing; only one trains nicely at depth without warmup.</p>
+
+<svg viewBox="0 0 760 260" class="diagram" aria-label="Pre-norm vs post-norm">
+  <defs>
+    <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/>
+    </marker>
+  </defs>
+
+  <g>
+    <text x="190" y="22" text-anchor="middle" font-size="14" font-weight="600">pre-norm (used here)</text>
+    <rect class="node-bg" x="100" y="40"  width="180" height="34" rx="6"/>
+    <text x="190" y="62" text-anchor="middle" font-size="12">input  x</text>
+    <path class="edge" d="M190 74 L190 100" marker-end="url(#arr2)"/>
+    <rect class="node-bg" x="100" y="100" width="180" height="34" rx="6"/>
+    <text x="190" y="122" text-anchor="middle" font-size="12">LayerNorm</text>
+    <path class="edge" d="M190 134 L190 160" marker-end="url(#arr2)"/>
+    <rect class="node-bg" x="100" y="160" width="180" height="34" rx="6"/>
+    <text x="190" y="182" text-anchor="middle" font-size="12">Attn / MLP</text>
+    <path class="edge" d="M190 194 L190 220" marker-end="url(#arr2)"/>
+    <rect class="node-bg" x="100" y="220" width="180" height="34" rx="6"/>
+    <text x="190" y="242" text-anchor="middle" font-size="12">+   (residual add)</text>
+
+    <!-- residual skip arrow on the right -->
+    <path class="edge" d="M280 57 C 330 57, 330 237, 280 237" marker-end="url(#arr2)"/>
+    <text x="335" y="150" font-size="11" fill="var(--text-mute)">residual</text>
+  </g>
+
+  <g>
+    <text x="570" y="22" text-anchor="middle" font-size="14" font-weight="600">post-norm (original)</text>
+    <rect class="node-bg" x="480" y="40"  width="180" height="34" rx="6"/>
+    <text x="570" y="62" text-anchor="middle" font-size="12">input  x</text>
+    <path class="edge" d="M570 74 L570 100" marker-end="url(#arr2)"/>
+    <rect class="node-bg" x="480" y="100" width="180" height="34" rx="6"/>
+    <text x="570" y="122" text-anchor="middle" font-size="12">Attn / MLP</text>
+    <path class="edge" d="M570 134 L570 160" marker-end="url(#arr2)"/>
+    <rect class="node-bg" x="480" y="160" width="180" height="34" rx="6"/>
+    <text x="570" y="182" text-anchor="middle" font-size="12">+   (residual add)</text>
+    <path class="edge" d="M570 194 L570 220" marker-end="url(#arr2)"/>
+    <rect class="node-bg" x="480" y="220" width="180" height="34" rx="6"/>
+    <text x="570" y="242" text-anchor="middle" font-size="12">LayerNorm</text>
+
+    <path class="edge" d="M660 57 C 710 57, 710 177, 660 177" marker-end="url(#arr2)"/>
+    <text x="715" y="120" font-size="11" fill="var(--text-mute)">residual</text>
+  </g>
+</svg>
+
+<p>The difference matters because of how the residual stream grows with depth. In pre-norm, each block adds an LN-normalised perturbation to <span class="math">x</span>: the residual stream's variance grows at most linearly in <span class="math">L</span>, and the final <code>ln_f</code> renormalises before the head. In post-norm, the LN comes <em>after</em> the addition, so the gradient that flows back through the residual passes through <span class="math">L</span> LayerNorms in series — small Jacobian errors compound, the early-layer gradients become tiny or huge, and you need an LR warmup to keep things sane (Xiong et al., 2020, gives the explicit signal-propagation analysis).</p>
+
+<p>Pre-norm is the default in every modern LLM (GPT-2 was the inflection point). The cost is essentially zero — same params, same flops — and it removes the warmup hyperparameter, which is the kind of "free" you take.</p>
+
+<h2>Weight tying: the head is the embedding</h2>
+
+<p>Look at the model's <code>__init__</code>:</p>
+
+<pre><code>self.head = nn.Linear(d, vocab, bias=False)
+self.head.weight = self.tok_emb.weight                 # share storage</code></pre>
+
+<p>Two operations, one weight matrix. The embedding maps a token id to a <span class="math">d</span>-vector by looking up a row of <span class="math">W<sub>te</sub></span>. The head maps a <span class="math">d</span>-vector to logits over the vocabulary by multiplying by <span class="math">W<sub>te</sub><sup>⊤</sup></span>. Sharing the storage cuts <span class="math">V · d</span> parameters and empirically improves perplexity. Why?</p>
+
+<ul>
+  <li><strong>Same semantics.</strong> The input and output spaces are the same vocabulary — the same tokens. The "vector for token <span class="math">v</span>" should be the same thing whether you are reading <span class="math">v</span> in or trying to predict <span class="math">v</span> out.</li>
+  <li><strong>Better gradient flow.</strong> Every output prediction provides gradient signal to the embedding row for the predicted token — at every position, for every example. The matrix gets vastly more updates than under separate parameterisation.</li>
+  <li><strong>Regularising effect.</strong> The shared parameterisation prevents the model from learning two unrelated representations and reduces the effective number of free parameters where it matters least.</li>
+</ul>
+
+<p>The trade-off is rigidity: if you want a different output vocabulary from your input vocabulary (some translation setups), you cannot tie. For a same-vocab LM it is essentially always a win.</p>
+
+<h2>Init std 0.02</h2>
+
+<p>From <code>_init_weights</code>:</p>
+
+<pre><code>nn.init.normal_(m.weight, mean=0.0, std=0.02)</code></pre>
+
+<p>This is smaller than Kaiming's <span class="math">√(2/d)</span> — for <span class="math">d = 128</span>, Kaiming would give std <span class="math">≈ 0.125</span>, six times larger. The reason: in a deep residual stack, every block adds a perturbation whose magnitude scales with the magnitudes of its weights. Pile up <span class="math">L</span> such additions and a Kaiming-scale init can blow up the residual stream's variance, especially in attention's value path. Small-std init keeps everything calm at step 0 and lets the optimizer find a good scale.</p>
+
+<p>GPT-2 actually goes one step further: it rescales the residual-projection weights (<code>self.proj</code> in attention and MLP) by an additional <span class="math">1/√(2L)</span>. The idea is to make the contribution of each layer's residual branch scale-stable with depth. We omit that refinement in this codebase to keep the init function one clean rule — it costs a little stability at very large <span class="math">L</span> but is invisible at <span class="math">L = 4</span>.</p>
+
+<h2>Parameter accounting</h2>
+
+<p>How big is this thing, and where do the parameters live? Let us count by hand, then check against the calculator below.</p>
+
+<table>
+  <thead><tr><th>component</th><th>params</th><th>note</th></tr></thead>
+  <tbody>
+    <tr><td>token embedding W<sub>te</sub></td><td>V·d</td><td>shared with head</td></tr>
+    <tr><td>position embedding W<sub>pe</sub></td><td>T<sub>max</sub>·d</td><td></td></tr>
+    <tr><td>per block: qkv Linear</td><td>3·d·d = 3d²</td><td>fused</td></tr>
+    <tr><td>per block: attn proj</td><td>d·d = d²</td><td></td></tr>
+    <tr><td>per block: MLP fc</td><td>d·4d + 4d = 4d² + 4d</td><td>bias on</td></tr>
+    <tr><td>per block: MLP proj</td><td>4d·d + d = 4d² + d</td><td>bias on</td></tr>
+    <tr><td>per block: 2× LayerNorm</td><td>4d</td><td>γ, β each (d,)</td></tr>
+    <tr><td>final LayerNorm</td><td>2d</td><td></td></tr>
+    <tr><td>head</td><td>0</td><td>tied to W<sub>te</sub></td></tr>
+  </tbody>
+</table>
+
+<p>Per block: <span class="math">3d² + d² + 4d² + 4d² + O(d) = 12d² + O(d)</span>. Total: <span class="math">N ≈ V·d + T<sub>max</sub>·d + L · 12 d² + O(L·d)</span>.</p>
+
+<p>For the SFT toy task with <span class="math">d = 128, h = 4, L = 4, V = 29, T<sub>max</sub> = 11</span>:</p>
+
+<ul>
+  <li>W<sub>te</sub>: 29 · 128 = <strong>3,712</strong></li>
+  <li>W<sub>pe</sub>: 11 · 128 = <strong>1,408</strong></li>
+  <li>Per block: 12 · 128² + O(d) ≈ 12 · 16,384 + a few hundred ≈ <strong>197,000</strong></li>
+  <li>Four blocks: ≈ <strong>787,000</strong></li>
+  <li>Total: ≈ <strong>793,000 params</strong> — under 1M, fits in a CPU cache, trains in minutes.</li>
+</ul>
+
+<p>Crucially, the <em>block</em> parameters dominate by roughly 150×. Embeddings barely matter at this size. As you scale <span class="math">d</span>, the <span class="math">L · 12 d²</span> term grows quadratically while the embedding terms grow linearly — eventually almost everything is "in the blocks."</p>
+
+<h2>Interactive: shape calculator and parameter counter</h2>
+
+<p>Move the sliders. Watch every intermediate tensor shape, the per-component parameter count, the rough forward-pass FLOPs, and the causal-mask heatmap update in real time. The constraint <span class="math">d</span> mod <span class="math">h = 0</span> is enforced — when you change <span class="math">d</span>, <span class="math">h</span> is snapped to a divisor.</p>
+
+<div class="widget" id="shape-widget">
+  <div class="title">Forward-pass shapes and parameter counts</div>
+  <div class="hint">Embedding shapes are blue, attention shapes are orange, MLP shapes are green, head shapes are purple. The FLOPs estimate uses the Chinchilla-style "2N per token" rule for inference and "6N per token" for training; it ignores the attention quadratic term in T, which becomes significant only for T comparable to d.</div>
+
+  <div class="controls">
+    <label class="inline">B: <input type="range" id="sl-B" min="1" max="64" step="1" value="8"> <span class="val" id="v-B">8</span></label>
+    <label class="inline">T: <input type="range" id="sl-T" min="1" max="64" step="1" value="11"> <span class="val" id="v-T">11</span></label>
+    <label class="inline">d: <input type="range" id="sl-d" min="32" max="512" step="32" value="128"> <span class="val" id="v-d">128</span></label>
+    <label class="inline">h: <input type="range" id="sl-h" min="1" max="16" step="1" value="4"> <span class="val" id="v-h">4</span></label>
+    <label class="inline">L: <input type="range" id="sl-L" min="1" max="12" step="1" value="4"> <span class="val" id="v-L">4</span></label>
+    <label class="inline">V: <input type="range" id="sl-V" min="8" max="256" step="1" value="29"> <span class="val" id="v-V">29</span></label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">k = d/h</div><div class="v" id="kpi-k">32</div></div>
+    <div class="kpi"><div class="k">Total params</div><div class="v" id="kpi-N">—</div></div>
+    <div class="kpi"><div class="k">Forward FLOPs / token</div><div class="v" id="kpi-fwd">—</div></div>
+    <div class="kpi"><div class="k">Train FLOPs / token</div><div class="v" id="kpi-train">—</div></div>
+  </div>
+
+  <div style="display:grid; grid-template-columns: 1fr 200px; gap: 18px; margin-top: 10px;">
+    <div>
+      <div style="font-size: 12px; color: var(--text-mute); font-family: var(--mono); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px;">Forward-pass shapes</div>
+      <pre style="margin:0;" id="shape-list"></pre>
+      <div style="font-size: 12px; color: var(--text-mute); font-family: var(--mono); text-transform: uppercase; letter-spacing: 0.06em; margin: 16px 0 4px;">Per-component parameters</div>
+      <pre style="margin:0;" id="param-list"></pre>
+    </div>
+    <div>
+      <div style="font-size: 12px; color: var(--text-mute); font-family: var(--mono); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px;">Causal mask  (T × T)</div>
+      <canvas id="mask-canvas" width="200" height="200" style="width:200px; height:200px; background: var(--code-bg); border:1px solid var(--border); border-radius:6px; display:block;"></canvas>
+      <div id="mask-caption" style="font-size:11px; color: var(--text-mute); margin-top:6px; font-family: var(--mono);">green = attended · grey = masked</div>
+    </div>
+  </div>
+</div>
+
+<div class="callout warn">
+  <div class="label">When the "2N per token" rule breaks</div>
+  The Chinchilla rule counts dense-linear FLOPs and ignores attention's <span class="math">O(T<sup>2</sup>)</span> term. For our toy <span class="math">T = 11, d = 128</span>, attention is a rounding error. For <span class="math">T = 4096, d = 4096</span>, attention can dominate. Whenever <span class="math">T</span> approaches <span class="math">d</span> the rule starts to under-count; for production reasoning models with long contexts this matters and a full FLOP count keeps both terms.
+</div>
+
+<h2>The design space, in one table</h2>
+
+<p>Every choice above had a reasonable alternative. Here is the trade-off matrix to keep next to you when you read other codebases.</p>
+
+<table>
+  <thead><tr><th>choice in <code>model.py</code></th><th>alternative</th><th>why we picked this one</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>learned positions, T<sub>max</sub> fixed</td>
+      <td>sinusoidal · RoPE · ALiBi</td>
+      <td>simplest; toy seqs fit. Swap to RoPE for length extrapolation.</td>
+    </tr>
+    <tr>
+      <td>tied unembedding (head = W<sub>te</sub>)</td>
+      <td>separate head matrix</td>
+      <td>fewer params, better PPL, same-vocab in/out.</td>
+    </tr>
+    <tr>
+      <td>pre-norm</td>
+      <td>post-norm</td>
+      <td>trainable without warmup, stable at depth.</td>
+    </tr>
+    <tr>
+      <td>MLP 4× expansion, GELU</td>
+      <td>SwiGLU 8/3× · ReLU · GeGLU</td>
+      <td>simplest recipe, qualitatively identical at this scale.</td>
+    </tr>
+    <tr>
+      <td>bias=False on qkv & proj</td>
+      <td>bias=True</td>
+      <td>biases barely help in attention; saves a few params.</td>
+    </tr>
+    <tr>
+      <td>init std 0.02 flat</td>
+      <td>0.02 + 1/√(2L) on residual projs</td>
+      <td>at L=4 the refinement is invisible; we drop it for clarity.</td>
+    </tr>
+    <tr>
+      <td>fused qkv Linear (d→3d)</td>
+      <td>3 separate Linears</td>
+      <td>one GEMM, one HBM read of x.</td>
+    </tr>
+    <tr>
+      <td>F.softmax + masked_fill</td>
+      <td>FlashAttention / SDPA</td>
+      <td>readable; production stacks use the fused op for memory.</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Every shape in this architecture serves the same goal: compute <span class="math">p(x<sub>t</sub> | x<sub>&lt;t</sub>)</span> for every <span class="math">t</span> in parallel, cheaply, and stably enough that gradient descent can drive the log-likelihood down. Pre-norm + weight tying + √k scaling + the causal mask are the four design choices that make that goal reachable at depth.
+</div>
+
+<h2>Where this lesson sits in the pipeline</h2>
+
+<p>Take a step back. The next five lessons — pretrain, SFT, CoT, DPO, RLVR — all run <em>this same architecture</em>. They differ only in two ways:</p>
+
+<ol>
+  <li><strong>The data.</strong> Raw corpus → (prompt, response) pairs → (prompt, reasoning+answer) → (prompt, y<sub>w</sub>, y<sub>l</sub>) preference pairs → (prompt, rolled-out completion, verifier score).</li>
+  <li><strong>The positions that count in the loss.</strong> All positions → response positions only → response positions only → preference-pair logratios → reward-weighted log-probs of response tokens with a KL anchor.</li>
+</ol>
+
+<p>The architecture is fixed. The post-training story is, line for line, about what you put into <code>idx</code> and which entries of <code>logits</code> you turn into a loss. Holding that separation in your head is what makes the whole pipeline tellable as a linear story.</p>
+
+<p>In the next lesson, we will see this architecture trained on raw text with the dense cross-entropy loss — and watch the per-character probability distribution sharpen as compression discovers grammar, then arithmetic, then structure. That is pretraining.</p>
+
+<footer class="lesson-nav">
+  <a href="index.html">
+    <span class="dir">← Index</span>
+    <span class="ttl">All lessons</span>
+  </a>
+  <a class="next" href="02_pretrain.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">02 · Pretrain — next-token prediction</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const slB = document.getElementById('sl-B');
+  const slT = document.getElementById('sl-T');
+  const slD = document.getElementById('sl-d');
+  const slH = document.getElementById('sl-h');
+  const slL = document.getElementById('sl-L');
+  const slV = document.getElementById('sl-V');
+  const vB = document.getElementById('v-B');
+  const vT = document.getElementById('v-T');
+  const vD = document.getElementById('v-d');
+  const vH = document.getElementById('v-h');
+  const vL = document.getElementById('v-L');
+  const vV = document.getElementById('v-V');
+
+  const kpiK     = document.getElementById('kpi-k');
+  const kpiN     = document.getElementById('kpi-N');
+  const kpiFwd   = document.getElementById('kpi-fwd');
+  const kpiTrain = document.getElementById('kpi-train');
+  const shapeEl  = document.getElementById('shape-list');
+  const paramEl  = document.getElementById('param-list');
+  const maskCv   = document.getElementById('mask-canvas');
+  const maskCtx  = maskCv.getContext('2d');
+  const maskCap  = document.getElementById('mask-caption');
+
+  // colour codes by category (matches text in the hint)
+  const C = {
+    emb:  '#2563eb',   // blue
+    attn: '#d97706',   // orange
+    mlp:  '#16a34a',   // green
+    head: '#7c3aed',   // purple
+    mute: '#5b6573',
+  };
+
+  // Snap h to a divisor of d. Prefer the slider value; fall back to highest divisor ≤ value.
+  function snapH(d, want){
+    const divisors = [];
+    for (let i = 1; i <= 16 && i <= d; i++) if (d % i === 0) divisors.push(i);
+    if (divisors.includes(want)) return want;
+    let best = divisors[0];
+    for (const x of divisors) if (Math.abs(x - want) < Math.abs(best - want)) best = x;
+    return best;
+  }
+
+  function fmt(n){
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + 'G';
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(2) + 'K';
+    return n.toString();
+  }
+
+  function row(color, label, shape){
+    return '<span style="color:' + color + '">' +
+           label.padEnd(14) + '</span>' +
+           '<span style="color:' + C.mute + '">' + shape + '</span>';
+  }
+  function prow(color, label, n){
+    return '<span style="color:' + color + '">' +
+           label.padEnd(20) + '</span>' +
+           '<span style="color:' + C.mute + '">' + fmt(n).padStart(10) + '   (' + n.toLocaleString() + ')</span>';
+  }
+
+  function drawMask(T){
+    const W = maskCv.width, H = maskCv.height;
+    maskCtx.clearRect(0, 0, W, H);
+    const cell = Math.min(W, H) / T;
+    for (let r = 0; r < T; r++){
+      for (let c = 0; c < T; c++){
+        maskCtx.fillStyle = (c <= r) ? '#1b4030' : '#1f242f';
+        maskCtx.fillRect(c * cell, r * cell, Math.max(1, cell - 1), Math.max(1, cell - 1));
+      }
+    }
+    maskCap.textContent = 'green = attended · grey = masked   (T=' + T + ', cells=' + (T*T) + ')';
+  }
+
+  function recompute(){
+    let B = +slB.value, T = +slT.value, d = +slD.value, h = +slH.value, L = +slL.value, V = +slV.value;
+    h = snapH(d, h);
+    slH.value = h;
+
+    const k = d / h;
+
+    vB.textContent = B;
+    vT.textContent = T;
+    vD.textContent = d;
+    vH.textContent = h;
+    vL.textContent = L;
+    vV.textContent = V;
+    kpiK.textContent = k;
+
+    // ── Shapes ──
+    const lines = [];
+    lines.push(row(C.emb,  'idx',         '(' + B + ', ' + T + ')'));
+    lines.push(row(C.emb,  'tok_emb',     '(' + B + ', ' + T + ', ' + d + ')'));
+    lines.push(row(C.emb,  'pos_emb',     '   ' + '(' + T + ', ' + d + ')'));
+    lines.push(row(C.emb,  'x  (in)',     '(' + B + ', ' + T + ', ' + d + ')'));
+    lines.push(row(C.attn, 'qkv',         '(' + B + ', ' + T + ', ' + (3*d) + ')'));
+    lines.push(row(C.attn, 'q / k / v',   '(' + B + ', ' + h + ', ' + T + ', ' + k + ')'));
+    lines.push(row(C.attn, 'scores',      '(' + B + ', ' + h + ', ' + T + ', ' + T + ')'));
+    lines.push(row(C.attn, 'attn',        '(' + B + ', ' + h + ', ' + T + ', ' + T + ')'));
+    lines.push(row(C.attn, 'attn·v',      '(' + B + ', ' + h + ', ' + T + ', ' + k + ')'));
+    lines.push(row(C.attn, 'merge',       '(' + B + ', ' + T + ', ' + d + ')'));
+    lines.push(row(C.attn, 'attn out',    '(' + B + ', ' + T + ', ' + d + ')'));
+    lines.push(row(C.mlp,  'mlp fc',      '(' + B + ', ' + T + ', ' + (4*d) + ')'));
+    lines.push(row(C.mlp,  'mlp proj',    '(' + B + ', ' + T + ', ' + d + ')'));
+    lines.push(row(C.head, 'ln_f',        '(' + B + ', ' + T + ', ' + d + ')'));
+    lines.push(row(C.head, 'logits',      '(' + B + ', ' + T + ', ' + V + ')'));
+    shapeEl.innerHTML = lines.join('\n');
+
+    // ── Params ──
+    const p_tok   = V * d;
+    const p_pos   = 64 * d; // pos_emb is (T_max, d) — fixed at the model's max context, not T
+    const p_attn_block = 3*d*d + d*d;                  // fused qkv + proj (no bias)
+    const p_mlp_block  = d*(4*d) + (4*d) + (4*d)*d + d; // fc + bias + proj + bias
+    const p_ln_block   = 4*d;                           // 2 LN × (γ,β)
+    const p_block      = p_attn_block + p_mlp_block + p_ln_block;
+    const p_blocks     = L * p_block;
+    const p_lnf        = 2*d;
+    // head tied → 0
+    const N = p_tok + p_pos + p_blocks + p_lnf;
+
+    const plines = [];
+    plines.push(prow(C.emb,  'tok_emb (V·d)',      p_tok));
+    plines.push(prow(C.emb,  'pos_emb (T_max·d)',  p_pos));
+    plines.push(prow(C.attn, 'attn / block',       p_attn_block));
+    plines.push(prow(C.mlp,  'mlp  / block',       p_mlp_block));
+    plines.push(prow(C.head, 'LN   / block',       p_ln_block));
+    plines.push(prow(C.head, 'all blocks (×L)',    p_blocks));
+    plines.push(prow(C.head, 'ln_f',               p_lnf));
+    plines.push(prow(C.head, 'head (tied)',        0));
+    paramEl.innerHTML = plines.join('\n');
+
+    kpiN.textContent     = fmt(N);
+
+    // Chinchilla-style FLOPs per token.
+    const fwd_per_tok   = 2 * N;
+    const train_per_tok = 6 * N;
+    kpiFwd.textContent   = fmt(fwd_per_tok);
+    kpiTrain.textContent = fmt(train_per_tok);
+
+    drawMask(Math.min(T, 32));
+  }
+
+  [slB, slT, slD, slH, slL, slV].forEach(s => s.addEventListener('input', recompute));
+  recompute();
+})();
+</script>
+
+</body>
+</html>

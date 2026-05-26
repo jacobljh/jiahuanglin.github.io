@@ -1,0 +1,781 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>11 · Inference — TP vs replication</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">11 · TP vs replication</span>
+    <span class="step-pill">lesson 11 / 19</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Inference — TP for latency, replicas for throughput</h1>
+<p class="subtitle">Same hardware, opposite goals. Training cares about the gradient AllReduce; inference cares about per-token decode time. The math behind "TP=8 or 8× replicas?" comes down to whether the workload is memory-bound or compute-bound.</p>
+
+<h2>What changes at inference time</h2>
+
+<p>Training is dominated by big batches doing big matmuls — comfortably compute-bound (above the roofline ridge, lesson 01). Inference splits into two regimes:</p>
+
+<ul>
+  <li><strong>Prefill.</strong> One forward pass on the full prompt. The matmul operates on <span class="math">(B, T_prefill, d)</span>; arithmetic intensity is high; <strong>compute-bound</strong>, exactly like training.</li>
+  <li><strong>Decode.</strong> One forward pass per generated token. The input is <span class="math">(B, 1, d)</span>. The KV cache from previous tokens grows but the new query is just one token. Arithmetic intensity is <em>low</em>: per parameter read, only one multiply-add per sample in the batch. <strong>Memory-bound</strong>: you spend all your time reading weights from HBM.</li>
+</ul>
+
+<p>This is the core asymmetry. Training and prefill scale on compute; decode scales on HBM bandwidth. Most of inference's tokens-per-second is set by decode. So the question becomes: <em>how fast can we read weights from HBM, per output token, per request?</em></p>
+
+<h2>The decode latency calculation</h2>
+
+<p>Per token, you read every weight once. For a 70B bf16 model, that's 140 GB. On one H100 at 3.35 TB/s HBM bandwidth, the absolute minimum per-token time is:</p>
+
+<div class="math block">
+  t_token_min &nbsp;=&nbsp; |weights_in_bytes| / HBM_BW &nbsp;=&nbsp; 140 / 3350 ≈ <strong>42 ms</strong>
+</div>
+
+<p>That's <strong>24 tokens/sec, single GPU, single request, peak bandwidth utilization</strong>. In practice you achieve ~60–80% of that.</p>
+
+<p>Now use TP=8. The weight read is spread across 8 GPUs' HBM bandwidths: each one reads only 1/8 of the weights, so the read time drops by 8×. The cost is a per-layer AllReduce, which on NVLink is tiny relative to the saving. New per-token time:</p>
+
+<div class="math block">
+  t_token_TP=8 &nbsp;=&nbsp; 140 / (8 · 3350) + small_AR ≈ <strong>5–6 ms</strong>
+</div>
+
+<p>Roughly an 8× latency improvement. But the per-token <em>throughput per GPU</em> is unchanged: TP=8 uses 8× the GPUs to serve one request 8× faster. From the cluster's point of view, it's the same total work.</p>
+
+<h2>Animated · one decode token, bytes flowing from HBM</h2>
+
+<p>Pick a TP degree and watch where the bytes physically come from. At TP=1, a single GPU streams the entire <span class="math">140 GB</span> of weights through its HBM bus, layer by layer. At TP=8, each of the 8 GPUs reads only its 1/8 shard — in parallel, eight times faster. Each blue particle is a chunk of weights moving from HBM into a tensor-core compute unit.</p>
+
+<div class="widget" id="hbmflow-widget">
+  <div class="title">HBM → compute · weight bytes per decode step</div>
+  <div class="hint">The horizontal lane is one GPU's HBM bus. Particles flow from HBM (left) into the SM (right) at a rate set by HBM bandwidth. TP=N puts N lanes in parallel — each carries 1/N of the bytes.</div>
+
+  <div class="controls">
+    <label class="inline">TP: <input type="range" id="hf-tp" min="0" max="3" step="1" value="0"> <span class="val" id="hf-tp-v">1</span></label>
+    <label class="inline">model (B): <input type="range" id="hf-p" min="7" max="200" step="1" value="70"> <span class="val" id="hf-p-v">70</span></label>
+    <button id="hf-play" class="primary">▶ play</button>
+    <button id="hf-reset">⟲ reset</button>
+  </div>
+
+  <canvas id="hf-canvas" width="760" height="320" style="width:100%; height:320px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">bytes per GPU</div><div class="v" id="hf-bpg">—</div></div>
+    <div class="kpi"><div class="k">elapsed (modeled)</div><div class="v" id="hf-el">—</div></div>
+    <div class="kpi"><div class="k">token complete?</div><div class="v" id="hf-done" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">speedup vs TP=1</div><div class="v" id="hf-sp">—</div></div>
+  </div>
+</div>
+
+<h2>Throughput vs latency — the choice</h2>
+
+<p>Now consider a serving fleet with 8 GPUs and two options:</p>
+
+<table>
+  <thead><tr><th>Option</th><th>Latency / request</th><th>Per-GPU throughput, batch=1 (tok/s)</th></tr></thead>
+  <tbody>
+    <tr><td>1 replica TP=8</td><td>~5 ms/tok (8× faster)</td><td>~24 tok/s (unchanged)</td></tr>
+    <tr><td>8 replicas TP=1</td><td>~42 ms/tok</td><td>~24 tok/s (unchanged)</td></tr>
+  </tbody>
+</table>
+
+<p>(Both shapes batch many concurrent requests in production — we'll bring that in below. At batch=1, the table compares the single-stream extreme.)</p>
+
+<p>The two options give the <em>same total tokens-per-second</em>. What differs is how they're allocated: TP=8 lets each request run faster; replication lets more requests run simultaneously. <strong>Pick by what matters.</strong> Latency-sensitive workloads (chat, autocomplete, coding agents) want TP high. Bulk-throughput workloads (batched embedding, document processing) want replication high.</p>
+
+<h2>The catch — batching changes the math</h2>
+
+<p>The single-stream comparison above assumes batch = 1. As you batch more requests onto the same forward pass, the per-token cost goes up only slightly (you do more arithmetic but read the same weights), so the cost per request <em>drops</em>. With batch <span class="math">B</span> = 32 sharing the same forward:</p>
+
+<div class="math block">
+  cost_per_request &nbsp;≈&nbsp; t_token_single / B &nbsp;+&nbsp; small_per_request_overhead
+</div>
+
+<p>Decode batching, plus continuous batching (lesson 04 in the vLLM series), is what makes shared GPU serving economical. The TP-vs-replicas question becomes: with batching, is one TP=8 replica running batch 32 cheaper than 8 TP=1 replicas each running batch 32? In wall-clock per request: the TP=8 replica is still ~8× faster (memory-bound dynamics survive batching for a while). In total cluster throughput: roughly equal again — the GPU work is the same, just spread.</p>
+
+<p>So the right framing: at any batch size, TP and replication trade <em>latency for parallelism</em>, not for total throughput. The exception is when batching itself becomes a constraint:</p>
+
+<ul>
+  <li><strong>HBM budget for KV cache.</strong> Bigger batches need more KV-cache slots. With TP, each rank only holds 1/N of the KV cache (sharded across heads, as in lesson 09 of the vLLM series). So TP <em>increases effective KV capacity</em> per replica — useful for long-context workloads. The GQA wrinkle from lesson 06 applies: TP can't exceed the KV-head count, so a model with 8 KV heads (Llama-3-70B) caps at TP=8 for honest KV sharding; further TP would replicate KV state and undo the capacity win.</li>
+  <li><strong>Time-to-first-token (TTFT).</strong> Prefill is compute-bound and benefits from TP linearly (in compute, not memory). Workloads with very long prompts (RAG, code repos) get TP gains on both prefill and decode.</li>
+</ul>
+
+<h2>PP is rare at inference time, here's why</h2>
+
+<p>PP across the layers of a model adds a per-stage bubble at inference: a single request must walk all N stages sequentially, paying <span class="math">N - 1</span> stage-time of bubble before its first token comes out. For chat use cases (TTFT &lt; 500 ms), this is too high a price. PP shows up at inference only in two cases:</p>
+<ul>
+  <li>The model is so big a TP-maxed-out node still can't fit it. You add PP across nodes as a last resort.</li>
+  <li>Throughput-only workloads with no TTFT constraint, where you can fill the pipeline with many concurrent requests.</li>
+</ul>
+
+<h2>The decision table</h2>
+
+<table>
+  <thead><tr><th>Workload</th><th>Right answer</th></tr></thead>
+  <tbody>
+    <tr><td>Chat, code complete (latency king, batch small)</td><td>TP high (4–8), replicas to fit QPS</td></tr>
+    <tr><td>Bulk inference (no per-request latency budget)</td><td>TP low (1–2), many replicas, big batch</td></tr>
+    <tr><td>Long-context RAG (prefill heavy)</td><td>TP high for prefill, replicas for QPS</td></tr>
+    <tr><td>MoE serving (huge total weights)</td><td>EP across GPUs, TP=1, replicas for QPS</td></tr>
+    <tr><td>Single-GPU-fits dense model</td><td>TP=1, just replicate</td></tr>
+  </tbody>
+</table>
+
+<h2>TP at serving differs from TP at training</h2>
+
+<p>Two subtle differences:</p>
+
+<ol>
+  <li><strong>No backward.</strong> No gradient AllReduce. The per-step comm cost drops by 2× compared to training, since training also pays the symmetric AllReduce in backward.</li>
+  <li><strong>The per-step compute is smaller</strong> (batch is smaller, sequence dim is smaller during decode). So the comm/compute ratio at decode is <em>worse</em> than at training — TP's AllReduces become a larger fraction of the time. Modern serving stacks (vLLM, TRT-LLM) work hard to fuse the AllReduce into the matmul kernel where possible to hide it.</li>
+</ol>
+
+<p>This is why some serving stacks use TP=4 even when TP=8 would be available — the marginal latency improvement saturates because the AllReduce cost is no longer dwarfed by compute.</p>
+
+<h2>Animated · Amdahl ladder · TP scaling, sublinear because of comm</h2>
+
+<p>Pure HBM-bandwidth math says decode latency falls linearly with TP. In practice the curve flattens because (a) every TP step costs an AllReduce on NVLink, (b) at higher batch sizes some of the work becomes compute-bound and stops benefiting from more HBM lanes. The widget below traces latency as you sweep TP from 1 to 16; move the batch-size slider to watch the curve bend.</p>
+
+<div class="widget" id="amd-widget">
+  <div class="title">Decode latency vs TP · batched and unbatched</div>
+  <div class="hint">Dashed: ideal Amdahl curve (latency / TP). Solid: realistic curve with AllReduce overhead + a per-token compute floor that grows with batch size.</div>
+
+  <div class="controls">
+    <label class="inline">batch: <input type="range" id="am-b" min="1" max="128" step="1" value="1"> <span class="val" id="am-b-v">1</span></label>
+    <label class="inline">model (B): <input type="range" id="am-p" min="7" max="400" step="1" value="70"> <span class="val" id="am-p-v">70</span></label>
+    <label class="inline">NVLink (GB/s): <input type="range" id="am-nv" min="100" max="1800" step="50" value="900"> <span class="val" id="am-nv-v">900</span></label>
+  </div>
+
+  <canvas id="am-canvas" width="760" height="280" style="width:100%; height:280px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">latency @ TP=1</div><div class="v" id="am-l1">—</div></div>
+    <div class="kpi"><div class="k">latency @ TP=8</div><div class="v" id="am-l8">—</div></div>
+    <div class="kpi"><div class="k">marginal gain TP=4→8</div><div class="v" id="am-m48" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">comm fraction @ TP=8</div><div class="v" id="am-cf" style="font-size:14px;">—</div></div>
+  </div>
+</div>
+
+<h2>2D · choose your (TP, replicas) point on the frontier</h2>
+
+<p>Below is the same throughput-vs-latency frontier as the original widget, but interactive: pick a TP degree and a number of replicas with the sliders. The chosen point is highlighted; nearby alternatives are dim. Configs whose per-rank KV-cache exceeds HBM are <strong>greyed out as infeasible</strong>. The Pareto front is the chain in green.</p>
+
+<div class="widget" id="frontier-widget">
+  <div class="title">Pareto explorer · pick TP and replicas</div>
+  <div class="hint">Per-rank KV-cache budget = HBM − weight shard. Configs whose batch × seq pushes past this are infeasible (X marker). Move sliders to position yourself on the frontier.</div>
+
+  <div class="controls">
+    <label class="inline">TP: <input type="range" id="fr-tp" min="0" max="3" step="1" value="2"> <span class="val" id="fr-tp-v">4</span></label>
+    <label class="inline">replicas: <input type="range" id="fr-rep" min="1" max="32" step="1" value="4"> <span class="val" id="fr-rep-v">4</span></label>
+    <label class="inline">target seq: <input type="range" id="fr-seq" min="1024" max="32768" step="1024" value="4096"> <span class="val" id="fr-seq-v">4096</span></label>
+    <label class="inline">batch / replica: <input type="range" id="fr-b" min="1" max="64" step="1" value="16"> <span class="val" id="fr-b-v">16</span></label>
+  </div>
+
+  <canvas id="fr-canvas" width="760" height="320" style="width:100%; height:320px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">chosen latency</div><div class="v" id="fr-lat">—</div></div>
+    <div class="kpi"><div class="k">chosen throughput</div><div class="v" id="fr-tput">—</div></div>
+    <div class="kpi"><div class="k">total GPUs</div><div class="v" id="fr-g">—</div></div>
+    <div class="kpi"><div class="k">on Pareto front?</div><div class="v" id="fr-on" style="font-size:14px;">—</div></div>
+  </div>
+</div>
+
+<h2>Interactive · which shape gives you the QPS×latency point you want?</h2>
+
+<p>Set the cluster size, the model, and the per-request constraints. The widget lays out feasible (TP, replicas) shapes and overlays them on a "throughput × latency" plot. The Pareto front is the family of shapes that aren't dominated. Anything not on the front is a waste.</p>
+
+<div class="widget" id="i-widget">
+  <div class="title">Pareto: throughput vs single-request latency</div>
+  <div class="hint">Each dot is one (TP, replicas) shape using all cluster GPUs. X = single-request decode latency (ms/tok). Y = aggregate cluster throughput (tok/s). The "knee" is usually the best buy if you care about both.</div>
+
+  <div class="controls">
+    <label class="inline">params (B): <input type="range" id="i-p" min="7" max="700" step="1" value="70"> <span class="val" id="i-p-v">70</span></label>
+    <label class="inline">cluster GPUs: <input type="range" id="i-g" min="8" max="256" step="8" value="64"> <span class="val" id="i-g-v">64</span></label>
+    <label class="inline">HBM BW (GB/s): <input type="range" id="i-bw" min="800" max="5000" step="100" value="3350"> <span class="val" id="i-bw-v">3350</span></label>
+    <label class="inline">HBM size (GB): <input type="range" id="i-hbm" min="40" max="200" step="8" value="80"> <span class="val" id="i-hbm-v">80</span></label>
+  </div>
+
+  <canvas class="dist-canvas" id="i-canvas" width="760" height="240" style="height: 240px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">latency-best shape</div><div class="v" id="i-lb">—</div></div>
+    <div class="kpi"><div class="k">throughput-best shape</div><div class="v" id="i-tb">—</div></div>
+    <div class="kpi"><div class="k">balanced "knee"</div><div class="v" id="i-kn">—</div></div>
+    <div class="kpi"><div class="k">infeasible (can't fit)</div><div class="v" id="i-no">—</div></div>
+  </div>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Decode is memory-bound: per-token time is set by HBM bandwidth, not FLOPs. TP=N spreads the read across N GPUs, dividing latency. Replication multiplies parallel requests. Per-cluster throughput is the same either way — until KV-cache or batching effects break the symmetry. The right choice is whichever knob your bottleneck is on.
+</div>
+
+<footer class="lesson-nav">
+  <a href="10_3d_parallelism.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">10 · 3D parallelism</span>
+  </a>
+  <a class="next" href="12_disaggregated_serving.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">12 · Disaggregated prefill/decode</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const get = id => document.getElementById(id);
+  const els = {
+    p:get('i-p'),pv:get('i-p-v'),g:get('i-g'),gv:get('i-g-v'),
+    bw:get('i-bw'),bwv:get('i-bw-v'),hbm:get('i-hbm'),hbmv:get('i-hbm-v'),
+    canvas:get('i-canvas'),
+    lb:get('i-lb'),tb:get('i-tb'),kn:get('i-kn'),no:get('i-no')
+  };
+  const ctx = els.canvas.getContext('2d');
+
+  function compute(){
+    const P = parseInt(els.p.value) * 1e9;
+    const G = parseInt(els.g.value);
+    const BW = parseInt(els.bw.value) * 1e9;
+    const HBM = parseInt(els.hbm.value) * 1e9;
+
+    els.pv.textContent = parseInt(els.p.value)+'B'; els.gv.textContent = G;
+    els.bwv.textContent = parseInt(els.bw.value); els.hbmv.textContent = parseInt(els.hbm.value);
+
+    const weight_bytes = P * 2;
+    const points = [];
+    let infeasible = 0;
+    for (const TP of [1,2,4,8,16]){
+      if (G % TP !== 0) continue;
+      const replicas = G / TP;
+      const memPerRank = weight_bytes / TP;
+      if (memPerRank > HBM * 0.7){ infeasible++; continue; }
+      const lat_ms = (weight_bytes / (TP * BW)) * 1000;
+      const tps_one = 1000 / lat_ms;
+      const tps_total = tps_one * replicas;
+      points.push({ TP, replicas, lat_ms, tps_total });
+    }
+
+    let lb = points[0], tb = points[0], kn = points[0];
+    points.forEach(p => {
+      if (p.lat_ms < lb.lat_ms) lb = p;
+      if (p.tps_total > tb.tps_total) tb = p;
+    });
+    const min_lat = Math.min(...points.map(p=>p.lat_ms));
+    const max_t  = Math.max(...points.map(p=>p.tps_total));
+    let bestScore = Infinity;
+    points.forEach(p => {
+      const nx = p.lat_ms / min_lat;
+      const ny = max_t / p.tps_total;
+      const s = nx*nx + ny*ny;
+      if (s < bestScore){ bestScore = s; kn = p; }
+    });
+
+    els.lb.textContent = `TP=${lb.TP} · ${lb.lat_ms.toFixed(1)}ms`;
+    els.tb.textContent = `TP=${tb.TP} · ${(tb.tps_total).toFixed(0)} tok/s`;
+    els.kn.textContent = `TP=${kn.TP} · R=${kn.replicas}`;
+    els.no.textContent = infeasible;
+
+    return { points, lb, tb, kn };
+  }
+
+  function render(){
+    const { points, lb, tb, kn } = compute();
+    const dpr = window.devicePixelRatio || 1;
+    const W = els.canvas.clientWidth, H = els.canvas.clientHeight;
+    if (els.canvas.width !== Math.round(W*dpr)){
+      els.canvas.width = Math.round(W*dpr); els.canvas.height = Math.round(H*dpr);
+    }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 60, padR = 14, padT = 14, padB = 36;
+    const innerW = W - padL - padR, innerH = H - padT - padB;
+    const maxX = Math.max(...points.map(p=>p.lat_ms)) * 1.1;
+    const maxY = Math.max(...points.map(p=>p.tps_total)) * 1.1;
+
+    ctx.strokeStyle = '#cbd5e1'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + innerH); ctx.lineTo(padL + innerW, padT + innerH); ctx.stroke();
+
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('latency (ms/tok)', padL + innerW/2 - 50, H - 6);
+    ctx.save(); ctx.translate(16, padT + innerH/2 + 50); ctx.rotate(-Math.PI/2);
+    ctx.fillText('aggregate throughput (tok/s)', 0, 0); ctx.restore();
+
+    ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+    for (let i = 0; i <= 4; i++){
+      const x = padL + (i/4) * innerW;
+      ctx.fillText(((i/4)*maxX).toFixed(0), x - 8, padT + innerH + 14);
+      const y = padT + innerH - (i/4) * innerH;
+      ctx.fillText(((i/4)*maxY).toFixed(0), 30, y + 4);
+    }
+
+    points.forEach(p => {
+      const x = padL + (p.lat_ms / maxX) * innerW;
+      const y = padT + innerH - (p.tps_total / maxY) * innerH;
+      let c = '#2563eb';
+      if (p === lb) c = '#d97706';
+      if (p === tb) c = '#16a34a';
+      if (p === kn) c = '#dc2626';
+      ctx.fillStyle = c;
+      ctx.beginPath(); ctx.arc(x, y, 6, 0, 2*Math.PI); ctx.fill();
+      ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+      ctx.fillText(`TP=${p.TP}`, x + 8, y - 4);
+    });
+
+    ctx.fillStyle = '#d97706'; ctx.font = '10px monospace';
+    ctx.fillText('orange = latency-best · green = throughput-best · pink = balanced knee', padL, padT - 2);
+  }
+
+  ['input','change'].forEach(ev=>{
+    [els.p,els.g,els.bw,els.hbm].forEach(el=>el.addEventListener(ev,render));
+  });
+  window.addEventListener('resize',render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: HBM → compute byte flow animation ─── */
+(function(){
+  const C = document.getElementById('hf-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const TP_OPTS = [1,2,4,8];
+  let tpIdx = 0, P_B = 70;
+  let particles = []; // {lane, x, vx, life}
+  let playing = false, lastT = 0;
+  let elapsedMs = 0; // simulated
+  let bytesLeft = []; // per lane
+
+  const elTpRange = $('hf-tp'), elTpV = $('hf-tp-v');
+  const elPRange = $('hf-p'), elPV = $('hf-p-v');
+  const elPlay = $('hf-play'), elReset = $('hf-reset');
+
+  elTpRange.addEventListener('input', ()=>{ tpIdx = +elTpRange.value; elTpV.textContent = TP_OPTS[tpIdx]; reset(); render(); });
+  elPRange.addEventListener('input', ()=>{ P_B = +elPRange.value; elPV.textContent = P_B; reset(); render(); });
+  elPlay.addEventListener('click', ()=>{ playing = !playing; elPlay.textContent = playing?'❚❚ pause':'▶ play';
+    if (playing){ lastT = performance.now(); requestAnimationFrame(tick); } });
+  elReset.addEventListener('click', ()=>{ reset(); render(); });
+
+  function reset(){
+    const TP = TP_OPTS[tpIdx];
+    const totalBytes = P_B * 2e9; // bytes
+    const perLane = totalBytes / TP;
+    bytesLeft = Array(TP).fill(perLane);
+    particles = [];
+    elapsedMs = 0;
+    playing = false;
+    elPlay.textContent = '▶ play';
+  }
+
+  // 1 particle = some chunk of bytes; we move at speed reflecting BW
+  function tick(ts){
+    if (!playing) return;
+    const dt = Math.min(50, ts - lastT);
+    lastT = ts;
+    // simulated step: 0.4 ms simulated per real ms
+    const simDt = dt * 0.4;
+    elapsedMs += simDt;
+    const TP = TP_OPTS[tpIdx];
+    const bwPerLane = 3350e9; // bytes/s per GPU HBM
+    const bytesPerLanePerMs = bwPerLane / 1000;
+    let allDone = true;
+    for (let l=0; l<TP; l++){
+      bytesLeft[l] = Math.max(0, bytesLeft[l] - bytesPerLanePerMs * simDt);
+      if (bytesLeft[l] > 0) allDone = false;
+    }
+    // spawn particles in proportion to remaining work
+    for (let l=0; l<TP; l++){
+      if (bytesLeft[l] > 0 && Math.random() < 0.7){
+        particles.push({ lane:l, x:0, life:1 });
+      }
+    }
+    // advance particles
+    particles.forEach(p => { p.x += 1.6 + (dt*0.04); });
+    particles = particles.filter(p => p.x < 1);
+    render();
+    if (!allDone) requestAnimationFrame(tick);
+    else { playing=false; elPlay.textContent='▶ play'; render(); }
+  }
+
+  function render(){
+    const TP = TP_OPTS[tpIdx];
+    const totalBytes = P_B * 2e9;
+    const perLane = totalBytes / TP;
+    // ideal time
+    const idealMsPerLane = (perLane / 3350e9) * 1000;
+    const idealMsTP1 = (totalBytes / 3350e9) * 1000;
+
+    const dpr = window.devicePixelRatio||1;
+    const W=C.clientWidth, H=C.clientHeight;
+    if (C.width!==Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padT = 30, padL = 90, padR = 90, padB = 20;
+    const usableH = H - padT - padB;
+    const laneH = usableH / Math.max(1, TP);
+    const innerW = W - padL - padR;
+
+    // HBM box (left), SM box (right)
+    ctx.fillStyle='#eef1f5'; ctx.strokeStyle='#dde2ea'; ctx.lineWidth=1;
+    ctx.fillRect(20, padT, padL-30, usableH);
+    ctx.strokeRect(20, padT, padL-30, usableH);
+    ctx.fillRect(W-padR+10, padT, padR-30, usableH);
+    ctx.strokeRect(W-padR+10, padT, padR-30, usableH);
+    ctx.fillStyle='#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('HBM', 30, padT-8);
+    ctx.fillText('compute', W-padR+18, padT-8);
+
+    // lanes
+    for (let l=0; l<TP; l++){
+      const ly = padT + laneH*l + laneH/2;
+      // bus rail
+      ctx.strokeStyle='#dde2ea'; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(padL, ly); ctx.lineTo(W-padR, ly); ctx.stroke();
+      // progress shading
+      const progressFrac = 1 - (bytesLeft[l] / perLane);
+      ctx.fillStyle = '#2563eb'; ctx.globalAlpha = 0.18;
+      ctx.fillRect(padL, ly - laneH*0.32, innerW*progressFrac, laneH*0.64);
+      ctx.globalAlpha = 1;
+      // lane label
+      ctx.fillStyle='#94a3b8'; ctx.font='10px monospace';
+      ctx.fillText('GPU '+l, padL-30, ly+4);
+      // remaining bytes
+      ctx.fillStyle='#5b6573';
+      ctx.fillText((bytesLeft[l]/1e9).toFixed(1)+' GB', W-padR+14, ly+4);
+    }
+
+    // particles
+    particles.forEach(p => {
+      const ly = padT + laneH*p.lane + laneH/2;
+      const px = padL + p.x*innerW;
+      ctx.fillStyle = '#2563eb';
+      ctx.beginPath(); ctx.arc(px, ly, 3.5, 0, 2*Math.PI); ctx.fill();
+      ctx.fillStyle = 'rgba(106,169,255,0.3)';
+      ctx.fillRect(px-12, ly-1, 12, 2);
+    });
+
+    // KPIs
+    $('hf-bpg').textContent = (perLane/1e9).toFixed(1) + ' GB';
+    $('hf-el').textContent  = elapsedMs.toFixed(1) + ' ms';
+    const allDone = bytesLeft.every(b => b <= 0);
+    $('hf-done').textContent = playing? (allDone?'yes':'streaming…') : (allDone?'yes':'paused');
+    $('hf-sp').textContent = (idealMsTP1 / idealMsPerLane).toFixed(1) + '×';
+
+    // top axis: TP info
+    ctx.fillStyle='#1f2430'; ctx.font='12px monospace';
+    ctx.fillText('TP = '+TP+'  ·  each lane carries '+(perLane/1e9).toFixed(1)+' GB at 3350 GB/s ⇒ '+idealMsPerLane.toFixed(1)+' ms', padL, 18);
+  }
+
+  reset();
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: Amdahl ladder · decode latency vs TP ─── */
+(function(){
+  const C = document.getElementById('am-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const TPS = [1,2,4,8,16];
+  const els = {
+    b:$('am-b'), bv:$('am-b-v'),
+    p:$('am-p'), pv:$('am-p-v'),
+    nv:$('am-nv'), nvv:$('am-nv-v'),
+    l1:$('am-l1'), l8:$('am-l8'), m48:$('am-m48'), cf:$('am-cf')
+  };
+
+  function compute(){
+    const B = +els.b.value, P = +els.p.value, NV = +els.nv.value;
+    els.bv.textContent = B; els.pv.textContent = P; els.nvv.textContent = NV;
+    const weightBytes = P * 2e9; // bf16 params
+    const hbm = 3350e9;
+    // per-layer AllReduce bytes ≈ 2 * d_model * B * 2 bytes; approximate d_model ≈ 6000 for big models
+    // We model AllReduce time per layer as proportional to B / NV-bandwidth.
+    const d_model = Math.round(4000 + Math.sqrt(P)*200);
+    // Realistic layer counts: 7B≈32, 70B≈80, 405B≈126
+    const layers = Math.max(24, Math.round(40 * Math.pow(P / 7, 0.4)));
+    const arBytesPerLayer = 2 * d_model * B * 2; // bytes
+    return TPS.map(tp => {
+      const memTime = (weightBytes / tp) / hbm * 1000; // ms
+      // AR happens twice per layer
+      const arPerStep = layers * 2 * arBytesPerLayer / (NV*1e9) * 1000; // ms
+      const arCost = tp === 1 ? 0 : arPerStep;
+      // compute floor (compute-bound when batch big enough): total FLOPs = 2*P*1e9*B, H100 = 312 TFLOPs/s per rank
+      const compTime = (2 * P * 1e9 * B) / (312e12 * tp) * 1000; // ms
+      const total = Math.max(memTime, compTime) + arCost;
+      const idealLat = (weightBytes / hbm * 1000) / tp;
+      return { tp, total, ideal: idealLat, memTime, arCost, compTime };
+    });
+  }
+
+  function render(){
+    const pts = compute();
+    const dpr = window.devicePixelRatio||1;
+    const W=C.clientWidth, H=C.clientHeight;
+    if (C.width!==Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL=58, padR=18, padT=18, padB=36;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+    const maxL = Math.max(...pts.map(p=>Math.max(p.total, p.ideal))) * 1.1;
+
+    // axes
+    ctx.strokeStyle='#cbd5e1'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT+innerH); ctx.lineTo(padL+innerW, padT+innerH); ctx.stroke();
+    ctx.fillStyle='#94a3b8'; ctx.font='10px monospace';
+    for (let i=0;i<=4;i++){
+      const v = (i/4)*maxL;
+      const y = padT+innerH - (i/4)*innerH;
+      ctx.fillText(v.toFixed(0)+'ms', 12, y+4);
+      ctx.strokeStyle='#eef1f5'; ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL+innerW, y); ctx.stroke();
+    }
+    pts.forEach((p,i)=>{
+      const x = padL + (i/(pts.length-1))*innerW;
+      ctx.fillStyle='#5b6573'; ctx.font='11px monospace';
+      ctx.fillText('TP='+p.tp, x-12, padT+innerH+14);
+    });
+
+    // ideal curve (dashed)
+    ctx.strokeStyle='#94a3b8'; ctx.setLineDash([5,4]); ctx.lineWidth=1.6;
+    ctx.beginPath();
+    pts.forEach((p,i)=>{
+      const x = padL + (i/(pts.length-1))*innerW;
+      const y = padT+innerH - (p.ideal/maxL)*innerH;
+      if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // real curve (solid)
+    ctx.strokeStyle='#d97706'; ctx.lineWidth=2.2;
+    ctx.beginPath();
+    pts.forEach((p,i)=>{
+      const x = padL + (i/(pts.length-1))*innerW;
+      const y = padT+innerH - (p.total/maxL)*innerH;
+      if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+
+    // stacked bars: memTime + compTime (floor) + arCost
+    pts.forEach((p,i)=>{
+      const x = padL + (i/(pts.length-1))*innerW;
+      const y0 = padT+innerH;
+      const total = p.total;
+      const memH = (Math.max(p.memTime, p.compTime)/maxL)*innerH;
+      const arH = (p.arCost/maxL)*innerH;
+      ctx.fillStyle='#2563eb'; ctx.globalAlpha=0.5;
+      ctx.fillRect(x-12, y0 - memH, 8, memH);
+      ctx.fillStyle='#dc2626'; ctx.fillRect(x-12, y0 - memH - arH, 8, arH);
+      ctx.globalAlpha=1;
+      // point
+      ctx.fillStyle='#d97706';
+      ctx.beginPath(); ctx.arc(x, y0 - (total/maxL)*innerH, 4, 0, 2*Math.PI); ctx.fill();
+    });
+
+    // legend
+    const ly = padT + 4;
+    ctx.fillStyle='#94a3b8'; ctx.fillText('---- ideal (1/TP)', padL+10, ly+8);
+    ctx.fillStyle='#d97706'; ctx.fillText('— realistic', padL+150, ly+8);
+    ctx.fillStyle='#2563eb'; ctx.fillRect(padL+260, ly, 8, 8); ctx.fillStyle='#5b6573'; ctx.fillText('HBM/compute', padL+274, ly+8);
+    ctx.fillStyle='#dc2626'; ctx.fillRect(padL+380, ly, 8, 8); ctx.fillStyle='#5b6573'; ctx.fillText('AllReduce cost', padL+394, ly+8);
+
+    const p1 = pts.find(p=>p.tp===1), p4 = pts.find(p=>p.tp===4), p8 = pts.find(p=>p.tp===8);
+    els.l1.textContent = p1.total.toFixed(1)+' ms';
+    els.l8.textContent = p8.total.toFixed(1)+' ms';
+    els.m48.textContent = (p4.total/p8.total).toFixed(2)+'×';
+    els.cf.textContent = (100*p8.arCost/p8.total).toFixed(0)+'%';
+  }
+
+  ['input','change'].forEach(ev=>{
+    [els.b, els.p, els.nv].forEach(el=>el.addEventListener(ev, render));
+  });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: 2D Pareto explorer · pick TP & replicas ─── */
+(function(){
+  const C = document.getElementById('fr-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const TP_OPTS = [1,2,4,8];
+  const els = {
+    tp:$('fr-tp'), tpv:$('fr-tp-v'),
+    rep:$('fr-rep'), repv:$('fr-rep-v'),
+    seq:$('fr-seq'), seqv:$('fr-seq-v'),
+    b:$('fr-b'), bv:$('fr-b-v'),
+    lat:$('fr-lat'), tput:$('fr-tput'), g:$('fr-g'), on:$('fr-on')
+  };
+
+  const HBM = 80e9; // 80 GB per GPU
+  const HBM_BW = 3350e9;
+  const NV_BW = 900e9;
+  // P_BYTES is derived from the shared i-widget model-size slider (params in B, bf16 = 2 bytes/param)
+  function getPBytes(){
+    const ipEl = document.getElementById('i-p');
+    const P_B = ipEl ? +ipEl.value : 70;
+    return P_B * 2e9;
+  }
+  // KV bytes per token (Llama-70B): 671 MB / 2048 tok = ~328 kB/tok
+  const KV_PER_TOK = 671e6 / 2048;
+
+  function configForPoint(tp, rep, seq, batch){
+    const P_BYTES = getPBytes();
+    // memory per rank: weights/tp + KV (sharded across heads ≈ tp)
+    const weight_per_rank = P_BYTES / tp;
+    const kv_per_rank = (KV_PER_TOK / tp) * seq * batch;
+    const fits = (weight_per_rank + kv_per_rank) < HBM * 0.95;
+    // latency: HBM bytes / (tp * BW) + small AR
+    const memT = weight_per_rank / HBM_BW * 1000;
+    const arT = tp === 1 ? 0 : 0.3 * tp;
+    const lat = memT + arT; // ms/tok per request
+    const tput_one = 1000 / lat; // tok/s per replica (batch=1 stream)
+    const tput_total = tput_one * rep * Math.min(batch, 32); // batching multiplies up to a point
+    return { tp, rep, lat, tput_total, fits, weight_per_rank, kv_per_rank };
+  }
+
+  function render(){
+    const tp = TP_OPTS[+els.tp.value];
+    els.tpv.textContent = tp;
+    const rep = +els.rep.value; els.repv.textContent = rep;
+    const seq = +els.seq.value; els.seqv.textContent = seq;
+    const batch = +els.b.value; els.bv.textContent = batch;
+
+    // generate full grid of (tp, rep) candidates for visualization
+    const REP_OPTS = [];
+    for (let r=1; r<=32; r++) REP_OPTS.push(r);
+    const points = [];
+    TP_OPTS.forEach(tpv => {
+      REP_OPTS.forEach(rv => {
+        const c = configForPoint(tpv, rv, seq, batch);
+        points.push(c);
+      });
+    });
+
+    const chosen = configForPoint(tp, rep, seq, batch);
+
+    // compute Pareto: feasible only, minimise lat, maximise tput
+    const feas = points.filter(p=>p.fits);
+    // sort by latency ascending
+    feas.sort((a,b)=>a.lat-b.lat);
+    const front = [];
+    let bestT = 0;
+    feas.forEach(p=>{ if (p.tput_total > bestT){ front.push(p); bestT = p.tput_total; } });
+    const isOnFront = front.some(p => p.tp===chosen.tp && p.rep===chosen.rep);
+
+    const dpr=window.devicePixelRatio||1;
+    const W=C.clientWidth, H=C.clientHeight;
+    if (C.width!==Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL=66, padR=14, padT=18, padB=40;
+    const innerW = W-padL-padR, innerH = H-padT-padB;
+    const maxX = Math.max(...points.map(p=>p.lat))*1.1;
+    const maxY = Math.max(...points.map(p=>p.tput_total))*1.1;
+
+    // grid
+    ctx.strokeStyle='#cbd5e1'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT+innerH); ctx.lineTo(padL+innerW, padT+innerH); ctx.stroke();
+    ctx.fillStyle='#94a3b8'; ctx.font='10px monospace';
+    for (let i=0;i<=4;i++){
+      const x = padL + (i/4)*innerW;
+      ctx.fillText(((i/4)*maxX).toFixed(0)+'ms', x-12, padT+innerH+14);
+      const y = padT+innerH - (i/4)*innerH;
+      ctx.fillText(((i/4)*maxY/1000).toFixed(1)+'k/s', 10, y+4);
+    }
+    ctx.fillStyle='#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('latency / tok (ms)', padL + innerW/2 - 50, H-6);
+    ctx.save(); ctx.translate(14, padT+innerH/2+70); ctx.rotate(-Math.PI/2);
+    ctx.fillText('throughput (tok/s)', 0, 0); ctx.restore();
+
+    // draw Pareto front
+    ctx.strokeStyle='#16a34a'; ctx.lineWidth=2;
+    ctx.beginPath();
+    front.forEach((p,i)=>{
+      const x = padL + (p.lat/maxX)*innerW;
+      const y = padT+innerH - (p.tput_total/maxY)*innerH;
+      if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+
+    // all points
+    const TP_COLORS = {1:'#2563eb', 2:'#3b82f6', 4:'#d97706', 8:'#7c3aed'};
+    points.forEach(p => {
+      const x = padL + (p.lat/maxX)*innerW;
+      const y = padT+innerH - (p.tput_total/maxY)*innerH;
+      const isChosen = (p.tp===chosen.tp && p.rep===chosen.rep);
+      if (!p.fits){
+        // X marker
+        ctx.strokeStyle='#cbd5e1'; ctx.lineWidth=1;
+        ctx.beginPath(); ctx.moveTo(x-3,y-3); ctx.lineTo(x+3,y+3); ctx.moveTo(x-3,y+3); ctx.lineTo(x+3,y-3); ctx.stroke();
+      } else {
+        const onFront = front.some(f => f.tp===p.tp && f.rep===p.rep);
+        ctx.fillStyle = TP_COLORS[p.tp] || '#2563eb';
+        ctx.globalAlpha = isChosen ? 1 : (onFront ? 0.85 : 0.3);
+        ctx.beginPath(); ctx.arc(x, y, isChosen?7:3.2, 0, 2*Math.PI); ctx.fill();
+        ctx.globalAlpha=1;
+        if (isChosen){
+          ctx.strokeStyle='#fff'; ctx.lineWidth=2;
+          ctx.beginPath(); ctx.arc(x, y, 9, 0, 2*Math.PI); ctx.stroke();
+        }
+      }
+    });
+
+    // legend
+    const lx = padL + innerW - 200;
+    let lyy = padT + 4;
+    ctx.fillStyle='#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('TP color key', lx, lyy); lyy += 14;
+    TP_OPTS.forEach(t => {
+      ctx.fillStyle = TP_COLORS[t]; ctx.fillRect(lx, lyy, 8, 8);
+      ctx.fillStyle='#5b6573'; ctx.fillText('TP='+t, lx+14, lyy+8);
+      lyy += 14;
+    });
+    ctx.strokeStyle='#cbd5e1'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(lx, lyy+2); ctx.lineTo(lx+8, lyy+10); ctx.moveTo(lx, lyy+10); ctx.lineTo(lx+8, lyy+2); ctx.stroke();
+    ctx.fillStyle='#5b6573'; ctx.fillText('infeasible (HBM)', lx+14, lyy+10);
+    lyy += 18;
+    ctx.strokeStyle='#16a34a'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(lx, lyy+6); ctx.lineTo(lx+10, lyy+6); ctx.stroke();
+    ctx.fillStyle='#5b6573'; ctx.fillText('Pareto front', lx+14, lyy+10);
+
+    els.lat.textContent = chosen.fits ? chosen.lat.toFixed(1)+' ms' : '—';
+    els.tput.textContent = chosen.fits ? (chosen.tput_total/1000).toFixed(2)+' k/s' : '—';
+    els.g.textContent = (chosen.tp*chosen.rep) + ' GPUs';
+    els.on.textContent = !chosen.fits ? 'INFEASIBLE' : (isOnFront ? 'YES' : 'no (dominated)');
+  }
+
+  ['input','change'].forEach(ev=>{
+    [els.tp, els.rep, els.seq, els.b].forEach(el=>el.addEventListener(ev, render));
+    // also re-render when the shared model-size slider in the i-widget changes
+    const ipEl = document.getElementById('i-p');
+    if (ipEl) ipEl.addEventListener(ev, render);
+  });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

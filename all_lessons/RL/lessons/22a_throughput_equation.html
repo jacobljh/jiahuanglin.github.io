@@ -1,0 +1,516 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>22a · The throughput equation</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">rl_lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">22a · throughput equation</span>
+    <span class="step-pill">lesson 8½ / 9 · part III</span>
+  </div>
+</header>
+
+<main>
+
+<h1>The throughput equation — what you're actually optimizing</h1>
+<p class="subtitle">Lessons 19–22 give you topology, KV cache, scheduling, and memory math as a toolkit. This lesson is the assembly: write down the single equation those tools all push on, identify which term dominates under your setup, and the rest of system-level RL optimization writes itself as "lower the largest term until something else becomes the largest."</p>
+
+<div class="callout">
+  <div class="label">Where this lesson sits</div>
+  This opens a three-lesson sub-track on system throughput. Lesson 22a (here) derives the optimization target from the controller loop. Lesson 22b drills into the largest single term for most setups — rollout long-tail stragglers — and the packing and dynamic-K patches. Lesson 22c covers async pipelining and the weight-sync engineering that makes async worth running.
+</div>
+
+<h2>The optimization target, derived from the loop</h2>
+
+<p>Start where every previous lesson started: the controller's loop body, in seven lines.</p>
+
+<div class="ascii">  for step in range(N):
+      prompts  = sample_batch()                              # cheap
+      rollouts = INFERENCE.generate(policy, prompts, K)      # τ_R
+      rewards  = ENV.score(rollouts)                         # τ_V
+      logp_ref = REF.forward(rollouts)                       # τ_ref
+      logp_θ   = TRAINER.forward(policy, rollouts)           # part of τ_T
+      advantages, loss = algo(rewards, logp_θ, logp_ref)
+      TRAINER.backward(loss); optimizer.step()               # rest of τ_T
+      WEIGHT_SYNC.push(policy → INFERENCE)                   # τ_S</div>
+
+<p>Each line consumes wall-clock. Label the five non-trivial terms <span class="math">τ_R</span> (rollout), <span class="math">τ_V</span> (verifier), <span class="math">τ_ref</span> (reference forward), <span class="math">τ_T</span> (trainer forward + backward + step), and <span class="math">τ_S</span> (weight sync). Per-step wall-clock <span class="math">τ_step</span> is some composition of those terms, and the composition depends entirely on the topology you chose in lesson 19:</p>
+
+<div class="math block">
+  τ_step (colocated)     =  τ_R + τ_V + τ_ref + τ_T + τ_S<br>
+  τ_step (disaggregated) =  max(τ_R + τ_V,  τ_ref + τ_T) + τ_S<br>
+  τ_step (fully async)   ≈  max(τ_R + τ_V,  τ_ref + τ_T,  τ_S)
+</div>
+
+<p>That is the throughput equation. Three lines, one per topology. Everything else in lessons 20–22 — paged attention, continuous batching, chunked CE, FP8 sync — is a constant-factor reduction on one of those terms. <strong>The job of an RL infra engineer is to identify which term dominates today and apply the cheapest patch that demotes it below something else.</strong></p>
+
+<div class="callout ok">
+  <div class="label">The single useful definition of "throughput"</div>
+  Useful tokens per second = (B · K · L̄) / τ_step, where B is prompt batch, K is rollouts per prompt, L̄ is mean response length. <em>Useful</em> means tokens whose log-prob participates in a gradient step. Tokens that were generated but discarded by dynamic sampling (lesson 13) or by online filter (lesson 18a stage 7) are not useful — they are part of τ_R but not the numerator. Optimizations that move generated tokens from "discarded" to "useful" raise throughput without lowering any term.
+</div>
+
+<h2>The five terms, sized and bounded</h2>
+
+<p>For a representative 7B-class run on an 8×H100 node, with K=16, batch=64 prompts, mean response length 1k tokens, the five terms typically size like this. Read the column "what bounds it" — that is the column you need to dominate to know where the patches go.</p>
+
+<table>
+  <thead><tr><th>Term</th><th>Typical share</th><th>What bounds it</th><th>Lowering it</th></tr></thead>
+  <tbody>
+    <tr><td><span class="math">τ_R</span> rollout</td><td>60–80%</td><td>HBM bandwidth on decode; compute on prefill</td><td>prefix cache · packing · paged KV · continuous batch · spec decode · FP8</td></tr>
+    <tr><td><span class="math">τ_V</span> verifier</td><td>1–10%</td><td>verifier I/O (sandbox spinup, judge call latency)</td><td>cache verifier calls · pre-launched sandboxes · async judges</td></tr>
+    <tr><td><span class="math">τ_ref</span> ref fwd</td><td>3–8%</td><td>HBM bandwidth (it's a forward, no backward)</td><td>collocate with trainer · FP8 ref · skip on cached prompts</td></tr>
+    <tr><td><span class="math">τ_T</span> trainer</td><td>10–26%</td><td>compute on forward+backward; activation memory on long L</td><td>chunked CE · sequence packing · activation recompute · TP/SP</td></tr>
+    <tr><td><span class="math">τ_S</span> weight sync</td><td>2–10%</td><td>NCCL bandwidth · dtype cast · reshard layout mismatch</td><td>broadcast tree · bucket fuse · FP8 sync · zero-copy reshard · overlap with next prefill</td></tr>
+  </tbody>
+</table>
+
+<p>Two patterns that fall out and recur at every model scale:</p>
+
+<ul>
+  <li><strong>Rollout dominates.</strong> 60–80% is a real number; lesson 28 attributes most of it to decode-bandwidth. This is why lesson 22b is dedicated to the rollout side: if you optimize anywhere else first, you are optimizing the wrong term.</li>
+  <li><strong>Weight sync looks small until it isn't.</strong> 2–10% is the typical share, but it scales with model size and reshard distance between trainer and inference layouts. At 70B+ with TP=8 on trainer and TP=4 on rollout, the reshard alone can hit 20%. This is the wall lesson 22c is built against.</li>
+</ul>
+
+<h2>Per-role roofline: where each term lives on the hardware</h2>
+
+<p>The "what bounds it" column of the table is a roofline statement. Every kernel a GPU runs sits at one of three regimes:</p>
+
+<ul>
+  <li><strong>Compute-bound.</strong> Arithmetic intensity (FLOPs / byte) exceeds the hardware's roofline knee; the bottleneck is TFLOPS. <em>Examples:</em> prefill in rollout, forward + backward in trainer at long L.</li>
+  <li><strong>Memory-bandwidth-bound.</strong> Arithmetic intensity sits below the knee; the bottleneck is HBM bytes/sec. <em>Examples:</em> decode in rollout, reference forward, KV reads.</li>
+  <li><strong>Communication-bound.</strong> Most of wall-clock is spent moving bytes between GPUs or across the network. <em>Examples:</em> weight sync, all-reduce on backward at very high TP, NCCL allgather during MoE.</li>
+</ul>
+
+<svg viewBox="0 0 720 320" class="diagram" id="roofline-svg">
+  <!-- axes -->
+  <line x1="70" y1="280" x2="690" y2="280" stroke="var(--text-dim)" stroke-width="1.2"/>
+  <line x1="70" y1="40"  x2="70"  y2="280" stroke="var(--text-dim)" stroke-width="1.2"/>
+  <text x="380" y="305" font-size="12" fill="var(--text-mute)" text-anchor="middle">arithmetic intensity (FLOPs / byte, log scale)</text>
+  <text x="22"  y="160" font-size="12" fill="var(--text-mute)" text-anchor="middle" transform="rotate(-90 22 160)">attained TFLOPS (log)</text>
+
+  <!-- roofline: rising line then flat peak -->
+  <path d="M70 280 L300 100 L690 100" stroke="var(--accent)" stroke-width="2" fill="none"/>
+  <text x="180" y="200" font-size="11" fill="var(--accent)" font-family="var(--mono)">slope = HBM bandwidth</text>
+  <text x="480" y="92"  font-size="11" fill="var(--accent)" font-family="var(--mono)">peak TFLOPS ≈ 989 (H100)</text>
+  <text x="300" y="118" font-size="10" fill="var(--text-mute)" font-family="var(--mono)" text-anchor="middle">knee</text>
+
+  <!-- markers for RL roles -->
+  <g font-family="var(--mono)" font-size="11">
+    <!-- decode: bandwidth bound, low AI -->
+    <circle cx="120" cy="240" r="6" fill="var(--bad)"/>
+    <text x="132" y="244" fill="var(--text)">rollout decode (τ_R)</text>
+    <text x="132" y="258" fill="var(--text-mute)" font-size="10">memory-BW bound · AI ≈ 1</text>
+
+    <!-- ref forward: bandwidth bound, slightly higher AI -->
+    <circle cx="170" cy="200" r="6" fill="#7c3aed"/>
+    <text x="182" y="204" fill="var(--text)">ref forward (τ_ref)</text>
+    <text x="182" y="218" fill="var(--text-mute)" font-size="10">memory-BW bound · AI ≈ 3</text>
+
+    <!-- prefill: compute bound, high AI -->
+    <circle cx="450" cy="100" r="6" fill="var(--accent-2)"/>
+    <text x="462" y="104" fill="var(--text)">rollout prefill</text>
+    <text x="462" y="118" fill="var(--text-mute)" font-size="10">compute bound · AI ≈ 100–150</text>
+
+    <!-- trainer fwd+bwd: compute bound -->
+    <circle cx="520" cy="100" r="6" fill="var(--ok)"/>
+    <text x="532" y="124" fill="var(--text)">trainer fwd+bwd (τ_T)</text>
+    <text x="532" y="138" fill="var(--text-mute)" font-size="10">compute bound · AI ≈ 400</text>
+
+    <!-- weight sync: not on this plot — it's NCCL bandwidth -->
+    <circle cx="100" cy="60" r="6" fill="var(--warn)"/>
+    <text x="112" y="64" fill="var(--text)">weight sync (τ_S)</text>
+    <text x="112" y="78" fill="var(--text-mute)" font-size="10">network-BW bound · off-roofline</text>
+  </g>
+</svg>
+
+<p>One reading of the chart: <strong>τ_R and τ_ref live below the knee, τ_T lives above it, τ_S lives off the chart entirely</strong>. This is why patches that work on the trainer (chunked CE, sequence packing) do nothing for the rollout (which needs paged KV, prefix cache, continuous batching) — they're on different sides of the roofline.</p>
+
+<div class="callout">
+  <div class="label">First-principles consequence</div>
+  Most of RL wall-clock is decode-bandwidth-bound. That single sentence explains why the optimization toolkit looks the way it does: prefix caching (read fewer KV bytes), paged attention (pack more sequences into the same HBM), continuous batching (raise effective batch on the same HBM read), FP8 KV (cut bytes per token). None of those touch FLOPS, because FLOPS are not the bottleneck on the term that dominates.
+</div>
+
+<h2>Interactive: where is your wall-clock going?</h2>
+
+<p>Pick a model size, a cluster, a topology, and a batch shape. The widget computes each <span class="math">τ</span> from a coarse first-principles model and shows where the wall-clock goes. The point isn't to predict absolute numbers — those depend on a dozen kernels — but to predict <em>which term dominates</em>, which is enough to choose the next optimization to apply.</p>
+
+<div class="widget" id="te-widget">
+  <div class="title">Per-role wall-clock model</div>
+  <div class="hint">Slide model size, K rollouts per prompt, mean response length, and topology. The bar chart is the predicted breakdown of <span class="math">τ_step</span>; the KPIs report total time, useful tokens/sec, and the dominant term.</div>
+  <div class="controls">
+    <label class="inline">
+      Params (B): <input type="range" id="te-P" min="1" max="70" step="1" value="7"><span class="val" id="te-P-v">7</span>
+    </label>
+    <label class="inline">
+      K rollouts: <input type="range" id="te-K" min="1" max="32" step="1" value="16"><span class="val" id="te-K-v">16</span>
+    </label>
+    <label class="inline">
+      Response length: <input type="range" id="te-L" min="128" max="8192" step="128" value="1024"><span class="val" id="te-L-v">1024</span>
+    </label>
+    <label class="inline">
+      Topology:
+      <select id="te-topo">
+        <option value="colo">colocated</option>
+        <option value="disagg" selected>disaggregated</option>
+        <option value="async">fully async</option>
+      </select>
+    </label>
+  </div>
+  <canvas id="te-canvas" class="dist-canvas" height="180"></canvas>
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">τ_step</div><div class="v" id="te-step">—</div></div>
+    <div class="kpi"><div class="k">tok/sec useful</div><div class="v" id="te-toks">—</div></div>
+    <div class="kpi"><div class="k">dominant</div><div class="v" id="te-dom">—</div></div>
+    <div class="kpi"><div class="k">compute util</div><div class="v" id="te-util">—</div></div>
+  </div>
+  <div class="hint" style="margin-top:10px;">
+    <strong>What to try.</strong> (1) 7B / K=16 / L=1024 / disagg: rollout dominates, ~70% of step. (2) Crank L to 8192 with same topology: rollout share grows past 85% — long sequences are the heaviest tax. (3) Drop to colocated: total τ_step jumps because everything serializes; tok/sec drops by ~30%. (4) 70B / async: weight sync becomes visible — at large models reshard cost grows faster than rollout.
+  </div>
+</div>
+
+<h2>The "where is my wall-clock going" decision tree</h2>
+
+<p>The optimization order is not "apply every patch from lesson 21." It is "measure, then patch the largest term, then re-measure." A decision tree that follows from the equation:</p>
+
+<svg viewBox="0 0 720 360" class="diagram" id="decision-svg">
+  <!-- root -->
+  <g>
+    <rect x="270" y="20" width="180" height="46" rx="6" class="node-bg"/>
+    <text x="360" y="40" text-anchor="middle" font-size="13" font-weight="600">measure τ_step components</text>
+    <text x="360" y="56" text-anchor="middle" font-size="11" fill="var(--text-mute)">torch.profiler · nvidia-smi</text>
+  </g>
+
+  <!-- branches: rollout / train / sync -->
+  <g>
+    <rect x="40"  y="100" width="180" height="46" rx="6" class="node-bg"/>
+    <text x="130" y="120" text-anchor="middle" font-size="13" font-weight="600">τ_R dominates?</text>
+    <text x="130" y="136" text-anchor="middle" font-size="11" fill="var(--text-mute)">decode → memory BW</text>
+  </g>
+  <g>
+    <rect x="270" y="100" width="180" height="46" rx="6" class="node-bg"/>
+    <text x="360" y="120" text-anchor="middle" font-size="13" font-weight="600">τ_T dominates?</text>
+    <text x="360" y="136" text-anchor="middle" font-size="11" fill="var(--text-mute)">forward+backward → compute</text>
+  </g>
+  <g>
+    <rect x="500" y="100" width="180" height="46" rx="6" class="node-bg"/>
+    <text x="590" y="120" text-anchor="middle" font-size="13" font-weight="600">τ_S dominates?</text>
+    <text x="590" y="136" text-anchor="middle" font-size="11" fill="var(--text-mute)">weight sync → comm BW</text>
+  </g>
+
+  <!-- leaves -->
+  <g>
+    <rect x="40"  y="200" width="180" height="60" rx="6" class="node-bg" stroke="var(--bad)" stroke-width="1.5"/>
+    <text x="130" y="218" text-anchor="middle" font-size="12" font-weight="600">prefix cache</text>
+    <text x="130" y="232" text-anchor="middle" font-size="11" fill="var(--text-mute)">continuous batch</text>
+    <text x="130" y="246" text-anchor="middle" font-size="11" fill="var(--text-mute)">paged KV · FP8 KV</text>
+    <text x="130" y="260" text-anchor="middle" font-size="11" fill="var(--text-mute)">+ lesson 22b patches</text>
+  </g>
+  <g>
+    <rect x="270" y="200" width="180" height="60" rx="6" class="node-bg" stroke="var(--ok)" stroke-width="1.5"/>
+    <text x="360" y="218" text-anchor="middle" font-size="12" font-weight="600">chunked CE</text>
+    <text x="360" y="232" text-anchor="middle" font-size="11" fill="var(--text-mute)">sequence packing</text>
+    <text x="360" y="246" text-anchor="middle" font-size="11" fill="var(--text-mute)">activation recompute</text>
+    <text x="360" y="260" text-anchor="middle" font-size="11" fill="var(--text-mute)">TP / SP</text>
+  </g>
+  <g>
+    <rect x="500" y="200" width="180" height="60" rx="6" class="node-bg" stroke="var(--warn)" stroke-width="1.5"/>
+    <text x="590" y="218" text-anchor="middle" font-size="12" font-weight="600">broadcast tree</text>
+    <text x="590" y="232" text-anchor="middle" font-size="11" fill="var(--text-mute)">bucket fuse</text>
+    <text x="590" y="246" text-anchor="middle" font-size="11" fill="var(--text-mute)">FP8 sync · zero-copy</text>
+    <text x="590" y="260" text-anchor="middle" font-size="11" fill="var(--text-mute)">+ lesson 22c patches</text>
+  </g>
+
+  <!-- arrows -->
+  <line x1="360" y1="66"  x2="130" y2="100" stroke="var(--text-dim)" stroke-width="1.2"/>
+  <line x1="360" y1="66"  x2="360" y2="100" stroke="var(--text-dim)" stroke-width="1.2"/>
+  <line x1="360" y1="66"  x2="590" y2="100" stroke="var(--text-dim)" stroke-width="1.2"/>
+  <line x1="130" y1="146" x2="130" y2="200" stroke="var(--text-dim)" stroke-width="1.2"/>
+  <line x1="360" y1="146" x2="360" y2="200" stroke="var(--text-dim)" stroke-width="1.2"/>
+  <line x1="590" y1="146" x2="590" y2="200" stroke="var(--text-dim)" stroke-width="1.2"/>
+
+  <!-- bottom annotation -->
+  <text x="360" y="305" font-size="12" fill="var(--text-mute)" text-anchor="middle" font-style="italic">re-measure after every patch — the dominant term changes</text>
+  <text x="360" y="325" font-size="11" fill="var(--text-dim)" font-family="var(--mono)" text-anchor="middle">optimization is iterative, not one-shot</text>
+</svg>
+
+<p>The point of the decision tree is the bottom annotation. You apply <em>one</em> patch, re-measure, and re-decide. If you batch up "all the optimizations" and apply them at once, you can't attribute the gain — and you'll spend the next month inheriting a stack of patches whose individual contributions you can't reproduce.</p>
+
+<h2>The tokens/sec formula, written out</h2>
+
+<p>The useful definition above expands into something you can actually log:</p>
+
+<div class="math block">
+  tokens/sec = (B · K · L̄ · keep_rate) / τ_step
+</div>
+
+<p>Where <span class="math">keep_rate</span> is the fraction of rollouts that survive dynamic sampling and the data-pipeline's online filter (lessons 13, 18a stage 7). For a healthy run, <span class="math">keep_rate</span> sits at 0.7–0.95; when it drops to 0.4–0.5 you are wasting a lot of decode FLOPs on degenerate groups, which the lesson on data pipelines (18a) addresses.</p>
+
+<p>Three useful invariants fall out of writing it this way:</p>
+
+<ol>
+  <li><strong>Doubling K is not 2× the gradient signal.</strong> It is roughly <span class="math">√(K/K₀)</span> times the signal under most variance-reduction baselines (lessons 11, 12, 14). But <span class="math">τ_R</span> grows linearly in K — see lesson 22b. So past a point, larger K loses tokens/sec faster than it gains signal/sec.</li>
+  <li><strong>Long L hurts twice.</strong> Once in <span class="math">τ_R</span> (more decode steps), and again in <span class="math">τ_T</span> (longer trainer forward — activation memory grows quadratically before mitigations). Length capping is one of the highest-leverage knobs.</li>
+  <li><strong>Topology only matters if the two largest terms are commensurate.</strong> If <span class="math">τ_R = 0.8</span> and <span class="math">τ_T = 0.1</span>, switching from colocated to disaggregated saves at most 0.1 — barely worth the engineering. If <span class="math">τ_R = 0.5</span> and <span class="math">τ_T = 0.4</span>, disaggregated nearly halves the step.</li>
+</ol>
+
+<h2>A worked example: where does a 7B run's hour go?</h2>
+
+<p>Concretize. 7B model, K=16, batch=64 prompts, mean L=1024 tokens, disaggregated topology on 8×H100. Each step is roughly:</p>
+
+<table>
+  <thead><tr><th>Term</th><th>Estimate</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td><span class="math">τ_R</span></td><td>~30 s</td><td>64·16=1024 trajectories at 1k tokens each = 1M tokens decoded; at ~12k tok/s/H100 sustained with paged KV + continuous batching (lesson 22), 4 rollout-side H100s deliver ~48k tok/s ≈ 21 s of mean decode, plus a long-tail multiplier of ~1.4× (lesson 22b)</td></tr>
+    <tr><td><span class="math">τ_V</span></td><td>~1 s</td><td>verifier checks are cheap (~ms each) and parallelize trivially</td></tr>
+    <tr><td><span class="math">τ_ref</span></td><td>~3 s</td><td>one forward pass over 1M tokens at FP8 on 4 trainer-side H100s ≈ 3 s memory-bound forward</td></tr>
+    <tr><td><span class="math">τ_T</span></td><td>~8 s</td><td>forward + backward over the same 1M tokens at BF16 with chunked CE ≈ 8 s</td></tr>
+    <tr><td><span class="math">τ_S</span></td><td>~1 s</td><td>7B params, FP8 broadcast across the node, ~1 s of NCCL</td></tr>
+  </tbody>
+</table>
+
+<p>Under disaggregated topology, <span class="math">τ_step = max(τ_R + τ_V, τ_ref + τ_T) + τ_S = max(31, 11) + 1 = 32</span> seconds. Useful tok/s = (64 · 16 · 1024) / 32 ≈ 33k tok/s across the cluster.</p>
+
+<p>Two things to notice. First, the trainer side (τ_ref + τ_T = 11 s) is sitting idle for the last 20 seconds of every step. That idle time is the <em>opportunity</em> async pipelining (lesson 22c) tries to claim. Second, the rollout-side wall-clock is mostly mean decode plus a long-tail multiplier; patching the tail (lesson 22b's bet) cuts τ_R by ~30% without changing the kernel.</p>
+
+<div class="callout">
+  <div class="label">Modeling caveats</div>
+  Two simplifications worth naming. (a) The disaggregated formula folds the verifier into the rollout stream (typical when env.score is in-process with generate) and the reference into the trainer stream (typical when ref shares the trainer's TP group). With dedicated verifier nodes (sandboxed code, LLM-judge) or a separate ref pool, these become their own streams and the equation grows two more max-arguments. (b) The per-role roofline numbers above are calibrated to a 7B BF16 model on H100 with paged KV and continuous batching — real numbers vary 2–3× with sequence length, batch shape, and engine choice.
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Per-step wall-clock is <span class="math">max</span> or <span class="math">sum</span> over five terms — rollout, verifier, ref forward, trainer, sync — whose composition is set by topology. Each term has a roofline; each roofline has a different optimization toolkit. The job is to measure, find the dominant term, lower it by one patch, re-measure. Lessons 22b and 22c go deep on the two terms that dominate in practice — rollout long-tail and weight sync — but every system patch in lessons 20–28 maps back to lowering one of these five.
+</div>
+
+<footer class="lesson-nav">
+  <a href="22_memory.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">22 · Memory &amp; throughput math</span>
+  </a>
+  <a class="next" href="22b_longtail_rollouts.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">22b · Long-tail rollouts</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const canvas = document.getElementById('te-canvas');
+  const ctx = canvas.getContext('2d');
+  const pEl = document.getElementById('te-P');
+  const kEl = document.getElementById('te-K');
+  const lEl = document.getElementById('te-L');
+  const tEl = document.getElementById('te-topo');
+  const pV = document.getElementById('te-P-v');
+  const kV = document.getElementById('te-K-v');
+  const lV = document.getElementById('te-L-v');
+  const stepK = document.getElementById('te-step');
+  const toksK = document.getElementById('te-toks');
+  const domK  = document.getElementById('te-dom');
+  const utilK = document.getElementById('te-util');
+
+  // First-principles cost model. Calibrated to roughly match a 7B/K=16/L=1024
+  // on 8xH100 disaggregated → τ_R≈22s, τ_T≈8s, τ_ref≈3s, τ_S≈1s.
+  function model(P, K, L, topo){
+    const B = 64;                 // prompt batch
+    const totalTok = B * K * L;
+    // rollout: decode is HBM-bandwidth-bound; bytes/token ≈ 2·P, so latency is linear in P.
+    // Calibrated to lesson 22's ~12k tok/s/H100 at 7B: 1M tokens on 4 H100s ≈ 1M / (4·12k) ≈ 21s
+    const decodeSecPerMTok = 21 * (P / 7);
+    const decodeTime = decodeSecPerMTok * (totalTok / 1e6);
+    // straggler tail: grows with L (more sampling steps → more variance). Lesson 22b derives this.
+    const tailFactor = 1 + 1.8 * Math.tanh(L / 2048);
+    const tauR = decodeTime * tailFactor / 4;  // 4 H100s on rollout side in disagg
+    // verifier ~ tiny
+    const tauV = 0.5 + 0.5 * (B / 64);
+    // trainer fwd+bwd: 6Pτ FLOPs per token, compute-bound, ~50% MFU on H100 at long L.
+    // Calibrated so 1M tokens at 7B on 4 H100s ≈ 8s.
+    const trainSecPerMTok = 8 * (P / 7);
+    const tauT = trainSecPerMTok * (totalTok / 1e6) / 4;
+    const tauRef = tauT / 3;
+    // weight sync: scales w/ P (bytes broadcast), gets worse w/ large P due to reshard
+    const tauS = 0.15 * P + 0.005 * P * P;
+
+    let tauStep;
+    if (topo === 'colo'){
+      tauStep = tauR + tauV + tauRef + tauT + tauS;
+    } else if (topo === 'disagg'){
+      tauStep = Math.max(tauR + tauV, tauRef + tauT) + tauS;
+    } else {
+      tauStep = Math.max(tauR + tauV, tauRef + tauT, tauS);
+    }
+
+    const toksPerSec = totalTok / tauStep;
+    // compute util: fraction of time the trainer is busy under chosen topology
+    const trainerBusy = tauRef + tauT;
+    const util = topo === 'colo' ? trainerBusy / tauStep : (topo === 'disagg' ? trainerBusy / (tauStep - tauS) : trainerBusy / tauStep);
+
+    return { tauR, tauV, tauRef, tauT, tauS, tauStep, toksPerSec, util };
+  }
+
+  function fmt(t){ return t >= 60 ? (t/60).toFixed(1)+'m' : t.toFixed(1)+'s'; }
+  function fmtTok(t){ return t >= 1000 ? (t/1000).toFixed(1)+'k' : t.toFixed(0); }
+
+  function render(){
+    const P = +pEl.value;
+    const K = +kEl.value;
+    const L = +lEl.value;
+    const topo = tEl.value;
+    pV.textContent = P;
+    kV.textContent = K;
+    lV.textContent = L;
+
+    const m = model(P, K, L, topo);
+    stepK.textContent = fmt(m.tauStep);
+    toksK.textContent = fmtTok(m.toksPerSec);
+    utilK.textContent = (m.util * 100).toFixed(0) + '%';
+
+    // dominant term
+    const terms = [
+      {n: 'τ_R', t: m.tauR,   c: 'var(--bad)'},
+      {n: 'τ_V', t: m.tauV,   c: 'var(--text-dim)'},
+      {n: 'τ_ref', t: m.tauRef, c: '#7c3aed'},
+      {n: 'τ_T', t: m.tauT,   c: 'var(--ok)'},
+      {n: 'τ_S', t: m.tauS,   c: 'var(--warn)'}
+    ];
+    const dominant = terms.reduce((a,b) => a.t > b.t ? a : b);
+    domK.textContent = dominant.n;
+
+    // --- render canvas: stacked horizontal bars showing each term's contribution under chosen topology ---
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W*dpr || canvas.height !== H*dpr) { canvas.width = W*dpr; canvas.height = H*dpr; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    // For visualization: show the two pipeline "streams" (rollout side, trainer side) as two horizontal bars
+    // plus sync as a tail. Under colocated, show a single concatenated bar.
+    const padL = 80, padR = 40, padT = 24, padB = 32;
+    const plotW = W - padL - padR;
+    const rowH = 30;
+
+    const totalShown =
+      topo === 'colo'   ? (m.tauR + m.tauV + m.tauRef + m.tauT + m.tauS)
+      : topo === 'async'? Math.max(m.tauR + m.tauV, m.tauRef + m.tauT, m.tauS)
+      :                   (Math.max(m.tauR + m.tauV, m.tauRef + m.tauT) + m.tauS);
+    const scale = plotW / totalShown;
+
+    ctx.font = '12px ' + getComputedStyle(document.body).getPropertyValue('--sans');
+    ctx.textAlign = 'right';
+    ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-mute');
+
+    function drawSeg(x, y, w, color, label){
+      ctx.fillStyle = color;
+      ctx.fillRect(x, y, Math.max(1, w), rowH);
+      if (w > 36){
+        ctx.fillStyle = '#ffffff';
+        ctx.textAlign = 'center';
+        ctx.fillText(label, x + w/2, y + rowH/2 + 4);
+      }
+    }
+
+    if (topo === 'colo'){
+      // single bar: τ_R · τ_V · τ_ref · τ_T · τ_S
+      ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-mute');
+      ctx.textAlign = 'right';
+      ctx.fillText('serialized', padL - 8, padT + rowH/2 + 4);
+      let x = padL;
+      [['τ_R', m.tauR, terms[0].c], ['τ_V', m.tauV, terms[1].c], ['τ_ref', m.tauRef, terms[2].c], ['τ_T', m.tauT, terms[3].c], ['τ_S', m.tauS, terms[4].c]]
+        .forEach(([n, t, c]) => { const w = t*scale; drawSeg(x, padT, w, c, n); x += w; });
+    } else {
+      // disaggregated and async share the two-row layout; the difference is whether sync is parallel.
+      // row 1: rollout side
+      ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-mute');
+      ctx.textAlign = 'right';
+      ctx.fillText('rollout side', padL - 8, padT + rowH/2 + 4);
+      let x = padL;
+      drawSeg(x, padT, m.tauR * scale, terms[0].c, 'τ_R'); x += m.tauR * scale;
+      drawSeg(x, padT, m.tauV * scale, terms[1].c, 'τ_V'); x += m.tauV * scale;
+      // idle on rollout side if trainer is the longer stream
+      if (m.tauRef + m.tauT > m.tauR + m.tauV){
+        const idleR = (m.tauRef + m.tauT) - (m.tauR + m.tauV);
+        ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--border');
+        ctx.fillRect(x, padT, idleR * scale, rowH);
+        if (idleR * scale > 50){
+          ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-mute');
+          ctx.textAlign = 'center';
+          ctx.fillText('idle', x + (idleR * scale)/2, padT + rowH/2 + 4);
+        }
+      }
+
+      // row 2: trainer side
+      ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-mute');
+      ctx.textAlign = 'right';
+      ctx.fillText('trainer side', padL - 8, padT + rowH + 12 + rowH/2 + 4);
+      let x2 = padL;
+      drawSeg(x2, padT + rowH + 12, m.tauRef * scale, terms[2].c, 'τ_ref'); x2 += m.tauRef * scale;
+      drawSeg(x2, padT + rowH + 12, m.tauT   * scale, terms[3].c, 'τ_T');   x2 += m.tauT * scale;
+      const longer = Math.max(m.tauR + m.tauV, m.tauRef + m.tauT);
+      const idle = longer - (m.tauRef + m.tauT);
+      if (idle > 0){
+        ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--border');
+        ctx.fillRect(x2, padT + rowH + 12, idle * scale, rowH);
+        if (idle * scale > 50){
+          ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-mute');
+          ctx.textAlign = 'center';
+          ctx.fillText('idle', x2 + (idle * scale)/2, padT + rowH + 12 + rowH/2 + 4);
+        }
+      }
+
+      // sync: appended at end for disagg, overlaps inside the longer stream for async
+      if (topo === 'disagg'){
+        const syncX = padL + longer * scale;
+        drawSeg(syncX, padT, m.tauS * scale, terms[4].c, 'τ_S');
+      } else {
+        // async: sync overlaps the rollout stream; render as a dashed strip inside the rollout row
+        const syncW = Math.min(m.tauS, longer) * scale;
+        ctx.globalAlpha = 0.55;
+        ctx.fillStyle = terms[4].c;
+        ctx.fillRect(padL + (longer - m.tauS) * scale, padT - 4, Math.max(1, syncW), 4);
+        ctx.globalAlpha = 1;
+        if (syncW > 40){
+          ctx.fillStyle = terms[4].c;
+          ctx.textAlign = 'center';
+          ctx.font = '10px ' + getComputedStyle(document.body).getPropertyValue('--mono');
+          ctx.fillText('τ_S (hidden in R)', padL + (longer - m.tauS/2) * scale, padT - 6);
+        }
+      }
+    }
+
+    // x-axis at the bottom
+    ctx.strokeStyle = getComputedStyle(document.body).getPropertyValue('--text-dim');
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(padL, H - padB + 6);
+    ctx.lineTo(padL + plotW, H - padB + 6);
+    ctx.stroke();
+    ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-mute');
+    ctx.font = '11px ' + getComputedStyle(document.body).getPropertyValue('--mono');
+    ctx.textAlign = 'left';
+    ctx.fillText('0', padL, H - padB + 20);
+    ctx.textAlign = 'right';
+    ctx.fillText(fmt(totalShown), padL + plotW, H - padB + 20);
+    ctx.textAlign = 'center';
+    ctx.fillText('τ_step', padL + plotW/2, H - padB + 20);
+  }
+
+  pEl.oninput = render;
+  kEl.oninput = render;
+  lEl.oninput = render;
+  tEl.onchange = render;
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

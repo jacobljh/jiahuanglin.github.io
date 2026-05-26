@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>05 · tl.dot and tensor cores</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">Triton kernels / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">05 · tl.dot</span>
+    <span class="step-pill">lesson 05 / 14</span>
+  </div>
+</header>
+
+<main>
+
+<h1>tl.dot and tensor cores</h1>
+<p class="subtitle">One primitive — <code>tl.dot(a, b)</code> — is the gateway to the tensor cores, the hardware that gives modern GPUs ~10× more flops than the vector units. The lesson answers: <strong>when does the lowering succeed, what dtypes are legal, and why bf16 in / fp32 accumulate is non-negotiable.</strong></p>
+
+<h2>What <code>tl.dot</code> actually compiles to</h2>
+
+<p>The primitive looks unassuming:</p>
+
+<pre><code>acc = tl.dot(a, b)         # a is (M, K), b is (K, N), result (M, N)
+# or with explicit accumulator:
+acc = tl.dot(a, b, acc=acc)   # acc += a @ b</code></pre>
+
+<p>On a tensor-core capable GPU and supported dtypes, Triton lowers this to a sequence of <code>mma.sync</code> (Ampere, Ada) or <code>wgmma</code> (Hopper) instructions — the hardware matmul ops. One <code>mma.sync</code> on Ampere computes a 16×8×16 outer product per warp per cycle, hundreds of times faster per cycle than the vector ALU could compute the same FMA chain.</p>
+
+<svg viewBox="0 0 720 240" class="diagram" role="img" aria-label="tl.dot of a BMxBK tile by a BKxBN tile, decomposed into many mma instructions">
+  <g font-size="11" fill="var(--text-mute)">
+    <text x="20" y="24" font-weight="700" fill="var(--text)">tl.dot tiles get diced into hardware mma blocks</text>
+    <g transform="translate(20,40)">
+      <rect width="160" height="120" fill="#dbeafe" stroke="#bfdbfe"/>
+      <text x="80" y="-4" text-anchor="middle" font-family="var(--mono)">A (BM × BK)</text>
+      <text x="80" y="68" text-anchor="middle" font-family="var(--mono)">128 × 32</text>
+      <g stroke="#94a3b8">
+        <line x1="40" x2="40" y1="0" y2="120"/><line x1="80" x2="80" y1="0" y2="120"/><line x1="120" x2="120" y1="0" y2="120"/>
+        <line x1="0" x2="160" y1="30" y2="30"/><line x1="0" x2="160" y1="60" y2="60"/><line x1="0" x2="160" y1="90" y2="90"/>
+      </g>
+    </g>
+    <text x="200" y="100" text-anchor="middle" font-size="20" font-weight="700" fill="var(--text)">×</text>
+    <g transform="translate(230,40)">
+      <rect width="160" height="120" fill="#dcfce7" stroke="#86efac"/>
+      <text x="80" y="-4" text-anchor="middle" font-family="var(--mono)">B (BK × BN)</text>
+      <text x="80" y="68" text-anchor="middle" font-family="var(--mono)">32 × 128</text>
+      <g stroke="#94a3b8">
+        <line x1="40" x2="40" y1="0" y2="120"/><line x1="80" x2="80" y1="0" y2="120"/><line x1="120" x2="120" y1="0" y2="120"/>
+        <line x1="0" x2="160" y1="30" y2="30"/><line x1="0" x2="160" y1="60" y2="60"/><line x1="0" x2="160" y1="90" y2="90"/>
+      </g>
+    </g>
+    <text x="420" y="100" text-anchor="middle" font-size="20" font-weight="700" fill="var(--text)">=</text>
+    <g transform="translate(450,40)">
+      <rect width="200" height="120" fill="#fef3c7" stroke="#fcd34d"/>
+      <text x="100" y="-4" text-anchor="middle" font-family="var(--mono)">C (BM × BN)</text>
+      <text x="100" y="68" text-anchor="middle" font-family="var(--mono)">accumulator in fp32</text>
+    </g>
+    <text x="20" y="200" fill="var(--text-mute)">Each colored sub-block of A and B is a single 16×8×16 mma.sync instruction. The compiler chooses the dicing.</text>
+    <text x="20" y="220" fill="var(--text-mute)">You write tl.dot once. The compiler emits dozens of mma's that the warp schedules together.</text>
+  </g>
+</svg>
+
+<h2>The shape constraints — when lowering succeeds</h2>
+
+<p>Tensor cores want specific tile shapes. The dimensions of the operands to <code>tl.dot</code> must be at least <strong>16 in every axis</strong>:</p>
+
+<pre><code>tl.dot(a, b)   # a: (BM, BK), b: (BK, BN)
+# Required: BM ≥ 16, BK ≥ 16, BN ≥ 16</code></pre>
+
+<p>And for best occupancy of the mma unit, you want them to be multiples of the hardware mma shape — typically <code>m16n8k16</code> on Ampere/Ada (Triton issues these in pairs so people often quote it as "16×16×16"), and <code>m64n[8..256]k16</code> via <code>wgmma</code> on Hopper. Pick BM ≥ 64 on Hopper for clean wgmma lowering.</p>
+
+<table>
+  <thead><tr><th>GPU</th><th>Native mma shape (M × N × K)</th><th>Triton calls this</th></tr></thead>
+  <tbody>
+    <tr><td>A100 (sm_80)</td><td>16 × 8 × 16</td><td><code>mma.sync.aligned.m16n8k16</code></td></tr>
+    <tr><td>H100 (sm_90)</td><td>64 × <em>N</em> × 16, N ∈ {8..256}</td><td><code>wgmma.mma_async.sync</code></td></tr>
+    <tr><td>RTX 4090 (sm_89)</td><td>16 × 8 × 16</td><td><code>mma.sync.aligned.m16n8k16</code></td></tr>
+  </tbody>
+</table>
+
+<p>If your tile dims are too small (e.g. <code>BK=8</code>), Triton silently falls back to the vector ALU — you get correct results but a small fraction of the flops. The cure is a bigger <code>BK</code>.</p>
+
+<h2>Dtype rules — bf16 in, fp32 accumulate</h2>
+
+<p>The mma instructions take low-precision inputs and accumulate in higher precision:</p>
+
+<table>
+  <thead><tr><th>Input dtypes</th><th>Allowed accumulator</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>bf16 × bf16</td><td>fp32</td><td>The modern default. Use this unless you have a reason not to.</td></tr>
+    <tr><td>fp16 × fp16</td><td>fp32 (or fp16)</td><td>fp16 accumulate is faster but can overflow on long-K matmuls.</td></tr>
+    <tr><td>fp8 × fp8</td><td>fp32</td><td>Hopper+. Triton supports e4m3 and e5m2.</td></tr>
+    <tr><td>int8 × int8</td><td>int32</td><td>Hopper+. For quantised inference.</td></tr>
+    <tr><td>tf32 × tf32</td><td>fp32</td><td>fp32 inputs, internally truncated to TF32 (19-bit: 8-bit exponent + 10-bit mantissa). The default for fp32 matmul on Ampere+.</td></tr>
+  </tbody>
+</table>
+
+<p>Concretely:</p>
+
+<pre><code>acc = tl.zeros((BM, BN), dtype=tl.float32)         # ← fp32 accumulator
+for k in range(0, K, BK):
+    a = tl.load(...).to(tl.bfloat16)                # ← bf16 inputs
+    b = tl.load(...).to(tl.bfloat16)
+    acc = tl.dot(a, b, acc)                          # mma.sync emits bf16×bf16→fp32
+y = acc.to(tl.bfloat16)                              # cast back when storing</code></pre>
+
+<div class="callout warn">
+  <div class="label">Why fp32 accumulate is non-negotiable</div>
+  Accumulating bf16 into bf16 over a K-loop of length 4096 produces drift visible in loss curves and broken downstream inference. The mantissa of bf16 is 7 bits; you need 22+ bits of accumulated precision for any non-trivial GEMM. Always <code>tl.zeros(..., dtype=tl.float32)</code>. The single most common silent bug in Triton GEMMs.
+</div>
+
+<h2>The K-loop pattern</h2>
+
+<p>For matmuls where K is much larger than your tile's BK, you loop over K:</p>
+
+<pre><code>acc = tl.zeros((BM, BN), dtype=tl.float32)
+for k in range(0, K, BK):
+    a = tl.load(a_ptr + offs_m[:, None]*stride_am + (k + offs_k)[None, :]*stride_ak,
+                mask=(offs_m[:, None] &lt; M) & ((k + offs_k)[None, :] &lt; K), other=0.).to(tl.bfloat16)
+    b = tl.load(b_ptr + (k + offs_k)[:, None]*stride_bk + offs_n[None, :]*stride_bn,
+                mask=((k + offs_k)[:, None] &lt; K) & (offs_n[None, :] &lt; N), other=0.).to(tl.bfloat16)
+    acc = tl.dot(a, b, acc)</code></pre>
+
+<p>Note:</p>
+
+<ul>
+  <li>The K mask uses <code>other=0.</code> — masked-off K positions contribute nothing to the dot product, exactly what we want.</li>
+  <li>The accumulator <code>acc</code> stays in registers across loop iterations. The compiler pipelines the next iteration's loads against the current iteration's <code>tl.dot</code> (lesson 13's <code>num_stages</code>).</li>
+</ul>
+
+<h2>Output: cast on store</h2>
+
+<p>The accumulator is fp32. The output tensor is typically bf16. Cast at the final store:</p>
+
+<pre><code>tl.store(c_ptr + ..., acc.to(tl.bfloat16), mask=...)</code></pre>
+
+<p>Storing fp32 to a bf16 output without casting will write four bytes per element to a two-byte slot — corruption, plus a runtime error if you're lucky.</p>
+
+<h2>When <code>tl.dot</code> falls back to non-tensor-core</h2>
+
+<p>If the compiler can't lower to mma, it generates a vector-ALU FMA loop instead. Triggers:</p>
+
+<ul>
+  <li><strong>Tile dim &lt; 16</strong> on any axis. Always use BM, BK, BN ≥ 16.</li>
+  <li><strong>Unsupported dtype combo</strong> on the target GPU (e.g. fp8 on Ampere).</li>
+  <li><strong>Strided / non-contiguous</strong> operands that can't be brought into a tensor-core-compatible layout.</li>
+  <li><strong>Awkward shapes</strong>: extremely small N (≤ 8) on Hopper can fall back from <code>wgmma</code> to <code>mma</code>.</li>
+</ul>
+
+<p>The compiler doesn't error out; it silently gives you slow code. The way to confirm tensor cores are firing is to dump the PTX (lesson 14) and grep for <code>mma.sync</code> / <code>wgmma</code>. Or just compare throughput to the cuBLAS reference — if you're 10× slower, you're on the ALU.</p>
+
+<h2>Interactive · is your tile shape tensor-core-friendly?</h2>
+<p>Set the tile dims and target GPU. See whether the lowering will hit tensor cores and what mma shape it dices into.</p>
+
+<div class="widget"><div class="title">tl.dot lowering preview</div><p class="hint">Real lowering depends on layouts and the autotuner. This widget approximates the rule: tile dims ≥ hardware mma shape on every axis.</p><div class="controls">
+<label class="inline">BM <input id="t5-bm" type="range" min="8" max="256" step="8" value="128"><span class="val" id="t5-bm-v">128</span></label>
+<label class="inline">BN <input id="t5-bn" type="range" min="8" max="256" step="8" value="128"><span class="val" id="t5-bn-v">128</span></label>
+<label class="inline">BK <input id="t5-bk" type="range" min="8" max="128" step="8" value="32"><span class="val" id="t5-bk-v">32</span></label>
+<label class="inline">GPU
+  <select id="t5-gpu">
+    <option value="ampere" selected>A100 (Ampere)</option>
+    <option value="hopper">H100 (Hopper)</option>
+    <option value="ada">RTX 4090 (Ada)</option>
+  </select>
+</label>
+</div><div id="t5-out" class="kpi-grid"></div><p class="hint" id="t5-note"></p></div>
+
+<h2>What's next</h2>
+
+<p>You can do dense matmuls. The other half of every transformer kernel is reductions — sums, maxes, and the softmax pattern. Lesson 06 introduces <code>tl.sum</code> and friends, and previews the online-softmax recurrence that makes Flash Attention possible.</p>
+
+<footer class="lesson-nav">
+  <a href="04_pointers_masks.html"><span class="dir">Previous</span><span class="ttl">04 · Pointers + masks</span></a>
+  <a class="next" href="06_reductions.html"><span class="dir">Next</span><span class="ttl">06 · Reductions and online algorithms</span></a>
+</footer>
+
+<script>
+(function(){
+  const e={bm:document.getElementById('t5-bm'),bn:document.getElementById('t5-bn'),bk:document.getElementById('t5-bk'),gpu:document.getElementById('t5-gpu')};
+  const out=document.getElementById('t5-out'),note=document.getElementById('t5-note');
+  function draw(){
+    document.getElementById('t5-bm-v').textContent=e.bm.value;
+    document.getElementById('t5-bn-v').textContent=e.bn.value;
+    document.getElementById('t5-bk-v').textContent=e.bk.value;
+    const bm=+e.bm.value, bn=+e.bn.value, bk=+e.bk.value, gpu=e.gpu.value;
+    const mma = {ampere:[16,8,16], hopper:[64,8,16], ada:[16,8,16]}[gpu];
+    const fitsM = bm >= mma[0], fitsN = bn >= mma[1], fitsK = bk >= mma[2];
+    const ok = fitsM && fitsN && fitsK;
+    const dicedM = Math.floor(bm/mma[0]), dicedN = Math.floor(bn/mma[1]), dicedK = Math.floor(bk/mma[2]);
+    const mmas = dicedM*dicedN*dicedK;
+    out.innerHTML = '';
+    function kpi(k,v,col){const d=document.createElement('div');d.className='kpi';d.innerHTML='<div class="k">'+k+'</div><div class="v" style="color:'+col+'">'+v+'</div>';out.appendChild(d);}
+    kpi('tensor cores?', ok ? 'YES' : 'NO', ok ? '#16a34a' : '#dc2626');
+    kpi('mma per tile', ok ? mmas : '— (falls back to ALU)', ok ? '#1f2430' : '#dc2626');
+    kpi('hw mma shape', mma.join(' × '), '#1f2430');
+    kpi('flops / tile', ok ? (2*bm*bn*bk).toLocaleString() : 'same flops, ~10× slower on ALU', ok ? '#1f2430' : '#d97706');
+    const why = [];
+    if (!fitsM) why.push('BM &lt; '+mma[0]);
+    if (!fitsN) why.push('BN &lt; '+mma[1]);
+    if (!fitsK) why.push('BK &lt; '+mma[2]);
+    let msg;
+    if (ok) {
+      const eff = (bm % mma[0] === 0 && bn % mma[1] === 0 && bk % mma[2] === 0)
+        ? ' Tile dims are multiples of the hw mma — clean lowering, no wasted lanes.'
+        : ' Tile dims are not all multiples of the hw mma; the compiler will pad which wastes some lanes.';
+      msg = 'tl.dot lowers to '+mmas+' mma.sync (or wgmma) instructions per tile.' + eff;
+    } else {
+      msg = '⚠ Lowering fails — '+why.join(', ')+'. Triton silently falls back to a vector FMA loop. Increase the dim(s) flagged.';
+    }
+    note.innerHTML = msg;
+  }
+  ['input','change'].forEach(ev => Object.values(e).forEach(x => x.addEventListener(ev,draw)));
+  draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

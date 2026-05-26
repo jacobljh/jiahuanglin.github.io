@@ -1,0 +1,932 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>12 · Disaggregated prefill / decode</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">12 · disaggregated serving</span>
+    <span class="step-pill">lesson 12 / 19</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Disaggregated prefill / decode — opposite phases, opposite pools</h1>
+<p class="subtitle">Prefill is compute-bound. Decode is memory-bound. Mixing them on the same GPU forces every step to be the worse of the two. Split them onto separate pools and each pool saturates its own bottleneck — at the cost of one KV-cache transfer per request.</p>
+
+<h2>Recap — why these phases want different things</h2>
+
+<p>From lesson 01's roofline and lesson 11's decode latency math:</p>
+
+<table>
+  <thead><tr><th>Phase</th><th>Per-token work</th><th>Bottleneck</th><th>What it wants</th></tr></thead>
+  <tbody>
+    <tr><td>Prefill</td><td>FLOPs on the full prompt all at once · large matmul</td><td>Tensor cores</td><td>Lots of compute, large batch dimensions, peak FLOPs/s</td></tr>
+    <tr><td>Decode</td><td>One forward, one new token. Read all weights, do tiny matmul</td><td>HBM bandwidth</td><td>High aggregate HBM BW, KV cache that fits, low latency</td></tr>
+  </tbody>
+</table>
+
+<p>Same model. Same hardware. Same kernels. Opposite bottlenecks. The classical co-located serving (one pool runs both) suffers from a few specific pathologies:</p>
+
+<ul>
+  <li><strong>A long prefill stalls decodes behind it.</strong> A request arrives with a 16k-token prompt. To prefill that, the GPU spends ~150 ms on a single huge forward. During those 150 ms, every other request in the batch is waiting — their decode tokens delayed.</li>
+  <li><strong>Scheduling is multi-dimensional.</strong> The scheduler has to decide how much prefill to do per step, how many decodes to batch, when to admit a new request. This is what chunked prefill (vLLM lesson 10) addresses — chop long prefills into pieces and pack each piece into a decode-heavy step. Helps, but doesn't eliminate the tension.</li>
+  <li><strong>The two phases want different hardware</strong>. A H100 with maximal FLOPs is wasted on decode (you only use ~1% of its compute peak). A node with maximal HBM bandwidth and lots of memory is wasted on prefill (you barely touch HBM beyond the input).</li>
+</ul>
+
+<p>Disaggregated serving (DistServe, SplitWise, Mooncake, 2024) takes the obvious step: <strong>two pools</strong>.</p>
+
+<h2>The architecture</h2>
+
+<svg viewBox="0 0 720 280" class="diagram">
+  <text x="40" y="20" font-size="12" font-family="monospace" fill="var(--text-mute)">disaggregated serving · two specialised pools</text>
+
+  <rect class="node-bg" x="40"  y="50" width="160" height="60" rx="8"/>
+  <text x="120" y="78" text-anchor="middle" font-weight="600" font-size="13">Router</text>
+  <text x="120" y="96" text-anchor="middle" font-size="10" fill="var(--text-mute)">picks prefill GPU<br/>then decode GPU</text>
+
+  <rect class="node-bg" x="240" y="50" width="200" height="60" rx="8" fill="#152033"/>
+  <text x="340" y="76" text-anchor="middle" font-weight="600" font-size="13" fill="#2563eb">Prefill Pool</text>
+  <text x="340" y="93" text-anchor="middle" font-size="10" fill="var(--text-mute)">few GPUs · compute-bound</text>
+  <text x="340" y="106" text-anchor="middle" font-size="10" fill="var(--text-mute)">large batched prefills</text>
+
+  <rect class="node-bg" x="480" y="50" width="200" height="60" rx="8" fill="#1c2410"/>
+  <text x="580" y="76" text-anchor="middle" font-weight="600" font-size="13" fill="#16a34a">Decode Pool</text>
+  <text x="580" y="93" text-anchor="middle" font-size="10" fill="var(--text-mute)">many GPUs · memory-bound</text>
+  <text x="580" y="106" text-anchor="middle" font-size="10" fill="var(--text-mute)">continuous batched decodes</text>
+
+  <path class="edge" d="M200 80 L240 80" marker-end="url(#arrow)"/>
+  <text class="edge-label" x="210" y="74">request</text>
+
+  <path class="edge" d="M440 80 L480 80" marker-end="url(#arrow)"/>
+  <text class="edge-label" x="448" y="74" fill="var(--accent-2)">KV cache transfer</text>
+
+  <rect class="node-bg" x="240" y="160" width="440" height="60" rx="8" fill="#13141c"/>
+  <text x="460" y="186" text-anchor="middle" font-size="13">network: NVLink / IB / RDMA</text>
+  <text x="460" y="204" text-anchor="middle" font-size="10" fill="var(--text-mute)">~50–900 GB/s · governs KV transfer time</text>
+
+  <path class="edge" d="M340 110 L340 160" marker-end="url(#arrow)"/>
+  <path class="edge" d="M580 110 L580 160" marker-end="url(#arrow)"/>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/>
+    </marker>
+  </defs>
+</svg>
+
+<p>A request flows:</p>
+<ol>
+  <li><strong>Router</strong> picks a prefill GPU and a decode GPU (or pair) based on load and the request's expected length.</li>
+  <li><strong>Prefill GPU</strong> runs the full forward pass on the prompt. Result: the KV cache for that prompt's tokens.</li>
+  <li><strong>KV cache is transferred</strong> from the prefill GPU to the decode GPU over the network.</li>
+  <li><strong>Decode GPU</strong> receives the KV, begins generating tokens one at a time, streams to the user.</li>
+</ol>
+
+<p>Each pool's scheduler is simpler (one workload class instead of two). Each pool's hardware can be specialised (different GPU SKUs, different TP shapes). Each pool's GPU utilisation rises closer to its physical limit.</p>
+
+<h2>Animated · disaggregated vs co-located, same request</h2>
+
+<p>The same request travels through both architectures side by side. Co-located (top lane) sequentially does prefill then decode on one pool, stalling any other request behind it. Disaggregated (bottom lane) runs prefill on the small specialised pool, transfers the KV cache over IB, and lets the decode pool start while the prefill pool is already free for the next request. Play to watch a sequence of requests stream through.</p>
+
+<div class="widget" id="dis-anim">
+  <div class="title">Two architectures · same workload · per-GPU timeline</div>
+  <div class="hint">Time runs left to right. Blue = prefill compute, green = decode compute, orange = KV cache transfer. Idle = empty. Each row is one GPU.</div>
+
+  <div class="controls">
+    <button id="da-play" class="primary">▶ play</button>
+    <button id="da-reset">⟲ reset</button>
+    <label class="inline">speed: <input type="range" id="da-spd" min="1" max="10" step="1" value="3"> <span class="val" id="da-spd-v">3×</span></label>
+    <label class="inline">prompt (tok): <input type="range" id="da-ap" min="200" max="8000" step="100" value="2000"> <span class="val" id="da-ap-v">2000</span></label>
+    <label class="inline">completion (tok): <input type="range" id="da-ac" min="20" max="800" step="20" value="200"> <span class="val" id="da-ac-v">200</span></label>
+  </div>
+
+  <canvas id="da-canvas" width="760" height="380" style="width:100%; height:380px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">co-located TTFT (this req)</div><div class="v" id="da-cttft">—</div></div>
+    <div class="kpi"><div class="k">disagg TTFT (this req)</div><div class="v" id="da-dttft">—</div></div>
+    <div class="kpi"><div class="k">co-located req completed</div><div class="v" id="da-creq">—</div></div>
+    <div class="kpi"><div class="k">disagg req completed</div><div class="v" id="da-dreq">—</div></div>
+  </div>
+</div>
+
+<h2>The new cost — KV transfer</h2>
+
+<p>Nothing is free. For a prompt of <span class="math">T</span> tokens, the KV cache is:</p>
+
+<div class="math block">
+  KV_bytes &nbsp;=&nbsp; 2 · h_kv · d_k · T · L · dtype_bytes
+</div>
+
+<p>For a Llama-70B model (<span class="math">h_kv = 8, d_k = 128, L = 80</span>) at <span class="math">T = 2048</span> in bf16: <span class="math">2 · 8 · 128 · 2048 · 80 · 2 = 671 MB</span>. At a fleet-wide 1000 req/s (across all replicas — not a single deployment), that's 671 GB/s of KV transfer load to schedule across the rack.</p>
+
+<p>At inter-node 50 GB/s per NIC, you'd need ~14 NICs of aggregate KV bandwidth — feasible but not free. The whole point of disaggregation is contingent on the KV transfer being cheap enough that the per-pool efficiency gains outweigh the transfer cost.</p>
+
+<p>Optimisations:</p>
+<ul>
+  <li><strong>Layer-wise streaming.</strong> Don't wait for the entire prefill to finish before starting transfer. As soon as prefill finishes layer <span class="math">l</span>, that layer's KV starts transferring. Decode can begin as soon as the first few layers' KV has arrived. Overlap transfer with the rest of prefill.</li>
+  <li><strong>Co-located racks.</strong> Put prefill and decode GPUs on the same NVLink island when possible — then KV transfer runs at ~900 GB/s instead of ~50 GB/s.</li>
+  <li><strong>KV compression.</strong> FP8 or even INT4 KV cache halves or quarters transfer cost. Same approach also reduces decode-time HBM read.</li>
+  <li><strong>Larger KV blocks.</strong> Per-message overhead matters. Sending one 670 MB chunk is faster than 16 × 42 MB chunks at the same total bytes, because of fewer NCCL launches.</li>
+</ul>
+
+<h2>3D · KV bytes flowing over IB, prefill rack → decode rack</h2>
+
+<p>Isometric view of two racks. Each rack holds <em>n</em> GPUs (stacked cubes). When a prefill finishes a layer, the bytes pop out and stream across the IB link to the decode rack. Slide the bandwidth knob: at IB 50 GB/s the stream is sparse; at NVLink-island 900 GB/s the link saturates instantly.</p>
+
+<div class="widget" id="kv3-widget">
+  <div class="title">KV transfer · prefill rack → decode rack (isometric)</div>
+  <div class="hint">Layer-wise streaming: each "byte particle" represents one layer's KV (~8 MB per layer at T=2k). Travel time = bytes / bandwidth.</div>
+
+  <div class="controls">
+    <label class="inline">prefill GPUs: <input type="range" id="kv-gp" min="1" max="8" step="1" value="2"> <span class="val" id="kv-gp-v">2</span></label>
+    <label class="inline">decode GPUs: <input type="range" id="kv-gd" min="1" max="8" step="1" value="4"> <span class="val" id="kv-gd-v">4</span></label>
+    <label class="inline">IB BW (GB/s): <input type="range" id="kv-bw" min="20" max="900" step="20" value="200"> <span class="val" id="kv-bw-v">200</span></label>
+    <label class="inline">prompt (tok): <input type="range" id="kv-t" min="500" max="8000" step="500" value="2000"> <span class="val" id="kv-t-v">2000</span></label>
+    <button id="kv-play" class="primary">▶ play</button>
+  </div>
+
+  <canvas id="kv-canvas" width="760" height="380" style="width:100%; height:380px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">total KV (per req)</div><div class="v" id="kv-tot">—</div></div>
+    <div class="kpi"><div class="k">transfer time</div><div class="v" id="kv-tt">—</div></div>
+    <div class="kpi"><div class="k">link utilisation</div><div class="v" id="kv-util">—</div></div>
+    <div class="kpi"><div class="k">overlap w/ prefill?</div><div class="v" id="kv-ov" style="font-size:14px;">—</div></div>
+  </div>
+</div>
+
+<h2>Why pool sizes don't match</h2>
+
+<p>One prefill GPU can feed several decode GPUs. The reason: a prefill GPU produces one prompt-worth of KV per ~100 ms (for typical prompts), and a decode GPU then spends seconds-to-minutes generating tokens against that KV. Numerical example (very rough):</p>
+
+<table>
+  <thead><tr><th>Quantity</th><th>Value</th></tr></thead>
+  <tbody>
+    <tr><td>Prefill latency for 2k prompt on H100</td><td>~150 ms</td></tr>
+    <tr><td>Decode latency per token (TP=8)</td><td>~6 ms</td></tr>
+    <tr><td>Avg generated length per request</td><td>200 tokens (= 1200 ms)</td></tr>
+    <tr><td>Decodes one prefill "fills"</td><td>~1200 / 150 ≈ 8 decode batches</td></tr>
+    <tr><td>Pool ratio (prefill : decode), GPUs</td><td>roughly 1 : 4 to 1 : 8</td></tr>
+  </tbody>
+</table>
+
+<p>This ratio depends on the workload mix (avg prompt vs avg completion length) and is a tunable in production. Many providers auto-scale the two pools independently based on observed queue length.</p>
+
+<h2>2D · utilisation heatmap, co-located vs disaggregated</h2>
+
+<p>Each row is one GPU, each column a 10 ms time slice. The cell colour is utilisation: darker = idle, bright = saturated on its bottleneck (FLOPs for prefill, HBM bandwidth for decode). The co-located heatmap shows the classic stripey pattern — prefills crowd out decodes, decode-only steps underuse FLOPs. The disaggregated heatmap shows two flat, mostly-bright bands.</p>
+
+<div class="widget" id="heat-widget">
+  <div class="title">Per-GPU utilisation over time · two architectures</div>
+  <div class="hint">Same total request stream is fed to both. Co-located mixes both phases; disaggregated splits them. Try long prompts to see the gap widen.</div>
+
+  <div class="controls">
+    <label class="inline">request rate (req/s): <input type="range" id="ht-r" min="2" max="40" step="1" value="12"> <span class="val" id="ht-r-v">12</span></label>
+    <label class="inline">avg prompt (tok): <input type="range" id="ht-ap" min="100" max="4000" step="100" value="1500"> <span class="val" id="ht-ap-v">1500</span></label>
+    <label class="inline">avg completion (tok): <input type="range" id="ht-ac" min="50" max="800" step="50" value="200"> <span class="val" id="ht-ac-v">200</span></label>
+    <label class="inline">GPUs (each side): <input type="range" id="ht-g" min="4" max="16" step="1" value="8"> <span class="val" id="ht-g-v">8</span></label>
+  </div>
+
+  <canvas id="ht-canvas" width="760" height="360" style="width:100%; height:360px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">co-located avg util</div><div class="v" id="ht-cu">—</div></div>
+    <div class="kpi"><div class="k">disagg avg util</div><div class="v" id="ht-du">—</div></div>
+    <div class="kpi"><div class="k">co-located variance</div><div class="v" id="ht-cv">—</div></div>
+    <div class="kpi"><div class="k">disagg variance</div><div class="v" id="ht-dv">—</div></div>
+  </div>
+</div>
+
+<h2>When NOT to disaggregate</h2>
+
+<ul>
+  <li><strong>Very short prompts.</strong> If prompts are 50 tokens, prefill is ~10 ms (at our 5000 tok/s/GPU rate) — the KV-transfer cost is on the same order as the saving. Co-located prefill+decode is fine.</li>
+  <li><strong>Single-machine deployments.</strong> The complexity is not worth it for one node.</li>
+  <li><strong>Latency-extreme workloads.</strong> Adding a network hop adds tens of ms; chat with sub-200 ms TTFT may not tolerate it.</li>
+  <li><strong>When chunked prefill suffices.</strong> If the in-pool scheduling problem is mild, the simpler vLLM/SGLang-style chunked prefill might be enough.</li>
+</ul>
+
+<h2>Disaggregation as a 3D parallelism analogue</h2>
+
+<p>Notice the parallel: training disaggregates the work by parallelism axis (TP, PP, DP), with the rule "fastest fabric for chattiest comm". Inference disaggregates by <em>phase</em>, with the analogous rule "match the phase to the hardware best at its bottleneck". The two share a deep idea: when one workload class doesn't suit one hardware shape, find the heterogeneity and let it be load-bearing.</p>
+
+<h2>Interactive · is disaggregation worth it for your workload?</h2>
+
+<p>Adjust avg prompt length, avg completion length, and KV bandwidth. The widget compares co-located scheduling (with chunked prefill) against disaggregated serving for the same number of GPUs. Outputs: effective tokens/sec, average TTFT, p99 TTFT.</p>
+
+<div class="widget" id="d-widget">
+  <div class="title">Co-located vs disaggregated serving · throughput &amp; latency</div>
+  <div class="hint">A toy queue simulator. Co-located has one pool that does both phases (with chunked prefill packing). Disaggregated has two pools split by the slider. Watch how disaggregation wins on TTFT for long prompts and loses on cost when prompts are short.</div>
+
+  <div class="controls">
+    <label class="inline">total GPUs: <input type="range" id="d-g" min="8" max="128" step="8" value="32"> <span class="val" id="d-g-v">32</span></label>
+    <label class="inline">prefill share: <input type="range" id="d-pr" min="10" max="60" step="5" value="25"> <span class="val" id="d-pr-v">25</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline">avg prompt (tok): <input type="range" id="d-ap" min="50" max="8000" step="50" value="1024"> <span class="val" id="d-ap-v">1024</span></label>
+    <label class="inline">avg completion (tok): <input type="range" id="d-ac" min="50" max="2000" step="50" value="200"> <span class="val" id="d-ac-v">200</span></label>
+    <label class="inline">KV xfer BW (GB/s): <input type="range" id="d-bw" min="20" max="900" step="20" value="200"> <span class="val" id="d-bw-v">200</span></label>
+  </div>
+
+  <canvas class="dist-canvas" id="d-canvas" width="760" height="240" style="height: 240px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">co-located TTFT</div><div class="v" id="d-cttft">—</div></div>
+    <div class="kpi"><div class="k">disagg TTFT</div><div class="v" id="d-dttft">—</div></div>
+    <div class="kpi"><div class="k">co-located TPS</div><div class="v" id="d-ctps">—</div></div>
+    <div class="kpi"><div class="k">disagg TPS</div><div class="v" id="d-dtps">—</div></div>
+  </div>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Disaggregation buys per-pool utilisation by splitting one mixed workload into two specialised ones, paying the cost of one KV transfer per request. The break-even depends on prompt length, network bandwidth, and the value of per-phase utilisation. It pairs naturally with continuous batching, paged KV, and chunked prefill — but at extreme scale (large model, long context, high QPS), disaggregation is the highest-impact serving lever after PagedAttention itself.
+</div>
+
+<div class="callout">
+  <div class="label">Where this goes next</div>
+  We've walked the bandwidth pyramid down and back up. Training disperses one model across many GPUs; inference reassembles it for users. The pieces in <a href="../../vllm/lessons/"><code>vllm/lessons/</code></a> — KV cache, PagedAttention, continuous batching, prefill chunking, speculative decoding, GQA/MQA — are all decode-pool-internal optimizations that compose with everything in this series. The pieces in <a href="../../RL/lessons/"><code>RL/lessons/</code></a> — rollout, reference, algorithm, trainer, weight-sync — compose with training-side parallelism to build a real RL post-training stack. <strong>All three lesson series are the same system, sliced different ways.</strong>
+</div>
+
+<footer class="lesson-nav">
+  <a href="11_inference_tp_vs_replication.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">11 · Inference TP vs replication</span>
+  </a>
+  <a class="next" href="13_pytorch_internals.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">13 · PyTorch internals</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const get = id => document.getElementById(id);
+  const els = {
+    g:get('d-g'),gv:get('d-g-v'),pr:get('d-pr'),prv:get('d-pr-v'),
+    ap:get('d-ap'),apv:get('d-ap-v'),ac:get('d-ac'),acv:get('d-ac-v'),
+    bw:get('d-bw'),bwv:get('d-bw-v'),
+    canvas:get('d-canvas'),
+    cttft:get('d-cttft'),dttft:get('d-dttft'),ctps:get('d-ctps'),dtps:get('d-dtps')
+  };
+  const ctx = els.canvas.getContext('2d');
+
+  function compute(){
+    const G = parseInt(els.g.value);
+    const pr_share = parseInt(els.pr.value)/100;
+    const ap = parseInt(els.ap.value);
+    const ac = parseInt(els.ac.value);
+    const bw = parseInt(els.bw.value)*1e9;
+
+    els.gv.textContent = G; els.prv.textContent = parseInt(els.pr.value);
+    els.apv.textContent = ap; els.acv.textContent = ac; els.bwv.textContent = parseInt(els.bw.value);
+
+    const prefill_tok_per_s = 5000;
+    const decode_tok_per_s  = 100;
+    const kv_bytes_per_tok = 671e6 / 2048;
+
+    const total_tok = ap + ac;
+    const pfrac = ap / total_tok;
+    const co_per_gpu_tps = 1 / (pfrac / prefill_tok_per_s + (1 - pfrac) / decode_tok_per_s);
+    const co_TPS = co_per_gpu_tps * G;
+    const co_ttft = (ap / prefill_tok_per_s) * 1000;
+
+    const Gp = Math.max(1, Math.round(G * pr_share));
+    const Gd = G - Gp;
+    const pre_TPS = Gp * prefill_tok_per_s;
+    const dec_TPS = Gd * decode_tok_per_s;
+    const req_per_s_pre = pre_TPS / ap;
+    const req_per_s_dec = dec_TPS / ac;
+    const req_per_s = Math.min(req_per_s_pre, req_per_s_dec);
+    const dis_TPS = req_per_s * (ap + ac);
+    const kv = ap * kv_bytes_per_tok;
+    const xfer_ms = (kv / bw) * 1000;
+    const dis_ttft = (ap / prefill_tok_per_s) * 1000 + xfer_ms;
+
+    els.cttft.textContent = co_ttft.toFixed(0) + ' ms';
+    els.dttft.textContent = dis_ttft.toFixed(0) + ' ms';
+    els.ctps.textContent  = (co_TPS / 1e3).toFixed(1) + ' k/s';
+    els.dtps.textContent  = (dis_TPS / 1e3).toFixed(1) + ' k/s';
+
+    return { co_TPS, dis_TPS, co_ttft, dis_ttft, Gp, Gd, xfer_ms };
+  }
+
+  function render(){
+    const r = compute();
+    const dpr = window.devicePixelRatio || 1;
+    const W = els.canvas.clientWidth, H = els.canvas.clientHeight;
+    if (els.canvas.width !== Math.round(W*dpr)){
+      els.canvas.width = Math.round(W*dpr); els.canvas.height = Math.round(H*dpr);
+    }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 100, padR = 14, padT = 14, padB = 22;
+
+    const innerW = (W - padL - padR) / 2 - 14;
+
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('throughput (tok/s)', padL, padT);
+    const tpsMax = Math.max(r.co_TPS, r.dis_TPS) * 1.1;
+    const bars1 = [
+      { name:'co-located', v:r.co_TPS, c:'#2563eb' },
+      { name:'disaggregated', v:r.dis_TPS, c:'#16a34a' },
+    ];
+    bars1.forEach((b,i)=>{
+      const y = padT + 20 + i*44;
+      ctx.fillStyle = '#1f2430'; ctx.fillText(b.name, 4, y + 16);
+      const w = (b.v / tpsMax) * innerW;
+      ctx.fillStyle = b.c;
+      ctx.fillRect(padL, y, Math.max(1, w), 28);
+      ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+      ctx.fillText((b.v/1e3).toFixed(1) + ' k/s', padL + w + 4, y + 18);
+    });
+
+    const x2 = padL + innerW + 28;
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('TTFT (ms · lower is better)', x2, padT);
+    const ttftMax = Math.max(r.co_ttft, r.dis_ttft) * 1.1;
+    const bars2 = [
+      { name:'co-located', v:r.co_ttft, c:'#2563eb' },
+      { name:'disaggregated', v:r.dis_ttft, c:'#d97706' },
+    ];
+    bars2.forEach((b,i)=>{
+      const y = padT + 20 + i*44;
+      const w = (b.v / ttftMax) * innerW;
+      ctx.fillStyle = b.c;
+      ctx.fillRect(x2, y, Math.max(1, w), 28);
+      ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+      ctx.fillText(b.v.toFixed(0) + ' ms', x2 + w + 4, y + 18);
+    });
+
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('pools (disagg): prefill ' + r.Gp + ' GPUs · decode ' + r.Gd + ' GPUs · KV xfer ' + r.xfer_ms.toFixed(1) + ' ms',
+                 padL, H - 6);
+  }
+
+  ['input','change'].forEach(ev=>{
+    [els.g,els.pr,els.ap,els.ac,els.bw].forEach(el=>el.addEventListener(ev,render));
+  });
+  window.addEventListener('resize',render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: animated prefill/decode disaggregation timeline ─── */
+(function(){
+  const C = document.getElementById('da-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    play:$('da-play'), reset:$('da-reset'),
+    spd:$('da-spd'), spdv:$('da-spd-v'),
+    ap:$('da-ap'), apv:$('da-ap-v'),
+    ac:$('da-ac'), acv:$('da-ac-v'),
+    cttft:$('da-cttft'), dttft:$('da-dttft'),
+    creq:$('da-creq'), dreq:$('da-dreq')
+  };
+
+  let playing=false, lastT=0, simT=0;
+  // 4 GPUs total in each layout
+  // Co-located: 4 GPUs both do everything.
+  // Disagg: 1 prefill GPU + 3 decode GPUs.
+  const CO_GPUS = 4, DIS_P = 1, DIS_D = 3;
+
+  // schedule a stream of arrivals every ~150ms simulated
+  function buildRequests(){
+    const reqs = [];
+    for (let i=0; i<10; i++){
+      reqs.push({ id:i, arrive: i*180 });
+    }
+    return reqs;
+  }
+  let REQS = buildRequests();
+
+  function reset(){
+    playing=false; els.play.textContent='▶ play';
+    simT = 0;
+    REQS = buildRequests();
+    render();
+  }
+  els.reset.addEventListener('click', reset);
+
+  function simulate(tEnd){
+    const ap = +els.ap.value, ac = +els.ac.value;
+    els.apv.textContent = ap; els.acv.textContent = ac;
+    const prefillMs = ap / 5000 * 1000; // ~prefill_tok_per_s = 5k
+    const decodeMs = ac * 6; // ~6 ms/tok at TP=8 (rough)
+    const xferMs = (ap / 2048 * 671e6) / (200e9) * 1000;
+
+    // Co-located: round-robin assign full request to one GPU.
+    const coGpus = Array(CO_GPUS).fill(0).map(()=>({ busy:[] }));
+    REQS.forEach((r, ri) => {
+      const g = ri % CO_GPUS;
+      const start = Math.max(r.arrive, coGpus[g].busy.length ? coGpus[g].busy[coGpus[g].busy.length-1].end : 0);
+      // prefill then decode on same gpu
+      coGpus[g].busy.push({ kind:'prefill', start, end: start+prefillMs, req:ri });
+      coGpus[g].busy.push({ kind:'decode',  start: start+prefillMs, end: start+prefillMs+decodeMs, req:ri });
+      r.coTTFT = (start+prefillMs) - r.arrive;
+    });
+
+    // Disagg: 1 prefill GPU pipelines prefills; KV transfer; decode pool round-robin.
+    const disP = Array(DIS_P).fill(0).map(()=>({ busy:[] }));
+    const disD = Array(DIS_D).fill(0).map(()=>({ busy:[] }));
+    REQS.forEach((r, ri) => {
+      const gp = ri % DIS_P;
+      const ps = Math.max(r.arrive, disP[gp].busy.length ? disP[gp].busy[disP[gp].busy.length-1].end : 0);
+      disP[gp].busy.push({ kind:'prefill', start: ps, end: ps+prefillMs, req:ri });
+      const xs = ps + prefillMs;
+      disP[gp].busy.push({ kind:'xfer', start: xs, end: xs+xferMs, req:ri });
+      const gd = ri % DIS_D;
+      const ds = Math.max(xs+xferMs, disD[gd].busy.length ? disD[gd].busy[disD[gd].busy.length-1].end : 0);
+      disD[gd].busy.push({ kind:'decode', start: ds, end: ds+decodeMs, req:ri });
+      r.disTTFT = ds - r.arrive;
+    });
+
+    return { coGpus, disP, disD, prefillMs, decodeMs, xferMs };
+  }
+
+  function render(){
+    const sim = simulate();
+    const dpr = window.devicePixelRatio||1;
+    const W=C.clientWidth, H=C.clientHeight;
+    if (C.width!==Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    // total horizon = max of all "end" times
+    let horizon = 0;
+    [sim.coGpus, sim.disP, sim.disD].forEach(arr => {
+      arr.forEach(g => g.busy.forEach(b => horizon = Math.max(horizon, b.end)));
+    });
+    horizon = horizon * 1.05;
+
+    const padL = 110, padR = 14;
+    const padT_co = 30, padT_dis = 180;
+    const rowH = 22;
+    const innerW = W - padL - padR;
+
+    function drawArchitecture(label, sublabel, padT, gpus, isCoLoc){
+      ctx.fillStyle = '#1f2430'; ctx.font = '13px monospace';
+      ctx.fillText(label, 10, padT-12);
+      ctx.fillStyle = '#5b6573'; ctx.font='10px monospace';
+      ctx.fillText(sublabel, 10, padT+2);
+      gpus.forEach((g, gi) => {
+        const y = padT + 14 + gi*rowH;
+        // lane background
+        ctx.fillStyle = '#f1f3f7'; ctx.strokeStyle='#dde2ea'; ctx.lineWidth=1;
+        ctx.fillRect(padL, y, innerW, rowH-4);
+        ctx.strokeRect(padL, y, innerW, rowH-4);
+        ctx.fillStyle = '#5b6573'; ctx.font='10px monospace';
+        ctx.fillText('GPU '+gi, 65, y+13);
+        g.busy.forEach(b => {
+          if (b.start > simT) return;
+          const x = padL + (b.start/horizon)*innerW;
+          const ex = padL + Math.min(b.end, simT)/horizon*innerW;
+          const w = Math.max(1, ex - x);
+          const col = b.kind==='prefill' ? '#2563eb' :
+                      b.kind==='decode'  ? '#16a34a' :
+                      b.kind==='xfer'    ? '#d97706' : '#94a3b8';
+          ctx.fillStyle = col;
+          ctx.fillRect(x, y+2, w, rowH-8);
+          if (w > 16){
+            ctx.fillStyle = '#ffffff'; ctx.font='10px monospace';
+            const lbl = b.kind==='prefill'?'P':b.kind==='decode'?'D':'KV';
+            ctx.fillText(lbl+b.req, x+2, y+13);
+          }
+        });
+      });
+    }
+
+    drawArchitecture('Co-located', '4 GPUs · both phases', padT_co, sim.coGpus, true);
+    drawArchitecture('Disaggregated', 'prefill pool (1) + decode pool (3)', padT_dis, [...sim.disP, ...sim.disD], false);
+    // separator inside disagg between pools
+    const sepY = padT_dis + 14 + DIS_P*rowH - 3;
+    ctx.strokeStyle = '#cbd5e1'; ctx.setLineDash([2,3]);
+    ctx.beginPath(); ctx.moveTo(padL-50, sepY); ctx.lineTo(padL+innerW+4, sepY); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle='#94a3b8'; ctx.font='9px monospace';
+    ctx.fillText('— pool boundary —', padL+innerW-130, sepY-2);
+
+    // time axis
+    const axisY = H - 28;
+    ctx.strokeStyle = '#cbd5e1';
+    ctx.beginPath(); ctx.moveTo(padL, axisY); ctx.lineTo(padL+innerW, axisY); ctx.stroke();
+    ctx.fillStyle='#94a3b8'; ctx.font='10px monospace';
+    for (let i=0;i<=8;i++){
+      const x = padL + (i/8)*innerW;
+      const t = (i/8)*horizon;
+      ctx.fillRect(x, axisY, 1, 4);
+      ctx.fillText(t.toFixed(0)+'ms', x-12, axisY+14);
+    }
+    // playhead
+    const phx = padL + (simT/horizon)*innerW;
+    ctx.strokeStyle = '#dc2626'; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.moveTo(phx, padT_co-16); ctx.lineTo(phx, axisY); ctx.stroke();
+
+    // legend
+    ctx.fillStyle='#2563eb'; ctx.fillRect(padL, 8, 10, 10); ctx.fillStyle='#5b6573'; ctx.font='10.5px monospace'; ctx.fillText('prefill', padL+14, 17);
+    ctx.fillStyle='#16a34a'; ctx.fillRect(padL+80, 8, 10, 10); ctx.fillStyle='#5b6573'; ctx.fillText('decode', padL+94, 17);
+    ctx.fillStyle='#d97706'; ctx.fillRect(padL+160, 8, 10, 10); ctx.fillStyle='#5b6573'; ctx.fillText('KV transfer', padL+174, 17);
+
+    // KPIs
+    const co0 = REQS[0]?.coTTFT || 0;
+    const di0 = REQS[0]?.disTTFT || 0;
+    els.cttft.textContent = co0.toFixed(0)+' ms';
+    els.dttft.textContent = di0.toFixed(0)+' ms';
+    const completedCo = sim.coGpus.flatMap(g=>g.busy).filter(b=>b.kind==='decode' && b.end<=simT).length;
+    const completedDis = sim.disD.flatMap(g=>g.busy).filter(b=>b.end<=simT).length;
+    els.creq.textContent = completedCo;
+    els.dreq.textContent = completedDis;
+  }
+
+  function tick(ts){
+    if (!playing) return;
+    const dt = Math.min(50, ts - lastT);
+    lastT = ts;
+    const spd = +els.spd.value;
+    simT += dt * (spd * 5); // sim time advances
+    render();
+    requestAnimationFrame(tick);
+  }
+
+  els.play.addEventListener('click', ()=>{
+    playing=!playing; els.play.textContent = playing?'❚❚ pause':'▶ play';
+    if (playing){ lastT = performance.now(); requestAnimationFrame(tick); }
+  });
+  els.spd.addEventListener('input', ()=>{ els.spdv.textContent = els.spd.value+'×'; });
+  els.ap.addEventListener('input', ()=>{ render(); });
+  els.ac.addEventListener('input', ()=>{ render(); });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: 3D KV transfer visualizer ─── */
+(function(){
+  const C = document.getElementById('kv-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  let GP=2, GD=4, BW=200, T=2000;
+  let playing=false, lastT=0;
+  let particles = []; // {x:0..1, layer}
+  let simT = 0;
+  let layerSent = 0;
+
+  const els = {
+    gp:$('kv-gp'),gpv:$('kv-gp-v'),
+    gd:$('kv-gd'),gdv:$('kv-gd-v'),
+    bw:$('kv-bw'),bwv:$('kv-bw-v'),
+    t:$('kv-t'),tv:$('kv-t-v'),
+    play:$('kv-play'),
+    tot:$('kv-tot'),tt:$('kv-tt'),util:$('kv-util'),ov:$('kv-ov')
+  };
+
+  els.gp.addEventListener('input', ()=>{ GP=+els.gp.value; els.gpv.textContent=GP; render(); });
+  els.gd.addEventListener('input', ()=>{ GD=+els.gd.value; els.gdv.textContent=GD; render(); });
+  els.bw.addEventListener('input', ()=>{ BW=+els.bw.value; els.bwv.textContent=BW; render(); });
+  els.t.addEventListener('input', ()=>{ T=+els.t.value; els.tv.textContent=T; render(); });
+  els.play.addEventListener('click', ()=>{
+    playing=!playing; els.play.textContent = playing?'❚❚ pause':'▶ play';
+    if (playing){ lastT=performance.now(); particles=[]; simT=0; layerSent=0; requestAnimationFrame(tick); }
+  });
+
+  const L_LAYERS = 80; // model layers
+  function kvBytes(){ return (671e6/2048)*T; }
+  function kvPerLayer(){ return kvBytes() / L_LAYERS; }
+  function transferTimeMs(){ return (kvBytes() / (BW*1e9))*1000; }
+  function prefillTimeMs(){ return (T / 5000) * 1000; }
+
+  function tick(ts){
+    if (!playing) return;
+    const dt = Math.min(50, ts-lastT); lastT = ts;
+    simT += dt*2.0; // simulated ms
+    // bytes per ms over link
+    const bytesPerMs = BW * 1e6;
+    // spawn a layer every (prefillTimeMs / L_LAYERS) ms, send instantly into pipe
+    const layerInterval = prefillTimeMs() / L_LAYERS;
+    while (layerSent < L_LAYERS && simT > (layerSent+1)*layerInterval){
+      particles.push({ x:0, layer:layerSent });
+      layerSent++;
+    }
+    // advance particles based on bw
+    const totalTime = transferTimeMs() * (L_LAYERS/L_LAYERS); // per layer time
+    const speedPerMs = 1 / (kvPerLayer()/bytesPerMs); // 1/ms
+    particles.forEach(p => { p.x += dt*2.0*speedPerMs; });
+    particles = particles.filter(p => p.x < 1);
+    render();
+    if (layerSent < L_LAYERS || particles.length > 0) requestAnimationFrame(tick);
+    else { playing=false; els.play.textContent='▶ play'; }
+  }
+
+  function proj(x,y,z,cx,cy){
+    const a = Math.PI/7;
+    return [cx + (x - z*0.6)*Math.cos(a), cy + (x*0.18 + y - z*0.55)];
+  }
+
+  function drawRack(cx, cy, nGpus, label, color){
+    const baseW = 80, baseD = 60;
+    const corners = [
+      proj(0,0,0,cx,cy), proj(baseW,0,0,cx,cy),
+      proj(baseW,0,baseD,cx,cy), proj(0,0,baseD,cx,cy)
+    ];
+    // floor
+    ctx.fillStyle='#eef1f5'; ctx.strokeStyle='#dde2ea'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(corners[0][0],corners[0][1]);
+    corners.slice(1).forEach(p=>ctx.lineTo(p[0],p[1]));
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    // GPUs stacked
+    const stackH = 100;
+    const perH = stackH / Math.max(1, nGpus);
+    for (let g=0; g<nGpus; g++){
+      const z0 = perH*g + 4;
+      const p000 = proj(8, z0, 8, cx, cy);
+      const p100 = proj(baseW-8, z0, 8, cx, cy);
+      const p110 = proj(baseW-8, z0, baseD-8, cx, cy);
+      const p010 = proj(8, z0, baseD-8, cx, cy);
+      const p001 = proj(8, z0+perH*0.8, 8, cx, cy);
+      const p101 = proj(baseW-8, z0+perH*0.8, 8, cx, cy);
+      const p111 = proj(baseW-8, z0+perH*0.8, baseD-8, cx, cy);
+      const p011 = proj(8, z0+perH*0.8, baseD-8, cx, cy);
+      function shade(c, f){
+        const m=c.replace('#',''); return 'rgb('+
+          Math.round(parseInt(m.substr(0,2),16)*f)+','+
+          Math.round(parseInt(m.substr(2,2),16)*f)+','+
+          Math.round(parseInt(m.substr(4,2),16)*f)+')';
+      }
+      // top
+      ctx.fillStyle=shade(color,1.0);
+      ctx.beginPath(); ctx.moveTo(p001[0],p001[1]); ctx.lineTo(p101[0],p101[1]);
+      ctx.lineTo(p111[0],p111[1]); ctx.lineTo(p011[0],p011[1]); ctx.closePath(); ctx.fill();
+      // front
+      ctx.fillStyle=shade(color,0.65);
+      ctx.beginPath(); ctx.moveTo(p001[0],p001[1]); ctx.lineTo(p011[0],p011[1]);
+      ctx.lineTo(p010[0],p010[1]); ctx.lineTo(p000[0],p000[1]); ctx.closePath(); ctx.fill();
+      // right
+      ctx.fillStyle=shade(color,0.82);
+      ctx.beginPath(); ctx.moveTo(p011[0],p011[1]); ctx.lineTo(p111[0],p111[1]);
+      ctx.lineTo(p110[0],p110[1]); ctx.lineTo(p010[0],p010[1]); ctx.closePath(); ctx.fill();
+    }
+    // label
+    ctx.fillStyle='#1f2430'; ctx.font='12px monospace';
+    const lblP = proj(8, stackH+20, 8, cx, cy);
+    ctx.fillText(label, lblP[0]-5, lblP[1]+8);
+    return { centerY: cy - stackH*0.4, leftX: corners[0][0], rightX: corners[1][0] };
+  }
+
+  function render(){
+    const dpr=window.devicePixelRatio||1;
+    const W=C.clientWidth, H=C.clientHeight;
+    if (C.width!==Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const leftCX = 130, rightCX = W - 280;
+    const cy = H/2 + 30;
+    const leftRack = drawRack(leftCX, cy, GP, 'prefill rack ('+GP+' GPU)', '#2563eb');
+    const rightRack = drawRack(rightCX, cy, GD, 'decode rack ('+GD+' GPU)', '#16a34a');
+
+    // IB link: thick line between racks
+    const linkY = cy - 30;
+    const linkX1 = leftRack.rightX + 30;
+    const linkX2 = rightRack.leftX - 10;
+    // pipe background
+    ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 18;
+    ctx.beginPath(); ctx.moveTo(linkX1, linkY); ctx.lineTo(linkX2, linkY); ctx.stroke();
+    // inner glow proportional to bandwidth utilization
+    const linkUtil = particles.length > 0 ? Math.min(1, particles.length / 8) : 0;
+    ctx.strokeStyle = 'rgba(255,184,106,'+(0.2+0.7*linkUtil)+')';
+    ctx.lineWidth = 12;
+    ctx.beginPath(); ctx.moveTo(linkX1, linkY); ctx.lineTo(linkX2, linkY); ctx.stroke();
+    // label
+    ctx.fillStyle='#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('InfiniBand · '+BW+' GB/s', (linkX1+linkX2)/2 - 50, linkY-14);
+    ctx.fillStyle='#94a3b8'; ctx.font='10px monospace';
+    ctx.fillText('KV cache transfer', (linkX1+linkX2)/2 - 50, linkY+22);
+
+    // particles flowing along pipe
+    particles.forEach(p => {
+      const x = linkX1 + p.x*(linkX2-linkX1);
+      ctx.fillStyle = '#d97706';
+      ctx.beginPath(); ctx.arc(x, linkY, 4, 0, 2*Math.PI); ctx.fill();
+      ctx.fillStyle='rgba(255,184,106,0.2)';
+      ctx.fillRect(x-14, linkY-1.5, 14, 3);
+    });
+
+    // status panel right
+    const px = W - 250, py = 30;
+    ctx.fillStyle='#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('layer-wise streaming', px, py);
+    ctx.fillStyle='#1f2430';
+    ctx.fillText('layers sent: '+layerSent+' / '+L_LAYERS, px, py+18);
+    ctx.fillText('particles in pipe: '+particles.length, px, py+34);
+
+    // KPIs
+    const kv = kvBytes();
+    const ttMs = transferTimeMs();
+    els.tot.textContent = (kv/1e6).toFixed(0) + ' MB';
+    els.tt.textContent  = ttMs.toFixed(0) + ' ms';
+    els.util.textContent = (linkUtil*100).toFixed(0)+'%';
+    const overlap = ttMs < prefillTimeMs() ? 'yes (free)' : 'partial';
+    els.ov.textContent = overlap;
+  }
+
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: utilisation heatmap, co-located vs disaggregated ─── */
+(function(){
+  const C = document.getElementById('ht-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    r:$('ht-r'),rv:$('ht-r-v'),
+    ap:$('ht-ap'),apv:$('ht-ap-v'),
+    ac:$('ht-ac'),acv:$('ht-ac-v'),
+    g:$('ht-g'),gv:$('ht-g-v'),
+    cu:$('ht-cu'),du:$('ht-du'),cv:$('ht-cv'),dv:$('ht-dv')
+  };
+
+  function compute(){
+    const rate = +els.r.value, ap = +els.ap.value, ac = +els.ac.value, G = +els.g.value;
+    els.rv.textContent=rate; els.apv.textContent=ap; els.acv.textContent=ac; els.gv.textContent=G;
+
+    const TIME_SLICES = 60; // columns
+    const sliceMs = 50;
+    const totalMs = TIME_SLICES * sliceMs;
+
+    // generate arrivals
+    const arrivals = [];
+    let t = 0;
+    while (t < totalMs){
+      const dt = -Math.log(Math.random()+1e-6) / (rate/1000);
+      t += dt;
+      if (t < totalMs) arrivals.push({arrive:t, ap, ac});
+    }
+
+    // co-located: random GPU per request, prefill then decode utilisation
+    const co = Array(G).fill(0).map(() => Array(TIME_SLICES).fill(0));
+    arrivals.forEach((r, ri) => {
+      const g = ri % G;
+      // prefill: needs (ap/5000)*1000 ms at near-100% FLOPs util
+      const prefillMs = ap/5000*1000;
+      const decodeMs = ac * 6;
+      // find first available slot in this GPU's row
+      let earliestEnd = 0;
+      for (let s=0; s<TIME_SLICES; s++){
+        if (co[g][s] === 0){ earliestEnd = s*sliceMs; break; }
+        if (s === TIME_SLICES-1) earliestEnd = totalMs+1;
+      }
+      let start = Math.max(r.arrive, earliestEnd);
+      let end = start + prefillMs + decodeMs;
+      for (let s=Math.floor(start/sliceMs); s<Math.min(TIME_SLICES, Math.ceil(end/sliceMs)); s++){
+        // prefill phase: ~100% saturated on FLOPs but only ~30% HBM
+        const tInSlot = s*sliceMs;
+        if (tInSlot < start + prefillMs){
+          co[g][s] = 0.95;
+        } else {
+          // decode: ~95% on HBM, but ~5% on FLOPs; average util to mid
+          co[g][s] = 0.35; // decode underutilises a co-located node's compute
+        }
+      }
+    });
+
+    // disagg: prefill pool (G/4 gpus) and decode pool (3G/4 gpus)
+    const Gp = Math.max(1, Math.floor(G*0.25));
+    const Gd = G - Gp;
+    const dp = Array(Gp).fill(0).map(()=>Array(TIME_SLICES).fill(0));
+    const dd = Array(Gd).fill(0).map(()=>Array(TIME_SLICES).fill(0));
+    arrivals.forEach((r, ri) => {
+      const gp = ri % Gp;
+      const prefillMs = ap/5000*1000;
+      const decodeMs = ac*6;
+      let earliestP = 0;
+      for (let s=0; s<TIME_SLICES; s++){
+        if (dp[gp][s] === 0){ earliestP = s*sliceMs; break; }
+        if (s === TIME_SLICES-1) earliestP = totalMs+1;
+      }
+      const ps = Math.max(r.arrive, earliestP);
+      const pe = ps + prefillMs;
+      for (let s=Math.floor(ps/sliceMs); s<Math.min(TIME_SLICES, Math.ceil(pe/sliceMs)); s++){
+        dp[gp][s] = 0.95;
+      }
+      const gd = ri % Gd;
+      let earliestD = 0;
+      for (let s=0; s<TIME_SLICES; s++){
+        if (dd[gd][s] === 0){ earliestD = s*sliceMs; break; }
+        if (s === TIME_SLICES-1) earliestD = totalMs+1;
+      }
+      const ds = Math.max(pe, earliestD);
+      const de = ds + decodeMs;
+      for (let s=Math.floor(ds/sliceMs); s<Math.min(TIME_SLICES, Math.ceil(de/sliceMs)); s++){
+        dd[gd][s] = 0.92;
+      }
+    });
+
+    function stats(grid){
+      const flat = grid.flat();
+      const mean = flat.reduce((a,b)=>a+b,0)/flat.length;
+      const variance = flat.reduce((a,b)=>a+(b-mean)*(b-mean),0)/flat.length;
+      return { mean, variance };
+    }
+    return { co, dp, dd, stats, Gp, Gd, sliceMs, TIME_SLICES };
+  }
+
+  function render(){
+    const sim = compute();
+    const dpr=window.devicePixelRatio||1;
+    const W=C.clientWidth, H=C.clientHeight;
+    if (C.width!==Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 100, padR = 14;
+    const innerW = W - padL - padR;
+    const rowH = 16;
+
+    function drawHeatmap(grid, padT, label, colorScale){
+      ctx.fillStyle='#1f2430'; ctx.font='12px monospace';
+      ctx.fillText(label, 10, padT-4);
+      const cw = innerW / sim.TIME_SLICES;
+      grid.forEach((row, gi) => {
+        const y = padT + gi*rowH;
+        ctx.fillStyle = '#f1f3f7'; ctx.strokeStyle='#dde2ea';
+        ctx.fillRect(padL, y, innerW, rowH-2);
+        ctx.strokeRect(padL, y, innerW, rowH-2);
+        row.forEach((v, ci) => {
+          const x = padL + ci*cw;
+          // map util 0..1 to color in given scale
+          const intensity = Math.min(1, v);
+          ctx.fillStyle = colorScale(intensity);
+          ctx.fillRect(x, y+1, Math.max(1, cw-1), rowH-4);
+        });
+        ctx.fillStyle = '#5b6573'; ctx.font='10px monospace';
+        ctx.fillText('G'+gi, 60, y+12);
+      });
+    }
+
+    function blueScale(t){
+      const r = Math.round(20 + t*86), g = Math.round(30 + t*139), b = Math.round(40 + t*215);
+      return 'rgb('+r+','+g+','+b+')';
+    }
+    function greenScale(t){
+      const r = Math.round(20 + t*111), g = Math.round(30 + t*207), b = Math.round(40 + t*151);
+      return 'rgb('+r+','+g+','+b+')';
+    }
+    function mixScale(t){
+      // co-located mixes blue & green awkwardly
+      const r = Math.round(20 + t*86), g = Math.round(30 + t*170), b = Math.round(40 + t*180);
+      return 'rgb('+r+','+g+','+b+')';
+    }
+
+    drawHeatmap(sim.co, 28, 'Co-located · all GPUs do both phases', mixScale);
+    drawHeatmap(sim.dp, 28 + sim.co.length*rowH + 24, 'Disagg · prefill pool ('+sim.Gp+')', blueScale);
+    drawHeatmap(sim.dd, 28 + sim.co.length*rowH + 24 + sim.dp.length*rowH + 18, 'Disagg · decode pool ('+sim.Gd+')', greenScale);
+
+    // time axis on bottom
+    const ax = H - 18;
+    ctx.fillStyle='#94a3b8'; ctx.font='10px monospace';
+    for (let i=0;i<=6;i++){
+      const x = padL + (i/6)*innerW;
+      ctx.fillText(((i/6)*sim.TIME_SLICES*sim.sliceMs/1000).toFixed(1)+'s', x-12, ax);
+    }
+
+    // KPIs
+    const co_s = sim.stats(sim.co);
+    const di_all = [...sim.dp.flat(), ...sim.dd.flat()];
+    const di_mean = di_all.reduce((a,b)=>a+b,0)/di_all.length;
+    const di_var = di_all.reduce((a,b)=>a+(b-di_mean)*(b-di_mean),0)/di_all.length;
+
+    els.cu.textContent = (co_s.mean*100).toFixed(0)+'%';
+    els.du.textContent = (di_mean*100).toFixed(0)+'%';
+    els.cv.textContent = co_s.variance.toFixed(2);
+    els.dv.textContent = di_var.toFixed(2);
+  }
+
+  ['input','change'].forEach(ev=>{
+    [els.r,els.ap,els.ac,els.g].forEach(el=>el.addEventListener(ev, render));
+  });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

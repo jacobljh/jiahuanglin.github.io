@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>08 · Ensembles &amp; Business Logic Scripting</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">Triton server / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">08 · ensembles &amp; BLS</span>
+    <span class="step-pill">lesson 08 / 11</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Ensembles &amp; Business Logic Scripting</h1>
+<p class="subtitle">Two ways to chain models inside the server. <strong>Ensembles</strong>: a declarative DAG of models that runs without a client round-trip. <strong>BLS</strong>: a Python backend that calls other models programmatically, with branches and loops. Pick the right one by the <em>shape</em> of your pipeline.</p>
+
+<h2>The problem — multi-step inference</h2>
+
+<p>Real serving paths are rarely a single model call:</p>
+
+<ul>
+  <li><strong>Vision</strong>: resize + normalise → ResNet → label lookup.</li>
+  <li><strong>NLP</strong>: tokenise → encoder → classifier head → label decoder.</li>
+  <li><strong>RAG</strong>: classify intent → retrieve → rerank → generate.</li>
+</ul>
+
+<p>The naive shape — run each step as its own model call from the client — costs you a network round-trip per step. For three steps at 5 ms each, that's 15 ms of <em>network</em> on top of compute, and the tensors leave the server box twice (decode → encode → decode → encode → …).</p>
+
+<p>Triton ships two ways to run all of it inside the server.</p>
+
+<svg viewBox="0 0 720 200" class="diagram" role="img" aria-label="Three round-trips vs one round-trip through an in-server pipeline">
+  <g font-size="11" fill="var(--text-mute)">
+    <text x="20" y="22" font-weight="700" fill="var(--text)">Three calls from the client — three round-trips</text>
+    <g transform="translate(20,32)">
+      <rect width="80" height="22" fill="#dbeafe" stroke="#bfdbfe"/><text x="40" y="16" text-anchor="middle">client</text>
+      <rect x="100" width="120" height="22" fill="#dcfce7" stroke="#86efac"/><text x="160" y="16" text-anchor="middle">preprocess</text>
+      <rect x="240" width="120" height="22" fill="#dcfce7" stroke="#86efac"/><text x="300" y="16" text-anchor="middle">resnet50</text>
+      <rect x="380" width="120" height="22" fill="#dcfce7" stroke="#86efac"/><text x="440" y="16" text-anchor="middle">label_lookup</text>
+      <text x="540" y="16" fill="var(--bad)">3 × network RT</text>
+    </g>
+    <text x="20" y="102" font-weight="700" fill="var(--text)">Ensemble — one client call, three models in sequence inside Triton</text>
+    <g transform="translate(20,112)">
+      <rect width="80" height="22" fill="#dbeafe" stroke="#bfdbfe"/><text x="40" y="16" text-anchor="middle">client</text>
+      <rect x="100" width="380" height="22" fill="#fef3c7" stroke="#fcd34d"/><text x="290" y="16" text-anchor="middle">ensemble: preprocess → resnet50 → label_lookup</text>
+      <text x="500" y="16" fill="var(--ok)">1 × network RT</text>
+    </g>
+    <text x="20" y="172" fill="var(--text-mute)">Tensors pass between steps via Triton's internal buffers — typically zero-copy on the same GPU.</text>
+  </g>
+</svg>
+
+<h2>Ensembles — declarative DAG</h2>
+
+<p>An ensemble is a "model" whose <code>config.pbtxt</code> has <code>platform: "ensemble"</code> and an <code>ensemble_scheduling</code> block describing a static graph of steps. No code; the steps are wired together by name.</p>
+
+<pre><code>name: "vision_pipeline"
+platform: "ensemble"
+max_batch_size: 16
+
+input  [ { name: "raw"   data_type: TYPE_UINT8 dims: [ -1 ] } ]
+output [ { name: "label" data_type: TYPE_STRING dims: [ 1 ]  } ]
+
+ensemble_scheduling {
+  step [
+    { model_name: "preprocess"   model_version: -1
+      input_map  { key: "raw" value: "raw" }
+      output_map { key: "x"   value: "prep_x" } },
+
+    { model_name: "resnet50"     model_version: -1
+      input_map  { key: "x"   value: "prep_x" }
+      output_map { key: "y"   value: "logits" } },
+
+    { model_name: "label_lookup" model_version: -1
+      input_map  { key: "y"     value: "logits" }
+      output_map { key: "label" value: "label" } }
+  ]
+}</code></pre>
+
+<p>The wiring rule: each step's <code>input_map</code> says "for the inner model's input named <code>key</code>, pass the tensor that the ensemble calls <code>value</code>". Each step's <code>output_map</code> registers an internal tensor name. Top-level <code>input</code>/<code>output</code> are the ensemble's external interface.</p>
+
+<table>
+  <thead><tr><th>What ensembles are good at</th><th>What they can't do</th></tr></thead>
+  <tbody>
+    <tr><td>Linear pipelines (A → B → C)</td><td>Branching (if intent==X then A else B)</td></tr>
+    <tr><td>Fan-out / fan-in DAGs (A → {B, C} → D)</td><td>Loops (decode until EOS)</td></tr>
+    <tr><td>Tensor passing without copy when models are on the same device</td><td>Conditional execution based on data</td></tr>
+    <tr><td>Per-step scheduling — each step has its own queue/batcher</td><td>Custom retry / error-handling logic</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <div class="label">The defining property</div>
+  An ensemble is a <em>static DAG</em>. The set of steps and the wiring is decided at config-load time; the graph cannot change at request time. If your pipeline branches on a model's output, you need BLS instead.
+</div>
+
+<h2>Per-step batching is preserved</h2>
+
+<p>Each step in an ensemble is a real Triton model — with its own <code>dynamic_batching</code> config, its own instance group, its own GPU placement. So a 32-wide ensemble request is presented to <code>preprocess</code> as a batch of 32, then <code>resnet50</code> sees a batch of 32 (possibly merged with <em>other</em> ensemble requests at that step thanks to dynamic batching), then <code>label_lookup</code> sees its batch.</p>
+
+<p>This is the killer feature: <strong>the steps cross-batch independently</strong>. If preprocess is slow at small batches but cheap at large ones, and many ensemble requests are in flight, Triton can fatten the preprocess batch even though no single client asked for that.</p>
+
+<h2>BLS — Business Logic Scripting</h2>
+
+<p>Some pipelines need code. Branching, looping, async fan-out, retries — none of these fit a static DAG. BLS is the escape hatch: a <strong>Python backend</strong> model whose <code>execute</code> can call other models in the server through a Python API.</p>
+
+<pre><code class="language-python">import triton_python_backend_utils as pb_utils
+import numpy as np
+
+class TritonPythonModel:
+    def execute(self, requests):
+        responses = []
+        for req in requests:
+            query = pb_utils.get_input_tensor_by_name(req, "query").as_numpy()
+
+            # 1. classify intent
+            cls_req = pb_utils.InferenceRequest(
+                model_name="classifier",
+                requested_output_names=["label"],
+                inputs=[pb_utils.Tensor("text", query)],
+            )
+            cls_resp = cls_req.exec()
+            intent = cls_resp.output_tensors()[0].as_numpy()[0]
+
+            # 2. branch
+            if intent == b"shopping":
+                retr = pb_utils.InferenceRequest(
+                    model_name="ann_shopping",
+                    requested_output_names=["docs"],
+                    inputs=[pb_utils.Tensor("q", query)],
+                ).exec()
+            else:
+                retr = pb_utils.InferenceRequest(
+                    model_name="ann_general",
+                    requested_output_names=["docs"],
+                    inputs=[pb_utils.Tensor("q", query)],
+                ).exec()
+            docs = retr.output_tensors()[0].as_numpy()
+
+            # 3. generate
+            gen = pb_utils.InferenceRequest(
+                model_name="generator",
+                requested_output_names=["answer"],
+                inputs=[pb_utils.Tensor("q", query),
+                        pb_utils.Tensor("ctx", docs)],
+            ).exec()
+
+            responses.append(pb_utils.InferenceResponse(
+                output_tensors=[gen.output_tensors()[0]]
+            ))
+        return responses</code></pre>
+
+<p>What you get: branches, loops, exception handling, async (<code>async_exec()</code> returns a future you can await — fan out to N models in parallel and merge their results). What you pay: the BLS model is a Python-backend process; each <code>InferenceRequest.exec()</code> call goes through Triton's IPC layer to the target model and back.</p>
+
+<h2>The cost difference, made concrete</h2>
+
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">ensemble step → step</div><div class="v">~0 µs (in-process)</div></div>
+  <div class="kpi"><div class="k">BLS inner call</div><div class="v">~100–500 µs IPC</div></div>
+  <div class="kpi"><div class="k">3-step pipeline ensemble</div><div class="v">≈ sum(model times)</div></div>
+  <div class="kpi"><div class="k">3-step BLS pipeline</div><div class="v">≈ sum(model times) + 3 × IPC</div></div>
+</div>
+
+<p>For a pipeline of three models that each run in 5 ms, ensembles add roughly zero overhead; BLS adds ~1 ms of IPC. That's a 7% latency tax — not catastrophic, but real. If your pipeline is purely linear, take the ensemble.</p>
+
+<h2>Async BLS — fan out, then merge</h2>
+
+<pre><code class="language-python">def execute(self, requests):
+    responses = []
+    for req in requests:
+        q = pb_utils.get_input_tensor_by_name(req, "q").as_numpy()
+        # fire three retrievers in parallel
+        futures = [
+            pb_utils.InferenceRequest(model_name=f"retriever_{i}",
+                requested_output_names=["docs"],
+                inputs=[pb_utils.Tensor("q", q)]).async_exec()
+            for i in range(3)
+        ]
+        # gather
+        all_docs = np.concatenate([f.get_response().output_tensors()[0].as_numpy()
+                                   for f in futures], axis=0)
+        # rerank + answer
+        ans = pb_utils.InferenceRequest(model_name="generator",
+            requested_output_names=["a"],
+            inputs=[pb_utils.Tensor("q", q),
+                    pb_utils.Tensor("ctx", all_docs)]).exec()
+        responses.append(pb_utils.InferenceResponse(
+            output_tensors=[ans.output_tensors()[0]]))
+    return responses</code></pre>
+
+<p>That's a pattern that an ensemble's DAG can express statically — but only with all three retrievers always called. If which retrievers you call is conditional, only BLS works.</p>
+
+<h2>Decision tree — which to use</h2>
+
+<table>
+  <thead><tr><th>Pipeline shape</th><th>Pick</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Linear: A → B → C</td><td><strong>Ensemble</strong></td><td>Zero Python in the hot path, no IPC overhead, per-step batching for free.</td></tr>
+    <tr><td>Static fan-out: A → {B, C, D} → E</td><td><strong>Ensemble</strong></td><td>Same — the DAG handles parallel branches.</td></tr>
+    <tr><td>Conditional branch on a tensor value</td><td><strong>BLS</strong></td><td>Ensembles can't read tensors at scheduling time.</td></tr>
+    <tr><td>Loop until a condition (e.g. decode tokens)</td><td><strong>BLS</strong> (or a specialised LLM backend, lesson 10)</td><td>No loops in ensembles.</td></tr>
+    <tr><td>Retries / fallbacks on a failed inner call</td><td><strong>BLS</strong></td><td>Error handling needs code.</td></tr>
+    <tr><td>Mix of static plumbing + small bit of logic</td><td><strong>Both</strong>: BLS at the top calling an ensemble model</td><td>Reuse the ensemble for its zero-overhead linear segment.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout ok">
+  <div class="label">The composable trick</div>
+  Ensembles and BLS aren't either-or. A BLS model can call an ensemble model (and vice versa). The common pattern: linear preprocessing is an ensemble; the branching logic is a BLS model whose first inner call is that ensemble. You pay IPC only once, at the boundary.
+</div>
+
+<h2>What you don't get from either</h2>
+
+<ul>
+  <li><strong>Cross-host pipelines.</strong> Both ensembles and BLS run inside one Triton process. To chain across machines, do it from the client.</li>
+  <li><strong>Cross-GPU tensor avoidance.</strong> If step A is on GPU 0 and step B on GPU 1, the tensor copies between them. Pin pipeline-mates to the same device when latency matters.</li>
+  <li><strong>Streaming partial outputs from an ensemble.</strong> Ensembles return once. For token-streaming or progressive results, use a backend that supports decoupled responses — enabled via <code>model_transaction_policy { decoupled: true }</code> in config.pbtxt, with the Python backend using <code>InferenceResponseSender</code> to emit multiple responses per request. The TRT-LLM and vLLM backends do this natively.</li>
+</ul>
+
+<h2>Interactive · pick ensemble vs BLS</h2>
+<p>Describe a pipeline shape and the simulator picks. It also estimates added latency vs a single-model call.</p>
+
+<div class="widget"><div class="title">Pipeline shape → ensemble or BLS?</div><p class="hint">Toy: each model step is 5 ms; ensemble step-boundary is ~0 ms; BLS inner-call IPC is ~0.3 ms.</p>
+<div class="controls">
+<label class="inline">number of steps <input id="t08-n" type="range" min="1" max="8" step="1" value="3"><span class="val" id="t08-n-v">3</span></label>
+<label class="inline">shape
+  <select id="t08-shape">
+    <option value="linear">linear (A→B→C)</option>
+    <option value="fanout">static fan-out (A→{B,C}→D)</option>
+    <option value="branch">conditional branch on a tensor</option>
+    <option value="loop">loop until condition</option>
+    <option value="retry">retry / fallback on error</option>
+  </select>
+</label>
+<label class="inline">model time per step (ms) <input id="t08-tms" type="range" min="1" max="50" step="1" value="5"><span class="val" id="t08-tms-v">5</span></label>
+</div>
+<div id="t08-out" class="kpi-grid"></div>
+<p class="hint" id="t08-note"></p>
+<canvas id="t08-canvas" class="dist-canvas" height="160"></canvas>
+</div>
+
+<h2>What's next</h2>
+
+<p>You can now serve, batch, pin sessions, and compose. Lesson 09 turns the question "how should I configure this?" into a number with <strong>Perf Analyzer</strong> and <strong>Model Analyzer</strong> — the tools that sweep the knobs of lessons 03–08 and hand you a Pareto frontier.</p>
+
+<footer class="lesson-nav">
+  <a href="07_sequence_batching.html"><span class="dir">Previous</span><span class="ttl">07 · Sequence batching</span></a>
+  <a class="next" href="09_perf_analyzer.html"><span class="dir">Next</span><span class="ttl">09 · Perf &amp; Model Analyzer</span></a>
+</footer>
+
+<script>
+(function(){
+  const e={n:document.getElementById('t08-n'),shape:document.getElementById('t08-shape'),tms:document.getElementById('t08-tms')};
+  const out=document.getElementById('t08-out'),note=document.getElementById('t08-note');
+  const c=document.getElementById('t08-canvas'),ctx=c.getContext('2d');
+  function draw(){
+    document.getElementById('t08-n-v').textContent=e.n.value;
+    document.getElementById('t08-tms-v').textContent=e.tms.value;
+    const n=+e.n.value, shape=e.shape.value, tms=+e.tms.value;
+    const ipc = 0.3; // ms per inner BLS call
+    const ensemblePossible = (shape==='linear' || shape==='fanout');
+    const pick = ensemblePossible ? 'Ensemble' : 'BLS';
+    const why = {
+      linear:  'Linear pipeline → ensemble has zero step-boundary overhead and per-step dynamic batching.',
+      fanout:  'Static fan-out is a DAG, which ensembles handle natively without code.',
+      branch:  'Branching on a tensor value requires reading data at runtime — only BLS can.',
+      loop:    'Looping until a condition (e.g. token decode) requires a loop construct — only BLS (or a specialised LLM backend).',
+      retry:   'Retry / fallback is error-handling code — only BLS.'
+    }[shape];
+    const stepsCount = (shape==='fanout') ? Math.max(2, n) : n;
+    const ensembleLat = ensemblePossible ? stepsCount*tms : null;
+    const blsLat = stepsCount*tms + stepsCount*ipc;
+    out.innerHTML='';
+    function kpi(k,v,col){const d=document.createElement('div');d.className='kpi';d.innerHTML='<div class="k">'+k+'</div><div class="v" style="color:'+(col||'#1f2430')+'">'+v+'</div>';out.appendChild(d);}
+    kpi('recommendation', pick, pick==='Ensemble'?'#16a34a':'#2563eb');
+    kpi('# steps', stepsCount);
+    kpi('Ensemble est. latency', ensemblePossible ? ensembleLat.toFixed(1)+' ms' : 'N/A', ensemblePossible?'#16a34a':'#94a3b8');
+    kpi('BLS est. latency', blsLat.toFixed(1)+' ms');
+    if (ensemblePossible){
+      kpi('BLS overhead vs ensemble', (blsLat-ensembleLat).toFixed(1)+' ms', '#dc2626');
+    } else {
+      kpi('Ensemble can express?', 'no', '#dc2626');
+    }
+    note.textContent = why + ' ' + (ensemblePossible
+      ? 'For ' + stepsCount + ' steps at ' + tms + ' ms each, ensemble runs in ' + ensembleLat.toFixed(1) + ' ms; BLS adds ' + (stepsCount*ipc).toFixed(1) + ' ms of IPC.'
+      : 'BLS adds ~' + (stepsCount*ipc).toFixed(1) + ' ms over the bare model time for the inner calls.');
+    // canvas: bar chart
+    c.width=c.clientWidth*devicePixelRatio; c.height=160*devicePixelRatio; ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.clearRect(0,0,c.clientWidth,160);
+    const padL=120, top=20, W=c.clientWidth-padL-30, barH=28;
+    ctx.fillStyle='#1f2430'; ctx.font='12px sans-serif';
+    ctx.fillText('end-to-end latency', padL, 14);
+    const maxLat = Math.max(blsLat, ensembleLat||0)*1.1;
+    if (ensemblePossible){
+      ctx.fillStyle='#dcfce7'; ctx.fillRect(padL, top+10, W*(ensembleLat/maxLat), barH);
+      ctx.strokeStyle='#86efac'; ctx.strokeRect(padL, top+10, W*(ensembleLat/maxLat), barH);
+      ctx.fillStyle='#1f2430'; ctx.font='11px var(--mono)';
+      ctx.fillText('Ensemble  '+ensembleLat.toFixed(1)+' ms', 10, top+30);
+    } else {
+      ctx.fillStyle='#94a3b8'; ctx.font='11px var(--mono)';
+      ctx.fillText('Ensemble  N/A', 10, top+30);
+    }
+    ctx.fillStyle='#dbeafe'; ctx.fillRect(padL, top+50, W*(blsLat/maxLat), barH);
+    ctx.strokeStyle='#bfdbfe'; ctx.strokeRect(padL, top+50, W*(blsLat/maxLat), barH);
+    ctx.fillStyle='#1f2430'; ctx.font='11px var(--mono)';
+    ctx.fillText('BLS       '+blsLat.toFixed(1)+' ms', 10, top+70);
+    if (ensemblePossible){
+      ctx.fillStyle='#fee2e2'; ctx.fillRect(padL+W*(ensembleLat/maxLat), top+50, W*((blsLat-ensembleLat)/maxLat), barH);
+      ctx.fillStyle='#dc2626'; ctx.font='10px var(--mono)';
+      ctx.fillText('+IPC', padL+W*(ensembleLat/maxLat)+4, top+68);
+    }
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

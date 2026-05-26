@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>05 · Cache-aware scheduling</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">sglang</a>
+    <span class="crumb">/</span>
+    <span class="crumb">05 · scheduling</span>
+    <span class="step-pill">lesson 5 / 11</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Cache-aware scheduling — order is the optimization</h1>
+<p class="subtitle">A radix tree is a passive index. The scheduler is what turns it into a throughput win. By admitting requests in the order that maximizes prefix overlap, SGLang can convert the tree's <em>capability</em> for sharing into actual hit rate — often 30–60 percentage points above first-come-first-served.</p>
+
+<h2>The shape of the win</h2>
+
+<p>Suppose 32 requests arrive simultaneously and 24 of them share a 2,000-token system prompt while 8 are unrelated. The radix tree can in principle hold all 32 prefixes; the question is whether the scheduler ever lets it. Three scheduling policies, three outcomes:</p>
+
+<table>
+  <thead><tr><th>Policy</th><th>Admission order</th><th>What the tree sees</th><th>Effective hit rate</th></tr></thead>
+  <tbody>
+    <tr><td>FCFS</td><td>arrival order</td><td>random walk over prompts</td><td>~50% (depends on luck)</td></tr>
+    <tr><td>Shortest job first</td><td>by predicted output length</td><td>still random over prefixes</td><td>~50%</td></tr>
+    <tr><td>Longest-prefix-match (LPM)</td><td>by depth of cache hit</td><td>shared-prefix requests first</td><td>>95%</td></tr>
+  </tbody>
+</table>
+
+<p>The reason LPM dominates is mechanical: the first request through a fresh tree pays the full prefill cost; the rest piggyback. Letting the cache-hitting requests run first means everyone benefits, including the ones that would have missed.</p>
+
+<h2>The scheduling problem, formally</h2>
+
+<p>At each step the engine has:</p>
+
+<ul>
+  <li><strong>A waiting queue</strong> of admitted-but-not-running requests, each with a length and a cached prefix length (from a lookup in the radix tree).</li>
+  <li><strong>A running set</strong> currently in the continuous-batch loop.</li>
+  <li><strong>A KV budget</strong>: free blocks in the pool.</li>
+</ul>
+
+<p>The decision: which waiting requests to admit into the running set this step. Constraints: the running set's KV must fit in the budget; some fairness floor (no request waits forever); some prefill-throughput cap (so prefill chunks don't starve decodes).</p>
+
+<p>The objective: maximize aggregate <em>useful</em> tokens generated per GPU-second, where "useful" means tokens that aren't redundant prefill. This collapses, roughly, to:</p>
+
+<div class="math block">
+maximize&nbsp;&nbsp; ∑<sub>r∈running</sub> (input_len(r) − cached_prefix_len(r)) + decode_tokens(r)
+</div>
+
+<p>The cache term is the entire knob the scheduler has — every other term is workload-given. Maximize it by picking, from the waiting queue, the requests whose <em>cached_prefix_len</em> is deepest.</p>
+
+<h2>The LPM-first algorithm</h2>
+
+<pre><code>def schedule_one_step(waiting, running, kv_budget, tree):
+    # 1. for each waiting request, look up its deepest cache hit
+    for r in waiting:
+        r.cached_len, r.node = tree.lookup(r.tokens)
+
+    # 2. sort by cached_len descending (LPM-first)
+    waiting.sort(key=lambda r: r.cached_len, reverse=True)
+
+    # 3. greedy-admit while KV budget holds; aged requests bypass the budget
+    admitted = []
+    for r in waiting:
+        new_blocks = blocks_needed(r) - r.node.cached_blocks  # what we have to allocate
+        if r.wait_age &gt; FAIRNESS_T:                # always admit aged requests
+            admitted.append(r); kv_budget -= new_blocks
+        elif new_blocks &lt;= kv_budget:              # otherwise gate on budget
+            admitted.append(r); kv_budget -= new_blocks
+
+    return admitted
+</code></pre>
+
+<p>Three pieces beyond a simple sort:</p>
+
+<ol>
+  <li><strong>"Cached blocks" is subtracted from the budget.</strong> An LPM-first request that hits 2,000 tokens of cache costs the pool only the new suffix blocks — the cached blocks already live in the tree and have their refcounts bumped, not freshly allocated.</li>
+  <li><strong>Greedy admission has a fairness escape.</strong> Any request waiting more than <code>FAIRNESS_T</code> jumps the queue. Without this, a hot prefix can starve cold requests forever.</li>
+  <li><strong>Eviction reverses the order.</strong> When the pool is tight, evict leaves whose subtrees have <em>lowest</em> aggregate hit benefit (cold prefixes). The LPM-first admit and LPM-aware evict cooperate.</li>
+</ol>
+
+<h2>The fairness ↔ hit-rate trade-off</h2>
+
+<svg viewBox="0 0 760 280" class="diagram" role="img" aria-label="Pareto curve between fairness and cache hit rate">
+  <text x="20" y="22" font-weight="700">cache hit rate vs. p99 wait time, as FAIRNESS_T varies</text>
+
+  <!-- axes -->
+  <path d="M80 230 L740 230" stroke="var(--text-dim)" fill="none"/>
+  <path d="M80 230 L80 50" stroke="var(--text-dim)" fill="none"/>
+  <text x="740" y="252" text-anchor="end" font-size="11" fill="var(--text-mute)">p99 wait time →</text>
+  <text x="80" y="42" text-anchor="middle" font-size="11" fill="var(--text-mute)">hit rate ↑</text>
+
+  <!-- pareto curve, hand-drawn -->
+  <path d="M120 220 Q 220 170 320 140 Q 460 105 600 90 Q 700 84 720 82" stroke="var(--accent)" fill="none" stroke-width="2"/>
+
+  <!-- points -->
+  <circle cx="120" cy="220" r="5" fill="var(--text-dim)"/>
+  <text x="130" y="216" font-size="11">FCFS · hit≈50%, wait p99 low</text>
+  <circle cx="320" cy="140" r="5" fill="var(--accent)"/>
+  <text x="330" y="136" font-size="11">FAIRNESS_T = 200ms · the sweet spot</text>
+  <circle cx="600" cy="90" r="5" fill="var(--text-dim)"/>
+  <text x="500" y="84" font-size="11" fill="var(--text-mute)">pure LPM · hit≈98%, but p99 wait → ∞</text>
+
+  <text x="80" y="266" font-size="11" fill="var(--text-mute)">left edge: never reorder. right edge: always reorder for cache. middle: bounded reordering.</text>
+</svg>
+
+<p>SGLang ships with FAIRNESS_T tuned for typical online workloads (a few hundred milliseconds in default config). For offline batch workloads — where there is no SLA — you can raise it freely and push hit rates above 95%. The right answer depends on whether you are pricing latency or throughput.</p>
+
+<h2>Why FCFS leaves so much on the floor — a concrete trace</h2>
+
+<p>Set up: 6 requests, 2 system prompts (A: 2,000 tokens · B: 1,500 tokens), arrival order alternates A,B,A,B,A,B. KV budget allows 4 concurrent.</p>
+
+<svg viewBox="0 0 760 240" class="diagram" role="img" aria-label="FCFS vs LPM-first scheduling traces">
+  <text x="20" y="22" font-weight="700" font-size="13">FCFS schedule (arrival order):</text>
+  <g font-family="var(--mono)" font-size="11">
+    <rect x="20" y="34" width="120" height="22" fill="#2563eb88"/><text x="30" y="49" fill="#fff">A1: full prefill</text>
+    <rect x="20" y="60" width="100" height="22" fill="#d9770688"/><text x="30" y="75" fill="#fff">B1: full prefill</text>
+    <rect x="20" y="86" width="40" height="22" fill="#16a34a88"/><text x="62" y="101" fill="var(--text)">A2: cached</text>
+    <rect x="20" y="112" width="40" height="22" fill="#16a34a88"/><text x="62" y="127" fill="var(--text)">B2: cached</text>
+  </g>
+  <text x="20" y="156" font-size="11" fill="var(--text-mute)">Total prefill compute: 2 × full + 2 × cached lookup.</text>
+  <text x="20" y="174" font-size="11" fill="var(--text-mute)">If KV budget is tight, A1's blocks may be evicted before A2/A3 arrive — losing the hit.</text>
+
+  <text x="400" y="22" font-weight="700" font-size="13">LPM-first schedule (after first miss):</text>
+  <g font-family="var(--mono)" font-size="11">
+    <rect x="400" y="34" width="120" height="22" fill="#2563eb88"/><text x="410" y="49" fill="#fff">A1: full prefill (seed)</text>
+    <rect x="400" y="60" width="40" height="22" fill="#16a34a88"/><text x="442" y="75" fill="var(--text)">A2: cached (re-order)</text>
+    <rect x="400" y="86" width="40" height="22" fill="#16a34a88"/><text x="442" y="101" fill="var(--text)">A3: cached</text>
+    <rect x="400" y="112" width="100" height="22" fill="#d9770688"/><text x="410" y="127" fill="#fff">B1: full prefill (seed)</text>
+    <rect x="400" y="138" width="40" height="22" fill="#16a34a88"/><text x="442" y="153" fill="var(--text)">B2: cached</text>
+  </g>
+  <text x="400" y="180" font-size="11" fill="var(--text-mute)">A-cluster runs first; B-cluster after. Hits are saturated within each cluster.</text>
+</svg>
+
+<h2>How the scheduler talks to the tree</h2>
+
+<p>Three queries on the tree from the scheduler, two updates:</p>
+
+<table>
+  <thead><tr><th>Call</th><th>Purpose</th><th>Cost</th></tr></thead>
+  <tbody>
+    <tr><td><code>tree.lookup(tokens)</code></td><td>For ranking: how deep does this request hit?</td><td>O(T) compares</td></tr>
+    <tr><td><code>tree.evictable_size()</code></td><td>For admission: how many blocks could the pool reclaim if needed?</td><td>O(1) cached field</td></tr>
+    <tr><td><code>tree.protect(node)</code></td><td>For correctness: pin a node during a step so eviction won't free it.</td><td>O(1)</td></tr>
+    <tr><td><code>tree.insert(tokens, blocks)</code></td><td>After prefill: add the new suffix to the tree.</td><td>O(suffix length)</td></tr>
+    <tr><td><code>tree.release(leaf)</code></td><td>On request completion: decrement refcounts.</td><td>O(depth)</td></tr>
+  </tbody>
+</table>
+
+<p>The scheduler is essentially a producer for these calls, plus the LPM-sort. SGLang's implementation lives in <code>python/sglang/srt/managers/scheduler.py</code> and <code>tree_cache.py</code> — about a thousand lines total. Worth reading after this lesson.</p>
+
+<h2>Continuous batching, briefly</h2>
+
+<p>All of this happens inside an iteration-level batched loop (Orca / vLLM lesson 04). At each decode step:</p>
+
+<ol>
+  <li>Compute decode for currently-running requests (one token each).</li>
+  <li>Pick up to <code>max_prefill_tokens</code> worth of waiting requests, prefill them in the same forward pass (chunked prefill, vLLM lesson 10).</li>
+  <li>Drop finished requests from the running set; release their KV via the tree.</li>
+  <li>Repeat.</li>
+</ol>
+
+<p>Cache-aware scheduling only changes step 2 — <em>which</em> waiting requests are picked up next. The continuous-batch machinery is unchanged.</p>
+
+<h2>What can go wrong</h2>
+
+<div class="callout warn">
+  <div class="label">Failure modes worth knowing</div>
+  <ul>
+    <li><strong>Hot-prefix starvation.</strong> Without FAIRNESS_T, a 10-user shared prompt starves single-user prompts. The fairness bump is not optional.</li>
+    <li><strong>Tree blow-up on adversarial inputs.</strong> If every incoming prompt has a unique prefix, the tree degenerates to one leaf per request. Throughput equals "vLLM without APC" — no worse, no better.</li>
+    <li><strong>Eviction thrash.</strong> Tight KV budget + churn over many small prefixes can cause LPM benefits to flap. Cure: increase pool size (gpu-memory-utilization), or accept lower hit rate.</li>
+    <li><strong>p99 wait under load shock.</strong> A burst of arrivals with no shared prefix forces the scheduler to admit serially. SGLang doesn't beat physics; it beats waste.</li>
+  </ul>
+</div>
+
+<h2>Interactive · LPM-first vs FCFS</h2>
+
+<p>Simulate a stream of requests with adjustable shared-prefix rate. Compare hit rate and average wait time under FCFS vs LPM-first with bounded reordering.</p>
+
+<div class="widget"><div class="title">FCFS vs LPM-first hit rate</div><p class="hint">As shared-prefix probability rises, LPM-first opens a large gap over FCFS in hit rate — at the cost of slightly higher wait variance.</p>
+<div class="controls">
+<label class="inline">shared prefix rate <input id="s-rate" type="range" min="0" max="100" step="5" value="60"><span class="val" id="s-rate-v">60</span>%</label>
+<label class="inline">arrival burst (per sec) <input id="s-burst" type="range" min="1" max="64" value="12"><span class="val" id="s-burst-v">12</span></label>
+<label class="inline">cache size (req-equivalents) <input id="s-cache" type="range" min="2" max="64" value="16"><span class="val" id="s-cache-v">16</span></label>
+</div>
+<canvas id="s-canvas" class="dist-canvas" height="220"></canvas>
+<p class="hint" id="s-note"></p></div>
+
+<footer class="lesson-nav">
+  <a href="04_radix_attention.html"><span class="dir">Previous</span><span class="ttl">04 · RadixAttention</span></a>
+  <a class="next" href="06_constrained_fsm.html"><span class="dir">Next</span><span class="ttl">06 · Constrained decoding</span></a>
+</footer>
+
+<script>
+(function(){
+  const e = {rate: document.getElementById('s-rate'), burst: document.getElementById('s-burst'), cache: document.getElementById('s-cache')};
+  const c = document.getElementById('s-canvas'), ctx = c.getContext('2d'), note = document.getElementById('s-note');
+  function sim(){
+    // toy model: hit rate = P(prefix-in-cache | shared) * sharedProb
+    const r = +e.rate.value / 100;
+    const burst = +e.burst.value;
+    const cache = +e.cache.value;
+    // FCFS: cache holds last `cache` requests. P(your prefix in cache) ≈ 1 - (1-r)^cache
+    const fcfsHit = r * (1 - Math.pow(1-r, Math.min(cache, burst)));
+    // LPM-first: reorders shared-prefix requests adjacent, so once one hits, the rest do too.
+    // Approx: r * (1 - (1-r)^(virtual)), where virtual = cache * (1 + r) (reordering gain)
+    const lpmHit = r * (1 - Math.pow(1-r, Math.min(cache * (1+r), burst*4)));
+    // wait p99 (toy): inverse of hit rate, scaled
+    const fcfsWait = 50 + 50 * (1 - fcfsHit);
+    const lpmWait = 50 + 50 * (1 - lpmHit) + 30 * r; // small reorder penalty
+    return {fcfsHit, lpmHit, fcfsWait, lpmWait};
+  }
+  function draw(){
+    Object.keys(e).forEach(k=>document.getElementById('s-'+k+'-v').textContent = e[k].value);
+    const dpr = window.devicePixelRatio||1;
+    c.width = c.clientWidth*dpr; c.height = 220*dpr;
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,c.clientWidth,220);
+    const {fcfsHit, lpmHit, fcfsWait, lpmWait} = sim();
+    const W = c.clientWidth - 260;
+    function bar(y, label, val, max, color, unit){
+      ctx.fillStyle='#eef1f5'; ctx.fillRect(240,y,W,28);
+      ctx.fillStyle=color; ctx.fillRect(240,y,W*Math.min(val/max,1),28);
+      ctx.fillStyle='#1f2430'; ctx.font='13px sans-serif';
+      ctx.fillText(label,20,y+18);
+      ctx.fillText((unit==='%'?(val*100).toFixed(0):val.toFixed(0))+unit, 246 + W*Math.min(val/max,1) + 8, y+18);
+    }
+    bar( 24,'FCFS · hit rate', fcfsHit, 1, '#94a3b888','%');
+    bar( 60,'LPM-first · hit rate', lpmHit, 1, '#2563eb88','%');
+    bar( 96,'FCFS · p99 wait', fcfsWait, 200, '#94a3b888',' ms');
+    bar(132,'LPM-first · p99 wait', lpmWait, 200, '#2563eb88',' ms');
+    ctx.fillStyle='#5b6573'; ctx.font='12px sans-serif';
+    ctx.fillText('Gap: '+((lpmHit-fcfsHit)*100).toFixed(0)+' pp on hit rate, '+(lpmWait-fcfsWait).toFixed(0)+' ms on p99 wait.',20,182);
+    note.textContent = lpmHit - fcfsHit > 0.2
+      ? 'LPM-first dominates at this sharing rate; reorder freely.'
+      : lpmHit - fcfsHit > 0.05
+      ? 'Modest gain. Worth enabling if SLA permits.'
+      : 'Shared-prefix rate is too low; FCFS and LPM converge.';
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));
+  draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

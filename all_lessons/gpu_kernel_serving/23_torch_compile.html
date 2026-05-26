@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>23 · torch.compile</title><link rel="stylesheet" href="../RL/lessons/style.css"><style>main{overflow-wrap:break-word}table{table-layout:fixed}th,td{overflow-wrap:anywhere}input[type="range"]{max-width:min(200px,44vw)}label.inline{flex-wrap:wrap;max-width:100%}</style></head>
+<body><header class="topnav"><div class="inner"><a class="crumb-link" href="../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">gpu_kernel_serving</a><span class="crumb">/</span><span class="crumb">23 · torch.compile</span><span class="step-pill">lesson 23 / 24</span></div></header><main>
+
+<h1>torch.compile: compiler-driven fusion</h1>
+<p class="subtitle">Three components — Dynamo (capture), AOTAutograd (trace forward+backward), Inductor (codegen) — turn your eager Python into fused Triton + CUDA-graph-captured kernels. Most of the time it just works. The other times you need to read the chain. This lesson teaches both.</p>
+
+<h2>The question this lesson answers</h2>
+<p>You read lesson 22 and you can write fused Triton. But you have 50 ops in a model and can't fuse them by hand. <code>torch.compile</code> does the fusion automatically. When does it work? When does it fall back to eager? And when does the fallback silently undo your speedup?</p>
+
+<h2>The three components</h2>
+<svg viewBox="0 0 920 320" class="diagram" role="img" aria-label="torch.compile pipeline: Dynamo captures Python into FX graph, AOTAutograd traces forward and backward, Inductor lowers to Triton or C++ then runs">
+  <defs><marker id="tc23" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <g font-size="11" fill="var(--text-mute)">
+    <rect class="node-bg" x="20"  y="40" width="200" height="84" rx="6"/><text x="120" y="64" text-anchor="middle" font-weight="700" fill="var(--text)">1 · Dynamo</text><text x="120" y="84" text-anchor="middle">CPython frame eval</text><text x="120" y="100" text-anchor="middle">Python → FX graph</text><text x="120" y="116" text-anchor="middle">graph breaks on guards</text>
+    <rect class="node-bg" x="240" y="40" width="200" height="84" rx="6"/><text x="340" y="64" text-anchor="middle" font-weight="700" fill="var(--text)">2 · AOTAutograd</text><text x="340" y="84" text-anchor="middle">decompose fwd ops</text><text x="340" y="100" text-anchor="middle">trace backward ahead</text><text x="340" y="116" text-anchor="middle">functionalize side effects</text>
+    <rect class="node-bg" x="460" y="40" width="200" height="84" rx="6"/><text x="560" y="64" text-anchor="middle" font-weight="700" fill="var(--text)">3 · Inductor</text><text x="560" y="84" text-anchor="middle">fuse pointwise/reduce/contig</text><text x="560" y="100" text-anchor="middle">emit Triton (GPU) or C++ (CPU)</text><text x="560" y="116" text-anchor="middle">capture CUDA graph</text>
+    <rect class="node-bg" x="680" y="40" width="220" height="84" rx="6"/><text x="790" y="64" text-anchor="middle" font-weight="700" fill="var(--text)">runtime cache</text><text x="790" y="84" text-anchor="middle">key: shapes / dtypes / control</text><text x="790" y="100" text-anchor="middle">hit → replay graph</text><text x="790" y="116" text-anchor="middle">miss → recompile</text>
+
+    <path class="edge" d="M220 82 L240 82" marker-end="url(#tc23)"/>
+    <path class="edge" d="M440 82 L460 82" marker-end="url(#tc23)"/>
+    <path class="edge" d="M660 82 L680 82" marker-end="url(#tc23)"/>
+  </g>
+  <rect x="20" y="160" width="880" height="60" rx="6" fill="var(--bg-soft)" stroke="var(--border)"/>
+  <text x="40" y="182" font-size="12" fill="var(--text)" font-weight="700">Each step has a way to fall back</text>
+  <text x="40" y="202" font-size="12" fill="var(--text-mute)">Dynamo can graph-break and resume eager. AOTAutograd can fall back to eager for unsupported ops. Inductor can fall back to ATen kernels for ops it can't lower. None of these regress correctness — they just give up performance.</text>
+  <rect x="20" y="232" width="880" height="60" rx="6" fill="var(--bg-soft)" stroke="var(--border)"/>
+  <text x="40" y="254" font-size="12" fill="var(--text)" font-weight="700">What you get when it works</text>
+  <text x="40" y="274" font-size="12" fill="var(--text-mute)">Pointwise chains fuse into 1 Triton kernel. GEMM epilogues fuse (bias + activation). The full forward + backward replays from a CUDA graph. 80–200 kernels per layer collapses to a handful.</text>
+</svg>
+
+<h2>Three terms used throughout this lesson</h2>
+<ul>
+  <li><strong>FX graph</strong> — PyTorch's symbolic IR. A flat list of <code>(op, args, kwargs, output)</code> nodes plus tensor metadata. Dynamo's output, Inductor's input.</li>
+  <li><strong>Functionalize</strong> — rewrite in-place mutations (e.g., <code>x.add_(y)</code>, <code>x.relu_()</code>) as pure ops that return a new tensor, so the graph is referentially transparent. AOTAutograd does this.</li>
+  <li><strong>Decompose</strong> — replace a high-level op (e.g., <code>F.layer_norm</code>) with its primitive components (mean, var, divide, scale, bias). Inductor needs primitives so it can fuse across boundaries.</li>
+</ul>
+
+<h2>The minimum you need to know</h2>
+<pre><code>import torch
+
+model = MyModel().cuda()
+opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+# one call. defaults are usually right.
+model = torch.compile(model)   # mode="default" — Dynamo + Inductor + autograd
+
+for batch in loader:
+    out = model(batch)         # first call(s): compile. Later: replay.
+    loss = loss_fn(out, batch['y'])
+    loss.backward()
+    opt.step()
+    opt.zero_grad()</code></pre>
+
+<p>Three modes you'll see:</p>
+<ul>
+  <li><code>mode="default"</code> — balanced. Use this first.</li>
+  <li><code>mode="reduce-overhead"</code> — also captures CUDA graphs. Best for small-batch decode; needs stable shapes.</li>
+  <li><code>mode="max-autotune"</code> — exhaustive Inductor autotune; can take minutes to compile but is the fastest at run time.</li>
+</ul>
+
+<h2>What gets fused, what doesn't</h2>
+<table><thead><tr><th>Pattern</th><th>Fusion result</th><th>Notes</th></tr></thead><tbody>
+<tr><td>Pointwise chain (add, mul, gelu)</td><td>Single Triton kernel.</td><td>The classic win. RMSNorm, residual add, activations.</td></tr>
+<tr><td>Pointwise + reduction (sum, max)</td><td>Often a fused kernel.</td><td>Inductor recognizes the template.</td></tr>
+<tr><td>GEMM + activation</td><td>cuBLAS epilogue fuses; or a separate Triton elementwise after.</td><td>Inductor doesn't replace cuBLAS for the matmul itself.</td></tr>
+<tr><td>Attention (sdpa)</td><td>Calls FlashAttention or efficient SDPA backend.</td><td>The backend itself is hand-tuned; Inductor just routes to it.</td></tr>
+<tr><td>Data-dependent control flow</td><td>Graph break.</td><td>The chunk before the break compiles; the rest is eager.</td></tr>
+<tr><td>Custom CUDA / Triton op</td><td>Treated as an opaque op (no fusion across it).</td><td>Register it with <code>@torch.library.custom_op</code> to integrate.</td></tr>
+<tr><td>Mixed Python (numpy, third-party)</td><td>Graph break.</td><td>Move out of the compiled region or rewrite in torch.</td></tr>
+</tbody></table>
+
+<h2>Graph breaks — what they are and how to spot them</h2>
+<p>A <em>graph break</em> happens when Dynamo can't statically capture a frame: data-dependent branch, unsupported op, side effect, mutating a non-tensor global, etc. Dynamo stops the current graph, compiles it, hands control back to the Python interpreter for the un-traceable part, and starts a new graph after. Two consequences:</p>
+<ul>
+  <li><strong>Fusion stops at the break.</strong> Pointwise ops on either side won't fuse with each other.</li>
+  <li><strong>CUDA graph capture stops at the break.</strong> So <code>reduce-overhead</code> mode loses its win.</li>
+</ul>
+<pre><code># show graph breaks while compiling
+import torch._dynamo as dynamo
+dynamo.config.verbose = True                     # log decisions to stderr
+torch._dynamo.explain(model, sample_input)       # static report; inspect .graph_break_count
+TORCH_LOGS="graph_breaks,recompiles" python train.py   # at runtime — these are env-var
+                                                       # logging channels: print every graph
+                                                       # break / recompile event from Dynamo</code></pre>
+
+<p>Common causes you can fix:</p>
+<ul>
+  <li><code>print(...)</code> / <code>logger.info(...)</code> on a tensor. Move outside compiled region or call <code>.item()</code> deliberately at a sync point.</li>
+  <li><code>if x.sum() > 0:</code>. Data-dependent. Restructure into a masked op or accept the break.</li>
+  <li><code>tensor.to('cpu')</code> mid-forward. Move data movement out.</li>
+  <li>List/dict mutation. Make tensors flow through return values instead.</li>
+  <li>Calling a non-torch library (e.g., <code>numpy.linalg</code>). Replace with torch equivalent.</li>
+</ul>
+
+<h2>Dynamic shapes</h2>
+<p>By default torch.compile treats shapes as <em>dynamic</em> after the first variation it sees. That avoids endless recompiles but loses some specialization. Three knobs:</p>
+<ul>
+  <li><code>torch.compile(model, dynamic=True)</code> — opt all dimensions into dynamic from the start.</li>
+  <li><code>torch.compile(model, dynamic=False)</code> — specialize on every shape; one compile per shape (good if shapes are few and stable).</li>
+  <li>Default — first call specializes, second call with different shape promotes to dynamic.</li>
+</ul>
+<p>For LLM serving, sequence length is the main moving axis. <em>Padding</em> shapes up to a small set of "buckets" (e.g., 128, 256, 512, 1024) and using <code>mode="reduce-overhead"</code> gives you graph capture across a manageable number of bucket sizes.</p>
+
+<div class="callout warn"><div class="label">Production trap</div>The <em>first call</em> after deploy compiles for <strong>seconds to minutes</strong> (especially under <code>max-autotune</code>). Latency-sensitive services must warmup with representative shapes before serving traffic, or the first user requests time out. Cache the Inductor output (it survives across runs) but plan for cold-start anyway after rolling restarts.</div>
+
+<h2>Compile cost &amp; cache</h2>
+<table><thead><tr><th>Cost</th><th>Where it lives</th><th>How to manage</th></tr></thead><tbody>
+<tr><td>First-call latency</td><td>Compilation runs synchronously the first time a shape is seen.</td><td>Warmup with representative shapes before timing or serving.</td></tr>
+<tr><td>Inductor on-disk cache</td><td><code>~/.cache/torch/inductor</code></td><td>Survives across runs. Clear when bumping torch versions or kernel sources.</td></tr>
+<tr><td>Recompile storms</td><td>Every shape miss triggers a recompile.</td><td>Reduce shape variety (bucketing) or set <code>dynamic=True</code>.</td></tr>
+<tr><td>GPU memory headroom</td><td>CUDA graph capture pins buffers.</td><td>Use <code>torch.compiler.cudagraph_mark_step_begin()</code> at step boundaries.</td></tr>
+</tbody></table>
+
+<h2>Verifying the win, not assuming it</h2>
+<p>Three checks before claiming a compile win:</p>
+<ol>
+  <li><strong>Same outputs.</strong> Run eager and compiled on the same input; compare with <code>torch.allclose</code> at expected tolerance.</li>
+  <li><strong>Fewer kernels per step.</strong> Profile (lesson 20) and confirm the kernel count dropped, not just the wall clock.</li>
+  <li><strong>Steady state, not first call.</strong> Throw away the first few iterations. Compare median of the next 50.</li>
+</ol>
+
+<pre><code>def bench(fn, iters=100):
+    for _ in range(10): fn()                # warmup
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters): fn()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / iters * 1000  # ms
+
+eager_ms    = bench(lambda: model(x))
+model_c     = torch.compile(model)
+compiled_ms = bench(lambda: model_c(x))
+print(f"eager={eager_ms:.2f}  compiled={compiled_ms:.2f}  speedup={eager_ms/compiled_ms:.2f}x")</code></pre>
+
+<h2>torch.compile vs hand-Triton — when does each win</h2>
+<table><thead><tr><th>Scenario</th><th>Better choice</th><th>Why</th></tr></thead><tbody>
+<tr><td>Long pointwise chain (norm + residual + activation)</td><td>torch.compile</td><td>Inductor already knows this pattern. Free.</td></tr>
+<tr><td>Novel layer not in PyTorch</td><td>Hand-Triton + register as custom op</td><td>Inductor needs to know about the op to fuse around it.</td></tr>
+<tr><td>Tight loop with many small tensors</td><td>torch.compile + reduce-overhead</td><td>CUDA graphs erase the launch overhead.</td></tr>
+<tr><td>Backward of a tricky kernel</td><td>Hand-Triton with explicit autograd</td><td>You control numerics; Inductor's autograd handling is good but not magic.</td></tr>
+<tr><td>Very dynamic shapes</td><td>Eager or carefully marked dynamic compile</td><td>Recompile cost can swamp wins.</td></tr>
+<tr><td>Already library-bound (attention, GEMM)</td><td>Either — compile just calls the library</td><td>You're not in compiler-fusion territory.</td></tr>
+</tbody></table>
+
+<h2>Debugging when speedup is "1.0×"</h2>
+<ol>
+  <li>Run with <code>TORCH_LOGS="recompiles"</code>. If you see many recompiles, you have a dynamic-shape problem.</li>
+  <li>Run with <code>TORCH_LOGS="graph_breaks"</code>. If many breaks, you're effectively still eager.</li>
+  <li>Profile (lesson 20) and compare kernel counts. If unchanged, fusion didn't happen — most ops are calling out to libraries already.</li>
+  <li>Check the regions: <code>torch._dynamo.explain(model, x)</code> prints a tree of what compiled vs broke.</li>
+  <li>If <code>reduce-overhead</code> didn't help, check that shapes are stable. Even one dynamic dim disables graph capture.</li>
+</ol>
+
+<h2>Interactive · compile speedup estimator</h2>
+<p>How much should torch.compile help <em>your</em> model? Depends on launch-bound share, fusion potential, and how many graph breaks you have. The widget gives a rough estimate.</p>
+
+<div class="widget"><div class="title">Predicted compile speedup</div><p class="hint">Tiny pointwise-heavy models with stable shapes get the biggest wins. Library-bound models (large GEMMs) barely move. Many graph breaks erase the win.</p><div class="controls">
+<label class="inline">% step time in launch overhead <input id="cc-launch" type="range" min="0" max="80" value="40"><span class="val" id="cc-launch-v">40</span></label>
+<label class="inline">% step time in pointwise chains <input id="cc-pw" type="range" min="0" max="80" value="30"><span class="val" id="cc-pw-v">30</span></label>
+<label class="inline">% step time in big GEMMs / attention <input id="cc-lib" type="range" min="0" max="100" value="50"><span class="val" id="cc-lib-v">50</span></label>
+<label class="inline">graph breaks per step <input id="cc-gb" type="range" min="0" max="20" value="0"><span class="val" id="cc-gb-v">0</span></label>
+</div><canvas id="cc-canvas" class="dist-canvas" height="220"></canvas><p class="hint" id="cc-note"></p></div>
+
+<h2>What this gives you for the next lesson</h2>
+<p>You now have three tools to make code faster: hand-tuned Triton (22), <code>torch.compile</code> (this lesson), and the profiler that tells you which one to reach for (20–21). The final lesson stitches everything into PyTorch-level performance patterns — memory format, allocator pressure, async data movement, mixed precision — that hold whether or not you compile.</p>
+
+<script>
+(function(){
+  const ids=['launch','pw','lib','gb'];
+  const e=Object.fromEntries(ids.map(k=>[k,document.getElementById('cc-'+k)]));
+  const c=document.getElementById('cc-canvas'),ctx=c.getContext('2d'),note=document.getElementById('cc-note');
+  function draw(){
+    ids.forEach(k=>document.getElementById('cc-'+k+'-v').textContent=e[k].value);
+    c.width=c.clientWidth*devicePixelRatio;c.height=220*devicePixelRatio;ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.clearRect(0,0,c.clientWidth,220);
+    const rawL=+e.launch.value/100, rawP=+e.pw.value/100, rawLib=+e.lib.value/100, gb=+e.gb.value;
+    // normalize so the three shares sum to 1.0 — sliders are independent and could otherwise sum to >100%
+    const rawSum = rawL + rawP + rawLib;
+    const launch = rawSum>0 ? rawL/rawSum : 0;
+    const pw     = rawSum>0 ? rawP/rawSum : 0;
+    const lib    = rawSum>0 ? rawLib/rawSum : 0;
+    // crude model:
+    // launch-overhead can be cut by ~80% if no graph breaks
+    // pointwise share can be fused down by ~55% similarly
+    // library share gains ~5% from CUDA graphs
+    const break_factor = Math.max(0, 1 - gb/8);
+    const launch_after = launch * (1 - 0.8*break_factor);
+    const pw_after = pw * (1 - 0.55*break_factor);
+    const lib_after = lib * (1 - 0.05*break_factor);
+    const total_after = Math.min(1, launch_after + pw_after + lib_after);   // can't be slower than eager
+    const speedup = 1 / Math.max(0.05, total_after);
+    const items = [
+      ['eager (normalized)', 1, '#dc2626'],
+      ['compiled (predicted)', total_after, '#16a34a']
+    ];
+    const max = 1.05;
+    items.forEach(([n,v,col],i)=>{
+      const y=46+i*52,w=(c.clientWidth-260)*v/max;
+      ctx.fillStyle='#eef1f5';ctx.fillRect(220,y,c.clientWidth-260,30);
+      ctx.fillStyle=col;ctx.fillRect(220,y,w,30);
+      ctx.fillStyle='#1f2430';ctx.font='13px sans-serif';
+      ctx.fillText(n,30,y+20);
+      ctx.fillText(v.toFixed(2),226+w+6,y+20);
+    });
+    ctx.fillStyle='#5b6573';ctx.font='12px sans-serif';
+    ctx.fillText('predicted speedup: '+speedup.toFixed(2)+'×',30,170);
+    const advice = gb > 3 ? 'Many graph breaks are erasing the win. Find them with TORCH_LOGS="graph_breaks" and remove the worst.' :
+                   speedup > 1.5 ? 'Strong win — most of the step was launch + pointwise. Use mode="reduce-overhead" to also capture CUDA graphs.' :
+                   speedup > 1.15 ? 'Moderate win. Library-bound code limits the upside.' :
+                   'Library-bound. Compile is unlikely to help; look at lessons 18/22 instead.';
+    note.textContent = advice;
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+<footer class="lesson-nav"><a href="22_writing_triton.html"><span class="dir">Previous</span><span class="ttl">22 · Writing Triton</span></a><a class="next" href="24_performant_pytorch.html"><span class="dir">Next</span><span class="ttl">24 · Performant PyTorch</span></a></footer>
+</main></body></html>

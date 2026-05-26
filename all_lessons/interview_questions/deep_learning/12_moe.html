@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>12 · Mixture of Experts</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">deep_learning</a>
+    <span class="crumb">/</span>
+    <span class="crumb">12 · MoE</span>
+    <span class="step-pill">lesson 12 / 12</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Mixture-of-Experts — sparse activation</h1>
+<p class="subtitle">Replace one big FFN with N small FFNs and a router that picks 2 of them per token. Total parameters scale; active parameters don't. The result: dense-model-quality at MoE-model-cost. The cost is memory and an AllToAll on every layer.</p>
+
+<h2>The motivating arithmetic</h2>
+
+<p>From <a href="08_scaling_laws.html">lesson 08</a>: training FLOPs = 6 · N · D. Inference FLOPs per token = 2N. Both scale linearly in N, so bigger model = more compute. The MoE trick: <em>not all of N is "active" per token</em>. If only K of N experts run per token, active parameters are roughly <span class="math">N · (K/N_experts) + N_shared</span>.</p>
+
+<table>
+  <thead><tr><th>Model</th><th>Total params</th><th>Active params per token</th><th>Inference cost</th></tr></thead>
+  <tbody>
+    <tr><td>LLaMA-2 70B (dense)</td><td>70B</td><td>70B</td><td>1.0 (baseline)</td></tr>
+    <tr><td>Mixtral 8×7B</td><td>47B</td><td>~13B</td><td>~0.2 (5× cheaper to inference)</td></tr>
+    <tr><td>DBRX 16×12B</td><td>132B</td><td>36B</td><td>~0.5</td></tr>
+    <tr><td>DeepSeek-V3</td><td>671B</td><td>37B</td><td>~0.5</td></tr>
+  </tbody>
+</table>
+
+<p>The bet: a 671B-parameter model with 37B active will outperform a 37B-dense model (more total capacity for memorisation) while costing the same at inference. This is true empirically. The cost shifts from compute to memory and communication.</p>
+
+<h2>The MoE block — replace the FFN</h2>
+
+<p>In a standard transformer, every layer's FFN is the same applied to every token. In MoE, the FFN is split into N parallel experts plus a router:</p>
+
+<div class="math block">router_logits = x · W_r                       &nbsp;&nbsp;— W_r: (d, n_experts)
+top_k_experts = top_k(softmax(router_logits))  &nbsp;&nbsp;— pick k experts per token
+y = Σ_{i ∈ top_k} gate_i · Expert_i(x)         &nbsp;&nbsp;— weighted sum of expert outputs</div>
+
+<p>Each expert is a regular FFN (or SwiGLU). The router is a tiny linear layer. For Mixtral-8×7B: 8 experts of ~5.5B params each (in the MoE layers), router is ~50K params (negligible), top-k = 2 → ~13B params active per token.</p>
+
+<div class="ascii">  x ──┬─► W_r ─► router_logits ─► softmax ─► top_k indices + gates
+      │                                         │
+      ├──► Expert 1 ─┐                           │
+      ├──► Expert 2 ─┤
+      ├──► Expert 3 ─┼─► weighted sum (only k=2 selected) ──► y
+      │              │
+      ├──► Expert 7 ─┤
+      └──► Expert 8 ─┘
+</div>
+
+<h2>Load balancing — why this is hard</h2>
+
+<p>If the router learns to always pick the same 2 experts, you have 8 parameters that contribute and 6 that are dead weight. <em>Load imbalance</em> is the central engineering challenge.</p>
+
+<p>The standard fix: add an auxiliary loss that penalises imbalance.</p>
+
+<div class="math block">L_balance = α · n_experts · Σ_i f_i · P_i</div>
+
+<p>where <span class="math">f_i</span> is the fraction of tokens routed to expert i, and <span class="math">P_i</span> is the mean router probability assigned to expert i. This loss is minimised when both <span class="math">f</span> and <span class="math">P</span> are uniform; it penalises both "the router strongly prefers experts" and "the assignments concentrate on few experts". Typical <span class="math">α = 0.01</span>.</p>
+
+<p>Variants:</p>
+<ul>
+  <li><strong>Switch Transformer</strong> (Fedus et al. 2021): top-1 routing, simple aux loss.</li>
+  <li><strong>GShard / Mixtral</strong>: top-2 routing, aux loss above.</li>
+  <li><strong>Expert Choice</strong> (Zhou et al. 2022): the experts pick the top tokens instead of tokens picking the experts. Guarantees balance without aux loss; trickier with variable-length sequences.</li>
+  <li><strong>DeepSeek-MoE</strong>: top-k with N "shared" experts always active + K "routed" experts. Stabilises training.</li>
+</ul>
+
+<h2>Capacity factor and token dropping</h2>
+
+<p>In a batch, you route every token to its top-k experts. Some experts get assigned many tokens; some get few. To make the implementation fixed-shape (for GPU efficiency), you pre-allocate a fixed capacity per expert:</p>
+
+<div class="math block">capacity = (tokens_per_batch / n_experts) × capacity_factor</div>
+
+<p>If more tokens want to go to an expert than fit, the excess is <strong>dropped</strong>: their output is set to 0 (or routed to the residual without expert contribution). Capacity factor 1.0 = no slack; 1.25 means 25% extra buffer.</p>
+
+<table>
+  <thead><tr><th>Capacity factor</th><th>Throughput</th><th>Token drop rate (with aux loss)</th><th>Quality</th></tr></thead>
+  <tbody>
+    <tr><td>1.0</td><td>Fastest</td><td>Low (~1-5%) if balanced; much higher if router collapses</td><td>Near-baseline when well-balanced; degrades fast if not</td></tr>
+    <tr><td>1.25</td><td>~80% of 1.0</td><td>Very low (~&lt;1%)</td><td>Baseline</td></tr>
+    <tr><td>2.0</td><td>~50% of 1.0</td><td>~0%</td><td>Baseline</td></tr>
+  </tbody>
+</table>
+
+<p>Modern MoE training: 1.25 with strong load-balancing loss. Inference can often use ~1.0 because the load balance learned at training generalises.</p>
+
+<h2>Expert parallelism — an AllToAll on every layer</h2>
+
+<p>If you have 8 experts and 8 GPUs, distribute one expert per GPU. The forward pass at each MoE layer becomes:</p>
+
+<ol>
+  <li><strong>AllToAll #1</strong>: each GPU sends each token to the GPU that holds its target expert. Tokens shuffle across the network.</li>
+  <li><strong>Expert compute</strong>: each GPU runs its expert on its assigned tokens.</li>
+  <li><strong>AllToAll #2</strong>: send tokens back to their original GPU for the next layer.</li>
+</ol>
+
+<p>The dominant cost is the AllToAll communication. For 8 experts across a node connected via NVLink (~900 GB/s), this is feasible. Across multiple nodes (InfiniBand at 400 GB/s), it's a significant overhead.</p>
+
+<div class="callout warn">
+  <div class="label">The communication cost</div>
+  Each AllToAll transfers ~B · L · d bytes per layer (one float per token per dim). For Mixtral with B=64, L=4k, d=4096, dtype=bf16: ~2 GB per AllToAll, two per layer, 32 layers → ~130 GB of comm per step. At 900 GB/s NVLink: ~150 ms per step just for routing. For long pretraining runs, the AllToAll dominates.
+</div>
+
+<h2>Memory cost — the trade-off</h2>
+
+<table>
+  <thead><tr><th>Component</th><th>Dense 70B</th><th>MoE 8×7B (Mixtral)</th></tr></thead>
+  <tbody>
+    <tr><td>Params (bf16)</td><td>140 GB</td><td>94 GB</td></tr>
+    <tr><td>Optimizer state (AdamW)</td><td>1.12 TB</td><td>752 GB</td></tr>
+    <tr><td>Active params for forward FLOPs</td><td>70B</td><td>~13B</td></tr>
+    <tr><td>Inference forward FLOPs / token</td><td>140 GFLOPs</td><td>26 GFLOPs</td></tr>
+    <tr><td>KV cache</td><td>same per layer</td><td>same per layer</td></tr>
+  </tbody>
+</table>
+
+<p>So MoE saves <em>compute</em> (active params × tokens) but consumes <em>total parameters</em> (so total memory and optimizer state are bigger). At inference, you still need to hold all experts on chip (or stream them) because any token might route to any expert.</p>
+
+<p>Production MoE serving uses <em>expert parallelism</em>: shard experts across GPUs, route requests via AllToAll. The serving infrastructure is more complex than dense; the per-token cost is much lower.</p>
+
+<h2>Routing dynamics — what experts learn</h2>
+
+<p>Empirically, experts specialise in surprising ways:</p>
+<ul>
+  <li>Some experts handle syntactic patterns ("article-noun-verb" structure).</li>
+  <li>Some handle code vs natural language.</li>
+  <li>Some handle specific languages or domains.</li>
+  <li>Routing is mostly <em>positional</em>: certain experts activate at the first few tokens of a sequence, others at later positions.</li>
+</ul>
+
+<p>Anthropic / DeepSeek interpretability work shows that the per-expert specialisation is <em>imperfect but real</em> — experts have learned features but with significant overlap and redundancy.</p>
+
+<h2>The interview probes</h2>
+
+<ol>
+  <li><strong>"Why does MoE need a load-balancing loss?"</strong> Without one, the router gradient prefers whichever expert is most-trained, which causes a positive feedback loop: most-used experts get more gradient → improve faster → get used more. After a few thousand steps, the model degenerates to using 1-2 experts. The auxiliary loss explicitly pushes back against concentration.</li>
+  <li><strong>"How do MoE FLOPs compare to dense?"</strong> Per-token forward FLOPs: dense = 2N. MoE = 2 · N_active. For Mixtral 8×7B: 2 · 13B = 26 GFLOPs per token vs LLaMA-2 70B's 140 GFLOPs. ~5× cheaper inference. Training is the same per-token cost.</li>
+  <li><strong>"What's the bottleneck in MoE training?"</strong> AllToAll communication between experts. On a single node (NVLink), it's tolerable. Multi-node MoE training was impractical until DeepSpeed-MoE (2022) and PyTorch's native expert parallelism added overlap and compression tricks.</li>
+  <li><strong>"Why top-2, not top-1?"</strong> Switch Transformer used top-1 and showed that even one expert per token works. Top-2 gives a smoother training signal (each token's loss has gradient flowing through 2 experts → less variance) and slightly better quality. Top-2 is standard now.</li>
+  <li><strong>"What's the 'token dropping' problem?"</strong> Fixed-capacity experts can't accept more tokens than their capacity. Excess tokens get their expert output zeroed; they pass through the residual only. Capacity factor &gt; 1.0 buffers this. High drop rate = quality degradation.</li>
+</ol>
+
+<h2>MoE vs dense — the decision matrix</h2>
+
+<table>
+  <thead><tr><th>Use case</th><th>Dense or MoE</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Maximum inference throughput</td><td>MoE</td><td>5× cheaper per token at similar quality</td></tr>
+    <tr><td>Maximum quality at fixed memory</td><td>Dense</td><td>MoE wastes memory on inactive experts</td></tr>
+    <tr><td>Small batch, latency-sensitive</td><td>Dense</td><td>MoE's AllToAll dominates at small batch</td></tr>
+    <tr><td>Edge / single-GPU deployment</td><td>Dense</td><td>MoE memory exceeds single-GPU even at small active count</td></tr>
+    <tr><td>Multilingual / multi-domain</td><td>MoE</td><td>Experts can specialise; reduces interference</td></tr>
+    <tr><td>Fine-tuning / RLHF</td><td>Either — MoE harder</td><td>MoE post-training is more delicate (keep aux loss, watch router drift). Mixtral-Instruct, DeepSeek-Chat ship in production, so it works — just with more care than dense.</td></tr>
+  </tbody>
+</table>
+
+<h2>Interactive · MoE cost calculator</h2>
+
+<div class="widget" id="moe-widget">
+  <div class="title">Dense vs MoE compute / memory</div>
+  <div class="hint">Compare dense 70B vs MoE configurations. Inference FLOPs scale with active params; memory scales with total params.</div>
+
+  <div class="controls" style="flex-direction: column; align-items: stretch;">
+    <label class="inline">total experts: <input type="range" id="N" min="2" max="64" step="1" value="8"><span class="val" id="N-v">8</span></label>
+    <label class="inline">expert size (per): <input type="range" id="E" min="1" max="50" step="1" value="7"><span class="val" id="E-v">7</span></label>
+    <label class="inline">top-k: <input type="range" id="K" min="1" max="8" step="1" value="2"><span class="val" id="K-v">2</span></label>
+    <label class="inline">capacity factor: <input type="range" id="cf" min="1" max="3" step="0.05" value="1.25"><span class="val" id="cf-v">1.25</span></label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">total params</div><div class="v" id="total">—</div></div>
+    <div class="kpi"><div class="k">active params per token</div><div class="v" id="active">—</div></div>
+    <div class="kpi"><div class="k">inference cost ratio</div><div class="v" id="ratio">—</div></div>
+    <div class="kpi"><div class="k">memory (bf16)</div><div class="v" id="mem">—</div></div>
+  </div>
+
+  <div class="callout" id="moe-explain">
+    <div class="label">Reading</div>
+    <div id="moe-text">—</div>
+  </div>
+</div>
+
+<h2>Where things go subtly wrong</h2>
+
+<table>
+  <thead><tr><th>Bug</th><th>Symptom</th><th>Diagnosis</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Router collapse</td>
+      <td>One expert handles 80% of tokens; loss is fine but model effectively has 1 expert.</td>
+      <td>Aux loss weight too small. Increase α to 0.01–0.1. Plot per-expert load every few hundred steps.</td>
+    </tr>
+    <tr>
+      <td>Token drop catastrophe</td>
+      <td>Quality drops sharply at high batch sizes.</td>
+      <td>Capacity factor too low for the batch. Either increase capacity or reduce batch.</td>
+    </tr>
+    <tr>
+      <td>Router gradient instability</td>
+      <td>Loss oscillates because router keeps re-routing tokens between similar experts.</td>
+      <td>Add routing noise during training (epsilon-greedy on top-k). Or use Expert Choice. Or warmup the router LR more slowly.</td>
+    </tr>
+    <tr>
+      <td>Expert parallelism mismatch</td>
+      <td>Training stalls every step.</td>
+      <td>AllToAll deadlock from inconsistent token-count broadcasts. Always pad to capacity and synchronise.</td>
+    </tr>
+    <tr>
+      <td>Fine-tuning destroys load balance</td>
+      <td>Fine-tuned model's router becomes lopsided.</td>
+      <td>Keep aux loss on during fine-tuning. Some recipes also freeze router weights during fine-tune.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Interview prompts you should be ready for</h2>
+
+<div class="callout">
+  <ol style="margin: 4px 0;">
+    <li>"How is Mixtral 8×7B cheaper to serve than LLaMA-2 70B at similar quality?" <em>(Mixtral total 47B, active per token 13B. Inference cost ∝ active params: ~5× cheaper than 70B dense. Memory is similar to dense 47B model. Wins on compute, ties on memory.)</em></li>
+    <li>"Derive the load-balancing loss." <em>(For each expert i: f_i = fraction of tokens routed to expert i; P_i = mean of softmax probability assigned to expert i. L_balance = α · N · Σ f_i · P_i. The product is minimised when f and P are both uniform (each = 1/N) → uniform load. The factor of N keeps the magnitude independent of expert count.)</em></li>
+    <li>"What's the AllToAll cost in expert-parallel MoE?" <em>(Each token's hidden state (d bytes) must move to the rank holding its expert and back. Total comm per layer = 2 · B · L · d · k bytes (k experts per token, two-way trip). For B=64, L=4k, d=4096, k=2: ~4 GB per layer. With many layers and slow inter-node fabric, this dominates step time.)</em></li>
+    <li>"Why is fine-tuning MoE harder?" <em>(Routing is non-differentiable through top-k; gradients only flow to selected experts. With a small fine-tune dataset, you might never route to some experts → they stay unchanged. Load balance can degrade quickly. Mitigations: keep aux loss, freeze router, or use lighter-touch methods (LoRA on selected experts only).)</em></li>
+    <li>"Could MoE work without load-balancing loss?" <em>(Expert Choice (Zhou 2022) inverts routing: experts pick tokens (top-k tokens per expert), guaranteeing balanced load. But it requires global info (all tokens visible to all experts) which is awkward in distributed settings. Token Choice + aux loss is the standard.)</em></li>
+    <li>"Why do MoE models have shared experts (DeepSeek style)?" <em>(Shared experts are always active for every token; routed experts are selected per token. The shared experts provide a stable baseline (every token gets some computation), while routed experts add specialisation. Improves training stability and lowers variance.)</em></li>
+  </ol>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  MoE trades memory for compute. Total params increase (more capacity to memorise) but active params per token stay small (cheap inference). The cost is an AllToAll on every layer plus an auxiliary load-balancing loss to prevent router collapse. Modern recipes: top-2 routing, capacity factor ~1.25, aux loss α ≈ 0.01, sometimes shared experts. MoE wins when memory is plentiful and inference compute is the bottleneck; loses when memory or single-GPU latency matters. The interview signal is being able to do the back-of-envelope cost comparison and articulate when MoE is the right tool.
+</div>
+
+<div class="callout">
+  <div class="label">Where this track took you</div>
+  Twelve lessons: backprop → optimizers → norms → attention → positional encodings → transformer block → tokenization → scaling laws → calibration → A/B testing → init → MoE. From "what is a gradient?" to "should I deploy MoE for this workload?". Each is a standalone interview question; collectively they're the math you re-derive every time someone asks "but <em>why</em>?". The next layer of depth lives in the other tracks — <a href="../../RL/lessons/index.html">RL post-training</a>, <a href="../../system_ml/lessons/index.html">distributed systems</a>, <a href="../../gpu_kernel_serving/index.html">GPU kernels</a>, <a href="../../vllm/lessons/index.html">serving</a>, <a href="../../generative_continuous/lessons/index.html">generative</a>. They all assume what you've just learned.
+</div>
+
+<footer class="lesson-nav">
+  <a href="11_initialization.html">
+    <span class="dir">← Prev</span>
+    <span class="ttl">11 · Initialization</span>
+  </a>
+  <a class="next" href="index.html">
+    <span class="dir">↑ Index</span>
+    <span class="ttl">Series complete</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const ids = ['N','E','K','cf'];
+  function update(){
+    const N = parseInt(document.getElementById('N').value);
+    const E = parseInt(document.getElementById('E').value); // B per expert
+    const K = parseInt(document.getElementById('K').value);
+    const cf = parseFloat(document.getElementById('cf').value);
+    ['N','E','K'].forEach(id => document.getElementById(id+'-v').textContent = document.getElementById(id).value);
+    document.getElementById('cf-v').textContent = cf.toFixed(2);
+
+    const total = N * E * 1e9 + 10e9; // total = N*E + shared (10B fixed)
+    const active = Math.min(K, N) * E * 1e9 + 10e9;
+    const dense70 = 70e9;
+    const ratio = active / dense70;
+    const mem = total * 2; // bf16
+
+    function fmt(b){
+      if (b >= 1e12) return (b/1e12).toFixed(2)+' T';
+      if (b >= 1e9) return (b/1e9).toFixed(2)+' B';
+      return (b/1e6).toFixed(0)+' M';
+    }
+    function fmtB(b){
+      if (b >= 1e12) return (b/1e12).toFixed(2)+' TB';
+      return (b/1e9).toFixed(2)+' GB';
+    }
+
+    document.getElementById('total').textContent = fmt(total);
+    document.getElementById('active').textContent = fmt(active);
+    document.getElementById('ratio').textContent = ratio.toFixed(2) + 'x dense 70B';
+    document.getElementById('mem').textContent = fmtB(mem);
+
+    const tx = document.getElementById('moe-text');
+    if (ratio < 0.5){
+      tx.innerHTML = `Inference cost ${(ratio*100).toFixed(0)}% of a dense 70B. Total memory ${fmtB(mem)} — fits on multiple H100s with expert parallelism. Significant throughput win. AllToAll comm becomes the new bottleneck; tune capacity factor (${cf.toFixed(2)}) to balance throughput and token-drop.`;
+    } else {
+      tx.innerHTML = `Active params ${fmt(active)} is close to dense 70B (${fmt(dense70)}). The MoE setup is paying its memory cost but not getting the throughput win. Try smaller experts or top-1 routing.`;
+    }
+  }
+  ids.forEach(id => document.getElementById(id).addEventListener('input', update));
+  update();
+})();
+</script>
+
+</body>
+</html>

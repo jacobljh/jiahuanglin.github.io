@@ -1,0 +1,961 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>07 · Reductions</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">gpu_kernel_serving</a>
+    <span class="crumb">/</span>
+    <span class="crumb">07 · reductions</span>
+    <span class="step-pill">lesson 7 / 17</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Reductions — sum, max, softmax</h1>
+<p class="subtitle">A reduction collapses many values into one. Done naïvely, it's a serial chain; done well, it's a parallel tree that uses warp shuffles for the inner stage, shared memory for the block stage, and atomics for the global stage. Almost every "produce one number from many" in ML is a variant of this template.</p>
+
+<h2>The serial story</h2>
+
+<p>Sum N elements. Serial: <code>for (i=0; i&lt;N; i++) acc += x[i]</code>. That's N additions, each depending on the previous. Cannot be parallelised in this form.</p>
+
+<p>Reductions are <em>associative</em>: <code>(a + b) + c == a + (b + c)</code>. Floating-point is technically non-associative (rounding), but for most ML purposes the small bit-level difference is acceptable. Associativity lets us reshape the computation into a <strong>tree</strong>, with depth <span class="math">log₂(N)</span> and width <span class="math">N/2</span> at the leaves.</p>
+
+<svg viewBox="0 0 760 220" class="diagram">
+  <text x="40" y="22" font-size="12" font-family="monospace" fill="var(--text-mute)">parallel reduction tree · depth log₂(N)</text>
+
+  <g font-family="monospace" font-size="11" fill="var(--text)">
+    <text x="40" y="50">x₀</text><text x="100" y="50">x₁</text>
+    <text x="160" y="50">x₂</text><text x="220" y="50">x₃</text>
+    <text x="280" y="50">x₄</text><text x="340" y="50">x₅</text>
+    <text x="400" y="50">x₆</text><text x="460" y="50">x₇</text>
+
+    <text x="70" y="100">x₀+x₁</text>
+    <text x="190" y="100">x₂+x₃</text>
+    <text x="310" y="100">x₄+x₅</text>
+    <text x="430" y="100">x₆+x₇</text>
+
+    <text x="120" y="150">(x₀+x₁)+(x₂+x₃)</text>
+    <text x="360" y="150">(x₄+x₅)+(x₆+x₇)</text>
+
+    <text x="240" y="200">sum of all 8</text>
+  </g>
+
+  <g stroke="var(--text-dim)" fill="none">
+    <line x1="48" y1="56" x2="80" y2="86"/>
+    <line x1="108" y1="56" x2="80" y2="86"/>
+    <line x1="168" y1="56" x2="200" y2="86"/>
+    <line x1="228" y1="56" x2="200" y2="86"/>
+    <line x1="288" y1="56" x2="320" y2="86"/>
+    <line x1="348" y1="56" x2="320" y2="86"/>
+    <line x1="408" y1="56" x2="440" y2="86"/>
+    <line x1="468" y1="56" x2="440" y2="86"/>
+
+    <line x1="100" y1="106" x2="150" y2="136"/>
+    <line x1="220" y1="106" x2="150" y2="136"/>
+    <line x1="340" y1="106" x2="390" y2="136"/>
+    <line x1="460" y1="106" x2="390" y2="136"/>
+
+    <line x1="180" y1="156" x2="270" y2="186"/>
+    <line x1="420" y1="156" x2="270" y2="186"/>
+  </g>
+</svg>
+
+<h2>2D · log-N tree reduction, click to halve</h2>
+
+<p>The cleanest mental model. N=32 leaves at the top; each step pairs adjacent values and adds. After log₂(N)=5 steps a single value sits at the bottom. Click "step" and watch the active set halve. The sync counter shows how many <code>__syncthreads()</code> calls you'd pay in the SMEM version.</p>
+
+<div class="widget" id="tr-widget">
+  <div class="title">Binary tree reduction · log₂(N) depth</div>
+  <div class="hint">Each step: lane <em>i</em> reads lane <em>i + stride</em>, adds, writes back. Stride halves: 16, 8, 4, 2, 1. Active lanes shaded; idle ones fade.</div>
+
+  <div class="controls">
+    <button id="tr-step">step ▷</button>
+    <button id="tr-play">▶ play</button>
+    <button id="tr-reset">⟲ reset</button>
+    <label class="inline">N: <input type="range" id="tr-n" min="4" max="32" step="4" value="32"> <span class="val" id="tr-n-v">32</span></label>
+    <label class="inline">init:
+      <select id="tr-init">
+        <option value="ones">all = 1</option>
+        <option value="idx">val = idx</option>
+        <option value="rand">random</option>
+      </select>
+    </label>
+  </div>
+
+  <canvas id="tr-canvas" width="760" height="360" style="width:100%; height:360px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">step</div><div class="v" id="tr-st">0</div></div>
+    <div class="kpi"><div class="k">stride</div><div class="v" id="tr-str">—</div></div>
+    <div class="kpi"><div class="k">active lanes</div><div class="v" id="tr-act">—</div></div>
+    <div class="kpi"><div class="k">__syncthreads() calls</div><div class="v" id="tr-sync">0</div></div>
+  </div>
+</div>
+
+<h2>The three-level CUDA reduction</h2>
+
+<p>For a large array on the GPU, the standard pattern has four nested stages:</p>
+
+<ol>
+  <li><strong>Per-thread:</strong> each thread reads several elements and accumulates them serially in a register. ("Stride loop.")</li>
+  <li><strong>Per-warp:</strong> the 32 threads of a warp combine their per-thread sums using warp shuffles. Result in lane 0.</li>
+  <li><strong>Per-block:</strong> the warps write their lane-0 results to SMEM, one thread combines them, the block has its sum.</li>
+  <li><strong>Per-grid:</strong> blocks combine via global atomics or a second kernel.</li>
+</ol>
+
+<h3>Stage 1 — per-thread stride loop</h3>
+
+<pre><code>// each thread reads element i, i+gridSize, i+2*gridSize, ...
+int tid = blockIdx.x * blockDim.x + threadIdx.x;
+int stride = gridDim.x * blockDim.x;
+float acc = 0;
+for (int i = tid; i &lt; N; i += stride) acc += x[i];
+</code></pre>
+
+<p>The "stride" pattern (also called grid-stride loop) is coalesced: at step k, threads 0..31 of one warp read elements <code>tid+k*stride</code>, consecutive. The total work per thread is <span class="math">N / (gridSize · blockSize)</span> — choose grid + block size so each thread does enough work to amortise overhead.</p>
+
+<h3>Stage 2 — warp-level reduction via shuffles</h3>
+
+<p>The 32 threads of a warp each have a partial sum in <code>acc</code>. To combine them, use <code>__shfl_down_sync</code>:</p>
+
+<pre><code>// butterfly reduction: combine lanes 16-31 into 0-15, then 8-15 into 0-7, etc.
+for (int offset = 16; offset &gt; 0; offset /= 2)
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+// after this, lane 0 has the warp's total
+</code></pre>
+
+<p>Five rounds of shuffle (offsets 16, 8, 4, 2, 1) combine all 32 lanes into lane 0. Each round halves the active range. No SMEM, no <code>__syncthreads()</code> — warp shuffles are very cheap (the <code>_sync</code> variants do enforce convergence among the masked lanes since Volta, so they aren't <em>literally</em> free, but the cost is on the order of a single instruction, far below SMEM-with-barrier).</p>
+
+<svg viewBox="0 0 760 200" class="diagram">
+  <text x="40" y="22" font-size="12" font-family="monospace" fill="var(--text-mute)">__shfl_down_sync butterfly · 5 rounds → lane 0 holds the sum</text>
+
+  <g font-family="monospace" font-size="10">
+    <text x="40" y="50" fill="var(--text-mute)">offset 16:</text>
+    <text x="40" y="70" fill="var(--text)">L0 += L16  ·  L1 += L17  ·  …  L15 += L31</text>
+
+    <text x="40" y="98" fill="var(--text-mute)">offset 8:</text>
+    <text x="40" y="118" fill="var(--text)">L0 += L8  ·  L1 += L9  ·  …  L7 += L15</text>
+
+    <text x="40" y="146" fill="var(--text-mute)">offsets 4, 2, 1:</text>
+    <text x="40" y="166" fill="var(--text)">repeat → L0 holds the warp's sum</text>
+  </g>
+</svg>
+
+<h3>Stage 3 — block-level reduction via SMEM</h3>
+
+<pre><code>__shared__ float warp_sums[32];   // up to 32 warps per block
+int lane = threadIdx.x % 32;
+int warp = threadIdx.x / 32;
+if (lane == 0) warp_sums[warp] = acc;
+__syncthreads();
+
+// first warp reduces the warp_sums
+if (warp == 0) {
+    acc = (threadIdx.x &lt; blockDim.x/32) ? warp_sums[lane] : 0;
+    for (int offset = 16; offset &gt; 0; offset /= 2)
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    if (lane == 0) {
+        // acc now holds the block's total
+        atomicAdd(global_sum, acc);   // or write to block_sums[blockIdx.x]
+    }
+}
+</code></pre>
+
+<p>Notice the structure: warp shuffles inside, SMEM for cross-warp communication, atomic at the global level. Each stage uses the cheapest synchronisation available — the previous lesson's hierarchy is doing real work here.</p>
+
+<h2>Animated · three-layer reduction in flight</h2>
+
+<p>Watch a 16-block × 4-warp × 32-lane reduction collapse layer by layer. Each warp first does its butterfly shuffle (lane 0 catches the result), then warp 0's lane 0..3 read the 4 warp-sums from SMEM, then block 0..15 issue an atomic add to a single global. Three layers of fan-in. Step or play.</p>
+
+<div class="widget" id="t3-widget">
+  <div class="title">Three-layer reduction · warp · block · grid</div>
+  <div class="hint">Layer 1 (blue): 32 lanes → 1 per warp via shfl. Layer 2 (orange): 4 warp-sums → 1 per block via SMEM. Layer 3 (red): each block's sum → 1 global value via atomicAdd.</div>
+
+  <div class="controls">
+    <button id="t3-play">▶ play</button>
+    <button id="t3-step">step ▷</button>
+    <button id="t3-reset">⟲ reset</button>
+    <label class="inline">speed: <input type="range" id="t3-spd" min="1" max="6" step="1" value="3"> <span class="val" id="t3-spd-v">3×</span></label>
+  </div>
+
+  <canvas id="t3-canvas" width="760" height="380" style="width:100%; height:380px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">layer</div><div class="v" id="t3-layer" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">mechanism</div><div class="v" id="t3-mech" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">survivors</div><div class="v" id="t3-surv">—</div></div>
+    <div class="kpi"><div class="k">running global</div><div class="v" id="t3-glob">—</div></div>
+  </div>
+</div>
+
+<h3>Stage 4 — global combination</h3>
+
+<p>Two options for the across-block sum:</p>
+<ul>
+  <li><strong><code>atomicAdd</code> to a global counter.</strong> Simple, modest contention if the kernel launches many blocks. <code>atomicAdd(float*)</code> is available since CC 2.0; <code>atomicAdd(double*)</code> requires CC 6.0+. Both are fine for ML loss / norm reductions.</li>
+  <li><strong>Write per-block sums + relaunch a small reduction.</strong> One block does the final combine. Used when you want deterministic floating-point summation (atomic order is not deterministic).</li>
+</ul>
+
+<p>For most ML reductions, <code>atomicAdd</code> on the final result is fine. For loss values that need bit-exact reproducibility, do the two-kernel version.</p>
+
+<h2>Softmax — reduction's most-shipped customer</h2>
+
+<p>Softmax over a row of length N: <code>y[i] = exp(x[i] - max) / sum(exp(x[j] - max))</code>. Two reductions over the same row: <strong>max</strong>, then <strong>sum-of-exp</strong>. The naïve PyTorch implementation does this in three separate kernels with three HBM round-trips per row. A fused softmax kernel does it in one pass:</p>
+
+<pre><code>__global__ void softmax_row(const float* x, float* y, int N) {
+    int row = blockIdx.x;
+    // each thread handles N/blockDim elements via stride loop
+    float local_max = -INFINITY;
+    for (int i = threadIdx.x; i &lt; N; i += blockDim.x)
+        local_max = fmaxf(local_max, x[row*N + i]);
+    // warp reduce + block reduce → row_max
+    float row_max = block_reduce_max(local_max);
+
+    float local_sum = 0;
+    for (int i = threadIdx.x; i &lt; N; i += blockDim.x)
+        local_sum += expf(x[row*N + i] - row_max);
+    float row_sum = block_reduce_sum(local_sum);
+
+    // write result
+    for (int i = threadIdx.x; i &lt; N; i += blockDim.x)
+        y[row*N + i] = expf(x[row*N + i] - row_max) / row_sum;
+}
+</code></pre>
+
+<p>One thread block per row; one pass over the row for max, one for sum-of-exp, one for the final divide. HBM round-trips: 2× the row size (one read, one write) — versus the naïve 4–6× for unfused. The lesson-16 fusion principle applied to a reduction.</p>
+
+<h2>The online-softmax trick (FlashAttention's heart)</h2>
+
+<p>The kernel above still makes <em>two passes</em> over the data (one for max, one for sum). FlashAttention's contribution is to do it in <strong>one</strong> pass with a running <span class="math">(m, ℓ)</span> state:</p>
+
+<div class="math block">
+  m_new = max(m_old, x), &nbsp;&nbsp;  ℓ_new = ℓ_old · exp(m_old - m_new) + exp(x - m_new)
+</div>
+
+<p>When a new element arrives, you "rescale" the running normaliser to the new max. After all elements seen, <span class="math">ℓ</span> is exactly <span class="math">Σ exp(xᵢ - m)</span>. Two reductions become one. This generalises to <em>any</em> running statistic with the same shape (max, mean, variance via Welford's algorithm), which is why LayerNorm, RMSNorm, and FlashAttention all share this skeleton.</p>
+
+<h2>The atomic-vs-tree decision</h2>
+
+<table>
+  <thead><tr><th>Final stage</th><th>Latency</th><th>Throughput</th><th>Deterministic?</th></tr></thead>
+  <tbody>
+    <tr><td>Atomic add</td><td>Low (1 kernel)</td><td>Throughput limited by atomic contention</td><td>No (order varies)</td></tr>
+    <tr><td>Tree (2 kernels)</td><td>Higher (2 launches)</td><td>Better at high block counts</td><td>Yes (with proper care)</td></tr>
+    <tr><td>cooperative_groups grid reduce</td><td>Best (1 kernel, grid barrier)</td><td>Limited to one wave of blocks</td><td>Yes</td></tr>
+  </tbody>
+</table>
+
+<p>For most ML kernels (loss, gradient norm, layer norm), atomics are fine. For high-precision scientific computing, the two-kernel tree is the standard answer.</p>
+
+<h2>Variations on a theme</h2>
+
+<p>Every common reduction looks like the template above with different per-thread / per-warp combining operators:</p>
+
+<ul>
+  <li><strong>Sum:</strong> <code>+</code></li>
+  <li><strong>Max:</strong> <code>fmaxf</code></li>
+  <li><strong>Argmax:</strong> tuple of (value, index); combiner picks the max-value</li>
+  <li><strong>Welford mean/variance:</strong> the <em>online</em> formula keeps a running (n, mean, M2) triple</li>
+  <li><strong>Sum-of-squares (norms):</strong> per-thread accumulates <code>x*x</code>, then sum-reduce</li>
+  <li><strong>Top-k:</strong> a small heap per thread; combine via merge</li>
+</ul>
+
+<p>All have the same skeleton: per-thread accumulate, warp-shuffle combine, SMEM block combine, atomic/tree global combine.</p>
+
+<h2>2D · the template, applied to softmax · LayerNorm · grad-norm</h2>
+
+<p>Three side-by-side reductions, all sharing the same warp → block → grid skeleton, differing only in the per-lane combiner and the final post-processing. Hover or click a lane to inspect its contribution; toggle which reduction you're watching.</p>
+
+<div class="widget" id="sm-widget">
+  <div class="title">Three reductions, one template</div>
+  <div class="hint">Same skeleton: per-lane init, pairwise combine, final blend. Only the operator changes. LogSumExp tracks (m, ℓ); LayerNorm tracks (μ, σ²); grad-norm tracks Σx².</div>
+
+  <div class="controls">
+    <button id="sm-b1" class="primary">LogSumExp (softmax)</button>
+    <button id="sm-b2">LayerNorm (μ, σ²)</button>
+    <button id="sm-b3">grad-norm (||∇||₂)</button>
+    <label class="inline">data: <input type="range" id="sm-seed" min="0" max="30" step="1" value="7"> <span class="val" id="sm-seed-v">7</span></label>
+  </div>
+
+  <canvas id="sm-canvas" width="760" height="320" style="width:100%; height:320px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">per-lane state</div><div class="v" id="sm-state" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">combiner</div><div class="v" id="sm-comb" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">post-process</div><div class="v" id="sm-post" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">final value</div><div class="v" id="sm-final">—</div></div>
+  </div>
+</div>
+
+<h2>Interactive · stage-by-stage time and bandwidth</h2>
+
+<p>Pick N. The widget breaks down per-stage cost: per-thread reads (HBM-bound), per-warp shuffle (free), per-block SMEM (low), global atomic (constant). Drag N from 1k to 1B and see the per-thread stage dominate at large N.</p>
+
+<div class="widget" id="r-widget">
+  <div class="title">Reduction · time breakdown by stage</div>
+  <div class="hint">Toy model. Stage-1 time = N · 4 bytes / HBM BW. Other stages add up to microseconds, regardless of N.</div>
+
+  <div class="controls">
+    <label class="inline">N (elements): <input type="range" id="r-n" min="1000" max="1000000000" step="1000" value="1000000"> <span class="val" id="r-n-v">1000000</span></label>
+    <label class="inline">blocks: <input type="range" id="r-b" min="32" max="4096" step="32" value="512"> <span class="val" id="r-b-v">512</span></label>
+  </div>
+
+  <canvas class="dist-canvas" id="r-canvas" width="760" height="220" style="height: 220px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">stage 1 (per-thread, HBM)</div><div class="v" id="r-s1">—</div></div>
+    <div class="kpi"><div class="k">stage 2 (warp shuffle)</div><div class="v" id="r-s2">—</div></div>
+    <div class="kpi"><div class="k">stage 3 (SMEM, block)</div><div class="v" id="r-s3">—</div></div>
+    <div class="kpi"><div class="k">stage 4 (atomic)</div><div class="v" id="r-s4">—</div></div>
+  </div>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Reductions are trees. The kernel template is per-thread accumulate → warp-shuffle combine → SMEM block combine → global atomic. Each stage uses the cheapest sync mechanism that fits: registers, then warp shuffles, then <code>__syncthreads</code>, then <code>atomicAdd</code>. The online variant (Welford / FlashAttention) does it in one pass. LayerNorm, softmax, gradient norms — all the same skeleton.
+</div>
+
+<footer class="lesson-nav">
+  <a href="06_warps_divergence.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">06 · Warps, divergence</span>
+  </a>
+  <a class="next" href="08_occupancy.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">08 · Occupancy</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const get = id => document.getElementById(id);
+  const els = {
+    n: get('r-n'), nv: get('r-n-v'),
+    b: get('r-b'), bv: get('r-b-v'),
+    canvas: get('r-canvas'),
+    s1: get('r-s1'), s2: get('r-s2'), s3: get('r-s3'), s4: get('r-s4')
+  };
+  const ctx = els.canvas.getContext('2d');
+
+  function compute(){
+    const N = parseInt(els.n.value);
+    const B = parseInt(els.b.value);
+    els.nv.textContent = N; els.bv.textContent = B;
+    const HBM = 3.35e12; // B/s
+    const s1 = (N * 4) / HBM * 1e6;       // μs
+    const s2 = 0.1;                       // μs, ~5 shuffles
+    const s3 = 0.5;                       // μs, syncthreads + smem
+    const s4 = 0.5 + Math.log2(Math.max(1,B)) * 0.1;
+    els.s1.textContent = s1.toFixed(2) + ' μs';
+    els.s2.textContent = s2.toFixed(2) + ' μs';
+    els.s3.textContent = s3.toFixed(2) + ' μs';
+    els.s4.textContent = s4.toFixed(2) + ' μs';
+    return { s1, s2, s3, s4 };
+  }
+
+  function render(){
+    const r = compute();
+    const dpr = window.devicePixelRatio || 1;
+    const W = els.canvas.clientWidth, H = els.canvas.clientHeight;
+    if (els.canvas.width !== Math.round(W*dpr)){
+      els.canvas.width = Math.round(W*dpr); els.canvas.height = Math.round(H*dpr);
+    }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 200, padR = 30, padT = 18, padB = 30;
+    const innerW = W - padL - padR;
+    const total = r.s1 + r.s2 + r.s3 + r.s4;
+    const stages = [
+      { name: 'stage 1: HBM',     v: r.s1, c: '#dc2626' },
+      { name: 'stage 2: shuffle', v: r.s2, c: '#d97706' },
+      { name: 'stage 3: SMEM',    v: r.s3, c: '#2563eb' },
+      { name: 'stage 4: atomic',  v: r.s4, c: '#16a34a' },
+    ];
+    let acc = 0;
+    stages.forEach((s, i) => {
+      const w = (s.v / total) * innerW;
+      ctx.fillStyle = s.c;
+      ctx.fillRect(padL + acc, padT + 50, Math.max(1, w), 40);
+      acc += w;
+    });
+    let ly = padT + 110;
+    stages.forEach((s, i) => {
+      ctx.fillStyle = s.c; ctx.fillRect(padL, ly + i*18 - 9, 10, 10);
+      ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+      ctx.fillText(s.name + ' · ' + s.v.toFixed(2) + ' μs', padL + 14, ly + i*18);
+    });
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('total: ' + total.toFixed(2) + ' μs', padL, padT + 32);
+  }
+
+  ['input','change'].forEach(ev=>{
+    [els.n, els.b].forEach(el=>el.addEventListener(ev,render));
+  });
+  window.addEventListener('resize',render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: 2D log-N tree reduction ─── */
+(function(){
+  const C = document.getElementById('tr-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    step:$('tr-step'), play:$('tr-play'), reset:$('tr-reset'),
+    n:$('tr-n'), nv:$('tr-n-v'),
+    init:$('tr-init'),
+    st:$('tr-st'), str:$('tr-str'), act:$('tr-act'), sync:$('tr-sync'),
+  };
+  let N = +els.n.value;
+  let values = [];
+  let stride = N/2;
+  let stepN = 0;
+  let syncN = 0;
+  let playing = false;
+  let lastTs = 0;
+
+  function init(){
+    N = +els.n.value; els.nv.textContent = N;
+    stride = N/2; stepN = 0; syncN = 0;
+    values = new Array(N);
+    for (let i=0;i<N;i++){
+      if (els.init.value === 'ones') values[i] = 1;
+      else if (els.init.value === 'idx') values[i] = i;
+      else {
+        const h = (i*2654435761 + 13) >>> 0;
+        values[i] = (h % 9) + 1;
+      }
+    }
+    render();
+  }
+
+  function doStep(){
+    if (stride < 1) return;
+    for (let i=0; i<stride; i++){
+      values[i] = values[i] + values[i+stride];
+    }
+    stride = Math.floor(stride / 2);
+    stepN++;
+    syncN++;
+    render();
+  }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 24, padR = 24, padT = 28, padB = 30;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+    const cellW = innerW / N;
+    const rowH = 30;
+    const activeN = stride > 0 ? stride*2 : 1;
+
+    ctx.fillStyle = '#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('tree reduction · stride halves at each step', padL, padT - 10);
+
+    // Draw current state row at top
+    const yTop = padT;
+    const maxV = Math.max(...values, 1);
+    for (let i=0; i<N; i++){
+      const x = padL + i*cellW;
+      const isActive = i < activeN;
+      ctx.globalAlpha = isActive ? 1 : 0.25;
+      // base color band
+      const col = i < (stride||0) ? '#2563eb' : (i < activeN ? '#d97706' : '#cbd5e1');
+      ctx.fillStyle = col;
+      ctx.fillRect(x+1, yTop, cellW-2, rowH);
+      ctx.fillStyle = '#ffffff'; ctx.font='10px monospace';
+      if (cellW > 14) ctx.fillText(String(values[i]), x + 3, yTop + rowH/2 + 4);
+      ctx.globalAlpha = 1;
+    }
+
+    // Pairing arrows from upper half to lower half
+    if (stride >= 1){
+      ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 1.2;
+      for (let i=0; i<stride; i++){
+        const x1 = padL + i*cellW + cellW/2;
+        const x2 = padL + (i+stride)*cellW + cellW/2;
+        const ya = yTop + rowH + 10;
+        const yb = ya + 18;
+        ctx.beginPath();
+        ctx.moveTo(x2, ya);
+        ctx.bezierCurveTo(x2, yb, x1, yb, x1, ya);
+        ctx.stroke();
+        // arrowhead at x1
+        ctx.beginPath();
+        ctx.moveTo(x1, ya);
+        ctx.lineTo(x1 - 3, ya - 4);
+        ctx.lineTo(x1 + 3, ya - 4);
+        ctx.closePath();
+        ctx.fillStyle = '#fbbf24';
+        ctx.fill();
+      }
+    }
+
+    // Tree-shape diagram below
+    const treeY = yTop + rowH + 60;
+    const treeH = innerH - (rowH + 60) - 20;
+    const levels = Math.ceil(Math.log2(N)) + 1;
+    const lvlH = treeH / levels;
+
+    for (let lvl=0; lvl<levels; lvl++){
+      const nodesAt = N >> lvl;
+      if (nodesAt <= 0) break;
+      const w = innerW / nodesAt;
+      const y = treeY + lvl*lvlH;
+      const alpha = lvl <= stepN ? 1 : 0.25;
+      for (let i=0; i<nodesAt; i++){
+        const x = padL + i*w + w/2;
+        const isLatest = lvl === stepN;
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = isLatest ? '#16a34a' : (lvl < stepN ? '#475569' : '#dde2ea');
+        ctx.beginPath(); ctx.arc(x, y, Math.min(7, w/3), 0, Math.PI*2); ctx.fill();
+        // edges to children
+        if (lvl < levels-1){
+          const childW = innerW / Math.max(1, nodesAt*2);
+          const cx1 = padL + (i*2)*childW + childW/2;
+          const cx2 = padL + (i*2+1)*childW + childW/2;
+          const cy = treeY + (lvl+1)*lvlH;
+          ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(cx1, cy); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(cx2, cy); ctx.stroke();
+        }
+        ctx.globalAlpha = 1;
+      }
+      ctx.fillStyle = '#94a3b8'; ctx.font='10px monospace';
+      ctx.fillText('lvl '+lvl, 2, y+4);
+    }
+
+    els.st.textContent = stepN + ' / ' + Math.ceil(Math.log2(N));
+    els.str.textContent = stride > 0 ? stride : '— done';
+    els.act.textContent = activeN;
+    els.sync.textContent = syncN;
+  }
+
+  function tick(ts){
+    if (!playing) return;
+    if (!lastTs) lastTs = ts;
+    if (ts - lastTs > 600){
+      doStep(); lastTs = ts;
+      if (stride < 1){ playing=false; els.play.textContent='▶ play'; return; }
+    }
+    requestAnimationFrame(tick);
+  }
+
+  els.step.addEventListener('click', doStep);
+  els.play.addEventListener('click', ()=>{
+    if (stride < 1) init();
+    playing = !playing;
+    els.play.textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastTs = 0; requestAnimationFrame(tick); }
+  });
+  els.reset.addEventListener('click', init);
+  els.n.addEventListener('input', init);
+  els.init.addEventListener('change', init);
+  window.addEventListener('resize', render);
+  init();
+})();
+</script>
+
+<script>
+/* ─── Widget: animated three-layer reduction ─── */
+(function(){
+  const C = document.getElementById('t3-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    play:$('t3-play'), step:$('t3-step'), reset:$('t3-reset'),
+    spd:$('t3-spd'), spdv:$('t3-spd-v'),
+    layer:$('t3-layer'), mech:$('t3-mech'),
+    surv:$('t3-surv'), glob:$('t3-glob'),
+  };
+
+  const NB = 16, NW = 4, NL = 32; // 16 blocks · 4 warps · 32 lanes
+  let phase = 0; // 0..6
+  let progress = 0;
+  let playing = false;
+  let lastTs = 0;
+  // For each block, 4 warp-sums; for each warp, 32 lane values.
+  let lane = [];
+  let warp = [];
+  let block = [];
+  let global = 0;
+
+  function init(){
+    lane = [];
+    for (let b=0; b<NB; b++){
+      lane.push([]);
+      for (let w=0; w<NW; w++){
+        const row = [];
+        for (let l=0; l<NL; l++){
+          row.push(((b*NW + w)*NL + l) % 7 + 1);
+        }
+        lane[b].push(row);
+      }
+    }
+    warp = lane.map(b => b.map(w => 0));
+    block = new Array(NB).fill(0);
+    global = 0;
+    phase = 0; progress = 0;
+  }
+
+  function applyPhase(){
+    if (phase === 0){
+      // warp reduce
+      for (let b=0; b<NB; b++)
+        for (let w=0; w<NW; w++){
+          warp[b][w] = lane[b][w].reduce((a,c)=>a+c,0);
+        }
+    } else if (phase === 1){
+      // block reduce
+      for (let b=0; b<NB; b++)
+        block[b] = warp[b].reduce((a,c)=>a+c,0);
+    } else if (phase === 2){
+      // global atomicAdd
+      global = block.reduce((a,c)=>a+c,0);
+    }
+    phase++;
+    progress = 0;
+  }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 20, padR = 20, padT = 30;
+
+    // Layer 1: lanes — 16 blocks × 4 rows × 32 small cells (big grid)
+    const l1Y = padT;
+    const blockW = (W - padL - padR) / NB;
+    const warpRowH = 12;
+    const l1H = NW * warpRowH + 8;
+    ctx.fillStyle = '#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('layer 1 · 16 blocks × 4 warps × 32 lanes  (32 → 1 per warp via __shfl_down)', padL, l1Y - 14);
+
+    for (let b=0; b<NB; b++){
+      const bx = padL + b*blockW;
+      // block container
+      ctx.strokeStyle = '#dde2ea';
+      ctx.strokeRect(bx+1, l1Y, blockW-2, l1H);
+      for (let w=0; w<NW; w++){
+        const wy = l1Y + 4 + w*warpRowH;
+        const cellW = (blockW-6) / NL;
+        for (let l=0; l<NL; l++){
+          const x = bx + 3 + l*cellW;
+          let active = true, dim = 0;
+          if (phase === 0){
+            // partially collapsing in progress: lanes > (NL * (1-progress)) blank
+            const remaining = Math.ceil(NL * (1 - progress));
+            active = l < remaining;
+          } else if (phase >= 1){
+            // only lane 0 remains
+            active = l === 0;
+          }
+          ctx.fillStyle = active ? '#2563eb' : '#eef1f5';
+          ctx.globalAlpha = active ? 0.95 : 0.4;
+          ctx.fillRect(x, wy, Math.max(1, cellW-0.5), warpRowH-2);
+        }
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // Layer 2: warp-sums — 16 blocks × 4 warps
+    const l2Y = l1Y + l1H + 36;
+    const l2H = 26;
+    ctx.fillStyle = '#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('layer 2 · 4 warp-sums → 1 block sum  (SMEM + final __shfl)', padL, l2Y - 12);
+
+    for (let b=0; b<NB; b++){
+      const bx = padL + b*blockW;
+      const cellW = (blockW-6) / NW;
+      for (let w=0; w<NW; w++){
+        const x = bx + 3 + w*cellW;
+        let active = false;
+        if (phase === 1){
+          active = w < Math.ceil(NW * (1 - progress));
+        } else if (phase === 0){
+          active = false;
+        } else if (phase >= 2){
+          active = w === 0;
+        }
+        ctx.fillStyle = phase >= 1 ? (active ? '#d97706' : '#eef1f5') : '#eef1f5';
+        ctx.globalAlpha = (phase >= 1) ? (active ? 0.95 : 0.4) : 0.3;
+        ctx.fillRect(x, l2Y, Math.max(1, cellW-1), l2H);
+        ctx.globalAlpha = 1;
+      }
+      ctx.strokeStyle = '#dde2ea'; ctx.strokeRect(bx+1, l2Y-2, blockW-2, l2H+4);
+    }
+
+    // Layer 3: block-sums → global
+    const l3Y = l2Y + l2H + 40;
+    const l3H = 30;
+    ctx.fillStyle = '#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('layer 3 · 16 block-sums → 1 global  (atomicAdd)', padL, l3Y - 12);
+
+    for (let b=0; b<NB; b++){
+      const bx = padL + b*blockW;
+      let active = phase >= 2;
+      let fading = phase === 2 ? (b < Math.floor(NB * progress)) : false;
+      ctx.fillStyle = active ? (fading ? '#cbd5e1' : '#dc2626') : '#eef1f5';
+      ctx.globalAlpha = active ? (fading ? 0.4 : 0.95) : 0.3;
+      ctx.fillRect(bx+3, l3Y, blockW-6, l3H);
+      ctx.globalAlpha = 1;
+      // arrow from this block to global
+      if (phase === 2 && !fading){
+        ctx.strokeStyle = '#dc2626'; ctx.lineWidth = 1.5;
+        ctx.globalAlpha = 0.4 + 0.5*progress;
+        const fx = bx + blockW/2;
+        ctx.beginPath();
+        ctx.moveTo(fx, l3Y + l3H);
+        ctx.lineTo(W/2, l3Y + l3H + 22);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // Global accumulator circle
+    const gY = l3Y + l3H + 30;
+    ctx.fillStyle = phase >= 3 ? '#16a34a' : '#dde2ea';
+    ctx.beginPath(); ctx.arc(W/2, gY, 12, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#ffffff'; ctx.font='bold 11px monospace';
+    ctx.fillText('Σ', W/2 - 4, gY + 4);
+
+    // KPIs
+    const layerNames = ['waiting','warp shuffle','block (SMEM)','global atomicAdd','done'];
+    const mechNames = ['—','__shfl_down_sync','__syncthreads + SMEM','atomicAdd(global, sum)','—'];
+    const survNames = [NB*NW*NL+' raw', (NB*NW)+' per-warp', NB+' per-block', '1 global', '1 global'];
+    els.layer.textContent = layerNames[Math.min(phase, 4)];
+    els.mech.textContent = mechNames[Math.min(phase, 4)];
+    els.surv.textContent = survNames[Math.min(phase, 4)];
+    els.glob.textContent = phase >= 3 ? global : (phase === 2 ? (block.slice(0, Math.floor(NB*progress)).reduce((a,c)=>a+c,0)) : 0);
+    els.spdv.textContent = els.spd.value + '×';
+  }
+
+  function tick(ts){
+    if (!playing) return;
+    if (!lastTs) lastTs = ts;
+    const dt = ts - lastTs; lastTs = ts;
+    const spd = +els.spd.value;
+    progress += dt / (1200 / spd);
+    if (progress >= 1){
+      progress = 1; render();
+      applyPhase();
+      if (phase >= 4){ playing = false; els.play.textContent='▶ play'; render(); return; }
+    }
+    render();
+    requestAnimationFrame(tick);
+  }
+
+  els.play.addEventListener('click', ()=>{
+    if (phase >= 4) init();
+    playing = !playing;
+    els.play.textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastTs = 0; requestAnimationFrame(tick); }
+  });
+  els.step.addEventListener('click', ()=>{
+    if (phase >= 4) init();
+    progress = 1; applyPhase(); render();
+  });
+  els.reset.addEventListener('click', ()=>{ init(); render(); });
+  els.spd.addEventListener('input', ()=>{ els.spdv.textContent = els.spd.value+'×'; });
+  window.addEventListener('resize', render);
+  init(); render();
+})();
+</script>
+
+<script>
+/* ─── Widget: softmax · LayerNorm · grad-norm side-by-side ─── */
+(function(){
+  const C = document.getElementById('sm-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    b1:$('sm-b1'), b2:$('sm-b2'), b3:$('sm-b3'),
+    seed:$('sm-seed'), seedv:$('sm-seed-v'),
+    state:$('sm-state'), comb:$('sm-comb'), post:$('sm-post'),
+    final:$('sm-final'),
+  };
+  const N = 16;
+  let mode = 'lse';
+
+  function setMode(m){
+    mode = m;
+    [els.b1, els.b2, els.b3].forEach(b => b.classList.remove('primary'));
+    if (m==='lse') els.b1.classList.add('primary');
+    if (m==='ln')  els.b2.classList.add('primary');
+    if (m==='gn')  els.b3.classList.add('primary');
+    render();
+  }
+  els.b1.addEventListener('click', ()=>setMode('lse'));
+  els.b2.addEventListener('click', ()=>setMode('ln'));
+  els.b3.addEventListener('click', ()=>setMode('gn'));
+
+  function rng(seed){
+    let s = (seed*2654435761) >>> 0;
+    return () => { s = (s * 1664525 + 1013904223) >>> 0; return (s/4294967296); };
+  }
+
+  function generate(){
+    const seed = +els.seed.value;
+    els.seedv.textContent = seed;
+    const r = rng(seed);
+    const vals = new Array(N);
+    for (let i=0;i<N;i++){
+      vals[i] = (r() * 4 - 2);
+    }
+    return vals;
+  }
+
+  function render(){
+    const data = generate();
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 20, padR = 20, padT = 26, padB = 30;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+
+    // Title strip & inputs row
+    ctx.fillStyle = '#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('input values · x[0..15]', padL, padT - 10);
+
+    const cellW = innerW / N;
+    const rowH = 30;
+    const maxAbs = Math.max(...data.map(d=>Math.abs(d)));
+    for (let i=0; i<N; i++){
+      const x = padL + i*cellW;
+      const intensity = Math.abs(data[i]) / maxAbs;
+      const positive = data[i] >= 0;
+      ctx.fillStyle = positive ? '#2563eb' : '#dc2626';
+      ctx.globalAlpha = 0.4 + 0.55*intensity;
+      ctx.fillRect(x+2, padT, cellW-3, rowH);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#1f2430'; ctx.font='10px monospace';
+      ctx.fillText(data[i].toFixed(2), x + 4, padT + rowH/2 + 4);
+    }
+
+    // Three reduction columns
+    const colY = padT + rowH + 40;
+    const colH = innerH - rowH - 40 - padB + 40;
+    const colW = innerW / 3 - 14;
+
+    const cols = [
+      {
+        name:'LogSumExp (softmax)',
+        color:'#d97706',
+        steps:[
+          'm = max_i x_i  →  '+Math.max(...data).toFixed(3),
+          'ℓ = Σ exp(x_i − m)  →  '+data.reduce((a,c)=>a+Math.exp(c - Math.max(...data)),0).toFixed(3),
+          'logsumexp = m + log ℓ'
+        ],
+        final: (Math.max(...data) + Math.log(data.reduce((a,c)=>a+Math.exp(c - Math.max(...data)),0))).toFixed(4),
+        state: '(m, ℓ)',
+        combiner: 'max, sum-of-exp',
+        post: 'log ℓ + m'
+      },
+      {
+        name:'LayerNorm (μ, σ²)',
+        color:'#16a34a',
+        steps:[
+          'μ = (1/N) Σ x_i  →  '+ (data.reduce((a,c)=>a+c,0)/N).toFixed(3),
+          'σ² = (1/N) Σ (x_i − μ)²  →  '+ (() => {
+            const m = data.reduce((a,c)=>a+c,0)/N;
+            return (data.reduce((a,c)=>a+(c-m)*(c-m),0)/N).toFixed(3);
+          })(),
+          'y_i = (x_i − μ) / √(σ² + ε)'
+        ],
+        final: (() => {
+            const m = data.reduce((a,c)=>a+c,0)/N;
+            const v = data.reduce((a,c)=>a+(c-m)*(c-m),0)/N;
+            return 'μ='+m.toFixed(3)+', σ='+Math.sqrt(v).toFixed(3);
+        })(),
+        state: '(μ, M2, n) [Welford]',
+        combiner: 'merge two means',
+        post: 'normalise each x'
+      },
+      {
+        name:'grad-norm (||∇||₂)',
+        color:'#7c3aed',
+        steps:[
+          's = Σ x_i²  →  '+ data.reduce((a,c)=>a+c*c,0).toFixed(3),
+          '||∇||₂ = √s'
+        ],
+        final: Math.sqrt(data.reduce((a,c)=>a+c*c,0)).toFixed(4),
+        state: 'Σ x²',
+        combiner: 'sum',
+        post: 'sqrt'
+      },
+    ];
+
+    cols.forEach((col, idx) => {
+      const x = padL + idx*(colW + 21);
+      // outline
+      ctx.strokeStyle = mode === ['lse','ln','gn'][idx] ? col.color : '#dde2ea';
+      ctx.lineWidth = mode === ['lse','ln','gn'][idx] ? 2 : 1;
+      ctx.strokeRect(x, colY, colW, colH);
+      // title
+      ctx.fillStyle = col.color; ctx.font='12px monospace';
+      ctx.fillText(col.name, x + 8, colY + 18);
+      ctx.fillStyle = '#5b6573'; ctx.font='10.5px monospace';
+      col.steps.forEach((s, i) => {
+        wrapText(s, x + 8, colY + 36 + i*30, colW - 16);
+      });
+      // final value
+      ctx.fillStyle = col.color; ctx.font='14px monospace';
+      ctx.fillText('→ '+col.final, x + 8, colY + colH - 12);
+    });
+
+    function wrapText(text, x, y, maxW){
+      const words = text.split(' ');
+      let line = '';
+      let yy = y;
+      for (const w of words){
+        const test = line + w + ' ';
+        if (ctx.measureText(test).width > maxW){
+          ctx.fillText(line, x, yy);
+          line = w + ' '; yy += 12;
+        } else line = test;
+      }
+      ctx.fillText(line, x, yy);
+    }
+
+    // KPIs depend on selected mode
+    const m = mode === 'lse' ? cols[0] : mode === 'ln' ? cols[1] : cols[2];
+    els.state.textContent = m.state;
+    els.comb.textContent = m.combiner;
+    els.post.textContent = m.post;
+    els.final.textContent = m.final;
+  }
+
+  els.seed.addEventListener('input', render);
+  window.addEventListener('resize', render);
+  setMode('lse');
+})();
+</script>
+
+</body>
+</html>

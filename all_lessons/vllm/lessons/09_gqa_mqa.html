@@ -1,0 +1,711 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>09 · GQA / MQA</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">vllm_lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">09 · GQA / MQA</span>
+    <span class="step-pill">lesson 9 / 12</span>
+  </div>
+</header>
+
+<main>
+
+<h1>GQA / MQA</h1>
+<p class="subtitle">The attention-architecture change that shrinks KV cache by 4–8× with negligible quality loss. If you don't know this lesson, your serving math is wrong by an order of magnitude.</p>
+
+<h2>Why this lesson matters</h2>
+
+<p><a href="01_kv_cache.html">Lesson 01</a> put one formula in your head:</p>
+
+<div class="math block">
+  bytes_per_token &nbsp;=&nbsp; 2 · n_layers · <strong>n_kv_heads</strong> · head_dim · dtype_bytes
+</div>
+
+<p>That bolded term — <code>n_kv_heads</code> — is the lever this lesson is about. In LLaMA-1 7B it equals the number of query heads (32). In LLaMA-2 70B it's 8. In Falcon-40B it's <em>1</em>. Same family of models, same number of layers, KV cache per token differs by 64×.</p>
+
+<p>If you compute "<code>LLaMA-2 70B has 64 attention heads at d_head=128, so 80 layers × 64 × 128 × 2 × 2 = 2.6 MB/token</code>" you've quietly assumed the term that no longer applies. The actual number is <strong>320 KB/token</strong>. That difference is the whole story for what you can serve on one H100 node.</p>
+
+<h2>MHA recap</h2>
+
+<p>Standard multi-head attention with hidden size <span class="math">d</span>, <span class="math">h</span> heads, head dim <span class="math">k = d/h</span>. For each head independently:</p>
+
+<div class="math block">
+  Q<sub>i</sub> = X · W<sub>Q</sub><sup>i</sup>, &nbsp; K<sub>i</sub> = X · W<sub>K</sub><sup>i</sup>, &nbsp; V<sub>i</sub> = X · W<sub>V</sub><sup>i</sup> &nbsp;&nbsp;∈&nbsp; ℝ<sup>(T, k)</sup>
+</div>
+
+<p>The KV cache stores all <span class="math">h</span> key tensors and all <span class="math">h</span> value tensors, one per layer:</p>
+
+<div class="math block">
+  KV per layer per sequence &nbsp;=&nbsp; 2 · h · k · T · bytes_per_dtype
+</div>
+
+<p>Halve <span class="math">h</span>, halve the cache. That's the entire idea. The trick is finding the right <span class="math">h</span> to halve.</p>
+
+<h2>The empirical observation</h2>
+
+<p>Queries across heads naturally diverge: head 3 attends to syntax, head 17 to coreference, head 24 to semantics. Routing matters; removing query heads kills quality fast.</p>
+
+<p>Keys and values across heads, however, end up <em>highly correlated</em> — many heads' K vectors and V vectors land in roughly the same subspace. That redundancy costs HBM but earns nothing. The architecture change is: keep all the Q heads (they do the routing), shrink the K and V heads (they're redundant).</p>
+
+<h2>MQA · the maximal version (Shazeer 2019)</h2>
+
+<p>All <span class="math">h</span> query heads share <em>one</em> key and <em>one</em> value:</p>
+
+<div class="math block">
+  Q<sub>i</sub> = X · W<sub>Q</sub><sup>i</sup> &nbsp;(h heads), &nbsp;&nbsp; K = X · W<sub>K</sub>, &nbsp; V = X · W<sub>V</sub> &nbsp;(one shared)
+</div>
+
+<div class="math block">
+  head<sub>i</sub> &nbsp;=&nbsp; softmax(Q<sub>i</sub> · K<sup>T</sup> / √k) · V
+</div>
+
+<p>KV cache per layer drops to <span class="math">2 · 1 · k · T · bytes</span> — an <strong>h×</strong> reduction. On LLaMA-2 70B that's 64×. Quality cost: ~0.5–1 PPL on LLaMA-scale models. Real but small for many use cases, sometimes too aggressive for frontier quality.</p>
+
+<h2>GQA · the interpolation (Ainslie et al. 2023)</h2>
+
+<p>Introduce <span class="math">h<sub>kv</sub></span> KV heads with <span class="math">h<sub>kv</sub> &lt; h</span>. Each contiguous group of <span class="math">(h / h<sub>kv</sub>)</span> query heads shares one (K, V) head:</p>
+
+<div class="math block">
+  Q<sub>i</sub> = X · W<sub>Q</sub><sup>i</sup> &nbsp;(h heads), &nbsp;&nbsp; K<sub>j</sub> = X · W<sub>K</sub><sup>j</sup>, &nbsp; V<sub>j</sub> = X · W<sub>V</sub><sup>j</sup> &nbsp;(h<sub>kv</sub> heads)
+</div>
+
+<div class="math block">
+  head<sub>i</sub> &nbsp;=&nbsp; softmax(Q<sub>i</sub> · K<sub>group(i)</sub><sup>T</sup> / √k) · V<sub>group(i)</sub>
+</div>
+
+<p>Two extremes:</p>
+
+<ul>
+  <li><span class="math">h<sub>kv</sub> = h</span> → group_size 1 → exactly MHA.</li>
+  <li><span class="math">h<sub>kv</sub> = 1</span> → group_size h → exactly MQA.</li>
+</ul>
+
+<p>KV reduction is <span class="math">h / h<sub>kv</sub></span>. LLaMA-2 70B picks <span class="math">h = 64, h<sub>kv</sub> = 8</span> → 8× smaller cache, quality essentially indistinguishable from MHA.</p>
+
+<h2>Shape flow side-by-side</h2>
+
+<p>Let B = batch, T = sequence, h = query heads, h<sub>kv</sub> = KV heads, k = head_dim.</p>
+
+<pre><code>MHA  (h_kv = h):
+    Q: (B, h,   T, k)    K: (B, h,   T, k)    V: (B, h,   T, k)
+    scores = Q @ K^T / √k                     (B, h, T, T)
+    out    = scores @ V                       (B, h, T, k)
+
+MQA  (h_kv = 1):
+    Q: (B, h,   T, k)    K: (B, 1,   T, k)    V: (B, 1,   T, k)
+    broadcast K, V over h: stride-0 expand    (B, h, T, k)   — no memcopy
+    rest identical to MHA.
+
+GQA  (h_kv = h/G, group_size G):
+    Q: (B, h,    T, k)   K: (B, h_kv, T, k)   V: (B, h_kv, T, k)
+    K = K.repeat_interleave(G, dim=1)         (B, h, T, k)   — materializes a copy in pure PyTorch
+    V = V.repeat_interleave(G, dim=1)                          (fused kernels broadcast inside the tile loop instead)
+    rest identical to MHA.</code></pre>
+
+<p>The broadcast is the key trick. In pure PyTorch, <code>repeat_interleave</code> materializes a copy of the (B, h_kv, T, k) tensor up to (B, h, T, k). Production fused attention kernels (FlashAttention's GQA path, vLLM's PagedAttention kernel) skip this materialization and broadcast K/V over the group inside the tile loop — so the per-token cache size matches <span class="math">h<sub>kv</sub></span> even though the math operates as if <span class="math">h</span> heads contribute.</p>
+
+<h2>Why quality holds at h<sub>kv</sub> = 8</h2>
+
+<p>Two reasons, in order of importance:</p>
+
+<ol>
+  <li><strong>The K/V subspace is still wide.</strong> With <span class="math">h<sub>kv</sub> = 8, k = 128</span>, your keys live in a 1024-dim space per token. That's plenty of capacity to express "what can be retrieved from this position." MQA's collapse to a 128-dim space is where the PPL loss starts.</li>
+  <li><strong>Queries stay fully multi-headed.</strong> The <em>routing</em> — what the model decides to attend to — happens in Q-space. K is what's <em>available</em>; Q is what's <em>asked for</em>. Sharing K across a Q-group means those queries see the same retrieval set, but each can weight it independently. That's the same content from different angles, which is exactly what attention is supposed to do.</li>
+</ol>
+
+<h2>The numbers · models you actually serve</h2>
+
+<table>
+  <thead><tr><th>Model</th><th>n_layers</th><th>h</th><th>h<sub>kv</sub></th><th>head_dim</th><th>KV/tok (fp16)</th><th>KV/tok (fp8)</th><th>vs naive-MHA</th></tr></thead>
+  <tbody>
+    <tr><td>LLaMA-1 7B (MHA)</td>      <td>32</td><td>32</td><td>32</td><td>128</td><td>512 KB</td><td>256 KB</td><td>1×</td></tr>
+    <tr><td>LLaMA-2 70B (GQA G=8)</td> <td>80</td><td>64</td><td>8</td> <td>128</td><td>320 KB</td><td>160 KB</td><td>8×</td></tr>
+    <tr><td>Mistral 7B (GQA G=4)</td>  <td>32</td><td>32</td><td>8</td> <td>128</td><td>128 KB</td><td>64 KB</td> <td>4×</td></tr>
+    <tr><td>Gemma-2 9B (GQA G=2)</td>  <td>42</td><td>16</td><td>8</td> <td>256</td><td>336 KB</td><td>168 KB</td><td>2×</td></tr>
+    <tr><td>Falcon-40B (MQA)</td>      <td>60</td><td>64</td><td>1</td> <td>64</td> <td>15 KB</td> <td>7.5 KB</td><td>64×</td></tr>
+  </tbody>
+</table>
+
+<p>Two things to notice: (1) LLaMA-2 70B has a <em>smaller</em> per-token KV than LLaMA-1 7B, despite being ten times bigger; (2) Falcon-40B's KV is essentially free — that's MQA's whole appeal for very-long-context applications.</p>
+
+<h2>The serving impact, made concrete</h2>
+
+<p>LLaMA-2 70B on an 80 GB H100 node (TP=2). After weights (~70 GB shard each), activations, framework overhead, you have ~30 GB HBM for KV cache. Plug into the formula:</p>
+
+<div class="math block">
+  Naive-MHA (wrong): &nbsp; 2 · 80 · 64 · 128 · 2 &nbsp;=&nbsp; 2.6 MB / token &nbsp;→&nbsp; ~11k concurrent tokens
+</div>
+<div class="math block">
+  GQA (actual): &nbsp; 2 · 80 · 8 · 128 · 2 &nbsp;=&nbsp; 320 KB / token &nbsp;→&nbsp; ~93k concurrent tokens
+</div>
+
+<div class="callout">
+  <div class="label">The punchline</div>
+  At 2048-token average context, the difference is "serve 5 concurrent sessions" vs "serve 45+". That's the same model, the same hardware, the same kernels — entirely the architecture choice in <span class="math">h<sub>kv</sub></span>.
+</div>
+
+<h2>Interactive · the head plan</h2>
+
+<p>Move the sliders to design your own attention. The top row of boxes is the <span class="math">h</span> query heads; the bottom row is the <span class="math">h<sub>kv</sub></span> KV heads. Lines show which Q heads share a (K, V). The KPI panel reports cache size and reduction relative to MHA at the same <span class="math">h</span>.</p>
+
+<div class="widget" id="gqa-widget">
+  <div class="title">Q/KV head plan</div>
+  <div class="hint">h_kv is clamped to a divisor of h (the only legal choices). Try h=64, h_kv=8 — that's LLaMA-2 70B.</div>
+
+  <div class="controls">
+    <label class="inline">h (query heads): <input type="range" id="gq-h" min="4" max="64" step="1" value="32"> <span class="val" id="gq-h-val">32</span></label>
+    <label class="inline">h_kv (KV heads): <input type="range" id="gq-hkv" min="1" max="64" step="1" value="8"> <span class="val" id="gq-hkv-val">8</span></label>
+  </div>
+
+  <canvas class="dist-canvas" id="gq-canvas" width="760" height="220" style="height: 220px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">group size</div><div class="v" id="gq-group">—</div></div>
+    <div class="kpi"><div class="k">flavor</div><div class="v" id="gq-flavor">—</div></div>
+    <div class="kpi"><div class="k">KV / tok / layer</div><div class="v" id="gq-pertok">—</div></div>
+    <div class="kpi"><div class="k">vs MHA reduction</div><div class="v" id="gq-red">—</div></div>
+  </div>
+
+  <p style="margin-top: 16px; color: var(--text-mute); font-size: 13px;">
+  Pick layer count, head_dim, dtype to evaluate against real model configs. The table recomputes per-token KV using only what's in the cache (<span class="math">h<sub>kv</sub></span>).
+  </p>
+
+  <div class="controls">
+    <label class="inline">n_layers: <input type="range" id="gq-L" min="16" max="120" step="2" value="80"> <span class="val" id="gq-L-val">80</span></label>
+    <label class="inline">head_dim: <input type="range" id="gq-d" min="32" max="256" step="32" value="128"> <span class="val" id="gq-d-val">128</span></label>
+    <label class="inline">dtype:
+      <select id="gq-dtype">
+        <option value="2" selected>fp16 / bf16 (2 B)</option>
+        <option value="1">fp8 / int8 (1 B)</option>
+      </select>
+    </label>
+  </div>
+
+  <table>
+    <thead><tr><th>preset</th><th>h</th><th>h_kv</th><th>KV/tok (your dtype)</th><th>per 2k seq</th></tr></thead>
+    <tbody id="gq-table"></tbody>
+  </table>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">show the formula this widget uses</summary>
+<pre><code>// only h_kv heads sit in the KV cache, not h
+const per_tok = 2 * n_layers * h_kv * head_dim * dtype_bytes;
+const reduction_vs_mha = h / h_kv;
+const group_size = h / h_kv;</code></pre>
+  </details>
+</div>
+
+<h2>Interactive · what gets read from HBM at decode time</h2>
+
+<p>The plan above tells you who shares what. The picture below tells you what actually moves. Press <em>play</em> to walk a single decode step:</p>
+
+<ol>
+  <li>The full <span class="math">Q</span> (all <span class="math">h</span> heads) is computed from the one new input token.</li>
+  <li>Only the physical <span class="math">h<sub>kv</sub></span> rows of <strong>K</strong> and <strong>V</strong> are read out of the cache — the boxes on the right.</li>
+  <li>Each row is broadcast (stride-0, no copy) across its query group so every Q head can see the same <span class="math">K</span>, <span class="math">V</span>.</li>
+  <li>Attention runs <em>logically</em> as if all <span class="math">h</span> heads had their own <span class="math">K</span>, <span class="math">V</span>.</li>
+</ol>
+
+<p>The left "logical" panel has <em>h</em> head rows that don't shrink as you slide h<sub>kv</sub>. The right "physical" panel does. That gap is the win — same compute graph, fewer bytes moved.</p>
+
+<div class="widget" id="gqa-flow-widget">
+  <div class="title">Decode-step flow · physical KV (right) → broadcast → logical attention (left)</div>
+  <div class="hint">Slide h, h_kv to redesign the architecture; press play to watch one token's worth of bytes travel through.</div>
+
+  <div class="controls">
+    <label class="inline">h: <input type="range" id="gf-h" min="4" max="32" step="1" value="16"> <span class="val" id="gf-h-val">16</span></label>
+    <label class="inline">h_kv: <input type="range" id="gf-hkv" min="1" max="32" step="1" value="4"> <span class="val" id="gf-hkv-val">4</span></label>
+    <button id="gf-play" class="primary">▶ play one decode step</button>
+    <button id="gf-reset">reset</button>
+  </div>
+
+  <canvas id="gf-canvas" width="760" height="360" style="width:100%; height:360px; background: var(--code-bg); border:1px solid var(--border); border-radius:8px; display:block;"></canvas>
+
+  <div class="kpi-grid" style="margin-top: 12px;">
+    <div class="kpi"><div class="k">physical K+V bytes / tok / layer</div><div class="v" id="gf-bytes">—</div></div>
+    <div class="kpi"><div class="k">logical attention heads</div><div class="v" id="gf-logical">—</div></div>
+    <div class="kpi"><div class="k">stride-0 broadcast factor</div><div class="v" id="gf-broadcast">—</div></div>
+    <div class="kpi"><div class="k">flavor</div><div class="v" id="gf-flavor">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">show the broadcast trick in code</summary>
+<pre><code># physical K_cache shape: (n_layers, h_kv, T, head_dim)
+# logical view used by the attention kernel: (n_layers, h, T, head_dim)
+# How it's done — without ever copying:
+
+K_logical = K_cache.unsqueeze(2).expand(n_layers, h_kv, group_size, T, head_dim)
+            .reshape(n_layers, h, T, head_dim)        # stride-0 along the group axis
+
+# In PyTorch this expand() is free; the .reshape would force a materialization,
+# so fused kernels (FlashAttention's GQA path, vLLM's PagedAttention kernel)
+# skip the reshape and broadcast inside the tile loop. Cache stays at h_kv.</code></pre>
+  </details>
+</div>
+
+<h2>Putting it together</h2>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  GQA replaces <span class="math">h</span> with <span class="math">h<sub>kv</sub></span> in the lesson-01 formula, period. Everything else — the broadcast, the attention math, the kernel shape — is unchanged. It's not a clever serving trick; it's a one-line architecture change at training time that gives you 4–8× more concurrent sequences for free at inference time. Every modern open model uses it.
+</div>
+
+<footer class="lesson-nav">
+  <a href="08_pd_disaggregation.html">
+    <span class="dir">← Prev</span>
+    <span class="ttl">08 · Prefill / decode disaggregation</span>
+  </a>
+  <a class="next" href="10_chunked_prefill.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">10 · Chunked prefill</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const canvas = document.getElementById('gq-canvas');
+  const ctx = canvas.getContext('2d');
+  const rH   = document.getElementById('gq-h');
+  const rHKV = document.getElementById('gq-hkv');
+  const rL   = document.getElementById('gq-L');
+  const rD   = document.getElementById('gq-d');
+  const sD   = document.getElementById('gq-dtype');
+  const vH   = document.getElementById('gq-h-val');
+  const vHKV = document.getElementById('gq-hkv-val');
+  const vL   = document.getElementById('gq-L-val');
+  const vD   = document.getElementById('gq-d-val');
+  const tbody= document.getElementById('gq-table');
+
+  // The hue palette: each Q-group gets one color, lerped around the wheel.
+  function hslFor(group_idx, n_groups) {
+    const hue = Math.floor(360 * group_idx / Math.max(1, n_groups));
+    return `hsl(${hue} 70% 60%)`;
+  }
+
+  function fmtBytes(b) {
+    if (b < 1024) return b.toFixed(0) + " B";
+    if (b < 1024**2) return (b/1024).toFixed(1) + " KB";
+    if (b < 1024**3) return (b/1024**2).toFixed(1) + " MB";
+    return (b/1024**3).toFixed(2) + " GB";
+  }
+
+  // Snap h_kv to a divisor of h.
+  function divisors(n) {
+    const out = [];
+    for (let i = 1; i <= n; i++) if (n % i === 0) out.push(i);
+    return out;
+  }
+  function snapHKV(h, requested) {
+    const ds = divisors(h);
+    let best = ds[0], bestDist = Infinity;
+    for (const d of ds) {
+      const dist = Math.abs(d - requested);
+      if (dist < bestDist) { bestDist = dist; best = d; }
+    }
+    return best;
+  }
+
+  const PRESETS = [
+    { name: "LLaMA-1 7B  (MHA)",     L: 32, h: 32, hkv: 32, d: 128 },
+    { name: "LLaMA-2 70B (GQA G=8)", L: 80, h: 64, hkv: 8,  d: 128 },
+    { name: "Mistral 7B (GQA G=4)",  L: 32, h: 32, hkv: 8,  d: 128 },
+    { name: "Gemma-2 9B (GQA G=2)",  L: 42, h: 16, hkv: 8,  d: 256 },
+    { name: "Falcon-40B (MQA)",      L: 60, h: 64, hkv: 1,  d: 64  },
+  ];
+
+  function render() {
+    const h = parseInt(rH.value);
+    let hkv = parseInt(rHKV.value);
+    // Constrain hkv to be a divisor of h and <= h.
+    if (hkv > h) hkv = h;
+    hkv = snapHKV(h, hkv);
+    rHKV.max = h;
+    rHKV.value = hkv;
+    vH.textContent = h;
+    vHKV.textContent = hkv;
+    const L = parseInt(rL.value);
+    const dHead = parseInt(rD.value);
+    const dtype = parseInt(sD.value);
+    vL.textContent = L;
+    vD.textContent = dHead;
+
+    const group_size = h / hkv;
+    const per_tok_layer = 2 * hkv * dHead * dtype;
+    const per_tok_total = per_tok_layer * L;
+    const reduction = h / hkv;
+
+    let flavor;
+    if (hkv === h) flavor = "MHA";
+    else if (hkv === 1) flavor = "MQA";
+    else flavor = "GQA G=" + group_size;
+
+    document.getElementById('gq-group').textContent = group_size + (group_size === 1 ? "  (no sharing)" : "  Q heads / KV");
+    document.getElementById('gq-flavor').textContent = flavor;
+    document.getElementById('gq-pertok').textContent = fmtBytes(per_tok_total);
+    document.getElementById('gq-red').textContent = reduction.toFixed(reduction === Math.floor(reduction) ? 0 : 1) + "×";
+
+    // Canvas: top row = h Q boxes, bottom row = h_kv KV boxes, lines between.
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    const padX = 24;
+    const usableW = W - 2*padX;
+    const topY = 28, bottomY = 168, boxH = 24;
+    const qBoxW = Math.max(8, Math.min(48, usableW / h - 2));
+    const kvBoxW = Math.max(qBoxW, Math.min(72, usableW / hkv - 6));
+    const qTotalW = h * qBoxW + (h - 1) * 2;
+    const kvTotalW = hkv * kvBoxW + (hkv - 1) * 6;
+    const qStartX = padX + (usableW - qTotalW) / 2;
+    const kvStartX = padX + (usableW - kvTotalW) / 2;
+
+    // Labels
+    ctx.font = '11px monospace';
+    ctx.fillStyle = '#5b6573';
+    ctx.fillText("Q heads (h = " + h + ")", padX, topY - 8);
+    ctx.fillText("KV heads (h_kv = " + hkv + ", " + flavor + ")", padX, bottomY + boxH + 14);
+
+    // Connection lines (draw first, behind boxes).
+    for (let i = 0; i < h; i++) {
+      const group = Math.floor(i / group_size);
+      const qx = qStartX + i * (qBoxW + 2) + qBoxW / 2;
+      const qy = topY + boxH;
+      const kx = kvStartX + group * (kvBoxW + 6) + kvBoxW / 2;
+      const ky = bottomY;
+      ctx.strokeStyle = hslFor(group, hkv);
+      ctx.globalAlpha = 0.55;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(qx, qy);
+      ctx.bezierCurveTo(qx, qy + 40, kx, ky - 40, kx, ky);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1.0;
+
+    // Q boxes
+    for (let i = 0; i < h; i++) {
+      const group = Math.floor(i / group_size);
+      ctx.fillStyle = hslFor(group, hkv);
+      ctx.fillRect(qStartX + i * (qBoxW + 2), topY, qBoxW, boxH);
+    }
+    // KV boxes
+    for (let j = 0; j < hkv; j++) {
+      ctx.fillStyle = hslFor(j, hkv);
+      ctx.fillRect(kvStartX + j * (kvBoxW + 6), bottomY, kvBoxW, boxH);
+      if (kvBoxW >= 28) {
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 11px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText("K,V", kvStartX + j * (kvBoxW + 6) + kvBoxW/2, bottomY + 16);
+        ctx.textAlign = 'left';
+      }
+    }
+
+    // Preset table.
+    tbody.innerHTML = '';
+    for (const p of PRESETS) {
+      const tr = document.createElement('tr');
+      const bpt = 2 * p.L * p.hkv * p.d * dtype;
+      const per2k = bpt * 2048;
+      tr.innerHTML = `<td>${p.name}</td><td>${p.h}</td><td>${p.hkv}</td>` +
+                     `<td>${fmtBytes(bpt)}</td><td>${fmtBytes(per2k)}</td>`;
+      tbody.appendChild(tr);
+    }
+  }
+
+  [rH, rHKV, rL, rD, sD].forEach(el => el.addEventListener('input', render));
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ── Lesson 09 · decode-step KV flow ───────────────────────────────────── */
+(function(){
+  const canvas = document.getElementById('gf-canvas');
+  const ctx = canvas.getContext('2d');
+  const rH   = document.getElementById('gf-h');
+  const rHKV = document.getElementById('gf-hkv');
+  const vH   = document.getElementById('gf-h-val');
+  const vHKV = document.getElementById('gf-hkv-val');
+  const btnPlay  = document.getElementById('gf-play');
+  const btnReset = document.getElementById('gf-reset');
+
+  const HEAD_DIM = 64;             // for byte-count display
+  const DTYPE    = 2;              // fp16
+
+  function divisors(n) { const o=[]; for (let i=1;i<=n;i++) if (n%i===0) o.push(i); return o; }
+  function snap(n, requested) {
+    const ds = divisors(n); let b=ds[0], bd=Infinity;
+    for (const d of ds) { const dist = Math.abs(d-requested); if (dist<bd){bd=dist;b=d;} }
+    return b;
+  }
+  function hueFor(g, ng) { return `hsl(${Math.floor(360*g/Math.max(1,ng))}, 70%, 58%)`; }
+  function hueDim(g, ng) { return `hsl(${Math.floor(360*g/Math.max(1,ng))}, 45%, 30%)`; }
+  function fmtBytes(b) {
+    if (b < 1024)    return b.toFixed(0)+" B";
+    if (b < 1024**2) return (b/1024).toFixed(1)+" KB";
+    if (b < 1024**3) return (b/1024**2).toFixed(1)+" MB";
+    return (b/1024**3).toFixed(2)+" GB";
+  }
+
+  // Animation: 4 phases
+  //   0: idle
+  //   1: physical K/V highlighted (read from HBM)
+  //   2: broadcast (lines from physical → logical)
+  //   3: logical attention boxes light up
+  let phase = 0;
+  let phaseStart = 0;
+  let timer = null;
+  const PHASE_MS = 750;
+
+  function startPlay() {
+    if (timer) clearTimeout(timer);
+    phase = 1; phaseStart = performance.now();
+    tick();
+  }
+  function tick() {
+    const elapsed = performance.now() - phaseStart;
+    if (elapsed >= PHASE_MS) {
+      phase++;
+      phaseStart = performance.now();
+      if (phase > 3) { phase = 0; timer = null; render(); return; }
+    }
+    render();
+    timer = setTimeout(tick, 30);
+  }
+  function reset() {
+    if (timer) clearTimeout(timer);
+    phase = 0; timer = null;
+    render();
+  }
+
+  btnPlay .addEventListener('click', startPlay);
+  btnReset.addEventListener('click', reset);
+
+  function render() {
+    let h = parseInt(rH.value);
+    let hkv = parseInt(rHKV.value);
+    if (hkv > h) hkv = h;
+    hkv = snap(h, hkv);
+    rHKV.max = h;
+    rHKV.value = hkv;
+    vH.textContent = h;
+    vHKV.textContent = hkv;
+
+    const G = h / hkv;
+    const physBytes = 2 * hkv * HEAD_DIM * DTYPE;          // K+V per token per layer
+    const flavor    = (hkv === h) ? 'MHA' : (hkv === 1) ? 'MQA' : `GQA G=${G}`;
+
+    document.getElementById('gf-bytes')    .textContent = fmtBytes(physBytes);
+    document.getElementById('gf-logical')  .textContent = `${h} (broadcast view)`;
+    document.getElementById('gf-broadcast').textContent = `${G}×`;
+    document.getElementById('gf-flavor')   .textContent = flavor;
+
+    // Canvas setup
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    // ── Layout: left "logical" panel, right "physical" panel
+    const padL = 16, padR = 16, padT = 24, padB = 18, midGap = 60;
+    const panelW = (W - padL - padR - midGap) / 2;
+    const logX = padL,            logY = padT;
+    const phyX = padL + panelW + midGap, phyY = padT;
+    const panelH = H - padT - padB;
+
+    // Panel frames
+    ctx.fillStyle = '#0e1118';
+    ctx.strokeStyle = '#dde2ea';
+    ctx.lineWidth = 1;
+    ctx.fillRect(logX, logY, panelW, panelH);
+    ctx.strokeRect(logX + 0.5, logY + 0.5, panelW - 1, panelH - 1);
+    ctx.fillStyle = '#0e1118';
+    ctx.fillRect(phyX, phyY, panelW, panelH);
+    ctx.strokeRect(phyX + 0.5, phyY + 0.5, panelW - 1, panelH - 1);
+
+    // Headers
+    ctx.fillStyle = '#2563eb';
+    ctx.font = 'bold 12px var(--mono), monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText('LOGICAL · attention sees h heads', logX + 10, logY + 8);
+    ctx.fillStyle = '#d97706';
+    ctx.fillText('PHYSICAL · cache holds h_kv heads', phyX + 10, phyY + 8);
+
+    // Sub-headers
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '10px var(--mono), monospace';
+    ctx.fillText(`Q: (${h}, k=${HEAD_DIM})    K_logical: (${h}, T, k)`, logX + 10, logY + 26);
+    ctx.fillText(`K_cache: (${hkv}, T, k)    V_cache: (${hkv}, T, k)`, phyX + 10, phyY + 26);
+
+    // ── Logical panel: Q boxes and logical K boxes stacked
+    const rowsTop = logY + 50;
+    const rowsBot = logY + panelH - 14;
+    const rowH    = (rowsBot - rowsTop) / h;
+    const qX      = logX + 14;
+    const klX     = logX + panelW - 14 - 110;
+    const qW      = 80;
+    const klW     = 110;
+
+    // Section labels (Q / K_logical)
+    ctx.fillStyle = '#5b6573';
+    ctx.font = '10px var(--mono), monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('Q', qX + qW/2, rowsTop - 8);
+    ctx.fillText('K, V  (logical)', klX + klW/2, rowsTop - 8);
+
+    // Active during phase 3 — boxes also stay full-color when idle so the structure is readable.
+    const logicalActive = (phase === 3);
+    const idle = (phase === 0);
+    for (let i = 0; i < h; i++) {
+      const group = Math.floor(i / G);
+      const y = rowsTop + i * rowH + 1;
+      const hh = Math.max(2, rowH - 2);
+
+      // Q head row
+      ctx.fillStyle = (logicalActive || idle) ? hueFor(group, hkv) : hueDim(group, hkv);
+      ctx.fillRect(qX, y, qW, hh);
+      ctx.strokeStyle = '#dde2ea';
+      ctx.strokeRect(qX + 0.5, y + 0.5, qW - 1, hh - 1);
+
+      // logical K, V row (drawn as a single block; broadcast indicator on left edge)
+      ctx.fillStyle = (logicalActive || idle) ? hueFor(group, hkv) : hueDim(group, hkv);
+      if (logicalActive) ctx.globalAlpha = 0.55;
+      else if (idle)     ctx.globalAlpha = 0.40;
+      ctx.fillRect(klX, y, klW, hh);
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = '#dde2ea';
+      ctx.strokeRect(klX + 0.5, y + 0.5, klW - 1, hh - 1);
+
+      // matmul arrow inside logical panel
+      if (logicalActive && rowH > 6) {
+        ctx.strokeStyle = '#16a34a';
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.moveTo(qX + qW + 2, y + hh/2);
+        ctx.lineTo(klX - 2, y + hh/2);
+        ctx.stroke();
+        ctx.lineWidth = 1;
+      }
+    }
+
+    // small "•" label between Q and K logical rows when active
+    if (logicalActive) {
+      ctx.fillStyle = '#16a34a';
+      ctx.font = '9px var(--mono), monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('Q · Kᵀ →  softmax · V →  O', logX + panelW/2, rowsBot + 6);
+    }
+
+    // ── Physical panel: only h_kv rows, taller each
+    const phyRowH = (rowsBot - rowsTop) / hkv;
+    const kpX = phyX + 14;
+    const kpW = panelW - 28;
+
+    // Active during phase 1 (initial read); also keep full color at idle.
+    const physActive = (phase === 1);
+    const physVisible = (physActive || idle);
+
+    for (let j = 0; j < hkv; j++) {
+      const y = rowsTop + j * phyRowH + 2;
+      const hh = Math.max(4, phyRowH - 4);
+
+      const color = physVisible ? hueFor(j, hkv) : hueDim(j, hkv);
+      ctx.fillStyle = color;
+      ctx.fillRect(kpX, y, kpW, hh);
+
+      // accent on left edge to indicate broadcast multiplicity
+      ctx.fillStyle = '#d97706';
+      ctx.globalAlpha = physActive ? 1 : 0.5;
+      ctx.fillRect(kpX, y, 4, hh);
+      ctx.globalAlpha = 1;
+
+      ctx.strokeStyle = physActive ? '#d97706' : '#dde2ea';
+      ctx.lineWidth   = physActive ? 1.5 : 1;
+      ctx.strokeRect(kpX + 0.5, y + 0.5, kpW - 1, hh - 1);
+      ctx.lineWidth = 1;
+
+      // K,V label
+      if (hh > 18) {
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 11px var(--mono), monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(`K_${j}, V_${j}   shared by ${G} Q-heads`, kpX + kpW/2, y + hh/2);
+      } else if (hh > 8) {
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '9px var(--mono), monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(`bcast ×${G}`, kpX + kpW/2, y + hh/2);
+      }
+    }
+
+    // ── Broadcast lines from physical (left edge of K_cache row) to logical (left edge of K_logical row)
+    const broadcasting = (phase === 2 || phase === 3);
+    if (broadcasting) {
+      for (let i = 0; i < h; i++) {
+        const group = Math.floor(i / G);
+        const yQ = rowsTop + i * rowH + rowH/2;
+        const yP = rowsTop + group * phyRowH + phyRowH/2;
+        const xFrom = kpX;
+        const xTo   = klX + klW;
+        ctx.strokeStyle = hueFor(group, hkv);
+        ctx.globalAlpha = (phase === 2) ? 0.85 : 0.45;
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.moveTo(xFrom, yP);
+        ctx.bezierCurveTo(xFrom - 30, yP, xTo + 30, yQ, xTo, yQ);
+        ctx.stroke();
+        ctx.lineWidth = 1;
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // ── Phase indicator at top
+    const phaseTexts = [
+      '',
+      'phase 1 · read h_kv physical K, V rows from HBM',
+      `phase 2 · stride-0 broadcast × ${G} into logical view (no copy)`,
+      'phase 3 · attention over h logical heads · Q · Kᵀ → softmax · V → O',
+    ];
+    if (phase >= 1) {
+      ctx.fillStyle = '#d97706';
+      ctx.font = 'bold 11px var(--mono), monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillText(phaseTexts[phase], W / 2, 6);
+    } else {
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '11px var(--mono), monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillText('press play to animate one decode step', W / 2, 6);
+    }
+  }
+
+  rH .addEventListener('input', () => { if (timer) reset(); render(); });
+  rHKV.addEventListener('input', () => { if (timer) reset(); render(); });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

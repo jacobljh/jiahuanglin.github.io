@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>07 · Vector add — your first kernel</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">Triton kernels / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">07 · vector add</span>
+    <span class="step-pill">lesson 07 / 14</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Vector add — your first kernel</h1>
+<p class="subtitle">The "hello world" of GPU programming. We use it to walk the <strong>full Triton workflow</strong> end to end: jit, grid, launch, autotune, verify against PyTorch, benchmark with <code>do_bench</code>. By the end you have a kernel you can paste into a Colab.</p>
+
+<h2>The complete kernel — 13 lines</h2>
+
+<pre><code>import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def add_kernel(a_ptr, b_ptr, c_ptr, N, BLOCK: tl.constexpr):
+    pid  = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m    = offs &lt; N
+    x    = tl.load(a_ptr + offs, mask=m, other=0.0)
+    y    = tl.load(b_ptr + offs, mask=m, other=0.0)
+    tl.store(c_ptr + offs, x + y, mask=m)</code></pre>
+
+<p>That's the whole kernel. Every primitive from lesson 04 is here: <code>program_id</code>, <code>arange</code>, mask, <code>tl.load</code> with <code>other</code>, <code>tl.store</code> with mask.</p>
+
+<h2>The PyTorch-facing wrapper</h2>
+
+<pre><code>def vector_add(a: torch.Tensor, b: torch.Tensor) -&gt; torch.Tensor:
+    assert a.is_cuda and b.is_cuda and a.shape == b.shape
+    N = a.numel()
+    c = torch.empty_like(a)
+    BLOCK = 1024
+    grid  = (triton.cdiv(N, BLOCK),)
+    add_kernel[grid](a, b, c, N, BLOCK=BLOCK)
+    return c</code></pre>
+
+<p>Two notable things:</p>
+
+<ul>
+  <li>The launch syntax <code>add_kernel[grid](...)</code> uses Python's <code>__getitem__</code>: the grid goes in <code>[]</code>, the kernel args in <code>()</code>. Triton overloads this on the <code>@jit</code> object.</li>
+  <li><code>BLOCK</code> is passed as a keyword. Because it's marked <code>tl.constexpr</code> in the kernel, this triggers compilation.</li>
+</ul>
+
+<h2>Verify against PyTorch — always</h2>
+
+<pre><code>a = torch.randn(1_000_000, device='cuda', dtype=torch.float32)
+b = torch.randn(1_000_000, device='cuda', dtype=torch.float32)
+
+c_triton = vector_add(a, b)
+c_torch  = a + b
+
+torch.testing.assert_close(c_triton, c_torch)        # exact for fp32 add</code></pre>
+
+<p>For bf16/fp16 you'd use <code>assert_close(... atol=1e-3, rtol=1e-2)</code> — same as you'd use for any GPU reduction comparison.</p>
+
+<div class="callout">
+  <div class="label">Always test at "ugly" sizes</div>
+  Test N = 1_000_000 (not a power of two) <em>and</em> N = 1024 (exact tile size) <em>and</em> N = 1 (tiny). The first checks the boundary mask. The second checks the no-boundary case. The third checks you didn't accidentally rely on a tile size larger than your data.
+</div>
+
+<h2>Benchmark with do_bench</h2>
+
+<p>Triton ships a microbenchmarker that handles warmup and the noise floor:</p>
+
+<pre><code>ms = triton.testing.do_bench(lambda: vector_add(a, b), warmup=25, rep=100)
+N_bytes = 3 * a.numel() * a.element_size()   # 2 loads + 1 store
+bw_gbps = N_bytes / (ms * 1e-3) / 1e9
+print(f"{ms:.3f} ms  ·  {bw_gbps:.0f} GB/s")</code></pre>
+
+<p>For a 1M-element fp32 add on an H100 (peak HBM ~3 TB/s) you should see ~2700 GB/s — close to peak because the kernel is purely bandwidth-bound. If you see &lt;50% of peak, the kernel is launch-bound (try a bigger N) or your BLOCK is too small.</p>
+
+<h2>Adding autotune — picking BLOCK for you</h2>
+
+<p>Different N's like different BLOCK sizes. Rather than hardcode 1024, let the autotuner choose:</p>
+
+<pre><code>@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK':  256}, num_warps=2),
+        triton.Config({'BLOCK':  512}, num_warps=4),
+        triton.Config({'BLOCK': 1024}, num_warps=4),
+        triton.Config({'BLOCK': 2048}, num_warps=8),
+    ],
+    key=['N'],
+)
+@triton.jit
+def add_kernel(a_ptr, b_ptr, c_ptr, N, BLOCK: tl.constexpr):
+    # ... same body ...
+
+def vector_add(a, b):
+    N = a.numel()
+    c = torch.empty_like(a)
+    grid = lambda meta: (triton.cdiv(N, meta['BLOCK']),)
+    add_kernel[grid](a, b, c, N)               # no BLOCK arg — autotune fills it
+    return c</code></pre>
+
+<p>The first call for each <code>N</code> in the key triggers a benchmarking pass — Triton compiles all four configs, runs each ~5 times, and picks the fastest. Subsequent calls with the same <code>N</code> hit the cache.</p>
+
+<svg viewBox="0 0 760 220" class="diagram" role="img" aria-label="Autotuner sweeps BLOCK configs and picks the fastest">
+  <g font-size="11" fill="var(--text-mute)">
+    <text x="20" y="24" font-weight="700" fill="var(--text)">First call with N=1_000_000 → autotuner sweep</text>
+    <g transform="translate(20,40)">
+      <rect width="160" height="44" fill="#dbeafe" stroke="#bfdbfe"/>
+      <text x="80" y="20" text-anchor="middle" font-weight="600">BLOCK=256</text>
+      <text x="80" y="36" text-anchor="middle" font-family="var(--mono)">0.42 ms</text>
+    </g>
+    <g transform="translate(200,40)">
+      <rect width="160" height="44" fill="#dbeafe" stroke="#bfdbfe"/>
+      <text x="80" y="20" text-anchor="middle" font-weight="600">BLOCK=512</text>
+      <text x="80" y="36" text-anchor="middle" font-family="var(--mono)">0.31 ms</text>
+    </g>
+    <g transform="translate(380,40)">
+      <rect width="160" height="44" fill="#dcfce7" stroke="#86efac" stroke-width="2"/>
+      <text x="80" y="20" text-anchor="middle" font-weight="600">BLOCK=1024 ✓</text>
+      <text x="80" y="36" text-anchor="middle" font-family="var(--mono)">0.27 ms (best)</text>
+    </g>
+    <g transform="translate(560,40)">
+      <rect width="160" height="44" fill="#dbeafe" stroke="#bfdbfe"/>
+      <text x="80" y="20" text-anchor="middle" font-weight="600">BLOCK=2048</text>
+      <text x="80" y="36" text-anchor="middle" font-family="var(--mono)">0.28 ms</text>
+    </g>
+    <text x="20" y="120" fill="var(--text-mute)">Result cached as <span style="font-family:var(--mono)">N=1_000_000 → BLOCK=1024, num_warps=4</span>.</text>
+    <text x="20" y="142" fill="var(--text-mute)">Subsequent calls with the same N: instant lookup.</text>
+    <text x="20" y="164" fill="var(--text-mute)">Different N (e.g. 16M): fresh sweep, picks whatever is best for that size.</text>
+  </g>
+</svg>
+
+<h2>What can go wrong on a vector add</h2>
+
+<table>
+  <thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
+  <tbody>
+    <tr><td>Wrong output at N = 1_000_000 but right at N = 1024</td><td>Forgot the mask</td><td>Add <code>mask=offs &lt; N, other=0.</code> to every load/store.</td></tr>
+    <tr><td>Segfault at large N</td><td>Mask missing OR you passed a non-contiguous tensor</td><td>Mask, and <code>a = a.contiguous()</code> before the call.</td></tr>
+    <tr><td>Only ~10% of peak bandwidth</td><td>Launch-bound (kernel runs too fast) or BLOCK too small</td><td>Increase BLOCK (try 4096) or batch more work per kernel.</td></tr>
+    <tr><td>First call takes 200 ms</td><td>Autotune sweep on first hit</td><td>Run a warmup call before timing.</td></tr>
+    <tr><td><code>RuntimeError: index out of bounds</code> on launch</td><td>Grid uses an old BLOCK after autotune changed it</td><td>Use <code>grid = lambda meta: (cdiv(N, meta['BLOCK']),)</code> so grid reads BLOCK from the meta dict.</td></tr>
+  </tbody>
+</table>
+
+<h2>Reading the roofline — is this kernel fast?</h2>
+
+<p>A vector add does 1 floating-point op per 3 memory accesses (2 loads, 1 store). That's an arithmetic intensity of <em>1/12</em> flop per byte for fp32 — far below the roofline knee. The kernel is bandwidth-bound, and the right ceiling is HBM peak, not flops peak.</p>
+
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">flops/byte (fp32)</div><div class="v">~0.08</div></div>
+  <div class="kpi"><div class="k">H100 HBM peak</div><div class="v">~3.0 TB/s</div></div>
+  <div class="kpi"><div class="k">target wall-clock at N=4M fp32</div><div class="v">~16 µs</div></div>
+  <div class="kpi"><div class="k">if you measure 30 µs</div><div class="v">launch-bound; increase N</div></div>
+</div>
+
+<h2>Interactive · tune your add kernel</h2>
+<p>Pick BLOCK and num_warps; see the predicted bandwidth on a 4-million-fp32 add and where each setting hurts.</p>
+
+<div class="widget"><div class="title">Vector add bandwidth predictor</div><p class="hint">Model: bandwidth ≈ HBM_peak · efficiency(BLOCK) · 1 − launch_overhead(BLOCK). The sweet spot moves with N.</p><div class="controls">
+<label class="inline">N (millions) <input id="t7-N" type="range" min="1" max="32" step="1" value="4"><span class="val" id="t7-N-v">4</span></label>
+<label class="inline">BLOCK <input id="t7-block" type="range" min="64" max="4096" step="64" value="1024"><span class="val" id="t7-block-v">1024</span></label>
+<label class="inline">num_warps <input id="t7-warps" type="range" min="1" max="8" step="1" value="4"><span class="val" id="t7-warps-v">4</span></label>
+</div><div id="t7-out" class="kpi-grid"></div><p class="hint" id="t7-note"></p></div>
+
+<h2>What's next</h2>
+
+<p>Vector add is bandwidth-bound and trivial to write. Lesson 08 picks a more typical workload — a fused linear + bias + GELU — that <em>only</em> wins through fusion. You'll see eager PyTorch's 3 launches collapse into 1 Triton kernel, and feel the bandwidth saving in your fingertips.</p>
+
+<footer class="lesson-nav">
+  <a href="06_reductions.html"><span class="dir">Previous</span><span class="ttl">06 · Reductions</span></a>
+  <a class="next" href="08_fused_activation.html"><span class="dir">Next</span><span class="ttl">08 · Fused linear + bias + GELU</span></a>
+</footer>
+
+<script>
+(function(){
+  const e={N:document.getElementById('t7-N'),block:document.getElementById('t7-block'),warps:document.getElementById('t7-warps')};
+  const out=document.getElementById('t7-out'),note=document.getElementById('t7-note');
+  function draw(){
+    document.getElementById('t7-N-v').textContent=e.N.value;
+    document.getElementById('t7-block-v').textContent=e.block.value;
+    document.getElementById('t7-warps-v').textContent=e.warps.value;
+    const Nm=+e.N.value, BLOCK=+e.block.value, W=+e.warps.value;
+    const N=Nm*1e6;
+    const lanesPerWarp = BLOCK / W;
+    const tooFewLanes = lanesPerWarp < 32;
+    const tooManyLanes = lanesPerWarp > 256;
+    const nProg = Math.ceil(N/BLOCK);
+    const launches_overhead_us = nProg * 0.00002; // 20 ns per program scheduling, rough
+    const peak_gbps = 3000; // H100
+    let eff = 1.0;
+    if (tooFewLanes) eff *= 0.4;
+    if (tooManyLanes) eff *= 0.6;
+    if (BLOCK < 128) eff *= 0.5;
+    if (nProg < 200) eff *= Math.max(0.3, nProg/200); // not enough programs to fill SMs
+    const bw = peak_gbps * eff;
+    const bytes = 3 * N * 4; // fp32
+    const ms_kernel = bytes / (bw*1e9) * 1000;
+    const ms_total = ms_kernel + launches_overhead_us*1000;
+    out.innerHTML='';
+    function kpi(k,v,col){const d=document.createElement('div');d.className='kpi';d.innerHTML='<div class="k">'+k+'</div><div class="v" style="color:'+(col||'#1f2430')+'">'+v+'</div>';out.appendChild(d);}
+    kpi('programs', nProg.toLocaleString(), '#1f2430');
+    kpi('lanes / warp', lanesPerWarp.toFixed(0), tooFewLanes||tooManyLanes ? '#dc2626':'#16a34a');
+    kpi('predicted bw', bw.toFixed(0)+' GB/s', bw > 2200 ? '#16a34a' : (bw>1000 ? '#d97706':'#dc2626'));
+    kpi('predicted time', ms_total.toFixed(3)+' ms', '#1f2430');
+    let m='';
+    if (tooFewLanes) m='⚠ '+lanesPerWarp+' lanes/warp wastes hardware — each warp is partial. Need BLOCK ≥ 32 · num_warps.';
+    else if (tooManyLanes) m='⚠ Each warp does '+(lanesPerWarp/32).toFixed(0)+' iterations per op — overhead grows. Try more warps or smaller BLOCK.';
+    else if (nProg < 200) m='⚠ Only '+nProg+' programs — not enough to fill all SMs on H100 (132). Bump N or shrink BLOCK.';
+    else m='Configuration is in the sweet spot. Bandwidth ≈ '+bw.toFixed(0)+' GB/s, '+(bw/30).toFixed(0)+'% of H100 peak.';
+    note.textContent=m;
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,883 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>19 · CUDA Graphs &amp; TensorRT</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">19 · CUDA Graphs &amp; TensorRT</span>
+    <span class="step-pill">lesson 19 / 19</span>
+  </div>
+</header>
+
+<main>
+
+<h1>CUDA Graphs &amp; TensorRT — serve-time graph capture</h1>
+<p class="subtitle">Decode emits one token per forward; each forward is hundreds of kernel launches; each launch is ~1–2 μs of GPU-side overhead. Capture the launches once, replay forever — and at the limit, hand the whole model to TensorRT and let it pick a globally-optimised plan.</p>
+
+<h2>What launches cost</h2>
+
+<p>From lesson 13 we counted host-side Python overhead (~5–10 μs per op). There's a second cost we haven't isolated yet: the <strong>device-side launch overhead</strong>, the time the GPU spends accepting and starting each kernel. On H100 this is roughly:</p>
+
+<ul>
+  <li>~1 μs per kernel for the GPU command processor to receive and queue it.</li>
+  <li>Plus ~0.5–2 μs of "bubble" between kernels when the GPU has finished one and is waiting for the next to be dispatched.</li>
+</ul>
+
+<p>This is invisible to most training code because backward kernels are large enough that the bubble is negligible. But for decode (~hundreds of launches per token, each kernel ~10–50 μs for a 7B model), the bubble is a meaningful fraction of step time. Even with <code>torch.compile</code> reducing host overhead, the device-side bubble between dozens of small kernels per attention block doesn't go away.</p>
+
+<h2>CUDA Graphs — capture once, replay many times</h2>
+
+<p>A CUDA Graph is a recorded sequence of kernel launches (and memcpys, and events) that the driver hands to the GPU as <strong>a single submission</strong>. The GPU's command processor sees one launch, expands it into the captured sequence internally, and runs through them with no host involvement and minimal between-kernel bubble.</p>
+
+<p>Two ways to build one:</p>
+
+<ul>
+  <li><strong>Stream capture.</strong> Wrap a regular sequence of kernel launches in <code>cuStreamBeginCapture</code> / <code>cuStreamEndCapture</code>. The driver records every launch on that stream into a graph, instead of executing them immediately.</li>
+  <li><strong>Manual construction.</strong> Build the graph as a DAG of node objects via the CUDA Graph API. More control, more code; rarely used by frameworks.</li>
+</ul>
+
+<p>PyTorch exposes this via <code>torch.cuda.CUDAGraph</code>:</p>
+
+<pre><code>g = torch.cuda.CUDAGraph()
+static_input  = torch.empty_like(x)
+static_output = torch.empty_like(model(x))
+
+# warmup (build cuDNN/cuBLAS workspaces, autotune kernels)
+for _ in range(3):
+    static_output = model(static_input)
+
+# capture
+with torch.cuda.graph(g):
+    static_output = model(static_input)
+
+# replay — fast
+for batch in loader:
+    static_input.copy_(batch)
+    g.replay()
+    use(static_output)
+</code></pre>
+
+<p>Replay is a single device-side submission. For a decoder model with batch=1, this typically cuts step time by <strong>20–40%</strong> — entirely from launch overhead reduction.</p>
+
+<h2>Animated · launch-overhead timeline</h2>
+
+<p>Same workload, two timelines. Top: eager dispatch — each kernel launch is preceded by a Python/CUDA-driver bubble (~10 μs). Bottom: CUDA Graph replay — one submission, kernels run back-to-back with minimal gap. Hit play to see real-time progress; both lines run at the same kernel speed, only the bubbles differ.</p>
+
+<div class="widget" id="lo-widget">
+  <div class="title">Eager vs CUDA Graph · launch overhead timeline</div>
+  <div class="hint">Each cell is one kernel. Grey gaps are launch bubbles (host/driver + device-side). Same N kernels in both rows, same per-kernel work; difference is dispatch overhead.</div>
+
+  <div class="controls">
+    <button id="lo-play">▶ play</button>
+    <button id="lo-reset">⟲ reset</button>
+    <label class="inline">kernels: <input type="range" id="lo-n" min="6" max="30" step="1" value="14"> <span class="val" id="lo-n-v">14</span></label>
+    <label class="inline">bubble μs: <input type="range" id="lo-b" min="1" max="15" step="1" value="9"> <span class="val" id="lo-b-v">9</span></label>
+    <label class="inline">kernel μs: <input type="range" id="lo-k" min="2" max="40" step="1" value="12"> <span class="val" id="lo-k-v">12</span></label>
+  </div>
+
+  <canvas id="lo-canvas" width="760" height="280" style="width:100%; height:280px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">eager finish</div><div class="v" id="lo-eager">—</div></div>
+    <div class="kpi"><div class="k">graph finish</div><div class="v" id="lo-graph">—</div></div>
+    <div class="kpi"><div class="k">speedup</div><div class="v" id="lo-sp">—</div></div>
+    <div class="kpi"><div class="k">launch overhead</div><div class="v" id="lo-ovr" style="font-size:14px;">—</div></div>
+  </div>
+</div>
+
+<h2>The shape-dependence trap</h2>
+
+<p>A captured graph has every tensor's shape, stride, and address <em>baked in</em>. Two things follow:</p>
+
+<ol>
+  <li><strong>Inputs and outputs must be at fixed addresses.</strong> You can't pass a new tensor each call; you copy the new data into the same buffer ("static input"). For inference this matches naturally (<code>static_input.copy_(batch)</code>); for training the data loader has to write into a pinned destination.</li>
+  <li><strong>Shapes must be fixed.</strong> A different sequence length, batch size, or KV-cache length needs a different captured graph. Production serving stacks capture <strong>one graph per (batch, sequence) bucket</strong>, with <code>(1, 1, 2, 4, 8, 16, 32)</code> being common.</li>
+</ol>
+
+<p>This is also why <code>mode="reduce-overhead"</code> in <code>torch.compile</code> only kicks in when shapes are stable: the compiler wraps the compiled forward in a CUDA Graph, but if shapes change it has to give up and re-capture (or fall back to ungraphed execution).</p>
+
+<div class="callout warn">
+  <div class="label">The KV cache problem in graph capture</div>
+  In decode, the KV cache grows by one token per step. A naïve capture bakes in "KV length = 137" — the next step needs "KV length = 138". Solutions: (a) capture one graph per length up to <code>max_length</code> and switch between them (memory-expensive), or (b) over-allocate KV to <code>max_length</code> and write into the next slot each step (one graph, used everywhere — vLLM does this with paged KV). The second is why paged attention was the right architecture for graph capture.
+</div>
+
+<h2>2D · the shape-dependence trap</h2>
+
+<p>A graph was captured at batch size <code>B_capture = 4</code>. Slide the request batch size. If you land on the captured shape: instant replay (fast). If you don't: the graph invalidates and you pay re-capture (slow) or fall back to ungraphed execution. Production stacks capture one graph per bucket so the slider always lands on a marker.</p>
+
+<div class="widget" id="sd-widget">
+  <div class="title">Shape-dependence · captured graphs vs request shape</div>
+  <div class="hint">Yellow markers = captured shapes (bucket boundaries). Slide the request batch; the widget says replay / re-capture / fall-back, and shows the per-step cost.</div>
+
+  <div class="controls">
+    <label class="inline">request batch: <input type="range" id="sd-b" min="1" max="64" step="1" value="4"> <span class="val" id="sd-b-v">4</span></label>
+    <label class="inline">captured buckets:
+      <select id="sd-bk" style="background:var(--code-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px;font-family:var(--mono);font-size:12px;">
+        <option value="4">4 only</option>
+        <option value="1,4,16,64">1, 4, 16, 64</option>
+        <option value="any" selected>1, 2, 4, 8, 16, 32 (production)</option>
+      </select>
+    </label>
+    <label class="inline">on miss:
+      <select id="sd-miss" style="background:var(--code-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px;font-family:var(--mono);font-size:12px;">
+        <option value="recap">re-capture (slow)</option>
+        <option value="pad" selected>pad up to nearest bucket</option>
+        <option value="eager">fall back to eager</option>
+      </select>
+    </label>
+  </div>
+
+  <canvas id="sd-canvas" width="760" height="280" style="width:100%; height:280px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">status</div><div class="v" id="sd-st" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">step time (ms)</div><div class="v" id="sd-t">—</div></div>
+    <div class="kpi"><div class="k">wasted compute</div><div class="v" id="sd-w">—</div></div>
+    <div class="kpi"><div class="k">used bucket</div><div class="v" id="sd-bk-v" style="font-size:14px;">—</div></div>
+  </div>
+</div>
+
+<h2>TensorRT — graph capture's professional cousin</h2>
+
+<p>TensorRT (NVIDIA's inference compiler) sits one level up from CUDA Graphs. The classical TRT path takes an ONNX model (or its own builder API) and outputs a <strong>plan file</strong> — a pre-compiled, layer-by-layer optimised binary. (TRT-LLM, the transformer-specific superstructure, doesn't go through ONNX; it has its own Python builder that consumes Hugging Face / Megatron checkpoints and emits the same plan-file format.) The plan file includes:</p>
+
+<ul>
+  <li>Kernel selection per layer, picked by trying every available implementation in cuBLAS/cuDNN and a TRT-internal library, and timing them on real inputs at build time. This is "autotuning per shape," done once.</li>
+  <li>Layer fusion much more aggressive than Inductor: convolution + bias + activation, GEMM + dequant + activation, multi-head attention as one kernel.</li>
+  <li>Precision-aware planning: it'll decide which layers run in fp16 vs int8 based on accuracy constraints you pass.</li>
+  <li>Memory layout decisions (NCHW vs NHWC for conv-heavy models; for transformers it's all just GEMM).</li>
+  <li>Optional <strong>persistent kernels</strong>: one kernel grid stays resident on all SMs and pulls work off an in-GPU queue, so repeated invocations of <em>that</em> kernel (e.g. the per-token attention/MLP loop) collapse from N launches into 1. The model still has many distinct kernels; persistent kernels eliminate launches for hot ones, not all of them.</li>
+</ul>
+
+<p><strong>TensorRT-LLM</strong> is a higher-level TRT-based stack specifically for transformer LLMs. It adds:</p>
+<ul>
+  <li>Pre-tuned attention kernels (multi-head, GQA, MQA, FlashAttention-style).</li>
+  <li>KV-cache-aware paged attention.</li>
+  <li>In-flight batching (the continuous-batching scheduler from the vLLM series, in TRT form).</li>
+  <li>fp8 / int8 / int4 quantisation paths with calibration.</li>
+  <li>Speculative decoding, multi-LoRA, prefix-cache.</li>
+</ul>
+
+<p>TRT-LLM is what most NVIDIA reference benchmarks (MLPerf, etc.) run. The serving-time speedup over a well-tuned vLLM is usually 10–30% on H100, with the gap closing as vLLM picks up similar techniques.</p>
+
+<h2>3D · TensorRT layer plan, isometric</h2>
+
+<p>A TRT plan file is a stack of layers, and for each layer the builder picked one pre-tuned kernel per supported input shape. Below, the stack is shown isometrically; each floor is one layer; the cards in the floor are the per-shape kernel choices. Click a layer to see its plan entries — the bottom strip shows which kernel runs for each shape bucket.</p>
+
+<div class="widget" id="trt-widget">
+  <div class="title">TensorRT plan · isometric layer stack</div>
+  <div class="hint">Click a layer. Tilt with rotation slider. Card color = chosen kernel family (cuBLAS, FlashAttn, custom). The bottom panel shows the per-shape kernel selection table for the selected layer.</div>
+
+  <div class="controls">
+    <label class="inline">model:
+      <select id="trt-m" style="background:var(--code-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px;font-family:var(--mono);font-size:12px;">
+        <option value="block">One transformer block</option>
+        <option value="full">Full model (3 blocks shown)</option>
+      </select>
+    </label>
+    <label class="inline">rotation: <input type="range" id="trt-rot" min="-25" max="25" step="1" value="0"> <span class="val" id="trt-rot-v">0°</span></label>
+  </div>
+
+  <canvas id="trt-canvas" width="760" height="420" style="width:100%; height:420px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">selected layer</div><div class="v" id="trt-sel" style="font-size:14px;">— click one —</div></div>
+    <div class="kpi"><div class="k">kernels in plan</div><div class="v" id="trt-k">—</div></div>
+    <div class="kpi"><div class="k">picked kernel</div><div class="v" id="trt-pk" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">vs cuBLAS default</div><div class="v" id="trt-vs">—</div></div>
+  </div>
+</div>
+
+<h2>Where the stack ends — and where the wins are</h2>
+
+<table>
+  <thead><tr><th>Mode</th><th>What it removes</th><th>Typical decode win on a 7B model</th></tr></thead>
+  <tbody>
+    <tr><td>Eager PyTorch</td><td>nothing — baseline</td><td>1.0×</td></tr>
+    <tr><td>torch.compile <code>default</code></td><td>Python overhead, some kernel-launch fusion</td><td>~1.3–1.6×</td></tr>
+    <tr><td>torch.compile <code>reduce-overhead</code> (CUDA Graphs)</td><td>device-side bubble, residual host overhead</td><td>~1.6–2.0×</td></tr>
+    <tr><td>vLLM (paged attn + Triton/CUDA kernels + CUDA Graphs)</td><td>same + paged KV + continuous batching</td><td>~2.5–4× (at scale)</td></tr>
+    <tr><td>TensorRT-LLM (custom CUDA kernels + persistent kernels + autotuned per shape)</td><td>everything torch.compile can't</td><td>~3–5× (at scale)</td></tr>
+  </tbody>
+</table>
+
+<p>The relative wins shrink at higher batch sizes — once you're at batch=32 decoding, the per-launch overhead matters less because each launch is doing more work. The biggest wins from graph capture are at the latency-sensitive batch=1 chat regime.</p>
+
+<h2>The asymmetry between training and inference compile</h2>
+
+<p>Training compile and inference compile look similar but have opposite priorities:</p>
+
+<ul>
+  <li><strong>Training</strong>: shapes are stable (the batch is yours), backward exists and is the bulk of compute. Compile pays off in the first hour. <code>torch.compile</code> is the right level.</li>
+  <li><strong>Inference</strong>: shapes vary per request (different prompt lengths, different KV positions), no backward, latency is the metric. Need to <em>pre-plan</em> for the shapes you'll see. Graph capture per shape bucket + paged KV + autotuned kernels per shape is the answer. <code>torch.compile</code> alone is not enough; production stacks add TRT-LLM or vLLM machinery on top.</li>
+</ul>
+
+<h2>What we walked through — the whole stack, top to bottom</h2>
+
+<ol>
+  <li><strong>Lessons 01–10:</strong> the cluster-level layout — how the model is sharded across thousands of GPUs.</li>
+  <li><strong>Lessons 11–12:</strong> the inference-time layer — how the model is reassembled to serve users.</li>
+  <li><strong>Lesson 13:</strong> the PyTorch framework that lets you write the model in Python.</li>
+  <li><strong>Lesson 14:</strong> the precisions the math runs in.</li>
+  <li><strong>Lesson 15:</strong> the allocator that recycles memory between ops.</li>
+  <li><strong>Lesson 16:</strong> the fusion principle — kernels' boundaries are HBM round-trips.</li>
+  <li><strong>Lesson 17:</strong> Triton, the DSL that lets one engineer write a fused kernel.</li>
+  <li><strong>Lesson 18:</strong> <code>torch.compile</code>, which writes the fused kernels for you.</li>
+  <li><strong>Lesson 19 (here):</strong> CUDA Graphs and TensorRT, which capture the whole forward into one replayable artifact.</li>
+</ol>
+
+<p>Every layer of this stack exists because the layer above wanted something — fewer launches, less overhead, less memory, more fusion, faster reads. Reading top-down, that's why each layer exists. Reading bottom-up, that's why each layer is shaped the way it is.</p>
+
+<h2>Interactive · the launch-overhead simulator</h2>
+
+<p>Pick a model (ops per forward), a batch, and the per-launch cost. The widget compares eager, compile-default, compile-reduce-overhead, and TRT-LLM-style. The point is: as ops-per-forward grows and per-launch work shrinks (i.e. you're in the decode regime), the gap between modes widens.</p>
+
+<div class="widget" id="cg-widget">
+  <div class="title">Decode latency · stack-by-stack</div>
+  <div class="hint">Approximate model: <code>ops</code> launches per token. Each launch costs <code>py_us</code> of host work and <code>device_us</code> of GPU launch overhead. Kernel time <code>k_us</code> per op runs on the GPU regardless.</div>
+
+  <div class="controls">
+    <label class="inline">ops/token: <input type="range" id="cg-ops" min="100" max="2000" step="50" value="600"> <span class="val" id="cg-ops-v">600</span></label>
+    <label class="inline">kernel μs/op: <input type="range" id="cg-k" min="1" max="200" step="1" value="15"> <span class="val" id="cg-k-v">15</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline">host μs/op (eager): <input type="range" id="cg-py" min="1" max="20" step="1" value="8"> <span class="val" id="cg-py-v">8</span></label>
+    <label class="inline">device μs/op: <input type="range" id="cg-dev" min="0" max="5" step="1" value="2"> <span class="val" id="cg-dev-v">2</span></label>
+  </div>
+
+  <canvas class="dist-canvas" id="cg-canvas" width="760" height="240" style="height: 240px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">eager (ms/tok)</div><div class="v" id="cg-eager">—</div></div>
+    <div class="kpi"><div class="k">compile (ms/tok)</div><div class="v" id="cg-cmp">—</div></div>
+    <div class="kpi"><div class="k">reduce-overhead</div><div class="v" id="cg-ro">—</div></div>
+    <div class="kpi"><div class="k">TRT-LLM (ms/tok)</div><div class="v" id="cg-trt">—</div></div>
+  </div>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Eager → compile saves host overhead. Compile → reduce-overhead saves device launch overhead. Reduce-overhead → TRT-LLM saves the kernels themselves (pre-tuned per shape, persistent kernels eliminating remaining bubbles). Each step removes a different cost. For latency-sensitive serving the stack matters; for throughput-sensitive batched workloads it matters less.
+</div>
+
+<div class="callout">
+  <div class="label">Where this connects</div>
+  This whole stack sits underneath the parallelism of Parts I–III. The rules don't change: TP, FSDP, EP, PP all still apply — but now you know what's happening on <em>each</em> GPU in addition to between them. Part V (lessons 20–28) takes us one step further down: <em>what a CUDA kernel actually is</em>, the hardware execution model, and how to write one from first principles.
+</div>
+
+<footer class="lesson-nav">
+  <a href="18_torch_compile.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">18 · torch.compile</span>
+  </a>
+  <a class="next" href="../../gpu_kernel_serving/index.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">GPU Kernels for LLM Serving →</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const get = id => document.getElementById(id);
+  const els = {
+    ops:get('cg-ops'),opsv:get('cg-ops-v'),
+    k:get('cg-k'),kv:get('cg-k-v'),
+    py:get('cg-py'),pyv:get('cg-py-v'),
+    dev:get('cg-dev'),devv:get('cg-dev-v'),
+    canvas:get('cg-canvas'),
+    eager:get('cg-eager'),cmp:get('cg-cmp'),ro:get('cg-ro'),trt:get('cg-trt')
+  };
+  const ctx = els.canvas.getContext('2d');
+
+  function compute(){
+    const ops = parseInt(els.ops.value);
+    const k = parseInt(els.k.value);
+    const py = parseInt(els.py.value);
+    const dev = parseInt(els.dev.value);
+    els.opsv.textContent = ops; els.kv.textContent = k;
+    els.pyv.textContent = py; els.devv.textContent = dev;
+
+    const eager = ops * (py + dev + k);
+    const fused_ops = Math.max(50, ops * 0.45);
+    const cmp = fused_ops * (py * 0.4 + dev + k * (ops/fused_ops) * 0.95);
+    const ro = fused_ops * (k * (ops/fused_ops) * 0.95) + 50;
+    const trt = fused_ops * (k * (ops/fused_ops) * 0.75) + 30;
+
+    els.eager.textContent = (eager/1000).toFixed(2) + ' ms';
+    els.cmp.textContent   = (cmp/1000).toFixed(2) + ' ms';
+    els.ro.textContent    = (ro/1000).toFixed(2) + ' ms';
+    els.trt.textContent   = (trt/1000).toFixed(2) + ' ms';
+    return { eager, cmp, ro, trt };
+  }
+
+  function render(){
+    const r = compute();
+    const dpr = window.devicePixelRatio || 1;
+    const W = els.canvas.clientWidth, H = els.canvas.clientHeight;
+    if (els.canvas.width !== Math.round(W*dpr)){
+      els.canvas.width = Math.round(W*dpr); els.canvas.height = Math.round(H*dpr);
+    }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 220, padR = 30, padT = 22, padB = 18;
+    const innerW = W - padL - padR;
+    const rows = [
+      { name: 'eager',                v: r.eager, c: '#dc2626' },
+      { name: 'torch.compile default', v: r.cmp,   c: '#d97706' },
+      { name: 'reduce-overhead (graphs)', v: r.ro, c: '#2563eb' },
+      { name: 'TRT-LLM',              v: r.trt,   c: '#16a34a' },
+    ];
+    const max = Math.max(...rows.map(r=>r.v)) * 1.05;
+    const rowH = (H - padT - padB) / rows.length;
+    rows.forEach((row, i) => {
+      const y = padT + i*rowH + 4;
+      ctx.fillStyle = '#1f2430'; ctx.font = '12px monospace';
+      ctx.fillText(row.name, 8, y + rowH/2);
+      const w = (row.v / max) * innerW;
+      ctx.fillStyle = row.c;
+      ctx.fillRect(padL, y, Math.max(1, w), rowH - 8);
+      ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+      ctx.fillText((row.v/1000).toFixed(2) + ' ms', padL + w + 4, y + rowH/2 + 4);
+    });
+  }
+
+  ['input','change'].forEach(ev=>{
+    [els.ops,els.k,els.py,els.dev].forEach(el=>el.addEventListener(ev,render));
+  });
+  window.addEventListener('resize',render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: launch-overhead timeline ───
+ * Top row: eager — bubble | kernel | bubble | kernel | ...
+ * Bottom row: graph replay — small startup bubble | kernel | kernel | ... (no bubbles between)
+ */
+(function(){
+  const C = document.getElementById('lo-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    play:$('lo-play'), reset:$('lo-reset'),
+    n:$('lo-n'), nv:$('lo-n-v'),
+    b:$('lo-b'), bv:$('lo-b-v'),
+    k:$('lo-k'), kv:$('lo-k-v'),
+    eager:$('lo-eager'), graph:$('lo-graph'),
+    sp:$('lo-sp'), ovr:$('lo-ovr'),
+  };
+  let playing = false;
+  let startT = 0;
+  let elapsedSim = 0;
+  let lastT = 0;
+
+  function tick(ts){
+    if (!playing) return;
+    const dt = (ts - lastT) / 1000;
+    lastT = ts;
+    elapsedSim += dt * 600; // simulated μs per real second
+    const N = +els.n.value, B = +els.b.value, K = +els.k.value;
+    const totalEager = N * (B + K) + B;
+    if (elapsedSim > totalEager + 50){ playing = false; els.play.textContent = '▶ play'; }
+    render();
+    if (playing) requestAnimationFrame(tick);
+  }
+  els.play.addEventListener('click', ()=>{
+    playing = !playing;
+    els.play.textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastT = performance.now(); requestAnimationFrame(tick); }
+  });
+  els.reset.addEventListener('click', ()=>{ elapsedSim = 0; playing=false; els.play.textContent='▶ play'; render(); });
+  [els.n, els.b, els.k].forEach(el => el.addEventListener('input', ()=>{
+    els.nv.textContent = els.n.value;
+    els.bv.textContent = els.b.value;
+    els.kv.textContent = els.k.value;
+    render();
+  }));
+
+  function render(){
+    const N = +els.n.value, B = +els.b.value, K = +els.k.value;
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 110, padR = 16, padT = 30, padB = 30;
+    const innerW = W - padL - padR;
+
+    // Total times
+    const totalEager = N * (B + K) + B; // each launch: bubble then kernel; one extra trailing bubble for symmetry
+    const totalGraph = B + N * K + 1; // single startup bubble, then kernels back to back
+
+    const timeMax = totalEager * 1.05;
+    const pxPerUs = innerW / timeMax;
+
+    // Eager row
+    const eagerY = padT;
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('eager dispatch', 6, eagerY + 18);
+    ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+    ctx.fillText(N + ' kernels', 6, eagerY + 32);
+
+    let cursor = 0;
+    for (let i=0; i<N; i++){
+      // bubble
+      ctx.fillStyle = '#dde2ea';
+      ctx.fillRect(padL + cursor*pxPerUs, eagerY, B*pxPerUs, 36);
+      ctx.strokeStyle = '#94a3b8'; ctx.lineWidth = 0.5;
+      ctx.strokeRect(padL + cursor*pxPerUs, eagerY, B*pxPerUs, 36);
+      cursor += B;
+      // kernel
+      ctx.fillStyle = '#2563eb';
+      ctx.fillRect(padL + cursor*pxPerUs, eagerY, K*pxPerUs, 36);
+      ctx.strokeStyle = '#3b82f6'; ctx.lineWidth = 0.8;
+      ctx.strokeRect(padL + cursor*pxPerUs, eagerY, K*pxPerUs, 36);
+      cursor += K;
+    }
+
+    // Graph row
+    const graphY = eagerY + 90;
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('CUDA Graph replay', 6, graphY + 18);
+    ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+    ctx.fillText('1 submission', 6, graphY + 32);
+
+    cursor = 0;
+    // single bubble at start
+    ctx.fillStyle = '#dde2ea';
+    ctx.fillRect(padL + cursor*pxPerUs, graphY, B*pxPerUs, 36);
+    ctx.strokeStyle = '#94a3b8'; ctx.lineWidth = 0.5;
+    ctx.strokeRect(padL + cursor*pxPerUs, graphY, B*pxPerUs, 36);
+    cursor += B;
+    for (let i=0; i<N; i++){
+      ctx.fillStyle = '#16a34a';
+      ctx.fillRect(padL + cursor*pxPerUs, graphY, K*pxPerUs, 36);
+      ctx.strokeStyle = '#82d6a8'; ctx.lineWidth = 0.6;
+      ctx.strokeRect(padL + cursor*pxPerUs, graphY, K*pxPerUs, 36);
+      cursor += K;
+    }
+
+    // Playhead
+    const t = Math.min(elapsedSim, totalEager);
+    ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 2;
+    const px = padL + t * pxPerUs;
+    ctx.beginPath();
+    ctx.moveTo(px, eagerY - 6); ctx.lineTo(px, graphY + 42); ctx.stroke();
+    ctx.fillStyle = '#fbbf24'; ctx.font = '10px monospace';
+    ctx.fillText('t=' + t.toFixed(0) + 'μs', px + 4, eagerY - 10);
+
+    // Eager finish marker
+    const eagerEnd = padL + totalEager * pxPerUs;
+    ctx.strokeStyle = '#dc2626'; ctx.setLineDash([3,3]);
+    ctx.beginPath(); ctx.moveTo(eagerEnd, padT - 6); ctx.lineTo(eagerEnd, padT + 130); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#dc2626'; ctx.font = '10px monospace';
+    ctx.fillText('eager done @ ' + totalEager + 'μs', eagerEnd - 110, padT - 8);
+
+    // Graph finish marker
+    const graphEnd = padL + totalGraph * pxPerUs;
+    ctx.strokeStyle = '#16a34a'; ctx.setLineDash([3,3]);
+    ctx.beginPath(); ctx.moveTo(graphEnd, graphY - 6); ctx.lineTo(graphEnd, graphY + 50); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#16a34a'; ctx.font = '10px monospace';
+    ctx.fillText('graph done @ ' + totalGraph + 'μs', graphEnd + 4, graphY + 50);
+
+    // Legend
+    ctx.fillStyle = '#dde2ea'; ctx.fillRect(padL, H - 18, 14, 10);
+    ctx.fillStyle = '#5b6573'; ctx.font='10px monospace'; ctx.fillText('launch bubble', padL+18, H - 9);
+    ctx.fillStyle = '#2563eb'; ctx.fillRect(padL+130, H - 18, 14, 10);
+    ctx.fillStyle = '#5b6573'; ctx.fillText('kernel (eager)', padL+148, H - 9);
+    ctx.fillStyle = '#16a34a'; ctx.fillRect(padL+260, H - 18, 14, 10);
+    ctx.fillStyle = '#5b6573'; ctx.fillText('kernel (graph)', padL+278, H - 9);
+
+    // KPIs
+    els.eager.textContent = totalEager + ' μs';
+    els.graph.textContent = totalGraph + ' μs';
+    els.sp.textContent = (totalEager / totalGraph).toFixed(2) + '×';
+    els.ovr.textContent = (N-1)*B + ' μs saved';
+  }
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: shape-dependence trap ─── */
+(function(){
+  const C = document.getElementById('sd-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    b:$('sd-b'), bv:$('sd-b-v'),
+    bk:$('sd-bk'), miss:$('sd-miss'),
+    st:$('sd-st'), t:$('sd-t'), w:$('sd-w'), bkv:$('sd-bk-v'),
+  };
+
+  function buckets(){
+    const v = els.bk.value;
+    if (v === 'any') return [1,2,4,8,16,32];
+    return v.split(',').map(s => +s.trim());
+  }
+
+  [els.b, els.bk, els.miss].forEach(el => el.addEventListener('input', render));
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const maxB = 64;
+    const padL = 30, padR = 20, padT = 50, padB = 70;
+    const innerW = W - padL - padR;
+    const axisY = padT + 80;
+
+    els.bv.textContent = els.b.value;
+    const B = +els.b.value;
+    const buckArr = buckets();
+    const miss = els.miss.value;
+
+    // X axis
+    ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, axisY); ctx.lineTo(padL + innerW, axisY); ctx.stroke();
+    // tick labels
+    ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+    for (let i=1; i<=maxB; i++){
+      if (i % 4 === 0 || i === 1){
+        const x = padL + (i/maxB) * innerW;
+        ctx.beginPath(); ctx.moveTo(x, axisY); ctx.lineTo(x, axisY + 4); ctx.stroke();
+        ctx.fillText(i.toString(), x - 6, axisY + 16);
+      }
+    }
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('request batch size', padL + innerW/2 - 50, axisY + 30);
+
+    // Captured bucket markers (yellow)
+    buckArr.forEach(b => {
+      const x = padL + (b/maxB) * innerW;
+      ctx.fillStyle = '#d97706';
+      ctx.beginPath();
+      ctx.moveTo(x, axisY - 18); ctx.lineTo(x - 6, axisY - 6); ctx.lineTo(x + 6, axisY - 6); ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = '#d97706'; ctx.font = '10px monospace';
+      ctx.fillText('B=' + b, x - 10, axisY - 22);
+    });
+    ctx.fillStyle = '#d97706'; ctx.fillText('▼ captured', padL + innerW - 70, axisY - 22);
+
+    // Determine status for request B
+    const exact = buckArr.includes(B);
+    const padTo = buckArr.find(x => x >= B);
+    let status, color, stepMs, wasted, usedBucket;
+    const cleanReplay = 12; // ms baseline
+    if (exact){
+      status = 'CACHE HIT — replay';
+      color = '#16a34a';
+      stepMs = cleanReplay;
+      wasted = 0;
+      usedBucket = B;
+    } else if (miss === 'pad' && padTo !== undefined){
+      const ratio = padTo / B;
+      stepMs = cleanReplay * (1 + (ratio - 1) * 0.6);
+      status = 'PAD UP to B=' + padTo;
+      color = '#d97706';
+      wasted = ((padTo - B) / padTo * 100).toFixed(0) + '% wasted compute';
+      usedBucket = padTo;
+    } else if (miss === 'recap'){
+      status = 'RE-CAPTURE (slow!)';
+      color = '#dc2626';
+      stepMs = cleanReplay + 800;
+      wasted = '~800ms re-capture';
+      usedBucket = B;
+    } else {
+      status = 'FALL BACK to eager';
+      color = '#dc2626';
+      stepMs = cleanReplay * 2.3;
+      wasted = 'launch overhead returns';
+      usedBucket = '— (eager)';
+    }
+
+    // Plot request marker
+    const reqX = padL + (B/maxB) * innerW;
+    ctx.strokeStyle = color; ctx.lineWidth = 2;
+    ctx.fillStyle = color; ctx.globalAlpha = 0.2;
+    ctx.fillRect(reqX - 6, padT, 12, axisY - padT);
+    ctx.globalAlpha = 1;
+    ctx.beginPath();
+    ctx.moveTo(reqX, padT); ctx.lineTo(reqX, axisY); ctx.stroke();
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(reqX, padT, 7, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#ffffff'; ctx.font = 'bold 10px monospace';
+    ctx.fillText('B=' + B, reqX - 9, padT + 3);
+
+    // pad-up bar connection
+    if (typeof usedBucket === 'number' && usedBucket !== B && miss === 'pad'){
+      const bx = padL + (usedBucket/maxB) * innerW;
+      ctx.strokeStyle = '#d97706';
+      ctx.setLineDash([4,3]);
+      ctx.beginPath(); ctx.moveTo(reqX, padT - 10); ctx.lineTo(bx, padT - 10); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = '#d97706'; ctx.font = '10px monospace';
+      ctx.fillText('→ pad', reqX + 8, padT - 14);
+    }
+
+    // status panel at bottom
+    ctx.fillStyle = color;
+    ctx.font = 'bold 14px monospace';
+    ctx.fillText(status, padL, H - 36);
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('per-step latency: ' + stepMs.toFixed(1) + ' ms · ' + (wasted || 'optimal'), padL, H - 18);
+
+    // KPIs
+    els.st.textContent = status;
+    els.t.textContent = stepMs.toFixed(1);
+    els.w.textContent = wasted || '0%';
+    els.bkv.textContent = usedBucket;
+  }
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: TensorRT layer plan, isometric 3D ─── */
+(function(){
+  const C = document.getElementById('trt-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    m:$('trt-m'), rot:$('trt-rot'), rotv:$('trt-rot-v'),
+    sel:$('trt-sel'), k:$('trt-k'), pk:$('trt-pk'), vs:$('trt-vs'),
+  };
+  let rotDeg = 0;
+  let selectedIdx = -1;
+
+  const KERNEL_FAMILIES = {
+    cublas:    { name:'cuBLAS GEMM',     color:'#2563eb' },
+    flash:     { name:'FlashAttn-3',     color:'#d97706' },
+    fused:     { name:'TRT fused',       color:'#16a34a' },
+    elem:      { name:'TRT elementwise', color:'#7c3aed' },
+  };
+
+  // Build a layer list. Each layer has:
+  //   { name, family, plans: [{shape, kernel, gflops}], speedup }
+  const LAYERS_BLOCK = [
+    { name:'layer_norm',  family:'elem',   speedup:1.05 },
+    { name:'q_proj',      family:'cublas', speedup:1.0  },
+    { name:'k_proj',      family:'cublas', speedup:1.0  },
+    { name:'v_proj',      family:'cublas', speedup:1.0  },
+    { name:'flash_attn',  family:'flash',  speedup:1.4  },
+    { name:'o_proj',      family:'cublas', speedup:1.0  },
+    { name:'add+norm',    family:'fused',  speedup:1.6  },
+    { name:'mlp_up',      family:'cublas', speedup:1.0  },
+    { name:'mlp_gate',    family:'fused',  speedup:1.3  },
+    { name:'silu·gate',   family:'fused',  speedup:1.8  },
+    { name:'mlp_down',    family:'cublas', speedup:1.0  },
+    { name:'residual',    family:'elem',   speedup:1.1  },
+  ];
+  const LAYERS_FULL = [];
+  for (let b=0; b<3; b++){
+    LAYERS_BLOCK.forEach(l => LAYERS_FULL.push({...l, name: l.name + '·B' + b}));
+  }
+
+  function currentLayers(){
+    return els.m.value === 'block' ? LAYERS_BLOCK : LAYERS_FULL;
+  }
+
+  function plansFor(layer){
+    // 4 shape buckets
+    const shapes = ['B=1', 'B=4', 'B=16', 'B=64'];
+    return shapes.map(s => {
+      // For each shape, the picked kernel may differ (small B prefers FlashAttn / GEMV)
+      let pick = layer.family;
+      if (layer.family === 'cublas' && s === 'B=1') pick = 'fused'; // GEMV path
+      if (layer.family === 'flash' && s === 'B=64') pick = 'flash';
+      return { shape: s, kernel: pick, gflops: 50 + Math.random()*200 };
+    });
+  }
+
+  els.m.addEventListener('change', ()=>{ selectedIdx = -1; render(); });
+  els.rot.addEventListener('input', ()=>{ rotDeg = +els.rot.value; els.rotv.textContent = rotDeg + '°'; render(); });
+
+  // Isometric projection
+  function proj(x, y, z, cx, cy){
+    const rot = rotDeg * Math.PI / 180;
+    const cosA = Math.cos(Math.PI/6 + rot), sinA = Math.sin(Math.PI/6 + rot);
+    const sx = (x - y) * cosA;
+    const sy = (x + y) * sinA - z;
+    return [cx + sx, cy + sy];
+  }
+
+  let layerBoxes = []; // hit testing: { idx, x, y, w, h }
+
+  C.addEventListener('click', e => {
+    const rect = C.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    let best = -1, bestD = 1e9;
+    for (let i=0; i<layerBoxes.length; i++){
+      const b = layerBoxes[i];
+      const dx = x - (b.cx), dy = y - (b.cy);
+      const d = Math.hypot(dx, dy);
+      if (d < bestD){ bestD = d; best = i; }
+    }
+    if (best >= 0 && bestD < 70){
+      selectedIdx = (selectedIdx === best) ? -1 : best;
+      render();
+    }
+  });
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const layers = currentLayers();
+    const cx = W * 0.42;
+    const cy = H * 0.85;
+    const floorH = 18;
+    const layerW = 90;
+    const layerD = 60;
+
+    layerBoxes = [];
+
+    // Draw layers bottom-up
+    for (let i=0; i<layers.length; i++){
+      const z = i * floorH;
+      const fam = KERNEL_FAMILIES[layers[i].family];
+      const isSel = (i === selectedIdx);
+
+      // 8 corners of the box
+      const p000 = proj(0,      0,      z,            cx, cy);
+      const p100 = proj(layerW, 0,      z,            cx, cy);
+      const p110 = proj(layerW, layerD, z,            cx, cy);
+      const p010 = proj(0,      layerD, z,            cx, cy);
+      const p001 = proj(0,      0,      z + floorH-2, cx, cy);
+      const p101 = proj(layerW, 0,      z + floorH-2, cx, cy);
+      const p111 = proj(layerW, layerD, z + floorH-2, cx, cy);
+      const p011 = proj(0,      layerD, z + floorH-2, cx, cy);
+
+      function shade(col, factor){
+        const m = col.replace('#','');
+        const r = parseInt(m.substr(0,2),16);
+        const g = parseInt(m.substr(2,2),16);
+        const b = parseInt(m.substr(4,2),16);
+        return 'rgb('+Math.round(r*factor)+','+Math.round(g*factor)+','+Math.round(b*factor)+')';
+      }
+
+      ctx.globalAlpha = (selectedIdx === -1 || isSel) ? 1 : 0.32;
+
+      // Top face (lit)
+      ctx.fillStyle = shade(fam.color, isSel ? 1.15 : 1.0);
+      ctx.beginPath();
+      ctx.moveTo(p001[0], p001[1]);
+      ctx.lineTo(p101[0], p101[1]);
+      ctx.lineTo(p111[0], p111[1]);
+      ctx.lineTo(p011[0], p011[1]);
+      ctx.closePath(); ctx.fill();
+      // outline
+      ctx.strokeStyle = isSel ? '#fff' : '#dde2ea'; ctx.lineWidth = isSel ? 2 : 1;
+      ctx.stroke();
+
+      // Front face (dim)
+      ctx.fillStyle = shade(fam.color, 0.55);
+      ctx.beginPath();
+      ctx.moveTo(p001[0], p001[1]);
+      ctx.lineTo(p011[0], p011[1]);
+      ctx.lineTo(p010[0], p010[1]);
+      ctx.lineTo(p000[0], p000[1]);
+      ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1; ctx.stroke();
+
+      // Right face (medium)
+      ctx.fillStyle = shade(fam.color, 0.75);
+      ctx.beginPath();
+      ctx.moveTo(p011[0], p011[1]);
+      ctx.lineTo(p111[0], p111[1]);
+      ctx.lineTo(p110[0], p110[1]);
+      ctx.lineTo(p010[0], p010[1]);
+      ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1; ctx.stroke();
+
+      // Label on top face
+      const topCenter = proj(layerW/2, layerD/2, z + floorH-2, cx, cy);
+      ctx.fillStyle = isSel ? '#ffffff' : '#ffffff';
+      ctx.font = 'bold 10px monospace';
+      const lbl = layers[i].name;
+      ctx.fillText(lbl, topCenter[0] - ctx.measureText(lbl).width/2, topCenter[1] + 3);
+
+      layerBoxes.push({ idx: i, cx: topCenter[0], cy: topCenter[1] });
+      ctx.globalAlpha = 1;
+    }
+
+    // Legend
+    ctx.fillStyle = '#f1f3f7'; ctx.strokeStyle = '#dde2ea';
+    ctx.fillRect(W - 200, 14, 188, 96);
+    ctx.strokeRect(W - 200, 14, 188, 96);
+    ctx.fillStyle = '#5b6573'; ctx.font = 'bold 10px monospace';
+    ctx.fillText('kernel families', W - 193, 28);
+    Object.values(KERNEL_FAMILIES).forEach((f, i) => {
+      ctx.fillStyle = f.color;
+      ctx.fillRect(W - 193, 38 + i*16, 14, 12);
+      ctx.fillStyle = '#1f2430'; ctx.font = '10px monospace';
+      ctx.fillText(f.name, W - 175, 48 + i*16);
+    });
+
+    // Plan strip at bottom (per-shape kernel selection for selected layer)
+    if (selectedIdx >= 0){
+      const layer = layers[selectedIdx];
+      const plans = plansFor(layer);
+      const stripY = H - 70;
+      ctx.fillStyle = '#f1f3f7'; ctx.strokeStyle = KERNEL_FAMILIES[layer.family].color; ctx.lineWidth = 1.5;
+      ctx.fillRect(8, stripY, 380, 60);
+      ctx.strokeRect(8, stripY, 380, 60);
+      ctx.fillStyle = '#5b6573'; ctx.font = 'bold 10px monospace';
+      ctx.fillText('plan entries · ' + layer.name + ' · per-shape kernel pick', 14, stripY + 14);
+      const cellW = (380 - 12) / plans.length;
+      plans.forEach((p, i) => {
+        const x = 12 + i*cellW;
+        const fam = KERNEL_FAMILIES[p.kernel];
+        ctx.fillStyle = fam.color;
+        ctx.globalAlpha = 0.75;
+        ctx.fillRect(x, stripY + 22, cellW - 4, 32);
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = '#ffffff'; ctx.font = 'bold 10px monospace';
+        ctx.fillText(p.shape, x + 6, stripY + 36);
+        ctx.font = '9px monospace';
+        ctx.fillText(fam.name, x + 6, stripY + 48);
+      });
+    }
+
+    // KPIs
+    if (selectedIdx >= 0){
+      const layer = layers[selectedIdx];
+      els.sel.textContent = layer.name;
+      els.k.textContent = plansFor(layer).length + ' plans';
+      els.pk.textContent = KERNEL_FAMILIES[layer.family].name;
+      els.vs.textContent = layer.speedup.toFixed(2) + '× vs cuBLAS';
+    } else {
+      els.sel.textContent = '— click one —';
+      els.k.textContent = '—'; els.pk.textContent = '—'; els.vs.textContent = '—';
+    }
+  }
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>04 · Continuous batching</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">vllm_lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">04 · continuous batching</span>
+    <span class="step-pill">lesson 4 / 12</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Continuous batching</h1>
+<p class="subtitle">Static batching wastes half your cycles waiting for stragglers. The fix is one paragraph of scheduler logic — but it only works because of paged KV.</p>
+
+<h2>The picture you inherited from training</h2>
+
+<p>Training-style inference takes a batch of B sequences, runs them in lockstep for T steps, returns the lot, takes the next batch. The batched matmul is efficient — that's the whole reason batches exist. So the natural mental model when you first deploy a model is "pack B requests, run them together, pop them off when they're done."</p>
+
+<p>This works in training because every example in a batch consumes exactly the same number of forward steps: one. You backprop, you're done. Inference is different. A request emits one token per step, and each request has its own <em>unknown</em> stopping time — the model decides when to emit <code>&lt;eos&gt;</code>. The batch no longer terminates at a single time T; it terminates at <span class="math">max<sub>i</sub>(T<sub>i</sub>)</span>.</p>
+
+<p>Which means: the batch runs for as long as its longest member. Every other slot, after it emits its own <code>&lt;eos&gt;</code>, sits there generating pad tokens that get discarded. The GPU still does the work — the kernel is shape-fixed, it doesn't know which sequences are "done" — it's just thrown away.</p>
+
+<div class="callout warn">
+  <div class="label">The static-batching cost, exactly</div>
+  Let a batch have output lengths <span class="math">T<sub>1</sub>, …, T<sub>B</sub></span>. Cycles spent = <span class="math">max<sub>i</sub>(T<sub>i</sub>)</span>. Useful tokens emitted = <span class="math">Σ T<sub>i</sub></span>. Utilization is
+  <div class="math block">
+    η<sub>static</sub> &nbsp;=&nbsp; (Σ T<sub>i</sub>) / (B · max<sub>i</sub> T<sub>i</sub>) &nbsp;=&nbsp; mean(T<sub>i</sub>) / max(T<sub>i</sub>)
+  </div>
+  This ratio is what determines whether you're getting 90% or 40% of the kernel's peak. It has nothing to do with the kernel.
+</div>
+
+<h2>Why production workloads punish this</h2>
+
+<p>Chat-style traffic is bimodal: most answers are short ("yes", "the capital is Paris", a one-line correction), a minority are long (a code block, an essay, a generated test plan). Empirically: ~80% of completions land between 10 and 50 tokens, ~20% in the 200–500 range. The mean is small, the max is large, and they're separated by an order of magnitude.</p>
+
+<p>Plug a representative batch <span class="math">(50, 60, 400, 80)</span> into the formula:</p>
+
+<div class="math block">
+  η &nbsp;=&nbsp; (50 + 60 + 400 + 80) / (4 · 400) &nbsp;=&nbsp; 590 / 1600 &nbsp;=&nbsp; 36.9%
+</div>
+
+<p>For 313 out of 400 steps (78%), three of the four slots are doing nothing. The slot stays allocated, the KV grows for it on the device side (because the kernel is shape-fixed), and the bytes still move through HBM. You paid for four sequences and got 1.5 worth of useful output.</p>
+
+<pre><code>step  ────────────────────────────────────────────  400
+A:50  ████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  (waiting 350 steps for the batch)
+B:60  █████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  (waiting 340)
+C:400 ████████████████████████████████████████████  (the straggler)
+D:80  ███████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  (waiting 320)
+                                  ▲
+                                  └── gray = wasted cycle, full HBM traffic, zero useful work</code></pre>
+
+<p>And it gets worse. A new request that arrives at step 5 can't join this batch — the kernel shapes are fixed. It waits until step 400 for the batch to drain, then waits for B-1 other requests to accumulate, then runs. <strong>Time-to-first-token</strong> is the batch's <em>predecessor's</em> straggler.</p>
+
+<h2>Continuous batching (Orca, OSDI 2022)</h2>
+
+<p>The fix is to stop treating the batch as a fixed-membership unit and instead make membership a <em>per-iteration</em> decision. The loop is exactly what the static loop should have been:</p>
+
+<pre><code>while pending or active:
+    # 1. Evict: any sequence whose last token was &lt;eos&gt; leaves the batch.
+    active = [r for r in active if not r.done]
+
+    # 2. Admit: pull pending requests from the queue until we hit max_active
+    #    (or the KV-cache budget — whichever bites first).
+    while pending and len(active) &lt; max_active:
+        active.append(pending.pop(0))
+
+    # 3. Run one forward step over the (now-updated) active set.
+    forward(active)
+</code></pre>
+
+<p>The kernel's batch dimension changes every step. A request that emitted <code>&lt;eos&gt;</code> on step k is gone on step k+1; a request that arrived in the queue at step k joins on step k+1. Nobody waits for stragglers, because there are no stragglers — only a continuously-refilled active set.</p>
+
+<p>The utilization changes:</p>
+
+<div class="math block">
+  η<sub>continuous</sub> &nbsp;=&nbsp; (Σ T<sub>i</sub>) / (Σ T<sub>i</sub>) &nbsp;=&nbsp; 1
+</div>
+
+<p>(modulo edge effects at the head and tail of the schedule, and modulo the KV budget). Every cycle produces |active| useful tokens. The 400-step straggler still takes 400 steps, but it shares those 400 steps with 7 or 15 or however-many <em>different</em> short requests that come and go around it.</p>
+
+<div class="callout ok">
+  <div class="label">What changed</div>
+  Same model, same kernels, same hardware. Only the scheduler. Throughput on bimodal workloads goes from ~45% of peak to 85–95%.
+</div>
+
+<h2>The link back to lesson 02 — why this needed paged KV</h2>
+
+<p>Step 2 of the loop says "admit pending requests up to max_active." Pretend for a moment we're still on the textbook contiguous KV cache from <a href="01_kv_cache.html">lesson 01</a>. To admit a new request <em>right now</em>, mid-step, we'd need to find a contiguous range of <code>max_seq_len</code> slots in HBM for its KV.</p>
+
+<p>After even a little churn — sequences ending, new ones starting, the active set turning over every few steps — that contiguous range doesn't exist. The buffer is a sea of holes: a 50-token gap here, a 60-token gap there, a 400-token survivor in the middle. Classic external fragmentation. We'd have to either copy-compact the cache (a stop-the-world operation that blows the whole point of avoiding stragglers) or refuse to admit (back to waiting).</p>
+
+<p>With <a href="02_paged_attention.html">paged KV</a> the problem evaporates. Admitting a new request means: grab as many free blocks as it needs <em>right now</em> from the shared pool, point its block table at them. Each block is 16 tokens; you only need <em>some</em> free blocks, not a contiguous run. The block manager hands them out, the new sequence's first row gets written into the first block, and on the next forward pass the attention kernel reads through the block table indirection like any other sequence.</p>
+
+<div class="callout">
+  <div class="label">The dependency, in one line</div>
+  Paged KV makes admit O(blocks_needed) instead of O(scan for contiguous range). Without it, "iteration-level scheduling" is a paper, not a system.
+</div>
+
+<p>This is also the answer to "what's the actual core innovation of vLLM?" PagedAttention is the paper headline, but its <em>practical</em> value is that it unlocks continuous batching. Either one alone is interesting; together they're the throughput story.</p>
+
+<h2>Prefill vs decode, and a foreshadow</h2>
+
+<p>The simulator below treats every step as one token per active sequence. That's the decode phase. The other phase is prefill: when a request arrives with a 1000-token prompt, those 1000 tokens go through in one parallel pass over the full sequence dimension. That single forward does ~1000× the FLOPs of one decode step — it's compute-bound (lots of matmul, small KV read per position), the mirror of decode's memory-boundedness (<a href="01_kv_cache.html">consequence B from lesson 01</a>).</p>
+
+<p>This causes a wrinkle for continuous batching: a long prefill in the active set monopolizes the GPU for tens of milliseconds, during which the other (decode) sequences in the same step finish slowly. Time-to-first-token for the new request is fine, but inter-token latency for everyone else hiccups.</p>
+
+<p><a href="10_chunked_prefill.html">Chunked prefill (lesson 10)</a> handles this by breaking long prefills into 512-token slices and packing each slice into a step alongside decode tokens. Because prefill is compute-bound and decode is memory-bound, the fused op hits both bottlenecks simultaneously rather than waiting on one. For now: just know the simulator's "one token per step" is a decode-only abstraction.</p>
+
+<h2>Where continuous batching gives less</h2>
+
+<p>The math says η goes from <span class="math">mean(T) / max(T)</span> to 1. The denominator and numerator are both Σ&nbsp;T<sub>i</sub> in the continuous case <em>only if there's always something in the queue</em>. Two regimes erode the win:</p>
+
+<ul>
+  <li><strong>Capacity-saturated.</strong> If your steady-state active set is already at <code>max_active</code> and the variance in T<sub>i</sub> is low (e.g. you're benchmarking on a fixed-length workload), static and continuous batching are nearly identical. Continuous batching's headline number is a function of length variance.</li>
+  <li><strong>Bursty light load.</strong> If the queue is often empty, continuous batching's active set drops below <code>max_active</code> and the GPU runs partial-batch steps. The kernel does less per cycle. Static batching has the same problem (worse, actually — it has to wait to fill a batch) but the comparison narrows.</li>
+</ul>
+
+<p>The juicy regime is moderate load with high length variance — which is exactly what chat workloads are.</p>
+
+<div class="callout warn">
+  <div class="label">Caveat</div>
+  Caveat: the 2–4× production gap quoted by vLLM benchmarks is closer to the lower bound when the active set is consistently full and request lengths are similar.
+</div>
+
+<h2>Interactive · feel the stragglers</h2>
+
+<p>Two panes, one workload. The top pane is static batching: each colored bar is a request, each <span style="color: var(--text-dim); font-family: var(--mono);">▪</span> gray wedge after a bar is the request sitting in its slot emitting pad tokens while the batch's straggler runs out the clock. The bottom pane is continuous batching on the same workload: bars are tighter because every step admits whatever's pending and evicts whatever's done. Pull the "% long" slider up and watch the gray wedges in the top pane balloon while the bottom barely changes.</p>
+
+<div class="widget" id="cb-widget">
+  <div class="title">Static vs continuous batching · the same bimodal workload</div>
+  <div class="hint">Top: static (batch fixed, wait for stragglers). Bottom: continuous (admit on arrival, evict on &lt;eos&gt;). Bars are request lifetimes; gray = wasted cycles (slot occupied, no useful output). KPIs at the bottom. Note: "fill rate" measures slot occupancy (mean_active / max_active), so it falls below 1 when the queue drains — not a sign of waste, just an under-full active set.</div>
+
+  <div class="controls">
+    <label class="inline">workload size: <input type="range" id="cb-n" min="8" max="64" step="2" value="32"> <span class="val" id="cb-n-val">32</span></label>
+    <label class="inline">max_active: <input type="range" id="cb-b" min="1" max="16" step="1" value="4"> <span class="val" id="cb-b-val">4</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline">% long requests: <input type="range" id="cb-pl" min="0" max="50" step="5" value="20"> <span class="val" id="cb-pl-val">20</span></label>
+    <label class="inline">long length: <input type="range" id="cb-ll" min="100" max="500" step="50" value="400"> <span class="val" id="cb-ll-val">400</span></label>
+  </div>
+
+  <canvas class="dist-canvas" id="cb-canvas" width="760" height="340" style="height: 340px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">static cycles</div><div class="v" id="cb-sc">—</div></div>
+    <div class="kpi"><div class="k">continuous cycles</div><div class="v" id="cb-cc">—</div></div>
+    <div class="kpi"><div class="k">static η</div><div class="v" id="cb-se">—</div></div>
+    <div class="kpi"><div class="k">continuous fill rate</div><div class="v" id="cb-ce">—</div></div>
+    <div class="kpi"><div class="k">mean latency (static)</div><div class="v" id="cb-sl">—</div></div>
+    <div class="kpi"><div class="k">mean latency (continuous)</div><div class="v" id="cb-cl">—</div></div>
+    <div class="kpi"><div class="k">speedup</div><div class="v" id="cb-sp">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">show the scheduler logic this widget simulates</summary>
+<pre><code>// static: batches of B fixed-membership, run for max(output_len) steps each.
+while i &lt; len(requests):
+    batch = requests[i:i+B];  i += B
+    cycles += max(r.output_len for r in batch)
+    useful += sum(r.output_len for r in batch)
+
+// continuous: per-step admit / evict.
+while pending or active:
+    while pending and len(active) &lt; max_active: active.append(pending.pop())
+    for r in active: r.tokens_done += 1
+    useful += len(active);  cycles += 1
+    active = [r for r in active if r.tokens_done &lt; r.output_len]</code></pre>
+  </details>
+</div>
+
+<h2>Where this sits in the optimization stack</h2>
+
+<table>
+  <thead><tr><th>Lesson</th><th>What it changed about this picture</th></tr></thead>
+  <tbody>
+    <tr><td><a href="02_paged_attention.html">02 PagedAttention</a></td><td>Made the "admit a new request" step O(blocks_needed) instead of impossible.</td></tr>
+    <tr><td>04 (this)</td><td>Made the scheduler decide per-iteration, not per-batch.</td></tr>
+    <tr><td><a href="10_chunked_prefill.html">10 Chunked prefill</a></td><td>Pack long prefills into the same fused step as decodes, so prefill doesn't stall the decode tail.</td></tr>
+    <tr><td><a href="11_preemption_swap.html">11 Preemption + swap</a></td><td>What happens when admit fails — the KV pool is full and you have to evict an in-flight sequence.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Static-batching utilization is <span class="math">mean(T) / max(T)</span>. On bimodal traffic that's ~0.37. Continuous batching makes the per-step admit/evict decision and pushes it to ~1, but only because paged KV makes admit cheap. The "win" is workload-dependent: it grows with length variance and shrinks under saturation.
+</div>
+
+<footer class="lesson-nav">
+  <a href="03_flash_attention.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">03 · FlashAttention</span>
+  </a>
+  <a class="next" href="05_optimizations.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">05 · Optimization catalog</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  // ─── elements ────────────────────────────────────────────────────────────
+  const canvas = document.getElementById('cb-canvas');
+  const ctx = canvas.getContext('2d');
+  const rN  = document.getElementById('cb-n');
+  const rB  = document.getElementById('cb-b');
+  const rPL = document.getElementById('cb-pl');
+  const rLL = document.getElementById('cb-ll');
+  const vN  = document.getElementById('cb-n-val');
+  const vB  = document.getElementById('cb-b-val');
+  const vPL = document.getElementById('cb-pl-val');
+  const vLL = document.getElementById('cb-ll-val');
+
+  // Seeded RNG so the picture is stable as you fiddle.
+  function mulberry32(seed){ return function(){
+    let t = seed += 0x6d2b79f5;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };}
+
+  function buildWorkload(n, pctLong, longLen, seed=7){
+    const rng = mulberry32(seed);
+    const reqs = [];
+    for (let i = 0; i < n; i++){
+      const isLong = rng() < (pctLong / 100);
+      // short: 10–40, long: clipped near longLen with some spread.
+      const L = isLong
+        ? Math.round(longLen * (0.7 + 0.6 * rng()))
+        : Math.round(10 + rng() * 30);
+      reqs.push({ id: i, arrive: i, out: L, isLong });
+    }
+    return reqs;
+  }
+
+  function simStatic(reqs, B){
+    // batches of B in arrival order; each batch runs for max(out) steps.
+    // returns per-request {start, finish, slotBatchEnd} plus aggregate stats.
+    let cycles = 0, useful = 0, time = 0;
+    const out = reqs.map(r => ({...r}));
+    for (let i = 0; i < out.length; i += B){
+      const batch = out.slice(i, i + B);
+      const start = Math.max(time, ...batch.map(r => r.arrive));
+      const maxL  = Math.max(...batch.map(r => r.out));
+      for (const r of batch){
+        r.start = start;
+        r.finish = start + r.out;
+        r.slotEnd = start + maxL;
+      }
+      cycles += maxL;
+      for (const r of batch) useful += r.out;
+      time = start + maxL;
+    }
+    const meanLat = out.reduce((s,r) => s + (r.slotEnd - r.arrive), 0) / out.length;
+    return { reqs: out, cycles, useful, eta: useful / (cycles * B), meanLat };
+  }
+
+  function simContinuous(reqs, M){
+    // per-iteration admit/evict.
+    const pending = reqs.map(r => ({...r, done: 0})).sort((a,b) => a.arrive - b.arrive);
+    const active = [];
+    let time = 0, cycles = 0, useful = 0;
+    const finished = [];
+    while (pending.length || active.length){
+      while (pending.length && pending[0].arrive <= time && active.length < M){
+        const r = pending.shift();
+        r.start = time;
+        active.push(r);
+      }
+      if (active.length === 0){
+        time = pending[0].arrive; continue;
+      }
+      for (const r of active) r.done += 1;
+      useful += active.length;
+      time += 1;
+      cycles += 1;
+      for (let i = active.length - 1; i >= 0; i--){
+        if (active[i].done >= active[i].out){
+          active[i].finish = time;
+          finished.push(active[i]);
+          active.splice(i, 1);
+        }
+      }
+    }
+    finished.sort((a,b) => a.id - b.id);
+    const meanLat = finished.reduce((s,r) => s + (r.finish - r.arrive), 0) / finished.length;
+    return { reqs: finished, cycles, useful, eta: useful / (cycles * M), meanLat };
+  }
+
+  // ─── render ──────────────────────────────────────────────────────────────
+  const PAD_L = 70, PAD_R = 14, PAD_T = 26, PAD_BTW = 36;
+
+  function drawPane(y0, y1, label, sim, M, tMax){
+    // background
+    ctx.fillStyle = 'rgba(255,255,255,0.015)';
+    ctx.fillRect(PAD_L, y0, canvas.clientWidth - PAD_L - PAD_R, y1 - y0);
+
+    // header
+    ctx.fillStyle = '#1f2430';
+    ctx.font = '12px ' + getComputedStyle(document.body).fontFamily;
+    ctx.fillText(label, PAD_L, y0 - 8);
+    ctx.fillStyle = '#5b6573';
+    ctx.font = '11px ' + getComputedStyle(document.body).fontFamily;
+    ctx.fillText(
+      'cycles=' + sim.cycles + '   η=' + (sim.eta * 100).toFixed(0) + '%',
+      PAD_L + 220, y0 - 8
+    );
+
+    // assign row per request (one row per request, ordered by id, up to N rows).
+    const reqs = sim.reqs.slice().sort((a,b) => a.id - b.id);
+    const N = reqs.length;
+    const rowH = Math.max(2, Math.min(14, (y1 - y0 - 4) / N));
+    const innerW = canvas.clientWidth - PAD_L - PAD_R;
+    const xPerCycle = innerW / Math.max(1, tMax);
+
+    // axis tick
+    ctx.strokeStyle = '#dde2ea';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(PAD_L, y1);
+    ctx.lineTo(PAD_L + innerW, y1);
+    ctx.stroke();
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '10px monospace';
+    const ticks = 5;
+    for (let i = 0; i <= ticks; i++){
+      const x = PAD_L + i * (innerW / ticks);
+      ctx.beginPath();
+      ctx.moveTo(x, y1); ctx.lineTo(x, y1 + 3); ctx.stroke();
+      ctx.fillText(Math.round(i * tMax / ticks).toString(), x - 6, y1 + 13);
+    }
+
+    for (let i = 0; i < N; i++){
+      const r = reqs[i];
+      const rowY = y0 + 2 + i * rowH;
+      const x0 = PAD_L + (r.start || 0) * xPerCycle;
+      const xFinish = PAD_L + (r.finish || (r.start + r.out)) * xPerCycle;
+      // useful portion
+      ctx.fillStyle = r.isLong ? '#d97706' : '#2563eb';
+      ctx.fillRect(x0, rowY, Math.max(1, xFinish - x0), Math.max(1, rowH - 1));
+      // pad / waste portion (static only — slot held past finish until slotEnd)
+      if (r.slotEnd !== undefined && r.slotEnd > r.finish){
+        const xEnd = PAD_L + r.slotEnd * xPerCycle;
+        ctx.fillStyle = '#cbd5e1';
+        ctx.fillRect(xFinish, rowY, Math.max(1, xEnd - xFinish), Math.max(1, rowH - 1));
+      }
+    }
+
+    // y-axis label
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '10px monospace';
+    ctx.fillText('req 0', 8, y0 + 10);
+    ctx.fillText('req ' + (N - 1), 8, y1 - 2);
+  }
+
+  function setupCanvas(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)){
+      canvas.width = Math.round(W * dpr);
+      canvas.height = Math.round(H * dpr);
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+  }
+
+  function render(){
+    const N  = parseInt(rN.value);
+    const B  = parseInt(rB.value);
+    const PL = parseInt(rPL.value);
+    const LL = parseInt(rLL.value);
+    vN.textContent = N; vB.textContent = B; vPL.textContent = PL; vLL.textContent = LL;
+
+    const reqs = buildWorkload(N, PL, LL);
+    const stat = simStatic(reqs, B);
+    const cont = simContinuous(reqs, B);
+
+    document.getElementById('cb-sc').textContent = stat.cycles;
+    document.getElementById('cb-cc').textContent = cont.cycles;
+    document.getElementById('cb-se').textContent = (stat.eta * 100).toFixed(0) + '%';
+    document.getElementById('cb-ce').textContent = (cont.eta * 100).toFixed(0) + '%';
+    document.getElementById('cb-sl').textContent = stat.meanLat.toFixed(0);
+    document.getElementById('cb-cl').textContent = cont.meanLat.toFixed(0);
+    const sp = stat.cycles / Math.max(1, cont.cycles);
+    document.getElementById('cb-sp').textContent = sp.toFixed(2) + '×';
+
+    setupCanvas();
+    const H = canvas.clientHeight;
+    const paneH = (H - PAD_T - PAD_T - PAD_BTW) / 2;
+    const tMax = Math.max(stat.cycles, cont.cycles);
+    drawPane(PAD_T,                       PAD_T + paneH,           'static batching · B = ' + B,        stat, B, tMax);
+    drawPane(PAD_T + paneH + PAD_BTW,     PAD_T + 2*paneH + PAD_BTW, 'continuous batching · max_active = ' + B, cont, B, tMax);
+
+    // shared x-axis label
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '10px monospace';
+    ctx.fillText('cycles →', canvas.clientWidth - PAD_R - 64, H - 2);
+
+    // legend
+    ctx.fillStyle = '#2563eb'; ctx.fillRect(PAD_L,        H - 16, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.font = '11px ' + getComputedStyle(document.body).fontFamily;
+    ctx.fillText('short useful', PAD_L + 14, H - 7);
+    ctx.fillStyle = '#d97706'; ctx.fillRect(PAD_L + 110, H - 16, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('long useful', PAD_L + 124, H - 7);
+    ctx.fillStyle = '#cbd5e1'; ctx.fillRect(PAD_L + 220, H - 16, 10, 10);
+    ctx.fillStyle = '#1f2430'; ctx.fillText('wasted (slot held, padding)', PAD_L + 234, H - 7);
+  }
+
+  [rN, rB, rPL, rLL].forEach(el => el.addEventListener('input', render));
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

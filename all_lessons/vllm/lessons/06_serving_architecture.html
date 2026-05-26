@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>06 · Serving architecture</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">vllm_lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">06 · serving architecture</span>
+    <span class="step-pill">lesson 6 / 12</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Serving architecture</h1>
+<p class="subtitle">From an HTTP <code>POST</code> to a CUDA kernel and back. The plumbing that lets one engine loop feed thousands of concurrent streams.</p>
+
+<h2>The request lifecycle, end to end</h2>
+
+<p>Lessons 01-05 lived inside the engine. This one zooms out. A single request is a long chain of handoffs between a Python web framework, an async runtime, an engine loop, and N GPU workers. The diagram below is what actually happens between <code>curl</code> hitting <code>:8000</code> and the first token coming back over a server-sent event.</p>
+
+<pre class="ascii">[client] ── HTTP POST /v1/chat/completions ─────────────────────────────────►
+    │
+    ▼
+[FastAPI / uvicorn worker]                                  (one OS thread,
+    parse OpenAI JSON                                        many asyncio
+    tokenize prompt on CPU (tokenizer pool)                  tasks)
+    build Request{req_id, sampling, stream=True}
+    │
+    ▼
+[AsyncLLMEngine.add_request(req)]
+    enqueue on input queue
+    return async iterator ────────────────────────────────► (awaitable)
+    │
+    ▼
+[engine loop — one iter ≈ one forward pass]                 (dedicated thread
+    sched_out  = scheduler.schedule()      ◄── admit / evict  or own process)
+    model_out  = model.execute_model(sched_out)
+    engine_out = process_outputs(model_out) ◄── sample + detok
+    deliver(engine_out)                    ──► output queues
+    │
+    ▼
+[TP workers — one per GPU, Ray actors]
+    embed → L × {attn, mlp, all-reduce} → unembed
+    PagedAttention reads KV through block tables  (lesson 02)
+    │
+    ▼
+[sampler]   temperature / top-k / top-p / repetition penalty
+[detok]     incremental BPE decode, handles partial UTF-8
+    │
+    ▼
+[async iterator yields token delta]
+    │
+    ▼
+[FastAPI streams SSE chunk]  data: {"choices":[{"delta":{"content":"…"}}]}
+    │
+    ▼
+[client receives token]   ── repeat until [DONE] ───────────────────────────►</pre>
+
+<p>The whole thing is asynchronous from the FastAPI side. The engine loop is what gives the request its actual GPU time. Everything above the engine loop is plumbing; everything below is execution. <strong>The loop is the contract.</strong></p>
+
+<h2>The engine loop in three calls</h2>
+
+<p>Strip away wrapping classes and the real vLLM engine reduces to this:</p>
+
+<pre><code>while not stopping:
+    sched_out  = scheduler.schedule()             # (1) who runs this step
+    model_out  = model.execute_model(sched_out)   # (2) one forward pass
+    engine_out = process_outputs(model_out)       # (3) sample + detokenize
+    deliver(engine_out)                           #     stream to clients</code></pre>
+
+<div class="callout">
+  <div class="label">The unifying lens</div>
+  Every optimization in lessons 02-12 makes exactly one of these three calls go faster, or admit more work per call:
+  <ul>
+    <li><code>scheduler.schedule()</code> — PagedAttention (02), continuous batching (04), prefix caching (05), chunked prefill (10), preemption (11). All change <em>what fits</em> in the batch.</li>
+    <li><code>model.execute_model()</code> — FlashAttention (03), CUDA graphs (05), TP (06), GQA (09), LoRA grouped GEMM (12). All change <em>how fast</em> the forward runs.</li>
+    <li><code>process_outputs()</code> — speculative decoding (07), disagg (08). Both change <em>how many useful tokens</em> the forward produced.</li>
+  </ul>
+</div>
+
+<h2>Why <code>asyncio</code>, not threads</h2>
+
+<p>A request can spend most of its life in "waiting" state — waiting for prefill, streaming tokens out at the human-readable rate of ~50/sec, idling between user turns. A naive thread-per-request design hits a wall fast.</p>
+
+<div class="math block">
+  1000 concurrent requests × 2 MB default kernel stack ≈ 2 GB of RSS, before a single token is produced
+</div>
+
+<p>That's just the kernel stacks. Add scheduler overhead, context switch syscalls (~1-3 μs each), and Python's GIL — and you're not getting 1000 connections off the ground on one process. asyncio collapses this:</p>
+
+<table>
+  <thead><tr><th></th><th>thread-per-request</th><th>asyncio task-per-request</th></tr></thead>
+  <tbody>
+    <tr><td>memory / connection</td><td>~2 MB (stack)</td><td>~3 KB (coroutine frame)</td></tr>
+    <tr><td>context switch</td><td>syscall, ~1-3 μs</td><td>function call, ~100 ns</td></tr>
+    <tr><td>I/O wait</td><td>blocks an OS thread</td><td>frees the loop via <code>await</code></tr>
+    <tr><td>concurrency unit</td><td>OS-scheduled</td><td>cooperatively scheduled</td></tr>
+  </tbody>
+</table>
+
+<p>1000 idle SSE streams cost ~3 MB total in asyncio. The loop ticks through them between engine steps with no syscall pressure.</p>
+
+<h2>Why the engine runs on its own thread (or process)</h2>
+
+<p>Counter-intuitive after the previous section: <em>the engine itself does not benefit from asyncio</em>. Inside the loop body, between CUDA calls, sits a pile of CPU-heavy Python: building block tables, packing input tensors, running the sampler, incremental detokenization. If you put that work directly on the asyncio loop, every decode step blocks the loop for many milliseconds and the SSE streams stutter.</p>
+
+<p>So vLLM puts the engine loop on its own thread (single-process mode) or its own process (Ray mode). The split:</p>
+
+<pre><code>[asyncio loop — main thread]              [engine thread/process]
+    HTTP handlers                            scheduler.schedule()
+    SSE streaming                            model.execute_model()
+    token-level fan-out                      sampling + detokenization
+    handshake via queues   ◄──────────►      handshake via queues</code></pre>
+
+<p>The two communicate via thread-safe queues. The asyncio loop never blocks. The engine never waits on a socket. The GIL is released inside CUDA calls (which are non-Python), so the asyncio side gets cycles even while the engine is in a forward pass.</p>
+
+<h2>Scaling beyond one GPU</h2>
+
+<p>One model copy on one GPU only takes you so far. Four orthogonal axes exist; production deployments combine them.</p>
+
+<table>
+  <thead><tr><th>axis</th><th>what's split</th><th>communication</th><th>where it lives</th></tr></thead>
+  <tbody>
+    <tr><td><strong>TP</strong> · tensor parallel</td><td>each weight matrix across N GPUs along the hidden dim</td><td>all-reduce after every split matmul; bytes ≈ batch · seq · d</td><td>intra-node, NVLink (~900 GB/s)</td></tr>
+    <tr><td><strong>PP</strong> · pipeline parallel</td><td>layers across nodes — first 20 on node A, next 20 on node B</td><td>activations only, GPU→GPU; bytes ≈ batch · seq · d <em>per stage boundary</em></td><td>cross-node — activations are much smaller than weights</td></tr>
+    <tr><td><strong>DP</strong> · data parallel</td><td>full model replicated; requests load-balanced across replicas</td><td>none on the critical path — just LB routing</td><td>whole fleet</td></tr>
+    <tr><td><strong>EP</strong> · expert parallel</td><td>MoE experts distributed across GPUs; tokens routed to their expert's GPU</td><td>all-to-all per MoE layer</td><td>intra-node for routing efficiency</td></tr>
+  </tbody>
+</table>
+
+<p>The rule of thumb is straightforward and follows from the bandwidth column. TP needs NVLink; once you cross to InfiniBand (~25-50 GB/s) the all-reduce stalls dominate the forward pass. PP is cheap across nodes because the network only sees one activation tensor per stage boundary, not a per-matmul all-reduce.</p>
+
+<p>Typical 70B on one 8-GPU node: <code>TP=8, PP=1, DP=many</code>. 405B across two nodes: <code>TP=8</code> within a node, <code>PP=2</code> across, <code>DP=many</code> in front for throughput.</p>
+
+<h2>Multi-node with Ray</h2>
+
+<p>vLLM uses Ray to orchestrate multi-node clusters. The master process — the one running the API server and the engine — issues a remote call to each worker for every forward pass. Workers are Python actors with one GPU each; they own a slice of the model weights.</p>
+
+<pre class="ascii">[engine, node 0]                  [worker, node 0, GPU 0..7]
+    schedule()                         hold TP shard of weights
+    pack input ids ────► (Ray RPC) ──► run forward on shard
+                                       all-reduce with peers (NVLink)
+    sample tokens ◄────  (Ray RPC) ◄── return logits
+    deliver to clients</pre>
+
+<p>The all-reduce is on the critical path of every forward. Network topology matters: NVLink for intra-node TP groups, NVSwitch full-mesh ideal, InfiniBand for PP stage crossings. A single under-provisioned link will bottleneck your H100 cluster down to A100 throughput.</p>
+
+<h2>Production topology</h2>
+
+<p>Putting it all together — what one team's deployment actually looks like:</p>
+
+<pre class="ascii">                            ┌──────────────┐
+                            │ load balancer │   (nginx / envoy / cloud LB)
+                            └──────┬───────┘
+              ┌────────────────────┼────────────────────┐
+              ▼                    ▼                    ▼
+        ┌───────────┐        ┌───────────┐        ┌───────────┐
+        │ DP repl A │        │ DP repl B │        │ DP repl C │
+        │           │        │           │        │           │
+        │  FastAPI  │        │  FastAPI  │        │  FastAPI  │
+        │     +     │        │     +     │        │     +     │
+        │ AsyncLLM  │        │ AsyncLLM  │        │ AsyncLLM  │
+        │  Engine   │        │  Engine   │        │  Engine   │
+        │     +     │        │     +     │        │     +     │
+        │ 8 × GPU   │        │ 8 × GPU   │        │ 8 × GPU   │
+        │ (TP=8 via │        │ (TP=8 via │        │ (TP=8 via │
+        │  Ray)     │        │  Ray)     │        │  Ray)     │
+        └───────────┘        └───────────┘        └───────────┘
+
+   each replica:  one FastAPI process · one AsyncLLMEngine · N Ray workers
+                  shared scheduler + block manager · OpenAI-compatible endpoint</pre>
+
+<p>Three DP replicas in front, each running TP=8 internally. The LB handles routing (least-connections or weighted round-robin); replicas don't coordinate. This is the canonical single-region deployment.</p>
+
+<h2>Interactive · feel the engine loop</h2>
+
+<p>Below: a discrete-event simulator of the async engine. Top lane is the arrival timeline. Middle lane is the engine's active set — at most <code>max_active</code> requests in flight at once, advancing one token per step. Bottom lane is the output stream per finished request.</p>
+
+<p>Try this sequence and watch the KPIs:</p>
+<ul>
+  <li>arrival rate 3/sec, max_active 8, step 15 ms — comfortable. GPU well utilized, TTFT low.</li>
+  <li>arrival rate 8/sec, max_active 4 — the queue grows without bound. p99 TTFT explodes. <em>Classic queueing behavior: when arrival rate λ exceeds service rate μ, the queue grows unbounded (the M/M/1 stability condition ρ &lt; 1 is violated). Little's law (L = λW) holds in steady state — when the system <strong>is</strong> stable, queue length scales with arrival rate × mean wait.</em></li>
+  <li>arrival rate 2/sec, max_active 1 — even with light load, single-slot queuing pushes p99 TTFT up. Concurrency isn't a luxury, it's a latency lever.</li>
+</ul>
+
+<div class="widget" id="engine-widget">
+  <div class="title">Async engine simulator</div>
+  <div class="hint">Top = arrivals. Middle = active slots (each row is one slot; coloured bands are requests in flight). Bottom = completed streams' first-and-last-token marks. Ten seconds of simulation at 60 fps.</div>
+
+  <div class="controls">
+    <label class="inline">arrival rate: <input type="range" id="eng-rate" min="1" max="10" step="0.5" value="4"> <span class="val" id="eng-rate-val">4</span> req/s</label>
+    <label class="inline">mean output: <input type="range" id="eng-outlen" min="5" max="80" step="1" value="30"> <span class="val" id="eng-outlen-val">30</span> tok</label>
+    <label class="inline">max_active: <input type="range" id="eng-cap" min="1" max="16" step="1" value="6"> <span class="val" id="eng-cap-val">6</span></label>
+    <label class="inline">step latency: <input type="range" id="eng-step" min="5" max="30" step="1" value="15"> <span class="val" id="eng-step-val">15</span> ms</label>
+    <button id="eng-run" class="primary">Run 10 s</button>
+    <button id="eng-reset">Reset</button>
+  </div>
+
+  <canvas class="dist-canvas" id="eng-canvas" width="760" height="340" style="height: 340px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">mean TTFT</div><div class="v" id="eng-ttft">—</div></div>
+    <div class="kpi"><div class="k">p99 TTFT</div><div class="v" id="eng-p99">—</div></div>
+    <div class="kpi"><div class="k">throughput</div><div class="v" id="eng-thru">—</div></div>
+    <div class="kpi"><div class="k">GPU util</div><div class="v" id="eng-util">—</div></div>
+    <div class="kpi"><div class="k">queue depth</div><div class="v" id="eng-q">—</div></div>
+    <div class="kpi"><div class="k">finished</div><div class="v" id="eng-done">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">show what each tick of the loop does (the same three calls)</summary>
+<pre><code>// One simulation step (≈ one engine iteration):
+// 1) admit waiting → running while running.length &lt; max_active     ── scheduler.schedule()
+// 2) advance every running request by one token                    ── model.execute_model()
+// 3) finished: tokens_produced &gt;= output_len → drop, record stats  ── process_outputs()</code></pre>
+  </details>
+</div>
+
+<h2>Takeaways</h2>
+
+<div class="callout ok">
+  <div class="label">What to keep</div>
+  <ul>
+    <li>The engine is three calls in a loop. Every optimization in lessons 02-12 makes one of those calls faster or thicker.</li>
+    <li>Above the loop is asyncio — cheap concurrency for thousands of streaming HTTP connections.</li>
+    <li>The loop itself runs on a dedicated thread/process so its CPU work doesn't stall the asyncio side.</li>
+    <li>TP for intra-node, PP for cross-node, DP for throughput. Pick by where the bandwidth is.</li>
+    <li>Multi-node Ray makes the all-reduce a network-critical-path operation. The fabric is the bottleneck, not the GPU.</li>
+  </ul>
+</div>
+
+<footer class="lesson-nav">
+  <a href="05_optimizations.html">
+    <span class="dir">← Prev</span>
+    <span class="ttl">05 · Optimization catalog</span>
+  </a>
+  <a class="next" href="07_speculative_decoding.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">07 · Speculative decoding</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const canvas = document.getElementById('eng-canvas');
+  const ctx = canvas.getContext('2d');
+
+  const eRate = document.getElementById('eng-rate');
+  const eOut  = document.getElementById('eng-outlen');
+  const eCap  = document.getElementById('eng-cap');
+  const eStep = document.getElementById('eng-step');
+  const lRate = document.getElementById('eng-rate-val');
+  const lOut  = document.getElementById('eng-outlen-val');
+  const lCap  = document.getElementById('eng-cap-val');
+  const lStep = document.getElementById('eng-step-val');
+
+  function syncLabels() {
+    lRate.textContent = eRate.value;
+    lOut.textContent  = eOut.value;
+    lCap.textContent  = eCap.value;
+    lStep.textContent = eStep.value;
+  }
+  [eRate, eOut, eCap, eStep].forEach(el => el.addEventListener('input', syncLabels));
+  syncLabels();
+
+  // ── Discrete-event-ish simulation; precomputed for the full 10 s window. ──
+  // Time is in ms. Each engine "tick" advances every running req by 1 token.
+  function simulate(){
+    const rate    = parseFloat(eRate.value);                  // req/s
+    const outMean = parseInt(eOut.value, 10);                 // tokens
+    const cap     = parseInt(eCap.value, 10);                 // slots
+    const stepMs  = parseInt(eStep.value, 10);                // ms per tick
+
+    const SIM_MS = 10000;
+    // Poisson-ish arrivals: exponential inter-arrival.
+    const arrivals = [];
+    let t = 0;
+    let seed = 1234567;
+    function rng() { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; }
+    while (t < SIM_MS) {
+      const dt = -Math.log(1 - rng()) / rate * 1000;
+      t += dt;
+      if (t >= SIM_MS) break;
+      // Output length: geometric-ish around outMean (min 3).
+      const outLen = Math.max(3, Math.round(-Math.log(1 - rng()) * outMean));
+      arrivals.push({ id: arrivals.length, arrive: t, outLen });
+    }
+
+    // Engine ticks every stepMs.
+    const reqs = arrivals.map(a => ({...a, admit: null, firstTok: null, finish: null, produced: 0}));
+    const waiting = []; const running = []; const done = [];
+    let ai = 0;
+    let busyTicks = 0, totalTicks = 0;
+    const slotHistory = []; // per-tick: array of running req ids (length cap)
+    const queueHistory = [];
+
+    for (let now = 0; now < SIM_MS; now += stepMs) {
+      // admit new arrivals to waiting
+      while (ai < reqs.length && reqs[ai].arrive <= now) { waiting.push(reqs[ai]); ai++; }
+      // schedule
+      while (running.length < cap && waiting.length > 0) {
+        const r = waiting.shift();
+        r.admit = now;
+        running.push(r);
+      }
+      // execute_model: advance one token each
+      if (running.length > 0) busyTicks++;
+      totalTicks++;
+      const snap = new Array(cap).fill(null);
+      for (let i = 0; i < running.length; i++) {
+        const r = running[i];
+        r.produced++;
+        if (r.firstTok === null) r.firstTok = now + stepMs;
+        snap[i] = r.id;
+      }
+      // process_outputs: evict finished
+      for (let i = running.length - 1; i >= 0; i--) {
+        const r = running[i];
+        if (r.produced >= r.outLen) {
+          r.finish = now + stepMs;
+          done.push(r);
+          running.splice(i, 1);
+        }
+      }
+      slotHistory.push(snap);
+      queueHistory.push(waiting.length);
+    }
+
+    return { reqs, done, slotHistory, queueHistory, SIM_MS, stepMs, cap, busyTicks, totalTicks };
+  }
+
+  function colorFor(id) {
+    // Stable hue per request id.
+    const h = (id * 47) % 360;
+    return `hsl(${h}, 65%, 55%)`;
+  }
+
+  function render(sim) {
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+
+    const padX = 50, padR = 14;
+    const plotW = W - padX - padR;
+    const tToX = t => padX + (t / sim.SIM_MS) * plotW;
+
+    // Lanes: top arrivals, middle slots, bottom completions.
+    const topY = 16, topH = 36;
+    const midY = topY + topH + 18, midH = 160;
+    const botY = midY + midH + 18, botH = 60;
+
+    // Labels.
+    ctx.font = '11px ' + getComputedStyle(document.body).fontFamily;
+    ctx.fillStyle = '#5b6573';
+    ctx.fillText('arrivals',   8, topY + topH/2 + 4);
+    ctx.fillText('active set', 8, midY + midH/2 + 4);
+    ctx.fillText('completed',  8, botY + botH/2 + 4);
+
+    // Lane backgrounds.
+    [[topY, topH], [midY, midH], [botY, botH]].forEach(([y, h]) => {
+      ctx.fillStyle = '#f1f3f7';
+      ctx.fillRect(padX, y, plotW, h);
+      ctx.strokeStyle = '#dde2ea';
+      ctx.strokeRect(padX, y, plotW, h);
+    });
+
+    // Time axis ticks (every 1 s).
+    ctx.strokeStyle = '#dde2ea';
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '10px monospace';
+    for (let s = 0; s <= 10; s++) {
+      const x = tToX(s * 1000);
+      ctx.beginPath(); ctx.moveTo(x, botY + botH); ctx.lineTo(x, botY + botH + 4); ctx.stroke();
+      ctx.fillText(s + 's', x - 5, botY + botH + 14);
+    }
+
+    // 1) Arrivals — vertical ticks colored by req id.
+    for (const r of sim.reqs) {
+      const x = tToX(r.arrive);
+      ctx.strokeStyle = colorFor(r.id);
+      ctx.beginPath(); ctx.moveTo(x, topY + 2); ctx.lineTo(x, topY + topH - 2); ctx.stroke();
+    }
+
+    // 2) Active set — one row per slot, draw bands where each slot was occupied.
+    const slotH = midH / sim.cap;
+    // Convert slotHistory to runs.
+    for (let s = 0; s < sim.cap; s++) {
+      let runStart = -1; let runId = null;
+      for (let i = 0; i <= sim.slotHistory.length; i++) {
+        const cur = i < sim.slotHistory.length ? sim.slotHistory[i][s] : null;
+        if (cur !== runId) {
+          if (runId !== null) {
+            const x0 = tToX(runStart * sim.stepMs);
+            const x1 = tToX(i * sim.stepMs);
+            ctx.fillStyle = colorFor(runId);
+            ctx.fillRect(x0, midY + s * slotH + 1, Math.max(1, x1 - x0), slotH - 2);
+          }
+          runId = cur; runStart = i;
+        }
+      }
+    }
+    // slot separators
+    ctx.strokeStyle = '#eef1f5';
+    for (let s = 1; s < sim.cap; s++) {
+      ctx.beginPath();
+      ctx.moveTo(padX, midY + s * slotH);
+      ctx.lineTo(padX + plotW, midY + s * slotH);
+      ctx.stroke();
+    }
+
+    // 3) Completed streams — for each finished req, line from firstTok→finish
+    for (const r of sim.done) {
+      if (r.firstTok === null || r.finish === null) continue;
+      const x0 = tToX(r.firstTok), x1 = tToX(r.finish);
+      const y = botY + 8 + ((r.id * 7) % (botH - 16));
+      ctx.strokeStyle = colorFor(r.id);
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
+      ctx.fillStyle = colorFor(r.id);
+      ctx.fillRect(x0 - 2, y - 2, 4, 4);
+      ctx.fillRect(x1 - 2, y - 2, 4, 4);
+    }
+    ctx.lineWidth = 1;
+
+    // KPIs
+    const ttfts = sim.done.map(r => r.firstTok - r.arrive).filter(x => x !== null && !isNaN(x));
+    ttfts.sort((a, b) => a - b);
+    const meanTTFT = ttfts.length ? ttfts.reduce((s, x) => s + x, 0) / ttfts.length : 0;
+    const p99 = ttfts.length ? ttfts[Math.max(0, Math.ceil(0.99 * ttfts.length) - 1)] : 0;
+    const totalTok = sim.done.reduce((s, r) => s + r.produced, 0);
+    const thru = totalTok / (sim.SIM_MS / 1000);
+    const util = sim.totalTicks > 0 ? sim.busyTicks / sim.totalTicks : 0;
+    const lastQ = sim.queueHistory.length ? sim.queueHistory[sim.queueHistory.length - 1] : 0;
+
+    document.getElementById('eng-ttft').textContent = meanTTFT.toFixed(0) + ' ms';
+    document.getElementById('eng-p99').textContent  = p99.toFixed(0) + ' ms';
+    document.getElementById('eng-thru').textContent = thru.toFixed(0) + ' tok/s';
+    document.getElementById('eng-util').textContent = (util * 100).toFixed(0) + '%';
+    document.getElementById('eng-q').textContent    = String(lastQ);
+    document.getElementById('eng-done').textContent = sim.done.length + ' / ' + sim.reqs.length;
+
+    // Warn when queue blew up
+    if (lastQ > 20) {
+      ctx.fillStyle = '#dc2626';
+      ctx.font = '12px monospace';
+      ctx.fillText('queue unbounded — λ > μ', padX + 8, topY + 14);
+    }
+  }
+
+  let animHandle = null;
+  function animatedRun() {
+    if (animHandle) cancelAnimationFrame(animHandle);
+    const sim = simulate();
+    // Reveal progressively over ~1.2 s for the "feel".
+    const start = performance.now();
+    const DUR = 1200;
+    function step() {
+      const now = performance.now();
+      const f = Math.min(1, (now - start) / DUR);
+      const cutTick = Math.floor(f * sim.slotHistory.length);
+      const partial = {
+        ...sim,
+        slotHistory: sim.slotHistory.slice(0, cutTick),
+        queueHistory: sim.queueHistory.slice(0, cutTick),
+        done: sim.done.filter(r => r.finish !== null && r.finish <= cutTick * sim.stepMs),
+        reqs: sim.reqs.filter(r => r.arrive <= cutTick * sim.stepMs),
+        busyTicks: sim.slotHistory.slice(0, cutTick).filter(snap => snap.some(x => x !== null)).length,
+        totalTicks: cutTick,
+      };
+      render(partial);
+      if (f < 1) animHandle = requestAnimationFrame(step);
+      else render(sim);  // final full render
+    }
+    step();
+  }
+
+  document.getElementById('eng-run').addEventListener('click', animatedRun);
+  document.getElementById('eng-reset').addEventListener('click', () => {
+    if (animHandle) cancelAnimationFrame(animHandle);
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    ['eng-ttft','eng-p99','eng-thru','eng-util','eng-q','eng-done'].forEach(id =>
+      document.getElementById(id).textContent = '—');
+  });
+  // initial run so the canvas isn't blank
+  window.addEventListener('load', animatedRun);
+})();
+</script>
+
+</body>
+</html>
