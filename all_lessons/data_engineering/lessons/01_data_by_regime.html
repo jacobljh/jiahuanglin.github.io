@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>01 · The data, by regime</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">data_engineering</a>
+    <span class="crumb">/</span>
+    <span class="crumb">01 · data by regime</span>
+    <span class="step-pill">lesson 1 / 11</span>
+  </div>
+</header>
+
+<main>
+
+<h1>The data, by regime</h1>
+<p class="subtitle">Before you build a pipeline you need to know exactly what it must produce. Each of the three post-training regimes defines a different <em>unit of data</em> with a different schema, a different loss mask, and different constraints on where it comes from and how it is generated.</p>
+
+<div class="callout">
+  <div class="label">Where we are</div>
+  Lesson 00 (orientation) introduced the three regimes and the medallion shape. This lesson zooms into the <em>record level</em>: what does one training example actually look like for each regime, what fields does it carry, and which tokens are masked for the loss. Everything downstream — ingestion, storage, dedup, tokenization — is shaped by these units.
+</div>
+
+<h2>SFT: the (prompt, response) pair</h2>
+
+<p>Supervised fine-tuning teaches the model to <em>imitate</em> a target response. The unit is a <strong>(prompt, response)</strong> pair. In practice almost nothing is stored as a flat string; instead the record is a list of <strong>chat messages</strong>, each with a <code>role</code> and <code>content</code>, that a <em>chat template</em> (Jinja2, typically) renders into a single token sequence before training.</p>
+
+<pre class="ascii">  SFT record (multi-turn)
+  ┌─────────────────────────────────────────────────┐
+  │ messages: [                                      │
+  │   { role: "system",    content: "You are …" }   │
+  │   { role: "user",      content: "Q1" }          │
+  │   { role: "assistant", content: "A1" }  ← LOSS  │
+  │   { role: "user",      content: "Q2" }          │
+  │   { role: "assistant", content: "A2" }  ← LOSS  │
+  │ ]                                                │
+  └─────────────────────────────────────────────────┘
+  Loss is computed ONLY on assistant tokens.
+  System + user tokens are masked out (label = -100).</pre>
+
+<p>Two properties dominate SFT data quality:</p>
+<ul>
+  <li><strong>Turn depth.</strong> A single exchange (<code>user → assistant</code>) is a degenerate case. Real instruction data includes multi-turn dialogues, which forces the model to track context. Single-turn data creates single-turn models.</li>
+  <li><strong>Response quality.</strong> The model learns to match the distribution of responses it sees. One bad-faith, over-hedged, or factually wrong response in the training set is worth far less than zero — it actively teaches the wrong behaviour. Correctness and stylistic consistency matter; volume is secondary.</li>
+</ul>
+
+<div class="callout warn">
+  <div class="label">Forward reference: loss masking (lesson 07)</div>
+  The <code>label = -100</code> convention signals PyTorch's cross-entropy to skip those positions when accumulating the loss. The pipeline stage that tokenizes the record must emit both <code>input_ids</code> and a matching <code>labels</code> tensor with all non-assistant positions zeroed out. Getting this wrong (masking the wrong span, or masking nothing) is silent — the loss still runs, just on the wrong tokens. Lesson 07 covers this in full; keep it in mind as you design the schema.
+</div>
+
+<h2>Preference: the (prompt, chosen, rejected) triple</h2>
+
+<p>Preference learning — DPO, IPO, KTO, reward modelling for RLHF — does not need a single "correct" response. It needs a <em>comparison</em>: given the same prompt, which response is better? The unit is a <strong>(prompt, chosen, rejected)</strong> triple, where both <code>chosen</code> and <code>rejected</code> are full response texts (or message lists).</p>
+
+<pre class="ascii">  Preference record
+  ┌─────────────────────────────────────────────────┐
+  │ prompt:   "Explain gradient descent"             │
+  │ chosen:   "Gradient descent is an iterative …"  │
+  │ rejected: "It's basically just going downhill"   │
+  │ source:   "human" | "ai" | "synthetic"           │
+  │ score_chosen:   4.2   (optional, continuous)     │
+  │ score_rejected: 1.8   (optional)                 │
+  └─────────────────────────────────────────────────┘</pre>
+
+<p>Three things to know about the source of preference labels:</p>
+<ul>
+  <li><strong>Human annotation (RLHF).</strong> Expensive, slow, hard to scale, but high-signal on subtle quality dimensions (tone, safety, factuality). Requires careful annotation guidelines and inter-annotator agreement checks.</li>
+  <li><strong>RLAIF (AI feedback).</strong> A stronger LLM plays the role of annotator. Faster and cheaper, but biases the data toward the judge model's own stylistic preferences — if the judge likes verbose answers, the dataset will systematically prefer verbose answers.</li>
+  <li><strong>Length bias.</strong> Annotators (human and AI) consistently prefer longer responses, all else equal. This is one of the most well-documented artefacts in preference data: a 500-token response beats a 100-token response on the same question, even when the short one is more accurate. Pipelines should log response lengths and check that the chosen/rejected split is not confounded with length.</li>
+</ul>
+
+<div class="callout warn">
+  <div class="label">Ties and the collapsed pair problem</div>
+  When a rater cannot distinguish two responses, the pair is a <em>tie</em>. Ties are not neutral — including them as training signal (randomly assigning chosen/rejected) adds label noise. Exclude ties or use a model that handles soft labels. Similarly, if your pipeline deduplicates by prompt and accidentally drops one side of a pair, the remaining record is corrupted and must be removed entirely.
+</div>
+
+<h2>RL / RLVR: the (prompt, verifier) seed</h2>
+
+<p>Reinforcement learning over verifiable rewards (RLVR) — the approach behind DeepSeek-R1, GRPO, and similar methods — looks like the simplest dataset: just a prompt and a way to score the model's answer. But it is architecturally the most different from SFT/preference, because <strong>the responses do not live in the dataset at all</strong>.</p>
+
+<pre class="ascii">  RL / RLVR record (the "seed")
+  ┌─────────────────────────────────────────────────┐
+  │ prompt:    "If 3x + 7 = 22, what is x?"         │
+  │ answer:    "5"          ← gold, for verifier     │
+  │ verifier:  "exact_match" | "python_eval" | …    │
+  │ domain:    "math/algebra"                        │
+  │ difficulty: 0.42                                 │
+  └─────────────────────────────────────────────────┘
+  Responses are NOT stored here.
+  The policy generates them LIVE during training.</pre>
+
+<p>At training time the policy samples <span class="math">K</span> responses per prompt, a verifier scores each one, and the scores become rewards that update the policy. The "dataset" is really a <strong>prompt bank</strong> — a curated collection of seeds that are diverse, appropriately difficult, and unambiguously verifiable. The actual training data is the online rollout stream, not the bank.</p>
+
+<div class="callout bad">
+  <div class="label">Why a static RL dataset doesn't exist in the SFT sense</div>
+  You cannot pre-generate the RL training responses and store them. The point of RL is that the responses change as the policy improves — on-policy data is required. Serving pre-generated responses would be behavioural cloning back to SFT. The data-engineering implication: the RL pipeline must be a <em>streaming loop</em>, not a batch job. Lesson 10 (the RL online dataplane) covers this architecture in full.
+</div>
+
+<h2>One schema, three projections</h2>
+
+<p>All three record types share enough structure that it pays to define a single <strong>canonical schema</strong> and treat SFT, preference, and RL as projections — subsets of the shared fields. This matters for storage, for quality gates that run across all regimes, and for auditability.</p>
+
+<table>
+  <thead>
+    <tr><th>Field</th><th>SFT</th><th>Preference</th><th>RL</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>id</code></td><td>required</td><td>required</td><td>required</td></tr>
+    <tr><td><code>source</code></td><td>required</td><td>required</td><td>required</td></tr>
+    <tr><td><code>messages</code> / <code>prompt</code></td><td><code>messages[]</code></td><td><code>prompt</code> string</td><td><code>prompt</code> string</td></tr>
+    <tr><td><code>response</code></td><td>last assistant turn</td><td>—</td><td>— (generated live)</td></tr>
+    <tr><td><code>chosen</code> / <code>rejected</code></td><td>—</td><td>required</td><td>—</td></tr>
+    <tr><td><code>answer</code> / <code>verifier</code></td><td>—</td><td>—</td><td>required</td></tr>
+    <tr><td><code>lang</code></td><td>recommended</td><td>recommended</td><td>recommended</td></tr>
+    <tr><td><code>difficulty</code></td><td>optional</td><td>optional</td><td>recommended</td></tr>
+    <tr><td><code>token_count</code></td><td>recommended</td><td>recommended</td><td>optional</td></tr>
+    <tr><td><code>license</code></td><td>required</td><td>required</td><td>required</td></tr>
+    <tr><td><code>origin</code></td><td>required</td><td>required</td><td>required</td></tr>
+    <tr><td><code>created_at</code></td><td>recommended</td><td>recommended</td><td>recommended</td></tr>
+  </tbody>
+</table>
+
+<p>Storing all records in the same Parquet table (with null values for unused fields per regime) lets you run one dedup pass, one quality gate, and one provenance audit across the whole corpus before splitting into regime-specific gold tables. The regime split is a late, cheap operation; the cleaning is early and shared.</p>
+
+<h2>Regime comparison</h2>
+
+<table>
+  <thead>
+    <tr><th>Property</th><th>SFT</th><th>Preference</th><th>RL / RLVR</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>Unit</strong></td><td>(prompt, response)</td><td>(prompt, chosen, rejected)</td><td>(prompt, verifier/answer)</td></tr>
+    <tr><td><strong>Typical source</strong></td><td>Human demos, distillation, synthetic</td><td>Human or AI pairwise judgments</td><td>Curated problem sets (math, code, logic)</td></tr>
+    <tr><td><strong>Loss masked on</strong></td><td>All non-assistant tokens</td><td>Implicitly via DPO loss; chosen/rejected responses both used</td><td>No static loss — reward signal from verifier</td></tr>
+    <tr><td><strong>Static vs dynamic</strong></td><td>Static — built once, trained on</td><td>Static — built once, trained on</td><td>Dynamic — prompt bank is static; responses generated live</td></tr>
+    <tr><td><strong>Scale sensitivity</strong></td><td>High quality &gt; high volume</td><td>Tie rate + length bias are the main hazards</td><td>Prompt diversity + verifier quality dominate</td></tr>
+    <tr><td><strong>Key pipeline concern</strong></td><td>Loss-mask correctness; multi-turn formatting</td><td>Deduplication must keep pairs together; length-bias audit</td><td>Prompt bank must be deduped; verifier must be deterministic</td></tr>
+  </tbody>
+</table>
+
+<h2>Interactive · record schema explorer</h2>
+
+<p>Toggle the regime to see the JSON-ish structure of one training record and which spans are masked for the loss (shown in colour). This is the shape your pipeline must emit into the gold layer.</p>
+
+<div class="widget" id="schema-widget">
+  <div class="title">Record schema by regime</div>
+  <div class="hint">Select a regime. The highlighted fields are present in that record; grey fields are null or absent. The loss-mask indicator shows which tokens a trainer would compute cross-entropy on.</div>
+
+  <div class="controls">
+    <label class="inline">regime:
+      <select id="rg-regime" style="margin-left:8px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg-elev);color:var(--text);font-family:var(--mono);font-size:13px;">
+        <option value="sft">SFT</option>
+        <option value="pref">Preference (DPO)</option>
+        <option value="rl">RL / RLVR</option>
+      </select>
+    </label>
+    <label class="inline">multi-turn (SFT only):
+      <input type="checkbox" id="rg-multi" checked>
+    </label>
+  </div>
+
+  <div id="rg-record" style="margin:18px 0;border-radius:8px;overflow:hidden;border:1px solid var(--border);"></div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">Static?</div><div class="v" id="rg-static">—</div></div>
+    <div class="kpi"><div class="k">Loss computed on</div><div class="v" id="rg-loss">—</div></div>
+    <div class="kpi"><div class="k">Main quality risk</div><div class="v" id="rg-risk" style="font-size:12px;">—</div></div>
+    <div class="kpi"><div class="k">Typical size</div><div class="v" id="rg-size">—</div></div>
+  </div>
+
+  <div class="callout" id="rg-note" style="margin-top:16px;"></div>
+</div>
+
+<h2>The dataset is the product</h2>
+
+<p>A phrase that recurs in practitioner writing on post-training: <strong>"the dataset is the product."</strong> It means that for the same model architecture and training recipe, the data is the primary lever on output quality — and that the relationship is not linear with volume.</p>
+
+<ul>
+  <li><strong>Small-and-clean beats large-and-noisy.</strong> LIMA (2023) showed that 1 000 carefully curated SFT examples could match or exceed the instruction-following quality of models trained on orders-of-magnitude more data. The bottleneck was not volume; it was the quality distribution of the response side.</li>
+  <li><strong>Diversity dominates at the margin.</strong> Once you have enough examples of a format or task type, adding more of the same hurts more than it helps (overfitting to the represented modes, under-representing others). The marginal value of a new example is its <em>informational distance</em> from examples already in the set — which is exactly why dedup and diversity sampling (lesson 06, lesson 08) are first-class pipeline stages, not afterthoughts.</li>
+  <li><strong>Difficulty is a dial.</strong> For RL / RLVR, the expected gradient signal from a prompt is maximised at intermediate difficulty: if the model already gets it right every time the reward is always 1 and there's nothing to learn; if it never gets it right the reward is always 0 and there's still nothing to learn. The pipeline must track and actively curate prompt difficulty — another reason <code>difficulty</code> is a first-class schema field.</li>
+</ul>
+
+<div class="callout">
+  <div class="label">Cross-link: the curation and signal angle</div>
+  The orthogonal question — <em>which</em> examples to keep to maximise gradient signal — is answered in the companion <a href="../../RL/lessons/18a_data_pipelines.html">RL series: data curation and pipelines (lesson 18a)</a>. This series answers <em>how</em> to build the pipeline that processes and serves those decisions. Read them together.
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway — what to carry to lesson 02</div>
+  Three regimes, three record shapes, one canonical schema. SFT and preference are static datasets; RL is a prompt bank fed to a live generation loop. The loss mask is not a training detail — it is a pipeline output that must be correct at the schema level. Lesson 02 introduces the ETL / ELT skeleton that turns raw versions of these records (bronze) into clean, validated, training-ready gold — the same shape for all three regimes.
+</div>
+
+<footer class="lesson-nav">
+  <a href="00_orientation.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">00 · Orientation</span>
+  </a>
+  <a class="next" href="02_etl_skeleton.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">02 · The ETL / ELT skeleton</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const $ = id => document.getElementById(id);
+
+  const REGIMES = {
+    sft: {
+      static: 'Yes — built once, trained on',
+      loss: 'assistant tokens only',
+      risk: 'Incorrect loss mask; single-turn only; bad responses in distribution',
+      size: '10 K – 1 M records',
+      note: { cls: 'ok', text: 'SFT is the entry point for most post-training pipelines. Focus on response quality and multi-turn coverage. 1 000 excellent examples routinely outperform 1 M mediocre ones.' },
+      schema: (multi) => multi ? [
+        { key: 'id',         val: '"sft-00042"',                    present: true },
+        { key: 'source',     val: '"human_demo"',                   present: true },
+        { key: 'messages',   val: null,                             present: true, children: [
+          { role: 'system',    content: '"You are a helpful assistant"', mask: false },
+          { role: 'user',      content: '"What is backpropagation?"',    mask: false },
+          { role: 'assistant', content: '"Backpropagation is …"',        mask: true  },
+          { role: 'user',      content: '"Can you give an example?"',    mask: false },
+          { role: 'assistant', content: '"Sure. Consider a network …"',  mask: true  },
+        ]},
+        { key: 'chosen',     val: 'null',                           present: false },
+        { key: 'rejected',   val: 'null',                           present: false },
+        { key: 'answer',     val: 'null',                           present: false },
+        { key: 'lang',       val: '"en"',                           present: true },
+        { key: 'token_count',val: '312',                            present: true },
+        { key: 'difficulty', val: '0.31',                           present: true },
+        { key: 'license',    val: '"cc-by-4.0"',                    present: true },
+        { key: 'origin',     val: '"annotation_batch_007"',         present: true },
+        { key: 'created_at', val: '"2024-11-03T09:14:00Z"',         present: true },
+      ] : [
+        { key: 'id',         val: '"sft-00042"',                    present: true },
+        { key: 'source',     val: '"synthetic"',                    present: true },
+        { key: 'messages',   val: null,                             present: true, children: [
+          { role: 'user',      content: '"What is backpropagation?"',    mask: false },
+          { role: 'assistant', content: '"Backpropagation is …"',        mask: true  },
+        ]},
+        { key: 'chosen',     val: 'null',                           present: false },
+        { key: 'rejected',   val: 'null',                           present: false },
+        { key: 'answer',     val: 'null',                           present: false },
+        { key: 'lang',       val: '"en"',                           present: true },
+        { key: 'token_count',val: '98',                             present: true },
+        { key: 'license',    val: '"cc-by-4.0"',                    present: true },
+        { key: 'origin',     val: '"synth_batch_003"',              present: true },
+        { key: 'created_at', val: '"2024-11-03T09:14:00Z"',         present: true },
+      ],
+    },
+    pref: {
+      static: 'Yes — built once, trained on',
+      loss: 'DPO loss over (chosen, rejected) pair',
+      risk: 'Length bias (longer = preferred); ties included as noise; pairs broken by dedup',
+      size: '50 K – 500 K pairs',
+      note: { cls: 'warn', text: 'Always check whether chosen responses are longer on average than rejected. If they are, and you care about conciseness, your pipeline needs a length-controlled sampling step before the gold layer.' },
+      schema: () => [
+        { key: 'id',         val: '"pref-00197"',                   present: true },
+        { key: 'source',     val: '"human_pairwise"',               present: true },
+        { key: 'prompt',     val: '"Summarise the French Revolution in 3 sentences"', present: true },
+        { key: 'chosen',     val: '"The French Revolution (1789–1799) …"',            present: true, mask: true },
+        { key: 'rejected',   val: '"It was basically a big revolt"',                  present: true, mask: true },
+        { key: 'score_chosen',  val: '4.1',                         present: true },
+        { key: 'score_rejected',val: '1.7',                         present: true },
+        { key: 'messages',   val: 'null',                           present: false },
+        { key: 'answer',     val: 'null',                           present: false },
+        { key: 'lang',       val: '"en"',                           present: true },
+        { key: 'token_count_chosen',  val: '87',                    present: true },
+        { key: 'token_count_rejected',val: '11',                    present: true },
+        { key: 'license',    val: '"proprietary"',                  present: true },
+        { key: 'origin',     val: '"crowdwork_batch_021"',          present: true },
+        { key: 'created_at', val: '"2024-10-15T14:22:00Z"',         present: true },
+      ],
+    },
+    rl: {
+      static: 'Prompt bank: yes. Responses: no — generated live.',
+      loss: 'No static loss — reward signal from verifier at runtime',
+      risk: 'Low diversity; too-easy or impossible prompts; non-deterministic verifier',
+      size: '1 K – 100 K prompt seeds',
+      note: { cls: 'bad', text: 'The RL dataset is deceptively small — often just thousands of prompts. The engineering challenge is not storage; it is building a verifier that is fast, deterministic, and impossible to game. A prompt with a bad verifier is worse than no prompt.' },
+      schema: () => [
+        { key: 'id',         val: '"rl-00831"',                     present: true },
+        { key: 'source',     val: '"competition_math"',             present: true },
+        { key: 'prompt',     val: '"Find all integer solutions to x² − 5x + 6 = 0"', present: true },
+        { key: 'answer',     val: '"x=2, x=3"',                     present: true },
+        { key: 'verifier',   val: '"exact_match_normalized"',        present: true },
+        { key: 'domain',     val: '"math/algebra"',                  present: true },
+        { key: 'difficulty', val: '0.38',                            present: true },
+        { key: 'messages',   val: 'null',                            present: false },
+        { key: 'chosen',     val: 'null',                            present: false },
+        { key: 'rejected',   val: 'null',                            present: false },
+        { key: 'lang',       val: '"en"',                            present: true },
+        { key: 'license',    val: '"mit"',                           present: true },
+        { key: 'origin',     val: '"amc_2023"',                      present: true },
+        { key: 'created_at', val: '"2024-09-01T00:00:00Z"',          present: true },
+      ],
+    },
+  };
+
+  const MASK_STYLE  = 'background:var(--ok);color:#fff;border-radius:3px;padding:0 3px;';
+  const OK_STYLE    = 'color:var(--text);';
+  const ABSENT_STYLE= 'color:var(--text-mute);';
+
+  function renderMessages(children){
+    return children.map(c => {
+      const masked = c.mask ? ` <span style="${MASK_STYLE}" title="loss mask: cross-entropy computed here">▓ loss</span>` : '';
+      const roleColor = c.role === 'assistant' ? 'var(--ok)' : c.role === 'system' ? 'var(--accent)' : 'var(--text-dim)';
+      return `<div style="padding:4px 0 4px 20px;border-left:2px solid var(--border);">` +
+        `<span style="color:${roleColor};font-weight:600;">${c.role}</span>: ` +
+        `<span style="color:var(--text-mute);">${c.content}</span>${masked}</div>`;
+    }).join('');
+  }
+
+  function renderSchema(schema){
+    return schema.map(f => {
+      if (!f.present){
+        return `<div style="padding:3px 0;${ABSENT_STYLE}"><span style="opacity:0.45;">"${f.key}"</span>: <span style="opacity:0.35;">${f.val}</span></div>`;
+      }
+      if (f.children){
+        return `<div style="padding:3px 0;${OK_STYLE}"><span style="color:var(--accent);">"${f.key}"</span>: [` +
+          `<div style="padding-left:12px;">${renderMessages(f.children)}</div>]</div>`;
+      }
+      const valStyle = f.mask ? MASK_STYLE : 'color:var(--text-mute);';
+      const lossTag  = f.mask ? ` <span style="${MASK_STYLE}" title="loss mask: cross-entropy computed here">▓ loss</span>` : '';
+      return `<div style="padding:3px 0;${OK_STYLE}"><span style="color:var(--accent);">"${f.key}"</span>: <span style="${valStyle}">${f.val}</span>${lossTag}</div>`;
+    }).join('');
+  }
+
+  function update(){
+    const rg    = $('rg-regime').value;
+    const multi = $('rg-multi').checked;
+    const def   = REGIMES[rg];
+    const schema= typeof def.schema === 'function'
+      ? (rg === 'sft' ? def.schema(multi) : def.schema())
+      : def.schema;
+
+    $('rg-static').textContent = def.static;
+    $('rg-loss').textContent   = def.loss;
+    $('rg-risk').textContent   = def.risk;
+    $('rg-size').textContent   = def.size;
+
+    $('rg-record').innerHTML =
+      `<div style="background:var(--code-bg);padding:14px 18px;font-family:var(--mono);font-size:12.5px;line-height:1.7;">`+
+      `<div style="color:var(--text-mute);font-size:11px;margin-bottom:8px;letter-spacing:.05em;">` +
+        `// canonical record · regime: <strong style="color:var(--text);">${rg.toUpperCase()}</strong></div>` +
+      `{<div style="padding-left:16px;">${renderSchema(schema)}</div>}` +
+      `<div style="margin-top:10px;font-size:11px;color:var(--text-mute);">` +
+        `<span style="${MASK_STYLE}">▓ loss</span> = cross-entropy computed here &nbsp;` +
+        `<span style="opacity:0.4;">grey = field absent / null for this regime</span></div>` +
+      `</div>`;
+
+    const noteEl = $('rg-note');
+    noteEl.className = 'callout ' + def.note.cls;
+    noteEl.innerHTML = `<div class="label">Read-out</div>${def.note.text}`;
+
+    // disable multi-turn checkbox when not SFT
+    $('rg-multi').disabled = rg !== 'sft';
+  }
+
+  $('rg-regime').addEventListener('change', update);
+  $('rg-multi').addEventListener('change', update);
+  update();
+})();
+</script>
+
+</body>
+</html>

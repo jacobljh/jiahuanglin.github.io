@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>11 · Scaling, cost &amp; monitoring</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">data_engineering</a>
+    <span class="crumb">/</span>
+    <span class="crumb">11 · scaling &amp; cost</span>
+    <span class="step-pill">lesson 11 / 11</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Scaling, cost &amp; monitoring</h1>
+<p class="subtitle">The capstone: think in records/sec and $/M-tokens end to end, find and widen the bottleneck, and instrument the pipeline so a silent upstream failure never corrupts a training run.</p>
+
+<div class="callout">
+  <div class="label">Where we are</div>
+  This is the final lesson. Every prior stage is now visible at once: ingest (03), store as Parquet (04), transform/shuffle (05), dedup (06), tokenize and pack (07), quality gates (08), orchestrate (09), and the RL online dataplane (10). Lesson 11 puts a cost and throughput model around the whole thing — so you can reason about where the money goes, what to fix first, and how to know when something silently breaks.
+</div>
+
+<h2>Think in throughput, not just time</h2>
+
+<p>A pipeline has one useful unit: <strong>records per second</strong> (or GB/s) per stage, and a derived unit: <strong>$/M tokens processed</strong> end to end. Time matters because it drives cluster cost; the right way to cut cost is almost never "run the same job more slowly" — it is to make each stage faster so the cluster is smaller or runs shorter.</p>
+
+<p>The governing principle is <strong>bottleneck (critical-path) reasoning</strong>: total wall-clock is dominated by the slowest stage, and no amount of parallelism in the fast stages helps. Add workers where the bottleneck is; everywhere else you are paying for idle cores.</p>
+
+<span class="math block">T<sub>total</sub> = max(T<sub>ingest</sub>, T<sub>transform</sub>, T<sub>dedup</sub>, T<sub>tokenize</sub>, T<sub>score</sub>)   — the bottleneck stage gates everything</span>
+
+<p>In practice the stages are not perfectly parallel, but the intuition holds: profile first, widen the single longest bar, repeat.</p>
+
+<h2>Bottleneck taxonomy</h2>
+
+<p>Four kinds of bottlenecks appear in every post-training pipeline. Each has a characteristic symptom, a root cause, and a fix that maps to a prior lesson.</p>
+
+<table>
+  <thead>
+    <tr><th>Symptom</th><th>Bound</th><th>Root cause</th><th>Fix</th><th>Lesson</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>High scan cost, workers idle while reading</td>
+      <td><strong>I/O-bound</strong></td>
+      <td>Row format (JSONL), no partition pruning, over-wide columns selected</td>
+      <td>Columnar Parquet + predicate pushdown + partition pruning; read only the columns you need</td>
+      <td><a href="04_storage_formats.html">04</a></td>
+    </tr>
+    <tr>
+      <td>Stage takes 10× longer than the map; network saturated</td>
+      <td><strong>Shuffle-bound</strong></td>
+      <td>All-to-all data movement in dedup/join; too many partitions or too large a shuffle payload</td>
+      <td>Filter and project <em>before</em> the shuffle; fewer, larger partitions; MinHash so only hashes move (not full records)</td>
+      <td><a href="05_transformation.html">05</a>, <a href="06_dedup_decon.html">06</a></td>
+    </tr>
+    <tr>
+      <td>CPU pinned at 100%, GPUs idle, queue grows</td>
+      <td><strong>CPU-bound</strong></td>
+      <td>Tokenizer or heuristic quality filters are single-threaded; insufficient workers for the tokenize/pack stage</td>
+      <td>More workers; parallelize tokenizer across cores; move cheap heuristics before expensive model calls</td>
+      <td><a href="07_tokenization_packing.html">07</a></td>
+    </tr>
+    <tr>
+      <td>GPU utilization low despite large batch; queue of un-scored records grows</td>
+      <td><strong>GPU-bound</strong></td>
+      <td>Model-in-loop scoring (reward model, LLM filter, RL rollouts) not batched; CPU preprocessing starves the GPU</td>
+      <td>Batch GPU calls; overlap CPU and GPU stages with Ray Data streaming; right-size GPU instance type</td>
+      <td><a href="05_transformation.html">05</a>, <a href="08_quality_validation.html">08</a>, <a href="10_rl_online_dataplane.html">10</a></td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Cost levers</h2>
+
+<p>Once you know the bottleneck, five levers determine cost in roughly decreasing order of impact:</p>
+
+<ol>
+  <li><strong>Read less data</strong> — columnar + pushdown is not a minor optimization; it is often a 10–50× scan reduction (lesson 04). Every byte not read is a byte not paid for and not processed.</li>
+  <li><strong>Spot / preemptible instances</strong> — most pipeline stages are idempotent (lesson 02) and can checkpoint. Running on spot instances cuts compute cost by 60–80% at the price of occasional restarts, which a well-designed orchestrator (lesson 09) handles transparently.</li>
+  <li><strong>Right-size partitions</strong> — partitions that are too small create scheduling and file-open overhead; too large and you lose parallelism and create stragglers (lesson 05). Aim for 100–500 MB per partition.</li>
+  <li><strong>Cache and materialize intermediate results</strong> — if the quality-gate output is expensive to produce (reward-model scored silver layer), materialize it as a versioned Parquet snapshot (lesson 09) rather than recomputing it every training run.</li>
+  <li><strong>Autoscale, don't overprovision</strong> — a cluster sized for peak ingest sits idle 22 hours a day. Orchestrators with autoscaling spin up workers only when a DAG stage needs them and release them immediately after.</li>
+</ol>
+
+<div class="callout warn">
+  <div class="label">The partition size trap</div>
+  Teams that hit a throughput wall often reach for more workers first. More often the problem is partition count: 50,000 tiny 2 MB Parquet files mean 50,000 separate open/read/close calls before a single transform runs. Compact to 128–512 MB files first, then add workers. The effect is usually 5–10× faster with no new hardware.
+</div>
+
+<h2>The end-to-end reference architecture</h2>
+
+<p>Every post-training pipeline is a variant of the same shape. The batch path runs nightly or on demand; the RL online path runs continuously inside the training loop.</p>
+
+<pre class="ascii">BATCH PATH (SFT / DPO / offline RL)
+─────────────────────────────────────────────────────────────────────────────
+ SOURCES          BRONZE              SILVER                       GOLD
+ annotate  ──┐   ┌──────────┐  ETL   ┌────────────────────┐  pack ┌────────┐
+ synth     ──┼──▶│  raw     │──────▶ │ clean              │──────▶│ token- │──▶ TRAINER
+ logs      ──┤   │  JSONL   │  Spark │ dedup (MinHash/LSH)│       │ ized   │    SFT/DPO
+ scrape    ──┘   │  immut.  │  Ray   │ decon (n-gram)     │       │ packed │
+                 │  proven. │  Daft  │ quality gate       │       │ Parquet│
+                 └──────────┘        │ (heuristic+model)  │       └────────┘
+                  lesson 03          └────────────────────┘        lesson 07
+                                     lessons 05, 06, 08
+                 Orchestrated by Airflow / Dagster / Prefect (lesson 09)
+                 Versioned, lineage-tracked, reproducible (lesson 02)
+
+RL ONLINE OVERLAY (lesson 10) — runs inside the training loop every step
+─────────────────────────────────────────────────────────────────────────────
+ PROMPT BANK ──▶ ROLLOUT WORKERS ──▶ VERIFY ──▶ REPLAY BUFFER ──▶ TRAINER
+                  (policy model)      (rule/                        updates
+                                      model)                        weights
+                       ▲                                               │
+                       └───────────────── weight sync ─────────────────┘
+ Batch ETL feeds the prompt bank; rollouts re-enter as data every step.</pre>
+
+<p>The two paths share the quality-gate and tokenize/pack stages — gold Parquet from the batch path is the same format the RL trainer consumes, which is why getting the batch path right (lessons 04–09) also sets up the RL path (lesson 10) correctly.</p>
+
+<h2>Monitoring and data observability</h2>
+
+<p>A pipeline that runs without monitoring is not a pipeline — it is a time bomb. Silent data quality degradation is the most common cause of mysterious training regressions. Four signals cover the vast majority of real failures:</p>
+
+<ul>
+  <li><strong>Volume</strong> — count records at each stage boundary. If dedup is passing 30% fewer records than last week and no rule changed, something upstream changed. Alert on drops and spikes above a percentage threshold (e.g. ±20%).</li>
+  <li><strong>Freshness / lateness</strong> — track the max ingestion timestamp of the newest record in each layer. A freshness lag growing beyond the SLA means an upstream source stopped or the ingest job is silently failing partial runs.</li>
+  <li><strong>Schema drift</strong> — a field changes type, is renamed, or disappears. In a typed system (Parquet with an enforced schema contract) this raises an exception; in a schema-on-read JSON world it propagates as silent nulls or wrong-typed values until a model produces garbage. Validate schema at every stage boundary, not just at ingest.</li>
+  <li><strong>Distribution / quality drift</strong> — the distribution of scores, token lengths, language mix, or pass-rate through quality gates shifts. This is harder to detect but more dangerous: the schema is fine, the counts are normal, but the data is different enough to send training in a bad direction.</li>
+</ul>
+
+<div class="callout bad">
+  <div class="label">Unmonitored schema drift — a real failure pattern</div>
+  An upstream annotation team renames <code>response</code> to <code>completion</code> in their export. The ingest job runs without error because it is schema-on-read. Bronze lands with the new field name. The transform stage reads <code>response</code>, finds nulls for all new records, drops them silently in the quality gate's null-length filter. Volume looks normal because old records still flow. The gold dataset is now half the size it should be — but the training job starts anyway, sees an underfit loss, and the team spends a week debugging the optimizer. The fix is schema contracts enforced at the bronze boundary and volume alerts on quality-gate pass-rate: a sudden drop from 85% to 40% would have flagged the issue within one pipeline run.
+</div>
+
+<h2>Interactive · end-to-end pipeline sizer</h2>
+
+<p>Set your dataset size, worker count, and pipeline configuration. The widget computes per-stage time, shows a stacked breakdown, highlights the bottleneck, and reports total wall-clock, effective throughput, and estimated cluster cost. Use it to find the bottleneck — then fix it with the lesson it points to.</p>
+
+<div class="widget" id="sizer-widget">
+  <div class="title">End-to-end pipeline sizer</div>
+  <div class="hint">Throughput assumptions are illustrative but internally consistent. The bottleneck stage (red) gates everything — adding workers elsewhere is money wasted.</div>
+
+  <div class="controls">
+    <label class="inline">dataset:
+      <input type="range" id="sz-data" min="10" max="5000" step="10" value="500">
+      <span class="val" id="sz-data-v">500 GB</span>
+    </label>
+    <label class="inline">workers:
+      <input type="range" id="sz-w" min="1" max="256" step="1" value="32">
+      <span class="val" id="sz-w-v">32</span>
+    </label>
+    <label class="inline">shuffle %:
+      <input type="range" id="sz-shuf" min="0" max="100" step="5" value="40">
+      <span class="val" id="sz-shuf-v">40%</span>
+    </label>
+    <label class="inline">model scoring:
+      <input type="checkbox" id="sz-gpu" checked>
+      <span class="val" id="sz-gpu-v">on</span>
+    </label>
+    <label class="inline">GPU batch size:
+      <input type="range" id="sz-batch" min="1" max="128" step="1" value="32">
+      <span class="val" id="sz-batch-v">32</span>
+    </label>
+  </div>
+
+  <div id="sz-bars" style="margin:16px 0;"></div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">Wall-clock</div><div class="v" id="sz-total">—</div></div>
+    <div class="kpi"><div class="k">Throughput</div><div class="v" id="sz-tput">—</div></div>
+    <div class="kpi"><div class="k">Cluster cost</div><div class="v" id="sz-cost">—</div></div>
+    <div class="kpi"><div class="k">$/M tokens</div><div class="v" id="sz-tok-cost">—</div></div>
+    <div class="kpi"><div class="k">Bottleneck</div><div class="v" id="sz-bn" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">Fix lesson</div><div class="v" id="sz-fix" style="font-size:14px;">—</div></div>
+  </div>
+
+  <div class="callout" id="sz-note" style="margin-top:16px;"></div>
+</div>
+
+<h2>Connecting monitoring to the pipeline sizer</h2>
+
+<p>The sizer above shows what <em>should</em> happen given your configuration. Monitoring tells you what <em>is</em> happening. When the two diverge — stage throughput drops below the modelled value, quality-gate pass-rate collapses, gold record count falls — you have an incident. The alert should name the stage (from your per-stage volume metrics), and that stage maps directly to the lesson and the fix.</p>
+
+<p>For RL pipelines (lesson 10), monitoring takes on a new urgency: a freshness failure in the replay buffer means the policy is training on stale trajectories that no longer reflect the current weights, which can cause reward hacking or training instability that looks like a hyperparameter problem.</p>
+
+<h2>Takeaway</h2>
+
+<div class="callout ok">
+  <div class="label">What this series was building toward</div>
+  A post-training data pipeline is an ETL system with a GPU stage in the middle and, in RL, a tight online loop at the end. The cost and throughput model is always the same: find the bottleneck stage, widen it with the right tool (columnar for I/O, fewer shuffles for network, more workers for CPU, batching + overlap for GPU), and monitor volume, freshness, schema, and distribution so a silent upstream change never reaches the trainer. Every lesson in this series — <a href="03_ingestion.html">ingest</a>, <a href="04_storage_formats.html">store</a>, <a href="05_transformation.html">transform</a>, <a href="06_dedup_decon.html">dedup</a>, <a href="07_tokenization_packing.html">tokenize</a>, <a href="08_quality_validation.html">quality</a>, <a href="09_orchestration.html">orchestrate</a>, <a href="10_rl_online_dataplane.html">online dataplane</a> — is a chapter in that story. To go deeper on <em>which</em> data to select for maximum gradient signal, pair this series with the <a href="../../RL/lessons/18a_data_pipelines.html">RL data-curation lesson</a>. To see the full RL training system this pipeline feeds, start from the <a href="../../RL/lessons/index.html">RL series index</a>.
+</div>
+
+<footer class="lesson-nav">
+  <a href="10_rl_online_dataplane.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">10 · The RL online dataplane</span>
+  </a>
+  <a class="next" href="index.html">
+    <span class="dir">↑ Contents</span>
+    <span class="ttl">↑ Back to contents</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+
+  // ── DOM handles ──
+  var slData  = $('sz-data');
+  var slW     = $('sz-w');
+  var slShuf  = $('sz-shuf');
+  var cbGpu   = $('sz-gpu');
+  var slBatch = $('sz-batch');
+
+  // ── throughput constants (all units: GB/s per worker unless noted) ──
+  var INGEST_GBPS   = 0.30;   // I/O read from object store per worker
+  var XFORM_GBPS    = 0.25;   // CPU narrow transform (filter/map) per worker
+  var NET_GBPS      = 1.25;   // effective shuffle network bandwidth per worker
+  var SHUF_OVERHEAD = 0.004;  // sec per partition connection overhead
+  var TOK_GBPS      = 0.18;   // tokenizer throughput per worker
+  var PARTITIONS    = 512;    // assumed partition count
+  // GPU scoring: records/sec per GPU at given batch size
+  // a reward model at batch=32 processes ~200 records/sec on a single A100.
+  // We assume W/8 GPUs (1 GPU per 8 CPU workers, typical ratio).
+  var GPU_REC_PER_SEC_BASE = 50;  // at batch=1
+  var GPU_BATCH_SCALE      = 0.7; // sub-linear: throughput ~ batch^0.7
+  var AVG_RECORD_BYTES     = 2000; // ~2 KB per (prompt, response) pair average
+  var COST_PER_WORKER_HR   = 0.12; // $/hr per CPU worker (spot-equivalent)
+  var AVG_TOKENS_PER_RECORD = 800; // tokens per record after packing
+
+  function fmtTime(s) {
+    if (s < 1)    return (s * 1000).toFixed(0) + ' ms';
+    if (s < 90)   return s.toFixed(1) + ' s';
+    if (s < 5400) return (s / 60).toFixed(1) + ' min';
+    return (s / 3600).toFixed(2) + ' h';
+  }
+
+  function fmtGB(gb) {
+    if (gb >= 1000) return (gb / 1000).toFixed(2) + ' TB';
+    if (gb >= 1)    return gb.toFixed(1) + ' GB';
+    return (gb * 1000).toFixed(0) + ' MB';
+  }
+
+  function recompute() {
+    var D   = +slData.value;          // GB
+    var W   = +slW.value;             // CPU workers
+    var SF  = +slShuf.value / 100;    // shuffle fraction 0–1
+    var GPU = cbGpu.checked;
+    var B   = +slBatch.value;         // GPU batch size
+
+    // update display labels
+    $('sz-data-v').textContent  = D >= 1000 ? (D / 1000).toFixed(2) + ' TB' : D + ' GB';
+    $('sz-w-v').textContent     = W;
+    $('sz-shuf-v').textContent  = (SF * 100).toFixed(0) + '%';
+    $('sz-gpu-v').textContent   = GPU ? 'on' : 'off';
+    $('sz-batch-v').textContent = B;
+    slBatch.disabled = !GPU;
+
+    // ── per-stage wall-clock ──
+
+    // 1. INGEST — read from source, parallel across workers
+    var tIngest = (D / W) / INGEST_GBPS;
+
+    // 2. TRANSFORM — narrow map/filter, parallel
+    var tXform = (D / W) / XFORM_GBPS;
+
+    // 3. DEDUP shuffle — SF fraction of data crosses network all-to-all
+    var shufBytes = D * SF;
+    var tDedup = (shufBytes / (W * NET_GBPS)) + (SF > 0 ? PARTITIONS * SHUF_OVERHEAD : 0);
+
+    // 4. TOKENIZE — CPU-bound, parallel across workers
+    var tTok = (D / W) / TOK_GBPS;
+
+    // 5. MODEL SCORING (GPU) — if enabled
+    var tScore = 0;
+    if (GPU) {
+      var numGPUs = Math.max(1, Math.floor(W / 8));
+      // throughput scales sub-linearly with batch size
+      var gpuTput = GPU_REC_PER_SEC_BASE * numGPUs * Math.pow(B, GPU_BATCH_SCALE);
+      var totalRecords = (D * 1e9) / AVG_RECORD_BYTES;
+      tScore = totalRecords / gpuTput;
+    }
+
+    var stages = [
+      { name: 'ingest',    t: tIngest, color: 'var(--accent)',   bn: 'I/O-bound',     fix: '04', fixLabel: 'columnar + pushdown' },
+      { name: 'transform', t: tXform,  color: '#7c3aed',         bn: 'CPU-bound',     fix: '05', fixLabel: 'more workers / narrow ops' },
+      { name: 'dedup',     t: tDedup,  color: 'var(--warn)',     bn: 'shuffle-bound', fix: '05/06', fixLabel: 'fewer/smaller shuffles' },
+      { name: 'tokenize',  t: tTok,    color: '#0891b2',         bn: 'CPU-bound',     fix: '07', fixLabel: 'more workers' },
+      { name: 'score(GPU)',t: tScore,  color: 'var(--bad)',      bn: 'GPU-bound',     fix: '08/10', fixLabel: 'larger batches + overlap' }
+    ];
+
+    // find bottleneck (slowest stage; skip score if GPU off)
+    var activeStages = GPU ? stages : stages.slice(0, 4);
+    var maxT = 0;
+    var bnStage = activeStages[0];
+    for (var i = 0; i < activeStages.length; i++) {
+      if (activeStages[i].t > maxT) {
+        maxT = activeStages[i].t;
+        bnStage = activeStages[i];
+      }
+    }
+
+    var total = maxT; // wall-clock gated by slowest (pipeline parallelism assumed)
+    var tputGB = D / total;
+    var totalRecords2 = (D * 1e9) / AVG_RECORD_BYTES;
+    var tputRec = totalRecords2 / total;
+
+    // cost: workers run for wall-clock time
+    var clusterCost = (W * COST_PER_WORKER_HR * total / 3600);
+    // add GPU cost if enabled: 1 A100 ~ $2/hr spot
+    if (GPU) {
+      var numGPUs2 = Math.max(1, Math.floor(W / 8));
+      clusterCost += numGPUs2 * 2.0 * total / 3600;
+    }
+    var totalTokens = totalRecords2 * AVG_TOKENS_PER_RECORD / 1e6; // M tokens
+    var costPerMTok = totalTokens > 0 ? clusterCost / totalTokens : 0;
+
+    $('sz-total').textContent    = fmtTime(total);
+    $('sz-tput').textContent     = tputGB.toFixed(2) + ' GB/s';
+    $('sz-cost').textContent     = '$' + clusterCost.toFixed(2);
+    $('sz-tok-cost').textContent = '$' + costPerMTok.toFixed(3) + '/M';
+    $('sz-bn').textContent       = bnStage.name + ' (' + bnStage.bn + ')';
+    $('sz-fix').textContent      = 'lesson ' + bnStage.fix;
+
+    // ── stacked bar ──
+    var barHtml = '<div style="font-size:12px;color:var(--text-mute);margin-bottom:4px;">per-stage wall-clock (bottleneck highlighted)</div>';
+    barHtml += '<div style="display:flex;height:28px;border-radius:6px;overflow:hidden;border:1px solid var(--border);">';
+    var sumT = 0;
+    for (var j = 0; j < activeStages.length; j++) { sumT += activeStages[j].t; }
+    for (var k = 0; k < activeStages.length; k++) {
+      var s = activeStages[k];
+      var pct = sumT > 0 ? (s.t / sumT * 100) : 0;
+      var isBn = s === bnStage;
+      var outline = isBn ? 'box-shadow:inset 0 0 0 2px rgba(255,255,255,0.6);' : '';
+      var label = pct > 8 ? s.name : '';
+      barHtml += '<div title="' + s.name + ': ' + fmtTime(s.t) + (isBn ? ' ← BOTTLENECK' : '') + '"'
+        + ' style="width:' + pct.toFixed(1) + '%;background:' + s.color + ';'
+        + 'display:flex;align-items:center;justify-content:center;'
+        + 'font-size:10px;color:#fff;' + outline + '">'
+        + label + '</div>';
+    }
+    barHtml += '</div>';
+    barHtml += '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px;">';
+    for (var m = 0; m < activeStages.length; m++) {
+      var st = activeStages[m];
+      var dot = '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + st.color + ';margin-right:4px;"></span>';
+      barHtml += '<span style="font-size:11px;color:var(--text-mute);display:inline-flex;align-items:center;">'
+        + dot + st.name + ' ' + fmtTime(st.t) + '</span>';
+    }
+    barHtml += '</div>';
+    $('sz-bars').innerHTML = barHtml;
+
+    // ── callout read-out ──
+    var noteEl = $('sz-note');
+    var cls, msg;
+    if (bnStage.name === 'ingest') {
+      cls = '';
+      msg = '<div class="label">Bottleneck: I/O (ingest)</div>'
+        + 'The scan is the bottleneck — workers are waiting on disk or network reads. '
+        + 'Convert sources to partitioned Parquet with column pushdown (<a href="04_storage_formats.html">lesson 04</a>). '
+        + 'A 50× scan reduction is realistic moving from JSONL to columnar. '
+        + 'Check partition file sizes: if they are &lt;50 MB, compaction will help before adding workers.';
+    } else if (bnStage.name === 'dedup') {
+      cls = 'warn';
+      msg = '<div class="label">Bottleneck: shuffle (dedup)</div>'
+        + 'The dedup shuffle is gating the pipeline. '
+        + 'With ' + (SF * 100).toFixed(0) + '% of data shuffled across ' + W + ' workers, '
+        + 'the all-to-all exchange dominates. '
+        + 'Filter and project <em>before</em> the shuffle to reduce payload size; '
+        + 'ensure MinHash signatures move instead of full records (<a href="06_dedup_decon.html">lesson 06</a>). '
+        + 'More workers help only marginally — reduce shuffle volume first.';
+    } else if (bnStage.name === 'score(GPU)') {
+      cls = 'bad';
+      msg = '<div class="label">Bottleneck: GPU scoring</div>'
+        + 'Model-based scoring (reward model / quality filter) is the slowest stage. '
+        + 'Increase batch size (currently ' + B + ') — GPU throughput scales sub-linearly with batch, '
+        + 'so doubling batch size is nearly free latency-wise. '
+        + 'Use Ray Data\'s streaming executor so CPU stages run ahead of the GPU, keeping it fed (<a href="05_transformation.html">lesson 05</a>). '
+        + 'Also consider moving cheap heuristic filters <em>before</em> model scoring to reduce the records the GPU sees (<a href="08_quality_validation.html">lesson 08</a>, <a href="10_rl_online_dataplane.html">lesson 10</a>).';
+    } else {
+      cls = '';
+      msg = '<div class="label">Bottleneck: CPU (' + bnStage.name + ')</div>'
+        + 'CPU processing is the constraint. '
+        + 'Adding more workers will scale this stage nearly linearly — it is an embarrassingly parallel operation. '
+        + 'See <a href="07_tokenization_packing.html">lesson 07</a> for tokenizer parallelism and <a href="05_transformation.html">lesson 05</a> for partition-to-worker sizing. '
+        + 'Check that your partition count (' + PARTITIONS + ') is at least 2–4× the worker count (' + W + ') '
+        + 'to keep all workers busy throughout the stage.';
+    }
+    noteEl.className = 'callout ' + cls;
+    noteEl.innerHTML = msg;
+  }
+
+  [slData, slW, slShuf, slBatch].forEach(function (el) {
+    el.addEventListener('input', recompute);
+  });
+  cbGpu.addEventListener('change', recompute);
+  recompute();
+})();
+</script>
+
+</body>
+</html>

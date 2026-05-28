@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>07 · Tokenization &amp; packing</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">data_engineering</a>
+    <span class="crumb">/</span>
+    <span class="crumb">07 · tokenization &amp; packing</span>
+    <span class="step-pill">lesson 7 / 11</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Tokenization &amp; packing</h1>
+<p class="subtitle">Lesson 06 gave us a clean, deduplicated silver dataset. This lesson is the gold-layer transform: run a tokenizer over every example, apply loss masks, then pack the resulting token arrays into dense, context-length sequences the trainer consumes with zero wasted compute.</p>
+
+<div class="callout">
+  <div class="label">Where we are</div>
+  Silver is text. Gold is token-id arrays stored as typed integer columns in Parquet (lesson 04's columnar layout), ready for the DataLoader to mmap directly without re-tokenizing at train time. This lesson builds that transformation.
+</div>
+
+<h2>Tokenization as a pipeline stage</h2>
+
+<p>Tokenization is a <strong>narrow / map operation</strong> (lesson 05's taxonomy): each example is converted independently, with no cross-example state. That means it parallelizes perfectly across partitions and workers — double the cluster, halve the time, no shuffle required.</p>
+
+<p>The catch is <strong>determinism</strong>. A tokenizer is not just a function — it is a specific version of a vocabulary file plus encoding logic. If you pin neither, two runs of the gold layer can produce different token-id arrays from the same text, silently breaking reproducibility (lesson 02). The rule:</p>
+
+<ul>
+  <li>Pin the tokenizer artifact by hash, not by name. <code>tokenizer == "Llama-3"</code> is ambiguous; <code>sha256 == a3f…</code> is not.</li>
+  <li>Record the tokenizer version in the Parquet metadata of every gold file — so any reader can verify what produced the file without reading the pipeline code.</li>
+  <li>Special tokens (<code>&lt;|im_start|&gt;</code>, <code>&lt;|eot_id|&gt;</code>, etc.) are part of the tokenizer contract. A mismatch here corrupts the chat template silently.</li>
+</ul>
+
+<p>In Parquet the output is an integer array column (<code>token_ids: list&lt;int32&gt;</code>) and a boolean / uint8 column (<code>loss_mask: list&lt;uint8&gt;</code>). Both compress very well under Zstd — integer sequences have low entropy and high repetition. Storing them columnar means the DataLoader reads only these two columns (not the raw text) at train time, which is the column-projection benefit from lesson 04.</p>
+
+<h2>Loss masking</h2>
+
+<p>Each token carries a binary <strong>loss mask</strong>: 1 means "compute cross-entropy loss here", 0 means "skip this token." The mask is not an afterthought — it determines what the model actually learns.</p>
+
+<table>
+  <thead>
+    <tr><th>Regime</th><th>What gets mask = 1</th><th>What gets mask = 0</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>SFT</strong></td><td>Assistant / response tokens</td><td>System prompt, user turn, padding</td></tr>
+    <tr><td><strong>Preference (DPO)</strong></td><td>Response tokens in both chosen and rejected</td><td>Shared prompt prefix, padding</td></tr>
+    <tr><td><strong>Tool-use / agentic</strong></td><td>Model-generated text and function calls</td><td>Tool observation / environment text the model did <em>not</em> generate</td></tr>
+  </tbody>
+</table>
+
+<p>Packing (below) changes the attention mask and position IDs across document boundaries — it does <em>not</em> change these per-document loss-mask rules. Boundary / BOS tokens introduced by packing remain unmasked only if they would have been unmasked in the original example.</p>
+
+<p>For SFT the loss mask is derived from the chat template structure: everything between <code>&lt;|im_start|&gt;system</code> / <code>&lt;|im_start|&gt;user</code> and the corresponding <code>&lt;|im_end|&gt;</code> is masked; only the assistant span is unmasked. For agentic / tool-use data, observation tokens — text produced by the environment, not by the model — must be masked too. Those are the "steps the model did not take" and training on them as if they were model output corrupts the policy. See the <a href="../../RL/lessons/08_agentic.html">agentic RL lesson</a> for how this interacts with multi-turn rollout structure.</p>
+
+<pre class="ascii">SFT example · token sequence with mask:
+
+  [SYS] You are a coding assistant.  [/SYS] [USER] Fix this bug. [/USER] [ASST] Here is the fix: ... [/ASST]
+   ──────────────── mask = 0 ─────────────────────────────────────────   ───── mask = 1 ──────────────────
+
+Agentic example:
+
+  [ASST] &lt;tool_call&gt;search("foo")&lt;/tool_call&gt;   [OBS] {"result":"bar"}  [/OBS]  [ASST] The answer is bar.
+   ──────────── mask = 1 ─────────────────────    ──────── mask = 0 ────────────   ─────── mask = 1 ──────</pre>
+
+<p>Preference data tokenizes both branches (chosen, rejected) as separate sequences and applies the same prompt-masking rule to both. A common implementation error is to forget to mask the shared prefix in the rejected branch — the model then receives gradient signal telling it to reduce the log-prob of the prompt itself.</p>
+
+<h2>Sequence packing: eliminating padding waste</h2>
+
+<p>Most post-training examples are short. An SFT example might be 200–800 tokens; a math chain-of-thought might be 2&nbsp;000. But the model's context window <span class="math">L</span> is 4&nbsp;096, 8&nbsp;192, or 131&nbsp;072 tokens. If you allocate one sequence per example and pad to <span class="math">L</span>, the padding fraction is:</p>
+
+<p class="math block">padding waste = 1 − mean_length / L</p>
+
+<p>At <span class="math">L = 8192</span> and mean length 512, you waste 94% of every sequence. That means 94% of the GPU's attention FLOP and memory bandwidth serve padding tokens — tokens that contribute zero gradient. You are paying full training cost to process noise.</p>
+
+<p><strong>Sequence packing</strong> solves this by concatenating multiple examples end-to-end into one length-<span class="math">L</span> sequence:</p>
+
+<pre class="ascii">Padded (one example per sequence, L = 32):
+
+  seq 1: [doc_A ─ 10 tok ─][padding ── 22 tok ────────────────]
+  seq 2: [doc_B ── 14 tok ────][padding ──── 18 tok ────────────]
+  seq 3: [doc_C ── 8 tok ─][padding ──── 24 tok ─────────────────]
+
+Packed (multiple examples per sequence, L = 32):
+
+  seq 1: [doc_A ─ 10 tok ─][doc_B ── 14 tok ────][doc_D ─ 8 tok ─]
+  seq 2: [doc_C ── 8 tok ─][doc_E ── 12 tok ─────][doc_F ─ 7 tok][pad 5]
+  seq 3: [doc_G ── 20 tok ─────────][doc_H ─ 12 tok ──────────────]</pre>
+
+<p>Packing raises utilization from <span class="math">mean_length / L</span> toward ~100%. Assembling sequences is a <strong>bin-packing</strong> problem: each example is an item of size <span class="math">len_i</span>, each sequence is a bin of capacity <span class="math">L</span>. First-fit decreasing (FFD) — sort examples longest-first, greedily assign each to the first bin that still fits — achieves near-optimal utilization in linear time and is the standard approach. Best-fit decreasing gets marginally better fill at higher CPU cost and is rarely worth it at scale.</p>
+
+<div class="callout bad">
+  <div class="label">The cross-document attention bug</div>
+  Packing without a matching attention mask silently corrupts training. A standard causal attention mask lets every token attend to all preceding tokens in the sequence. After packing, "preceding tokens" includes the tail of the previous document — which is semantically unrelated. Token <code>i</code> in document B attends to and is predicted given document A's context, which is wrong: it inflates log-probabilities for tokens that happen to follow a specific unrelated document, and injects spurious gradient signal. The fix is a <strong>block-diagonal attention mask</strong> (sometimes called "packed attention" or "document attention"): each document attends only to itself. Paired with per-document position IDs that reset to 0 at each document boundary (so positional encodings are locally coherent), this is the correct packing implementation. Flash Attention's varlen interface (<code>cu_seqlens</code>) implements this exactly. Without it, packing is not a free lunch — it is a training bug at scale.
+</div>
+
+<p>For RL, packing shows up again in rollout batches: variable-length trajectories are packed into fixed-size batches for the value / advantage computation. The same correctness constraints apply — see <a href="../../RL/lessons/22b_longtail_rollouts.html">RL lesson 22b on long-tail rollout handling</a>.</p>
+
+<h2>The throughput math</h2>
+
+<p>Define:</p>
+
+<ul>
+  <li><span class="math">N</span> = number of examples in the dataset</li>
+  <li><span class="math">L</span> = context length (sequence length)</li>
+  <li><span class="math">μ</span> = mean example length in tokens</li>
+</ul>
+
+<p><strong>Without packing</strong>, the number of training sequences is <span class="math">N</span> (one per example), total tokens processed = <span class="math">N × L</span>, of which <span class="math">N × (L − μ)</span> are padding. Padding efficiency = <span class="math">μ / L</span>.</p>
+
+<p><strong>With packing</strong>, the number of sequences shrinks to roughly <span class="math">N × μ / L</span> (approximately — bin-packing incurs small overhead). Total real tokens processed ≈ <span class="math">N × μ</span>. The speedup from packing is approximately <span class="math">L / μ</span> — the inverse of the padding efficiency. At <span class="math">L = 8192</span> and <span class="math">μ = 512</span> that is a 16× reduction in sequences and thus a ~16× throughput gain for identical gradient signal.</p>
+
+<h2>Interactive · packing-efficiency simulator</h2>
+
+<p>Set the context length, mean example length, and variance. Compare padded (one example per sequence) vs packed (bin-packed to fill the context window). Observe the padding waste, effective tokens, and the throughput multiplier.</p>
+
+<div class="widget" id="pack-widget">
+  <div class="title">Sequence packing efficiency</div>
+  <div class="hint">Drag the sliders to change the context window size, example lengths, and spread. The visualization shows real-token vs padding fill for a batch of 8 sequences under each strategy.</div>
+
+  <div class="controls">
+    <label class="inline">context length L: <input type="range" id="pk-L" min="512" max="16384" step="512" value="4096"><span class="val" id="pk-L-v">4096</span></label>
+    <label class="inline">mean example length: <input type="range" id="pk-mu" min="64" max="4096" step="64" value="512"><span class="val" id="pk-mu-v">512 tok</span></label>
+    <label class="inline">length variance (spread): <input type="range" id="pk-var" min="0" max="100" step="5" value="40"><span class="val" id="pk-var-v">40%</span></label>
+    <label class="inline">examples in dataset: <input type="range" id="pk-N" min="100" max="10000" step="100" value="1000"><span class="val" id="pk-N-v">1 000</span></label>
+  </div>
+
+  <div id="pk-vis" style="margin:20px 0;"></div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">Padding waste (padded)</div><div class="v" id="pk-waste">—</div></div>
+    <div class="kpi"><div class="k">Padding waste (packed)</div><div class="v" id="pk-waste2">—</div></div>
+    <div class="kpi"><div class="k">Sequences needed</div><div class="v" id="pk-seqs">—</div></div>
+    <div class="kpi"><div class="k">Throughput gain</div><div class="v" id="pk-gain">—</div></div>
+  </div>
+
+  <div class="callout" id="pk-note" style="margin-top:16px;"></div>
+</div>
+
+<h2>Takeaway</h2>
+
+<div class="callout ok">
+  <div class="label">What to carry to lesson 08</div>
+  The gold layer is not just "run a tokenizer." It is: pin the tokenizer version for determinism, apply correct loss masks per regime (SFT masks prompt; tool-use masks observations; preference masks shared prefix in both branches), and pack with a block-diagonal attention mask or you silently corrupt training. The throughput gain from packing can be 10–30×, which is why every serious post-training pipeline does it. Lesson 08 asks the next question: before these gold batches reach the trainer, how do you <em>validate</em> that the token arrays, masks, and lengths are actually correct?
+</div>
+
+<footer class="lesson-nav">
+  <a href="06_dedup_decon.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">06 · Dedup &amp; decontamination</span>
+  </a>
+  <a class="next" href="08_quality_validation.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">08 · Quality &amp; validation</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+
+  var slL   = $('pk-L');
+  var slMu  = $('pk-mu');
+  var slVar = $('pk-var');
+  var slN   = $('pk-N');
+
+  // Seeded LCG PRNG so the visualization is deterministic (same sliders => same bars)
+  function makePrng(seed){
+    var s = seed >>> 0;
+    return function(){
+      s = (Math.imul(1664525, s) + 1013904223) >>> 0;
+      return s / 4294967296;
+    };
+  }
+
+  // Sample example lengths from a bounded distribution around mu with spread fraction v
+  function sampleLengths(n, mu, spread, L, rng){
+    var half = mu * spread;
+    var lens = [];
+    for(var i = 0; i < n; i++){
+      // triangular-ish via two uniform draws
+      var u = (rng() + rng()) / 2;  // [0,1] bell-ish
+      var l = Math.round(mu + (u - 0.5) * 2 * half);
+      l = Math.max(1, Math.min(L, l));
+      lens.push(l);
+    }
+    return lens;
+  }
+
+  // First-fit decreasing bin packing; returns array of bins (each bin = array of lengths)
+  function binPackFFD(lens, L){
+    var sorted = lens.slice().sort(function(a,b){ return b - a; });
+    var bins = [];
+    var caps = [];
+    for(var i = 0; i < sorted.length; i++){
+      var item = sorted[i];
+      var placed = false;
+      for(var j = 0; j < bins.length; j++){
+        if(caps[j] >= item){
+          bins[j].push(item);
+          caps[j] -= item;
+          placed = true;
+          break;
+        }
+      }
+      if(!placed){
+        bins.push([item]);
+        caps.push(L - item);
+      }
+    }
+    return bins;
+  }
+
+  function fmtNum(n){
+    if(n >= 1000000) return (n/1000000).toFixed(2)+'M';
+    if(n >= 1000) return (n/1000).toFixed(1)+'k';
+    return n.toFixed(0);
+  }
+
+  function recompute(){
+    var L   = +slL.value;
+    var mu  = +slMu.value;
+    var vp  = +slVar.value / 100;  // spread fraction
+    var N   = +slN.value;
+
+    $('pk-L-v').textContent   = L.toLocaleString();
+    $('pk-mu-v').textContent  = mu.toLocaleString() + ' tok';
+    $('pk-var-v').textContent = (vp * 100).toFixed(0) + '%';
+    $('pk-N-v').textContent   = N.toLocaleString();
+
+    // clamp mu to L
+    if(mu > L) mu = L;
+
+    // Generate a fixed sample of N example lengths (seeded for reproducibility)
+    var rng = makePrng(42 + L + mu + Math.round(vp * 100) + N);
+    var lens = sampleLengths(N, mu, vp, L, rng);
+
+    // --- padded strategy ---
+    var paddedSeqs = N;
+    var paddedTokens = N * L;
+    var realTokens = lens.reduce(function(a,b){ return a+b; }, 0);
+    var paddingTokens = paddedTokens - realTokens;
+    var paddedWaste = paddingTokens / paddedTokens;
+
+    // --- packed strategy (FFD on full set, but cap bins for perf) ---
+    // For very large N we subsample for the packing simulation but scale results
+    var PACK_SAMPLE = Math.min(N, 2000);
+    var packLens = lens.slice(0, PACK_SAMPLE);
+    var bins = binPackFFD(packLens, L);
+    var packedSeqs = bins.length;
+    var packedRealTokens = packLens.reduce(function(a,b){ return a+b; }, 0);
+    var packedPadding = packedSeqs * L - packedRealTokens;
+    var packedWaste = packedPadding / (packedSeqs * L);
+
+    // Scale packed seq count to full N
+    var scaledPackedSeqs = Math.ceil(packedSeqs * N / PACK_SAMPLE);
+    // Throughput gain: padded seqs / packed seqs
+    var gain = paddedSeqs / scaledPackedSeqs;
+
+    $('pk-waste').textContent  = (paddedWaste * 100).toFixed(1) + '%';
+    $('pk-waste2').textContent = (packedWaste * 100).toFixed(1) + '%';
+    $('pk-seqs').textContent   = fmtNum(paddedSeqs) + ' → ' + fmtNum(scaledPackedSeqs);
+    $('pk-gain').textContent   = gain.toFixed(1) + '×';
+
+    // --- visualization: 8 sequences for each strategy ---
+    var VIS_N = 8;
+    // Padded: pick 8 examples from the sampled set
+    var padExamples = lens.slice(0, VIS_N);
+    // Packed: take the first 8 bins (or fewer if dataset is tiny)
+    var packBins = bins.slice(0, VIS_N);
+
+    function seqBar(segments, L, sectionLabel){
+      // segments: [{len, isPad, docIdx}]
+      var total = segments.reduce(function(a,s){ return a + s.len; }, 0);
+      var parts = segments.map(function(s, i){
+        var pct = (s.len / L * 100).toFixed(3);
+        var bg = s.isPad ? 'var(--bg-soft)' : (s.docIdx % 2 === 0 ? 'var(--ok)' : 'var(--accent)');
+        var border = s.isPad ? '1px solid var(--border)' : 'none';
+        var title = s.isPad ? 'padding (' + s.len + ' tok)' : 'doc (' + s.len + ' tok)';
+        return '<div title="' + title + '" style="width:' + pct + '%;background:' + bg + ';border-right:' + border + ';height:100%;box-sizing:border-box;"></div>';
+      });
+      return '<div style="display:flex;height:18px;border-radius:4px;overflow:hidden;border:1px solid var(--border);background:var(--bg-soft);">' + parts.join('') + '</div>';
+    }
+
+    var padHTML = '<div style="font-size:12px;color:var(--text-mute);margin-bottom:6px;font-weight:600;">PADDED — one example per sequence</div>';
+    for(var i = 0; i < padExamples.length; i++){
+      var realLen = padExamples[i];
+      var padLen  = L - realLen;
+      var segs = [{len: realLen, isPad: false, docIdx: i}];
+      if(padLen > 0) segs.push({len: padLen, isPad: true, docIdx: i});
+      padHTML += '<div style="margin-bottom:3px;">' + seqBar(segs, L) + '</div>';
+    }
+    padHTML += '<div style="font-size:11px;color:var(--text-mute);margin-top:4px;"><span style="display:inline-block;width:12px;height:10px;background:var(--ok);border-radius:2px;margin-right:4px;vertical-align:middle;"></span>real tokens&nbsp;&nbsp;<span style="display:inline-block;width:12px;height:10px;background:var(--bg-soft);border:1px solid var(--border);border-radius:2px;margin-right:4px;vertical-align:middle;"></span>padding</div>';
+
+    var packHTML = '<div style="font-size:12px;color:var(--text-mute);margin-top:16px;margin-bottom:6px;font-weight:600;">PACKED — bin-packed (first-fit decreasing)</div>';
+    for(var j = 0; j < packBins.length; j++){
+      var bin = packBins[j];
+      var binSegs = [];
+      var docBase = j * 3; // shift colors per bin
+      for(var k = 0; k < bin.length; k++){
+        binSegs.push({len: bin[k], isPad: false, docIdx: docBase + k});
+      }
+      var usedInBin = bin.reduce(function(a,b){ return a+b; }, 0);
+      var leftover = L - usedInBin;
+      if(leftover > 0) binSegs.push({len: leftover, isPad: true, docIdx: 0});
+      packHTML += '<div style="margin-bottom:3px;">' + seqBar(binSegs, L) + '</div>';
+    }
+    packHTML += '<div style="font-size:11px;color:var(--text-mute);margin-top:4px;"><span style="display:inline-block;width:12px;height:10px;background:var(--ok);border-radius:2px;margin-right:4px;vertical-align:middle;"></span>doc (even)<span style="display:inline-block;width:12px;height:10px;background:var(--accent);border-radius:2px;margin-left:8px;margin-right:4px;vertical-align:middle;"></span>doc (odd)&nbsp;&nbsp;<span style="display:inline-block;width:12px;height:10px;background:var(--bg-soft);border:1px solid var(--border);border-radius:2px;margin-left:8px;margin-right:4px;vertical-align:middle;"></span>padding</div>';
+
+    $('pk-vis').innerHTML = padHTML + packHTML;
+
+    // Callout
+    var note = $('pk-note');
+    var ratio = mu / L;
+    var cls, msg;
+    if(ratio < 0.15){
+      cls = 'bad';
+      msg = '<div class="label">Extreme waste — packing is mandatory</div>'
+        + 'Mean length ' + mu.toLocaleString() + ' tok vs context length ' + L.toLocaleString() + ' tok means <strong>' + (paddedWaste * 100).toFixed(0) + '% padding</strong> without packing. '
+        + 'Packed, you cut sequences from ' + fmtNum(paddedSeqs) + ' down to ~' + fmtNum(scaledPackedSeqs) + ' — a <strong>' + gain.toFixed(1) + '× throughput gain</strong> for identical gradient signal. '
+        + 'At this ratio, training without packing is indefensible.';
+    } else if(ratio < 0.5){
+      cls = 'warn';
+      msg = '<div class="label">Significant padding waste — packing strongly recommended</div>'
+        + (paddedWaste * 100).toFixed(0) + '% of each sequence is padding. '
+        + 'Packing yields a <strong>' + gain.toFixed(1) + '× speedup</strong> and reduces sequences from ' + fmtNum(paddedSeqs) + ' to ~' + fmtNum(scaledPackedSeqs) + '. '
+        + 'Implement block-diagonal attention masks (Flash Attention cu_seqlens) and reset position IDs at document boundaries.';
+    } else {
+      cls = 'ok';
+      msg = '<div class="label">Low padding waste — packing still helps but is less critical</div>'
+        + 'With mean length ' + mu.toLocaleString() + ' and context ' + L.toLocaleString() + ', padding waste is only ' + (paddedWaste * 100).toFixed(0) + '%. '
+        + 'Packing still gives a <strong>' + gain.toFixed(1) + '× gain</strong>, but the correctness overhead (block-diagonal masks, position ID resets) must be implemented carefully — a bug here is worse than no packing.';
+    }
+    note.className = 'callout ' + cls;
+    note.innerHTML = msg;
+  }
+
+  [slL, slMu, slVar, slN].forEach(function(el){ el.addEventListener('input', recompute); });
+  recompute();
+})();
+</script>
+
+</body>
+</html>

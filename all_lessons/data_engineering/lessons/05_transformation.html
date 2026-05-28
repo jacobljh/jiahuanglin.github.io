@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>05 · Transformation at scale — Spark, Ray, Daft</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">data_engineering</a>
+    <span class="crumb">/</span>
+    <span class="crumb">05 · transformation</span>
+    <span class="step-pill">lesson 5 / 11</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Transformation at scale — Spark, Ray, Daft</h1>
+<p class="subtitle">Once the data is in a columnar store (lesson 04), you have to <em>process</em> it: filter, map, join, dedup, score. At a few GB you do it on one box. At a few TB you need a cluster — and the moment you do, one operation dominates everything: the <strong>shuffle</strong>.</p>
+
+<div class="callout">
+  <div class="label">Where we are</div>
+  Lesson 04 gave us partitioned Parquet that's cheap to scan. This lesson is the engine that reads those partitions in parallel and turns bronze into silver. The next three lessons (dedup, tokenization, quality) are all specific transformations that run on the model built here.
+</div>
+
+<h2>The model: data is partitions, work is a DAG over them</h2>
+
+<p>Every distributed data tool — Spark, Ray Data, Daft — shares one mental model. Your dataset is split into <strong>partitions</strong> (independent chunks, ideally ~100–250&nbsp;MB each). Your job is a <strong>DAG of operations</strong> over those partitions. Operations come in two kinds, and the difference is the whole game:</p>
+
+<table>
+  <thead>
+    <tr><th></th><th>Narrow transformation</th><th>Wide transformation (shuffle)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Examples</td><td><code>map</code>, <code>filter</code>, <code>select</code>, tokenize</td><td><code>groupBy</code>, <code>join</code>, <code>distinct</code>, <code>repartition</code>, dedup</td></tr>
+    <tr><td>Data movement</td><td>None — each partition processed in place</td><td>All-to-all — every worker sends rows to every other</td></tr>
+    <tr><td>Cost</td><td>Embarrassingly parallel; scales linearly with workers</td><td>Network + disk spill; the bottleneck</td></tr>
+    <tr><td>Failure blast radius</td><td>One partition</td><td>The whole stage re-runs</td></tr>
+  </tbody>
+</table>
+
+<p>A narrow op is free in the sense that throughput scales with the number of workers <span class="math">W</span>: double the cluster, halve the time. A <strong>shuffle</strong> is different. To <code>groupBy(prompt_hash)</code> for dedup, rows with the same key must end up on the same worker — so every worker partitions its rows by key and sends each bucket across the network to the worker that owns it. That all-to-all exchange writes to disk, crosses the network, and reads back. Adding workers helps far less than for narrow ops: the byte volume per worker drops, but the connection fan-out grows as <span class="math">O(W<sup>2</sup>)</span> and per-partition coordination overhead eats into the gain — past a point you are buying more shuffle, not less.</p>
+
+<div class="callout warn">
+  <div class="label">The one rule</div>
+  Minimize shuffles, and shuffle as little data as possible. Filter <em>before</em> you join. Project away columns you don't need <em>before</em> the shuffle. A pipeline that does one shuffle over 200&nbsp;GB will beat one that does three shuffles over 2&nbsp;TB, even on the same cluster.
+</div>
+
+<h2>Skew: the straggler that eats your cluster</h2>
+
+<p>Partitions are processed in parallel, so a stage finishes only when its <em>slowest</em> partition finishes. If your data is skewed — one prompt hash has 50× the rows, one language dominates — that one fat partition becomes a <strong>straggler</strong>, and 99 idle workers wait for it. This is the single most common reason a "scaled-out" job is somehow not faster. The fixes: salt the hot key, increase partition count so the hot key spreads, or handle the heavy key separately.</p>
+
+<h2>Interactive · the shuffle and the straggler</h2>
+
+<p>Model a transformation over a dataset. Set the cluster size, how much of the work is a shuffle, and how skewed the data is. Watch where the wall-clock actually goes — and whether adding workers helps or just adds shuffle overhead.</p>
+
+<div class="widget" id="spark-widget">
+  <div class="title">Distributed transformation cost model</div>
+  <div class="hint">A simplified but honest model: narrow work parallelizes across workers; shuffle work pays an all-to-all network/spill tax that grows with partition count; skew creates a straggler that gates the stage.</div>
+
+  <div class="controls">
+    <label class="inline">data: <input type="range" id="de-data" min="10" max="4000" step="10" value="500"><span class="val" id="de-data-v">500 GB</span></label>
+    <label class="inline">workers: <input type="range" id="de-w" min="1" max="256" step="1" value="32"><span class="val" id="de-w-v">32</span></label>
+    <label class="inline">partitions: <input type="range" id="de-p" min="8" max="4096" step="8" value="512"><span class="val" id="de-p-v">512</span></label>
+    <label class="inline">shuffle fraction: <input type="range" id="de-sf" min="0" max="100" step="5" value="40"><span class="val" id="de-sf-v">40%</span></label>
+    <label class="inline">skew (hot key ×): <input type="range" id="de-sk" min="1" max="50" step="1" value="1"><span class="val" id="de-sk-v">1×</span></label>
+  </div>
+
+  <div id="de-bars" style="margin:16px 0;"></div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">Map time</div><div class="v" id="de-map">—</div></div>
+    <div class="kpi"><div class="k">Shuffle time</div><div class="v" id="de-shuf">—</div></div>
+    <div class="kpi"><div class="k">Straggler tax</div><div class="v" id="de-strag">—</div></div>
+    <div class="kpi"><div class="k">Wall-clock</div><div class="v" id="de-total">—</div></div>
+    <div class="kpi"><div class="k">Effective</div><div class="v" id="de-eff">—</div></div>
+    <div class="kpi"><div class="k">Suggested tool</div><div class="v" id="de-tool" style="font-size:14px;">—</div></div>
+  </div>
+
+  <div class="callout" id="de-note" style="margin-top:16px;"></div>
+</div>
+
+<h2>Three tools, three sweet spots</h2>
+
+<p>The model above is tool-agnostic, but the tools are not interchangeable. Pick by data size, what runs inside the transform, and your team's language.</p>
+
+<table>
+  <thead>
+    <tr><th>Tool</th><th>Engine</th><th>Sweet spot</th><th>Watch out</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>Single-node</strong><br>(Polars, DuckDB)</td><td>Rust / C++, in-process</td><td>&lt; ~100&nbsp;GB, no cluster to babysit. Often the right answer — most post-training datasets fit.</td><td>Bound by one machine's RAM &amp; cores.</td></tr>
+    <tr><td><strong>Spark</strong></td><td>JVM, lazy DAG</td><td>TB+ batch ETL, mature SQL, joins/aggregations at scale, well-understood shuffle.</td><td>JVM ↔ Python (UDF) serialization tax; awkward for GPU model calls.</td></tr>
+    <tr><td><strong>Ray Data</strong></td><td>Python-native, streaming</td><td>ML in the pipeline — running a reward model or LLM <em>as a transform</em> on GPUs, streaming so CPU and GPU stages overlap.</td><td>Younger; you manage more of the execution.</td></tr>
+    <tr><td><strong>Daft</strong></td><td>Rust + Python, lazy</td><td>Multimodal (images/audio) and Python-first columnar work with a Spark-like API.</td><td>Newest of the four; smaller ecosystem.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout ok">
+  <div class="label">Post-training–specific reason Ray shows up</div>
+  Much post-training data engineering involves <em>running models inside the pipeline</em>: scoring responses with a reward model, generating synthetic data with an LLM, filtering with a classifier. That's a GPU transform sitting in the middle of a CPU pipeline (read → tokenize → <strong>model</strong> → write). Ray Data's streaming executor keeps the GPU fed while CPU stages run ahead — which is exactly the producer/consumer overlap you'll see again in the <a href="10_rl_online_dataplane.html">RL online dataplane (lesson 10)</a>.
+</div>
+
+<h2>Lazy execution: why nothing runs until you ask</h2>
+
+<p>All three frameworks are <strong>lazy</strong>: <code>df.filter(...).select(...).groupBy(...)</code> builds a plan, not a result. Execution happens only at an <em>action</em> (<code>write</code>, <code>count</code>, <code>collect</code>). This lets the optimizer rewrite your plan — push the filter below the join, prune unused columns, fuse adjacent maps — before a single byte moves. It's the same predicate/column pushdown from lesson 04, now applied to the whole DAG. The practical consequence: write transforms declaratively and let the planner reorder them; don't hand-optimize by calling <code>collect()</code> in the middle, which forces materialization and defeats the optimizer.</p>
+
+<div class="callout bad">
+  <div class="label">Classic mistake</div>
+  Calling <code>.collect()</code> or <code>.toPandas()</code> mid-pipeline to "check" the data pulls the entire distributed dataset onto the driver node — which promptly runs out of memory, or silently truncates. Inspect with <code>.limit(n).show()</code>, which the planner can satisfy without materializing everything.
+</div>
+
+<h2>Takeaway</h2>
+
+<div class="callout ok">
+  <div class="label">What to carry to lesson 06</div>
+  Distributed transformation is partitions + a DAG of narrow (free-scaling) and wide (shuffle, expensive) ops. The shuffle and the straggler — not the map — decide wall-clock. Choose single-node until you can't, then Spark for batch SQL/joins and Ray when a model runs inside the transform. <strong>Dedup, the subject of lesson 06, is the canonical shuffle</strong> — it groups the whole dataset by a similarity key — so everything here applies directly.
+</div>
+
+<footer class="lesson-nav">
+  <a href="04_storage_formats.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">04 · Storage &amp; file formats</span>
+  </a>
+  <a class="next" href="06_dedup_decon.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">06 · Dedup &amp; decontamination</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const $ = id => document.getElementById(id);
+  const data=$('de-data'), w=$('de-w'), p=$('de-p'), sf=$('de-sf'), sk=$('de-sk');
+  const bars=$('de-bars');
+
+  // throughput assumptions (per worker)
+  const MAP_GBPS = 0.20;      // GB/s of narrow processing per worker (tokenize/filter)
+  const NET_GBPS = 1.25;      // GB/s effective shuffle bandwidth per worker (10 Gbit ~ 1.25 GB/s)
+  const SHUFFLE_OVERHEAD = 0.004; // sec per partition of connection/scheduling overhead
+
+  function fmt(s){
+    if (s < 1) return (s*1000).toFixed(0)+' ms';
+    if (s < 90) return s.toFixed(1)+' s';
+    if (s < 5400) return (s/60).toFixed(1)+' min';
+    return (s/3600).toFixed(2)+' h';
+  }
+
+  function recompute(){
+    const D = +data.value;            // GB
+    const W = +w.value;               // workers
+    const P = +p.value;               // partitions
+    const SF = +sf.value/100;         // shuffle fraction
+    const SK = +sk.value;             // skew multiplier on hottest partition
+
+    $('de-data-v').textContent = D>=1000 ? (D/1000).toFixed(2)+' TB' : D+' GB';
+    $('de-w-v').textContent = W;
+    $('de-p-v').textContent = P;
+    $('de-sf-v').textContent = (SF*100).toFixed(0)+'%';
+    $('de-sk-v').textContent = SK+'×';
+
+    // ideal even split: each worker handles D/W GB of map work
+    const idealMap = (D / W) / MAP_GBPS;
+
+    // skew: hottest partition is SK× the average partition size.
+    // a worker holding it does SK× that partition's share of work.
+    const avgPart = D / P;
+    const hotPart = avgPart * SK;
+    // straggler: extra time vs even split, bounded by the hot partition's map time
+    const stragglerTax = (hotPart - avgPart) / MAP_GBPS;
+
+    const mapTime = idealMap;
+    // shuffle: SF of data crosses the network, parallel across W, plus per-partition overhead.
+    const shufBytes = D * SF;
+    const shufTime = (shufBytes / (W * NET_GBPS)) + (SF>0 ? P * SHUFFLE_OVERHEAD : 0);
+
+    const total = mapTime + shufTime + stragglerTax;
+    const eff = D / total; // GB/s
+
+    $('de-map').textContent = fmt(mapTime);
+    $('de-shuf').textContent = fmt(shufTime);
+    $('de-strag').textContent = stragglerTax > 0.05 ? '+'+fmt(stragglerTax) : '—';
+    $('de-total').textContent = fmt(total);
+    $('de-eff').textContent = eff.toFixed(2)+' GB/s';
+
+    // stacked bar of where wall-clock goes
+    const segs = [
+      ['map', mapTime, 'var(--ok)'],
+      ['shuffle', shufTime, 'var(--accent)'],
+      ['straggler', stragglerTax, 'var(--bad)']
+    ];
+    bars.innerHTML = '<div style="font-size:12px;color:var(--text-mute);margin-bottom:4px;">wall-clock breakdown</div>'
+      + '<div style="display:flex;height:26px;border-radius:6px;overflow:hidden;border:1px solid var(--border);">'
+      + segs.map(([n,t,c]) => {
+          const pct = Math.max(0, t)/total*100;
+          return pct < 0.5 ? '' : `<div title="${n}: ${fmt(t)}" style="width:${pct}%;background:${c};display:flex;align-items:center;justify-content:center;font-size:10px;color:#fff;">${pct>8?n:''}</div>`;
+        }).join('')
+      + '</div>';
+
+    // tool suggestion
+    let tool, note, cls;
+    if (D < 100 && SF < 0.5){
+      tool = 'Single-node (Polars / DuckDB)';
+      note = `At ${D} GB with light shuffling, a single fat box beats a cluster — no shuffle network, no scheduling overhead, no cluster to manage. Reach for a cluster only when the data won't fit or the shuffle won't finish.`;
+      cls = 'ok';
+    } else if (SF >= 0.5){
+      tool = 'Spark (shuffle-heavy batch)';
+      note = `Shuffle is ${(SF*100).toFixed(0)}% of the work — joins/dedup/aggregations dominate. Spark's mature shuffle and SQL optimizer are built for exactly this. ${SK>1?'Your skew ('+SK+'×) is creating a '+fmt(stragglerTax)+' straggler — salt the hot key or raise partition count.':''}`;
+      cls = '';
+    } else {
+      tool = 'Spark or Ray Data';
+      note = `${D} GB of mostly-narrow work. Spark if it's plain SQL/ETL; Ray Data if a GPU model (reward model, LLM filter) runs inside the transform so CPU and GPU stages can overlap.`;
+      cls = 'ok';
+    }
+    $('de-tool').textContent = tool;
+    const noteEl = $('de-note');
+    noteEl.className = 'callout ' + cls;
+    noteEl.innerHTML = `<div class="label">Read-out</div>${note}`;
+  }
+
+  [data,w,p,sf,sk].forEach(el => el.addEventListener('input', recompute));
+  recompute();
+})();
+</script>
+
+</body>
+</html>

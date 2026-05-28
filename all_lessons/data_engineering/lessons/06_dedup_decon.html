@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>06 · Dedup &amp; decontamination</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">data_engineering</a>
+    <span class="crumb">/</span>
+    <span class="crumb">06 · dedup &amp; decon</span>
+    <span class="step-pill">lesson 6 / 11</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Dedup &amp; decontamination</h1>
+<p class="subtitle">Duplicates waste compute, teach the model to memorize, and skew the distribution. Test-set leakage makes your benchmark numbers a lie. This lesson shows you exactly how to catch both — and why the core operation is the canonical shuffle you met in lesson 05.</p>
+
+<div class="callout">
+  <div class="label">Where we are</div>
+  Lesson 05 showed that a shuffle — grouping a dataset by key across all workers — is the expensive, all-to-all operation that dominates distributed pipeline cost. Dedup is precisely that: to find duplicates you must group every document by a similarity key, which requires every worker to communicate with every other. Everything from lesson 05 applies here directly. The silver layer we build in this lesson feeds into lesson 07's tokenization stage.
+</div>
+
+<h2>Why duplicates hurt, three ways</h2>
+
+<p>Training on a corpus with duplicates causes three distinct problems, each serious on its own:</p>
+
+<table>
+  <thead>
+    <tr><th>Problem</th><th>Mechanism</th><th>Symptom</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>Memorization</strong></td><td>A document seen <em>k</em> times contributes <em>k</em> gradient updates on identical tokens. The model learns to regurgitate the exact string rather than generalize.</td><td>Verbatim output of training text at inference; privacy risk if the string is personal data.</td></tr>
+    <tr><td><strong>Compute waste</strong></td><td>Processing a duplicate is strictly wasted FLOP — the model is already fit to that example. At scale, a 30% duplicate rate means ~30% of training tokens are repeated work.</td><td>Higher cost for the same model quality; or lower quality for the same cost.</td></tr>
+    <tr><td><strong>Distribution skew</strong></td><td>High-duplicate sources (code hosts, forum mirrors, news syndication) are over-represented in the loss, biasing the model toward those styles and topics.</td><td>Domain imbalance, over-confident predictions on common phrasings.</td></tr>
+  </tbody>
+</table>
+
+<h2>Dedup is the canonical shuffle</h2>
+
+<p>In lesson 05 we learned that a <em>wide</em> (shuffle) operation requires all-to-all data movement: every worker partitions its rows by key and sends each bucket to the worker that owns that key. Dedup is exactly this pattern. To decide whether document A and document B are duplicates, they must land on the same worker. With <span class="math">N</span> documents across <span class="math">W</span> workers, there is no escaping the all-to-all exchange — the only question is how much data you exchange, and that is where the algorithm choice matters enormously.</p>
+
+<pre class="ascii">Worker 0      Worker 1      Worker 2
+  doc A  ──┐                           "A and B share the same
+  doc D    ├─── all-to-all ───────▶     similarity key — route
+  ...      │    (shuffle)               both to the same worker"
+  doc B  ──┘
+                                       Without this shuffle: O(n²)
+                                       pairwise comparisons.
+                                       With it + smart hashing: ~O(n).</pre>
+
+<h2>Step 1 — normalization</h2>
+
+<p>Before any hashing, normalize the content so that trivially equivalent documents hash identically. The standard pipeline:</p>
+
+<ol>
+  <li><strong>Unicode NFC</strong> — collapse composed/decomposed forms of the same glyph.</li>
+  <li><strong>Lowercasing</strong> — "The Cat" and "the cat" are the same document for dedup purposes.</li>
+  <li><strong>Whitespace collapse</strong> — replace all whitespace runs (tabs, newlines, double spaces) with a single space; strip leading/trailing.</li>
+  <li><strong>Boilerplate stripping</strong> (optional but high-value) — remove navigation bars, cookie banners, repeated headers/footers using regex or a DOM parser. This stops the boilerplate from dominating the hash while the real content is different.</li>
+  <li><strong>PII normalization</strong> — replace email addresses, phone numbers, and SSN patterns with placeholder tokens (<code>&lt;EMAIL&gt;</code>, <code>&lt;PHONE&gt;</code>) both to prevent memorization of personal data and so that two documents differing only in a name/email still hash as duplicates.</li>
+</ol>
+
+<div class="callout warn">
+  <div class="label">PII is a dedup concern, not just a privacy concern</div>
+  A news article scraped from 500 mirrors differs only in a byline or cookie banner. Without normalization, exact hashing sees 500 unique documents. With it, all 500 collapse to one. Do normalization before hashing, not as a post-processing step.
+</div>
+
+<h2>Step 2 — exact dedup</h2>
+
+<p>After normalization, hash each document (SHA-256 or xxHash — both fast and collision-resistant enough for this) and insert into a distributed hash set. O(n) time and one narrow pass — no shuffle needed because you're deduplicating against a set you build incrementally. Remove any document whose hash is already in the set.</p>
+
+<p>Exact dedup catches verbatim copies and near-verbatim copies that normalization collapsed. It misses paraphrases, lightly edited versions, and documents with the same ideas in different words — that's what near-duplicate detection is for.</p>
+
+<h2>Step 3 — near-duplicate dedup via MinHash + LSH</h2>
+
+<p>Near-duplicate detection is the expensive part. The naive approach — compare every pair — is <span class="math">O(n<sup>2</sup>)</span>, which is prohibitive at tens of millions of documents. The standard solution is <strong>MinHash + Locality-Sensitive Hashing (LSH)</strong>, which reduces it to roughly <span class="math">O(n)</span> by hashing similar documents into the same bucket with high probability.</p>
+
+<p>The chain has four steps:</p>
+
+<h3>3a — Shingles (k-grams)</h3>
+<p>Represent each document as a <strong>set of k-grams</strong> (consecutive k-token or k-character windows). With <span class="math">k = 5</span>, "the quick brown fox" produces shingles: <code>{the quick brown, quick brown fox, ...}</code>. Two documents that share most shingles are near-duplicates. Similarity between two sets <span class="math">A</span> and <span class="math">B</span> is captured by <strong>Jaccard similarity</strong>:</p>
+
+<p class="math block">J(A, B) = |A ∩ B| / |A ∪ B|</p>
+
+<p><span class="math">J = 1</span> means identical shingle sets (near-exact duplicate); <span class="math">J = 0</span> means no overlap at all. The practical threshold for "near-duplicate" is typically <span class="math">J ≥ 0.7 – 0.8</span>.</p>
+
+<h3>3b — MinHash signature</h3>
+<p>Computing exact Jaccard for every pair is the <span class="math">O(n<sup>2</sup>)</span> problem. <strong>MinHash</strong> sidesteps it: for each of <span class="math">h</span> independent hash functions, compute the <em>minimum</em> hash value over all shingles in the document. The resulting vector of <span class="math">h</span> minimums is the MinHash <strong>signature</strong>. The key property: the probability that two documents agree on a single MinHash position equals their Jaccard similarity.</p>
+
+<p class="math block">Pr[min(h(A)) = min(h(B))] = J(A, B)</p>
+
+<p>This is an unbiased estimator. The <span class="math">h</span>-position signature reduces each document to a compact fixed-length vector regardless of document size.</p>
+
+<h3>3c — LSH banding</h3>
+<p>Even comparing signatures pairwise is <span class="math">O(n<sup>2</sup>)</span>. <strong>LSH banding</strong> converts it to a bucket problem. Split the signature of length <span class="math">L = b × r</span> into <span class="math">b</span> bands of <span class="math">r</span> rows each. Hash each band independently. Two documents become a <strong>candidate pair</strong> if any one of their <span class="math">b</span> bands hashes to the same bucket. This is the shuffle: all documents go into buckets (group-by on band hashes), and each worker handles the candidate pairs in its buckets.</p>
+
+<p>The probability that a pair with Jaccard similarity <span class="math">s</span> becomes a candidate pair (the <strong>S-curve</strong>) is:</p>
+
+<p class="math block">P(candidate | s) = 1 − (1 − s<sup>r</sup>)<sup>b</sup></p>
+
+<p>This curve is steep: near 0 for <span class="math">s</span> below a threshold, near 1 above it. The effective threshold — where the S-curve crosses 0.5 — is approximately:</p>
+
+<p class="math block">threshold ≈ (1/b)<sup>1/r</sup></p>
+
+<p>You control the threshold and sensitivity by tuning <span class="math">b</span> and <span class="math">r</span>. More bands <span class="math">b</span> lowers the threshold (catches looser near-dups, more false-positive candidates to verify). More rows per band <span class="math">r</span> raises the threshold (stricter matching, fewer candidates).</p>
+
+<h3>3d — Candidate verification</h3>
+<p>For each candidate pair produced by banding, compute the exact Jaccard (or edit distance) and apply a hard threshold. Discard one document from each pair above the threshold. Because LSH already grouped the likely pairs, this verification step is cheap — it's proportional to the number of true near-duplicates, not <span class="math">O(n<sup>2</sup>)</span>.</p>
+
+<h2>Interactive · MinHash / LSH S-curve explorer</h2>
+
+<p>Tune the banding parameters and see how the detection probability curve shifts. The goal is a steep S-curve whose threshold sits at or below the similarity you care about — catching near-dups while rejecting distinct documents.</p>
+
+<div class="widget" id="lsh-widget">
+  <div class="title">MinHash / LSH parameter explorer</div>
+  <div class="hint">Adjust the number of bands <em>b</em> and rows per band <em>r</em>. The signature length is b × r. Move the Jaccard slider to read off the candidate probability at that similarity. The S-curve updates live.</div>
+
+  <div class="controls">
+    <label class="inline">bands (b): <input type="range" id="lsh-b" min="2" max="50" step="1" value="20"><span class="val" id="lsh-b-v">20</span></label>
+    <label class="inline">rows per band (r): <input type="range" id="lsh-r" min="1" max="20" step="1" value="5"><span class="val" id="lsh-r-v">5</span></label>
+    <label class="inline">query Jaccard (s): <input type="range" id="lsh-s" min="0" max="100" step="1" value="75"><span class="val" id="lsh-s-v">0.75</span></label>
+  </div>
+
+  <div id="lsh-curve" style="margin:16px 0;"></div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">Signature length</div><div class="v" id="lsh-sig">—</div></div>
+    <div class="kpi"><div class="k">Threshold ≈ (1/b)^(1/r)</div><div class="v" id="lsh-thr">—</div></div>
+    <div class="kpi"><div class="k">P(candidate) at s</div><div class="v" id="lsh-prob">—</div></div>
+    <div class="kpi"><div class="k">P(miss) at s</div><div class="v" id="lsh-miss">—</div></div>
+  </div>
+
+  <div class="callout" id="lsh-note" style="margin-top:16px;"></div>
+</div>
+
+<h2>Step 4 — semantic dedup (brief)</h2>
+
+<p>MinHash/LSH catches lexical near-duplicates — documents that share a lot of the same words. It cannot detect paraphrases that express the same content in different vocabulary. <strong>Semantic dedup</strong> handles those: embed each document with a dense encoder, build an approximate-nearest-neighbor (ANN) index (FAISS, ScaNN, or similar), and remove documents whose embedding cosine similarity exceeds a threshold. The cost is higher (embedding every document) but it catches reformulations that fool MinHash entirely. In practice, you run exact dedup then MinHash/LSH first, then optionally run semantic dedup on the remainder if the dataset is large and paraphrase-heavy.</p>
+
+<h2>Decontamination — preventing eval-set leakage</h2>
+
+<p>Decontamination solves a different problem from dedup: ensuring that benchmark <em>test</em> questions or passages do not appear in the training set. If they do, the model has "seen the answer" and benchmark scores are inflated — your numbers are lying.</p>
+
+<p>The standard approach is <strong>n-gram overlap</strong>:</p>
+<ol>
+  <li>Build a set (or inverted index) of all n-grams in the eval/test sets. <strong>13-grams</strong> are common for open-ended text; <strong>8-grams</strong> for shorter questions.</li>
+  <li>For each training document, compute what fraction of its n-grams appear in the eval set.</li>
+  <li>Flag or remove any document above a threshold (e.g. a 13-gram exact match anywhere in the document is often enough to flag it).</li>
+</ol>
+
+<p>The key dependency: you need the eval sets on hand <em>before</em> you finalize the training set. This connects directly to lesson 03's provenance requirement — eval set versions must be tracked and reproducible, or you can't know whether a future training run is contaminated.</p>
+
+<div class="callout bad">
+  <div class="label">Real failure: eval leakage inflating benchmarks</div>
+  Several high-profile post-training releases have been found to have benchmark contamination after the fact — test questions from MMLU, HumanEval, or GSM8K leaking into the pretraining or fine-tuning corpus. The published score is then not a measure of generalization; it's a measure of memorization. Downstream users who trust those numbers make wrong decisions: choosing a model that performs poorly on truly unseen tasks. The fix — n-gram decontamination against the held-out eval sets — is cheap. Skipping it is not a time saving; it's a scientific error.
+</div>
+
+<h2>Putting it all together: the dedup/decon stage in the pipeline</h2>
+
+<pre class="ascii">  bronze (raw Parquet)
+       │
+       ▼  narrow pass (embarrassingly parallel)
+  normalize + PII-normalize
+       │
+       ▼  narrow pass
+  exact dedup (hash → distributed set, drop matches)
+       │
+       ▼  WIDE / SHUFFLE  ◀── this is the expensive operation
+  MinHash → LSH banding → candidate pairs per bucket
+       │
+       ▼  narrow pass (per candidate pair)
+  Jaccard verify → remove near-duplicates
+       │
+       ▼  optional narrow pass
+  semantic dedup (embed + ANN)
+       │
+       ▼  narrow pass
+  decontamination (n-gram overlap vs eval sets)
+       │
+       ▼
+  silver (clean, deduped, decontaminated Parquet)</pre>
+
+<p>The stage has exactly one wide operation (the LSH banding shuffle). Everything else is embarrassingly parallel. Optimize the shuffle: push exact dedup <em>before</em> it so the document count is already reduced; use tight MinHash signatures (only as many hash functions as you need); partition the banded hashes into enough buckets that each worker's candidate list is manageable. If your corpus is 1 TB before exact dedup, it might be 700 GB after — that is the data you pay to shuffle, not the original 1 TB.</p>
+
+<h2>Takeaway</h2>
+
+<div class="callout ok">
+  <div class="label">What to carry to lesson 07</div>
+  Dedup and decontamination are silver-layer concerns: run them before tokenization, not after. The core algorithm — MinHash + LSH banding — is a controlled shuffle whose cost you manage by tuning the signature length and band structure. Exact dedup first (cheap, narrow) so the shuffle sees less data. Decontamination requires the eval sets on hand — another reason provenance (lesson 03) matters. The output of this stage is a clean, deduplicated, decontaminated Parquet corpus ready for lesson 07's tokenization and sequence-packing step.
+</div>
+
+<footer class="lesson-nav">
+  <a href="05_transformation.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">05 · Transformation at scale</span>
+  </a>
+  <a class="next" href="07_tokenization_packing.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">07 · Tokenization &amp; packing</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+  var bSlider = $('lsh-b'), rSlider = $('lsh-r'), sSlider = $('lsh-s');
+
+  var SVG_W = 560, SVG_H = 160;
+  var PAD_L = 36, PAD_R = 16, PAD_T = 12, PAD_B = 28;
+  var PLOT_W = SVG_W - PAD_L - PAD_R;
+  var PLOT_H = SVG_H - PAD_T - PAD_B;
+  var STEPS = 100;
+
+  function scurve(s, b, r){
+    return 1 - Math.pow(1 - Math.pow(s, r), b);
+  }
+
+  function threshold(b, r){
+    return Math.pow(1/b, 1/r);
+  }
+
+  function fmtPct(v){
+    return (v * 100).toFixed(1) + '%';
+  }
+
+  function buildSVG(b, r, s){
+    var points = [];
+    for (var i = 0; i <= STEPS; i++){
+      var sx = i / STEPS;
+      var py = scurve(sx, b, r);
+      var cx = PAD_L + sx * PLOT_W;
+      var cy = PAD_T + (1 - py) * PLOT_H;
+      points.push(cx.toFixed(1) + ',' + cy.toFixed(1));
+    }
+
+    var thr = threshold(b, r);
+    var thrX = PAD_L + thr * PLOT_W;
+
+    var qX = PAD_L + s * PLOT_W;
+    var qY = PAD_T + (1 - scurve(s, b, r)) * PLOT_H;
+
+    // x-axis ticks
+    var ticks = '';
+    for (var t = 0; t <= 10; t++){
+      var tx = PAD_L + (t/10) * PLOT_W;
+      ticks += '<line x1="' + tx.toFixed(1) + '" y1="' + (PAD_T + PLOT_H) + '" x2="' + tx.toFixed(1) + '" y2="' + (PAD_T + PLOT_H + 4) + '" stroke="var(--border)"/>';
+      if (t % 2 === 0){
+        ticks += '<text x="' + tx.toFixed(1) + '" y="' + (PAD_T + PLOT_H + 14) + '" text-anchor="middle" font-size="9" fill="var(--text-mute)">' + (t*10) + '%</text>';
+      }
+    }
+    // y-axis ticks
+    var yticks = '';
+    for (var y = 0; y <= 4; y++){
+      var yv = y / 4;
+      var yx = PAD_T + (1 - yv) * PLOT_H;
+      yticks += '<line x1="' + (PAD_L-4) + '" y1="' + yx.toFixed(1) + '" x2="' + PAD_L + '" y2="' + yx.toFixed(1) + '" stroke="var(--border)"/>';
+      yticks += '<text x="' + (PAD_L-6) + '" y="' + (yx + 3).toFixed(1) + '" text-anchor="end" font-size="9" fill="var(--text-mute)">' + (yv*100).toFixed(0) + '%</text>';
+    }
+
+    // clamp marker text positions
+    var thrLabelX = Math.min(Math.max(thrX, PAD_L + 20), PAD_L + PLOT_W - 20);
+    var qLabelY   = Math.max(qY - 8, PAD_T + 10);
+
+    return '<svg viewBox="0 0 ' + SVG_W + ' ' + SVG_H + '" style="width:100%;max-width:' + SVG_W + 'px;display:block;">'
+      + '<rect x="' + PAD_L + '" y="' + PAD_T + '" width="' + PLOT_W + '" height="' + PLOT_H + '" fill="var(--bg-soft)" stroke="var(--border)" rx="4"/>'
+      + ticks + yticks
+      // axis labels
+      + '<text x="' + (PAD_L + PLOT_W/2) + '" y="' + (SVG_H - 2) + '" text-anchor="middle" font-size="10" fill="var(--text-mute)">Jaccard similarity s</text>'
+      + '<text x="8" y="' + (PAD_T + PLOT_H/2) + '" text-anchor="middle" font-size="10" fill="var(--text-mute)" transform="rotate(-90,8,' + (PAD_T + PLOT_H/2) + ')">P(candidate)</text>'
+      // S-curve
+      + '<polyline points="' + points.join(' ') + '" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linejoin="round"/>'
+      // threshold line
+      + '<line x1="' + thrX.toFixed(1) + '" y1="' + PAD_T + '" x2="' + thrX.toFixed(1) + '" y2="' + (PAD_T + PLOT_H) + '" stroke="var(--warn)" stroke-width="1.5" stroke-dasharray="4 3"/>'
+      + '<text x="' + thrLabelX.toFixed(1) + '" y="' + (PAD_T - 2) + '" text-anchor="middle" font-size="9" fill="var(--warn)">threshold ≈' + fmtPct(thr) + '</text>'
+      // query point
+      + '<circle cx="' + qX.toFixed(1) + '" cy="' + qY.toFixed(1) + '" r="5" fill="var(--accent)" stroke="var(--bg)" stroke-width="1.5"/>'
+      + '<text x="' + (qX + 8).toFixed(1) + '" y="' + qLabelY.toFixed(1) + '" font-size="9" fill="var(--accent)">s=' + s.toFixed(2) + '</text>'
+      + '</svg>';
+  }
+
+  function recompute(){
+    var b = parseInt(bSlider.value, 10);
+    var r = parseInt(rSlider.value, 10);
+    var s = parseInt(sSlider.value, 10) / 100;
+
+    $('lsh-b-v').textContent = b;
+    $('lsh-r-v').textContent = r;
+    $('lsh-s-v').textContent = s.toFixed(2);
+
+    var sigLen = b * r;
+    var thr = threshold(b, r);
+    var prob = scurve(s, b, r);
+    var miss = 1 - prob;
+
+    $('lsh-sig').textContent = sigLen;
+    $('lsh-thr').textContent = fmtPct(thr);
+    $('lsh-prob').textContent = fmtPct(prob);
+    $('lsh-miss').textContent = fmtPct(miss);
+
+    $('lsh-curve').innerHTML = buildSVG(b, r, s);
+
+    var note = $('lsh-note');
+    var cls, msg;
+
+    if (s < thr - 0.05){
+      cls = 'ok';
+      msg = 'At s=' + s.toFixed(2) + ' the threshold is ' + fmtPct(thr) + ', so these documents are treated as distinct — only ' + fmtPct(prob) + ' become candidate pairs. Good: few false positives to verify.';
+    } else if (s > thr + 0.05){
+      cls = 'bad';
+      msg = 'At s=' + s.toFixed(2) + ' (above the threshold of ' + fmtPct(thr) + '), ' + fmtPct(prob) + ' of such pairs become candidates, giving a ' + fmtPct(miss) + ' miss rate. '
+        + (miss > 0.15 ? 'Miss rate is high — increase b or decrease r to lower the threshold.' : 'Miss rate is acceptable.');
+    } else {
+      cls = 'warn';
+      msg = 'At s=' + s.toFixed(2) + ' you are near the threshold (' + fmtPct(thr) + '). The S-curve is steepest here — small changes in b or r shift detection significantly. Candidate probability: ' + fmtPct(prob) + '.';
+    }
+
+    if (sigLen > 400){
+      msg += ' Signature length is ' + sigLen + ' — this is large; hashing cost grows proportionally. Consider fewer bands with more rows if you want a higher threshold, or fewer rows if you want more.';
+      if (cls === 'ok') cls = 'warn';
+    }
+
+    if (b > 30 && r <= 2){
+      msg += ' Many narrow bands (b=' + b + ', r=' + r + ') set a very low threshold — you will flag loosely similar documents as near-dups and may over-remove. Widen bands (increase r) to be more selective.';
+      cls = 'warn';
+    }
+
+    note.className = 'callout ' + cls;
+    note.innerHTML = '<div class="label">Read-out</div>' + msg;
+  }
+
+  bSlider.addEventListener('input', recompute);
+  rSlider.addEventListener('input', recompute);
+  sSlider.addEventListener('input', recompute);
+  recompute();
+})();
+</script>
+
+</body>
+</html>
