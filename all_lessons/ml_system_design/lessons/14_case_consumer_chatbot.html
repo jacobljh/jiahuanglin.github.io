@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>14 · Case: consumer chatbot</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">ml_system_design</a>
+    <span class="crumb">/</span>
+    <span class="crumb">14 · case · chatbot</span>
+    <span class="step-pill">lesson 14 / 18</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Case study — a consumer chatbot at scale (ChatGPT-style)</h1>
+<p class="subtitle">Lesson 13's autocomplete had tiny outputs and near-static inputs, so the wall was <strong>TTFT</strong> and the fix was deleting redundant prefill. Flip every one of those properties. Here outputs are long, multi-turn history <em>grows</em> every turn, and traffic swings 10× between day and night at tens of thousands of req/s. The transformer is the same; the binding wall is now <strong>KV-memory × concurrency × cost</strong>, and the system that falls out is unrecognizable next to the code assistant.</p>
+
+<div class="callout">
+  <div class="label">The brief</div>
+  A consumer chat assistant. <strong>Sessions:</strong> multi-turn, average ~6 turns. <strong>Output:</strong> ~300 tokens/turn. <strong>Context grows each turn</strong> — by turn 6 the history is ~3–4K tokens. <strong>Peak:</strong> ~50,000 req/s with a <strong>10× day/night swing</strong>. <strong>SLO:</strong> p95 TTFT &lt; 1 s, TPOT &lt; 60 ms. <strong>Tiers:</strong> a free tier and a paid tier. <strong>Budget:</strong> it has to be cheap — most users pay nothing.
+</div>
+
+<p>Run the loop. Before reading on: what binds — compute, bandwidth, memory, or cost? And what does multi-turn history do to the answer that a single-shot chat workload (lesson 03) wouldn't?</p>
+
+<h2>Stage 0 · Requirements → the number that matters (lesson 03)</h2>
+
+<p>One turn emits ~300 tokens, so by Little's Law the per-turn time-in-system is decode-dominated, not TTFT-dominated:</p>
+
+<div class="math block">
+W ≈ TTFT + 300·TPOT ≈ 1 + 300·0.06 ≈ 19 s per turn
+</div>
+
+<p>Concurrency at peak: <span class="math">L = λW = 50,000 · 19 ≈ 950,000</span> turns in flight at once. Compare lesson 13's 900. <strong>This is a near-million-way concurrency problem</strong>, and every one of those in-flight turns is holding a KV cache. Output length × request rate, not the model, just produced the headline number — and unlike the capstone's reasoning model, the length isn't even pathological; it's plain chat at consumer scale.</p>
+
+<div class="callout warn">
+  <div class="label">Binding constraint, stage 0</div>
+  <strong>Concurrency, and therefore KV memory.</strong> 950k concurrent turns each carrying a KV cache is a bytes problem before it is anything else. TTFT has a whole second of budget here — generous — so we will spend that budget to <em>save memory</em>, the exact opposite trade from lesson 13.
+</div>
+
+<h2>Stage 1 · Multi-turn history is the crux (lessons 02, 06)</h2>
+
+<p>The thing the brief adds over a single-shot chat is that a session is a <em>sequence</em> of turns sharing a growing history. By turn 6 the model attends over ~3–4K tokens of conversation. For a 70B model at 320 KB/token (lesson 02), a 4K-token history is:</p>
+
+<div class="math block">
+4000 · 320 KB ≈ 1.3 GB of KV — per active session
+</div>
+
+<p>Now you face a fork between turns of one session, and both branches look unaffordable:</p>
+
+<ul>
+  <li><strong>(a) Keep the history KV resident</strong> between a user's turns. Memory cost: 1.3 GB × hundreds of thousands of live sessions = hundreds of terabytes of HBM. An H100 has 80 GB. This is physically impossible at the budget.</li>
+  <li><strong>(b) Re-prefill the whole history</strong> at the start of every turn. Compute cost: turn 6 re-prefills ~3.5K tokens for 5 turns running — and it blows TTFT. Prefill of 4K tokens on a 70B at ~40% MFU on a TP-4 replica is <span class="math">4000 / (4·990e12·0.4/(2·70e9)) ≈ 4000/11,300 ≈ 350 ms</span>, paid <em>every turn</em> and growing with the conversation.</li>
+</ul>
+
+<p>Prefix caching (lesson 06, <a href="../../sglang/lessons/04_radix_attention.html">SGLang 04</a>) resolves the fork: the conversation history <em>is</em> a shared prefix across the turns of a session. Cache the history KV; on the next turn, prefill only the new user message (tens of tokens), reusing the cached history. You pay the memory of (a) only while the session is hot, and you pay the compute of (b) only for the genuinely new tokens.</p>
+
+<div class="callout bad">
+  <div class="label">Binding constraint, stage 1</div>
+  <strong>KV memory vs prefill-compute, on the growing history.</strong> Keeping every session resident is impossible; re-prefilling every turn is slow and wasteful. Prefix caching collapses the trade — but it cannot keep <em>all</em> sessions hot, so you need an <strong>eviction policy</strong>: evict idle sessions' KV, and re-prefill on their next turn. A resumed session eats one cold prefill (~350 ms, still inside the 1 s TTFT budget). That deliberate TTFT hit on resume is what buys back the memory. You are spending stage 0's latency slack exactly here.</p>
+</div>
+
+<h2>Stage 2 · Fit more sessions per GPU (lessons 02, 04, 06)</h2>
+
+<p>With caching deciding <em>which</em> sessions occupy memory, the next lever is making each session cheaper in bytes so more fit per GPU. Every byte saved per token multiplies across the resident-session count:</p>
+
+<ul>
+  <li><strong>GQA + fp8 KV cache.</strong> GQA already set <span class="math">n_kv_heads</span> low (the 320 KB/token figure assumes GQA-8). Storing K/V at fp8 instead of fp16 halves bytes/token again → 160 KB/token → ~double the session density for the same HBM. Validate quality on the regression suite (lesson 10) before trusting fp8 KV.</li>
+  <li><strong>Tier by model.</strong> The free tier doesn't need the 70B. A smaller model (say 7–13B) has far smaller KV/token (KV scales ~linearly with layers·heads, so a 7B is roughly an order of magnitude cheaper per token) <em>and</em> smaller weights, freeing HBM for more sessions. Quality/cost trade: cheap model for free users, big model for paid. Route tiers to <strong>different replica pools</strong> (lesson 05) — never co-mingle, or the expensive model's KV starves the cheap one's session count.</li>
+  <li><strong>Continuous batching (lesson 04).</strong> Turns are wildly length-skewed (a one-line reply vs a 300-token essay). Continuous batching backfills finished slots immediately so decode stays full across the skew, instead of a static batch idling on its longest member.</li>
+</ul>
+
+<p>The compounding is the point: fp8 (×2) on top of a smaller free-tier model (×~5 in KV) is an order-of-magnitude swing in sessions/GPU, and sessions/GPU is the denominator of the entire bill.</p>
+
+<table>
+  <thead><tr><th>Lever</th><th>Effect on KV bytes/token</th><th>Effect on sessions/GPU</th></tr></thead>
+  <tbody>
+    <tr><td>70B, fp16 KV</td><td>320 KB</td><td>baseline</td></tr>
+    <tr><td>70B, fp8 KV</td><td>160 KB</td><td>~2×</td></tr>
+    <tr><td>7B free tier, fp8 KV</td><td>~16 KB</td><td>~20× (and weights drop 140→14 GB)</td></tr>
+  </tbody>
+</table>
+
+<h2>Stage 3 · The 10× diurnal swing (lessons 05, 11)</h2>
+
+<p>Peak is 50k req/s; the trough is ~5k. Provision for peak 24/7 and you pay for capacity that sits idle most of the day:</p>
+
+<div class="math block">
+wasted fraction ≈ (peak − avg)/peak; for a 10× swing, off-peak is ~90% idle capacity
+</div>
+
+<p>Autoscaling (lesson 05) tracks the swing — but on <em>the right signal</em>. GPU utilization is the trap metric (lesson 11): a memory-bound decode fleet runs near-full on KV while showing modest SM utilization, so scaling on GPU-util under-provisions right as you breach SLO. Scale on <strong>queue depth and KV-utilization</strong> instead — the signals that actually predict an SLO breach.</p>
+
+<p>The catch is cold-start. Bringing a 70B replica up means loading 140 GB of weights (35 GB/GPU across TP-4) from storage — minutes, not seconds. If you scale reactively you're always minutes behind a rising ramp. So keep a <strong>warm pool</strong> sized to cover the cold-start window of the steepest expected ramp, and pre-warm ahead of the predictable morning rise rather than chasing it.</p>
+
+<div class="callout ok">
+  <div class="label">Binding constraint, stage 3</div>
+  <strong>Cost, set by how tightly you track the swing.</strong> Once KV is shrunk (stage 2), the bill is no longer "can we fit?" but "how much of peak do we pay for around the clock?" Tight tracking on KV-util + a warm pool gets you toward paying for ~average + spike headroom instead of peak 24/7 — close to a 2–3× cost reduction off the naive peak-provisioned design. The wall moved from bytes to dollars.</p>
+</div>
+
+<h2>Stage 4 · Multi-tenancy & QoS (lesson 11)</h2>
+
+<p>Free and paid share a fleet's economics but not its priority. Under a spike that outruns even the warm pool, something must give, and graceful degradation (lesson 11) decides what:</p>
+
+<ul>
+  <li><strong>Priority by tier.</strong> Paid requests jump the queue; free requests wait. KV admission favors paid sessions when memory is tight.</li>
+  <li><strong>Admission control / load shedding.</strong> When queue depth crosses a threshold, shed or queue <em>free</em> tier first — degrade gracefully (slower, queued, or "try again") rather than letting the whole fleet's TTFT collapse for everyone. Never shed paid before free.</li>
+  <li><strong>Per-tenant KV budgets.</strong> Cap resident history per free session (e.g. evict aggressively, summarize old turns) so one tier can't starve the other's session count.</li>
+</ul>
+
+<h2>Interactive · sessions per GPU & the monthly bill</h2>
+
+<p>The whole case in four KPIs. Shrink the KV (fp8, smaller model) and watch sessions/GPU rise and the fleet shrink; flip autoscale and watch the bill track the swing instead of peak. The note tells you which wall is binding.</p>
+
+<div class="widget"><div class="title">Sessions per GPU & the monthly bill</div><p class="hint">KV/token anchored at 320 KB/tok for 70B (GQA-8, fp16), scaled linearly in N; ×0.5 for fp8. Weights (2N GB) are spread across the GPUs they need (TP, ~60 GB usable each), leaving usable KV/GPU ≈ 80 − 2N/TP − 4 after the per-GPU weight share and overhead. $3/GPU-hr · 730 hr/mo. Autoscale-on bills ~40% of a peak-provisioned-24/7 fleet (avg + spike headroom across the 10× swing); off bills the full peak. Order-of-magnitude per the series' ±30% contract.</p>
+<div class="controls">
+<label class="inline">model params N (B) <input id="w-N" type="range" min="7" max="70" step="1" value="70"><span class="val" id="w-N-v">70</span></label>
+<label class="inline">KV dtype (1=fp8, 2=fp16) <input id="w-dt" type="range" min="1" max="2" step="1" value="2"><span class="val" id="w-dt-v">2</span></label>
+<label class="inline">avg history tokens <input id="w-hist" type="range" min="500" max="8000" step="500" value="3500"><span class="val" id="w-hist-v">3500</span></label>
+<label class="inline">concurrent sessions <input id="w-sess" type="range" min="10000" max="1000000" step="10000" value="500000"><span class="val" id="w-sess-v">500000</span></label>
+<label class="inline">autoscale (0/1) <input id="w-as" type="range" min="0" max="1" step="1" value="1"><span class="val" id="w-as-v">1</span></label>
+</div>
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">KV / session</div><div class="v" id="w-kvs">–</div></div>
+  <div class="kpi"><div class="k">sessions / GPU</div><div class="v" id="w-spg">–</div></div>
+  <div class="kpi"><div class="k">GPUs needed</div><div class="v" id="w-gpu">–</div></div>
+  <div class="kpi"><div class="k">$ / month</div><div class="v" id="w-cost">–</div></div>
+</div>
+<p class="hint" id="w-note"></p></div>
+
+<h2>What this case teaches</h2>
+
+<ul>
+  <li><strong>The workload picks the wall — again.</strong> Lesson 13 was TTFT-bound because outputs were tiny and inputs static. Here outputs are long and history grows, so the wall is KV-memory × concurrency × cost. Same transformer, opposite system.</li>
+  <li><strong>Multi-turn history is the new variable.</strong> A growing per-session KV turns "keep it resident vs re-prefill" into the central trade; prefix caching plus an eviction policy resolves it, spending the generous TTFT budget to save memory.</li>
+  <li><strong>Sessions/GPU is the denominator of the bill.</strong> fp8 KV, GQA, and a smaller free-tier model compound into an order-of-magnitude swing in density — and density, not FLOPs, sets cost.</li>
+  <li><strong>The diurnal swing makes cost a design parameter.</strong> Autoscale on KV-util/queue depth (not GPU-util, lesson 11) with a warm pool for the 140 GB cold-start, and you pay for average-plus-spike instead of peak 24/7.</li>
+  <li><strong>Multi-tenancy is a graceful-degradation problem.</strong> Shed free before paid; per-tenant KV budgets keep one tier from starving the other.</li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="13_case_code_assistant.html"><span class="dir">Previous</span><span class="ttl">13 · Case: code assistant</span></a>
+  <a class="next" href="15_case_rag_assistant.html"><span class="dir">Next</span><span class="ttl">15 · Case: RAG assistant</span></a>
+</footer>
+
+<script>
+(function(){
+  const ids=['N','dt','hist','sess','as'];
+  const el=Object.fromEntries(ids.map(k=>[k,document.getElementById('w-'+k)]));
+  function fmt(n){return n.toLocaleString();}
+  function draw(){
+    ids.forEach(k=>document.getElementById('w-'+k+'-v').textContent=el[k].value);
+    const N=+el.N.value, dt=+el.dt.value, hist=+el.hist.value, sess=+el.sess.value, as=+el.as.value;
+    // KV bytes/token: 320 KB at 70B fp16, linear in N, halve for fp8
+    const kvPerTok = 320e3 * (N/70) * (dt===1?0.5:1);   // bytes/token
+    const kvSessBytes = hist * kvPerTok;                 // bytes/session
+    const kvSessGB = kvSessBytes/1e9;
+    // weights = 2N GB; spread across the GPUs the model needs (TP), so per-GPU
+    // weight share leaves room for KV. usable KV/GPU ≈ 80 − (2N/tp) − 4 overhead.
+    const tp = Math.max(1, Math.ceil(2*N / 60));         // GPUs the weights need (~60 GB usable each)
+    const usableGB = Math.max(1, 80 - (2*N)/tp - 4);     // GB of KV room per GPU after weights+overhead
+    const spg = Math.max(1, Math.floor(usableGB*1e9 / kvSessBytes));
+    const gpus = Math.ceil(sess / spg);
+    const baseMonthly = gpus * 3 * 730;                  // peak 24/7
+    const monthly = as===1 ? baseMonthly*0.4 : baseMonthly;
+    document.getElementById('w-kvs').textContent = kvSessGB.toFixed(2)+' GB';
+    document.getElementById('w-spg').textContent = fmt(spg);
+    document.getElementById('w-gpu').textContent = fmt(gpus);
+    document.getElementById('w-cost').textContent = '$'+(monthly/1e6).toFixed(2)+'M';
+    // verdict: is this memory-bound (few sessions/GPU) or is cost the lever?
+    const note = document.getElementById('w-note');
+    if(spg < 40){
+      note.textContent = 'Memory-bound — only '+fmt(spg)+' sessions/GPU. Shrink KV: switch to fp8 ('+(dt===2?'try it':'already on')+'), use GQA, or drop to a smaller free-tier model. Every halving of KV bytes ~doubles density and ~halves the fleet (stage 2).';
+    } else if(as===1){
+      const saved = (baseMonthly - monthly)/1e6;
+      note.textContent = 'Autoscale on saves ≈$'+saved.toFixed(2)+'M/mo vs peak-24/7 by tracking the 10× swing — but watch cold-start: loading '+(2*N)+' GB of weights takes minutes, so keep a warm pool (lessons 05/11). Scale on KV-util, never GPU-util.';
+    } else {
+      note.textContent = 'Autoscale off — paying for peak capacity 24/7 across a 10× swing wastes ~90% off-peak. Turn it on to bill ~average+spike instead (stage 3). Cost, not memory, is the binding wall here.';
+    }
+  }
+  Object.values(el).forEach(x=>x.addEventListener('input',draw));
+  draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

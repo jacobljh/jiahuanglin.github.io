@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>15 · Case: RAG assistant</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">ml_system_design</a>
+    <span class="crumb">/</span>
+    <span class="crumb">15 · case · RAG</span>
+    <span class="step-pill">lesson 15 / 18</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Case study — a RAG knowledge assistant</h1>
+<p class="subtitle">The code assistant (lesson 13) had a near-static input and tiny output; the consumer chatbot (lesson 14) had cheap input and a concurrency-via-output wall. This one inverts both: the input is <em>huge and changing</em> — 6–8K tokens of freshly retrieved context per query — so the binding wall is the <strong>prefill cost of long context</strong>. Worse, there is now a <em>second subsystem</em> (retrieval) living inside the same latency budget, and the documents go stale during the day — a cache-coherence wrinkle no earlier case had.</p>
+
+<div class="callout">
+  <div class="label">The brief</div>
+  An enterprise knowledge assistant. Each query: <strong>retrieve top-10 chunks ≈ 6–8K tokens</strong> of context, prepended to a <strong>~1.5K-token system + tools prefix</strong>. Output ~<strong>400 tokens</strong>. SLO: <strong>p95 TTFT &lt; 1.5 s — including retrieval</strong>. Load <strong>~500 req/s</strong>. Documents are edited through the day, so <strong>freshness matters</strong>: a stale answer is a wrong answer.
+</div>
+
+<p>Run the loop. Before reading on: where does the 1.5 s go — retrieval or prefill? Is a bigger model affordable here? And what breaks the moment a document is edited?</p>
+
+<h2>Stage 0 · Requirements → the number that matters (lesson 03)</h2>
+
+<p>The new structure: TTFT now has <strong>two consumers</strong>, not one.</p>
+
+<div class="math block">
+TTFT = retrieval_latency + prefill_latency + (first decode step)
+</div>
+
+<p><strong>Retrieval</strong> = embed the query + ANN search + rerank ≈ <strong>50–150 ms</strong>. That alone eats up to 10% of the budget before the LLM sees a token. <strong>Prefill</strong> is the rest — and it is large, because the input is ~8K tokens (7K retrieved + 1.5K system, minus overlap). Output is only 400 tokens, so by Little's Law decode concurrency is modest (<span class="math">W ≈ 1.5 + 400·0.03 ≈ 13.5 s</span>, <span class="math">L = 500·13.5 ≈ 6,750</span> — a normal fleet). <strong>This is a TTFT-via-long-prefill problem, with a retrieval tax on top.</strong></p>
+
+<p>Do the prefill arithmetic on a 70B (compute-bound, lesson 01–02, 40% MFU, one H100-equivalent of compute):</p>
+
+<div class="math block">
+prefill_tps = 990e12 · 0.4 / (2 · 70e9) ≈ 2,830 tokens/s<br>
+prefill(8000) ≈ 8000 / 2830 ≈ 2.8 s
+</div>
+
+<div class="callout warn">
+  <div class="label">Binding constraint, stage 0</div>
+  <strong>Prefill of the long retrieved context dominates and blows the budget.</strong> At 2.8 s on a 70B, prefill <em>alone</em> is nearly 2× the entire 1.5 s SLO — before adding the 50–150 ms of retrieval. The naive "big model, prepend everything, prefill it cold" design fails on arithmetic, exactly as the code assistant did — but here the redundancy is in the <em>documents</em>, not the user's file.</p>
+</div>
+
+<h2>Stage 1 · Two reusable layers — cache both (lesson 06, SGLang premise)</h2>
+
+<p>RAG looks per-request unique, but it has the two-layer prefix structure the <a href="../../sglang/lessons/01_workload.html">SGLang workload lesson</a> opens on:</p>
+
+<svg viewBox="0 0 720 150" class="diagram" role="img" aria-label="Two reusable layers in a RAG prompt">
+  <rect x="20" y="30" width="150" height="30" fill="#2563eb88"/>
+  <rect x="172" y="30" width="380" height="30" fill="#d9770688"/>
+  <rect x="554" y="30" width="120" height="30" fill="#16a34a88"/>
+  <text x="95" y="50" text-anchor="middle" font-size="11" fill="#fff">system + tools</text>
+  <text x="362" y="50" text-anchor="middle" font-size="11" fill="#fff">retrieved top-10 chunks</text>
+  <text x="614" y="50" text-anchor="middle" font-size="11" fill="#fff">query</text>
+  <text x="95" y="84" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">~1.5K tok</text>
+  <text x="362" y="84" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">~6–8K tok</text>
+  <text x="614" y="84" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">~80 tok</text>
+  <text x="20" y="116" font-size="11" fill="var(--text-dim)">blue: identical across ALL requests → ~100% cache hit, prefill once.</text>
+  <text x="20" y="136" font-size="11" fill="var(--text-dim)">orange: shared across users hitting the same hot docs → 60–80% reusable. green: truly unique.</text>
+</svg>
+
+<ul>
+  <li><strong>Layer 1 — the system + tools prefix (~1.5K tokens)</strong> is byte-identical on every single request. Prefill it <em>once</em>; it lives permanently in the prefix cache at ~100% hit rate. Cost amortizes to zero.</li>
+  <li><strong>Layer 2 — the retrieved documents.</strong> A heavy knowledge service serves the same hot documents to many different queries; the SGLang lesson measures 60–80% byte reuse on this layer. So <strong>precompute and cache the KV of hot document chunks</strong> — ideally offline, as a background job over the corpus — keyed by chunk. On a hit, you <em>skip prefilling those chunks entirely</em> and attend to their cached KV via RadixAttention (lesson 06, <a href="../../sglang/lessons/04_radix_attention.html">SGLang 04</a>).</li>
+</ul>
+
+<p>The payoff: if system (1.5K) is always cached and 70% of the 7K retrieved tokens hit the doc-KV cache, the uncached prefill drops to <span class="math">7000·0.3 ≈ 2,100 tokens</span> → on the 70B, <span class="math">2100/2830 ≈ 0.74 s</span>. Add 100 ms retrieval → TTFT ≈ 0.85 s. <strong>Now under budget — but only because the cache hits.</strong></p>
+
+<h2>Stage 2 · What doesn't cache — chunked prefill + a smaller model (lessons 04, 06)</h2>
+
+<p>The per-query <em>unique</em> tokens (the query, cold/cache-missed chunks) still prefill cold. Two levers, each justified by the wall:</p>
+
+<ul>
+  <li><strong>Chunked prefill (lesson 06, <a href="../../vllm/lessons/10_chunked_prefill.html">vLLM 10</a>).</strong> An 8K cold prefill is a multi-hundred-ms compute monopoly; run it in one shot and it stalls every other request's decode (lesson 04's prefill/decode contention) — your decode TPOT spikes fleet-wide. Slice the prefill into chunks interleaved with decode steps so one heavy RAG prefill doesn't freeze the batch.</li>
+  <li><strong>Go smaller.</strong> Prefill cost ∝ N (the 2N rule). A <strong>13B</strong> prefills at <span class="math">990e12·0.4/(2·13e9) ≈ 15,200 tok/s</span> — <strong>~5.4× faster</strong> than the 70B. The same 2,100 uncached tokens now cost <span class="math">~0.14 s</span>. And RAG quality leans on <em>retrieval</em> (did you fetch the right chunk?) far more than on raw model size — the model is mostly reading and summarizing grounded text. <strong>Dropping from 70B to 13B is often a near-free latency win here.</strong></li>
+</ul>
+
+<h2>Stage 3 · Freshness / cache invalidation — the new wrinkle</h2>
+
+<p>The doc-KV cache from stage 1 is what makes the budget feasible. But documents are <em>edited through the day</em>. The instant a document changes, its cached KV is <strong>stale</strong> — attending to it serves an answer grounded in the old text. This is the classic cache-coherence problem, now playing out over KV tensors.</p>
+
+<p>The fix is ordinary cache discipline made explicit:</p>
+
+<ul>
+  <li><strong>Key the cache by <code>(doc_id, version)</code></strong>, not by <code>doc_id</code> alone. An edit bumps the version; the old KV is now unreachable and gets evicted by LRU, the new version is recomputed on first use.</li>
+  <li><strong>Invalidate on the write path.</strong> The document store emits a change event → evict the affected chunks' KV → re-embed and re-index them for retrieval too (the ANN index is <em>also</em> a cache that goes stale). A chunk is only safely cached between edits.</li>
+</ul>
+
+<div class="callout bad">
+  <div class="label">Binding constraint, stage 3</div>
+  <strong>Correctness vs. the hit rate that makes the latency budget feasible.</strong> A long cache TTL maximizes the doc-KV hit rate (and keeps TTFT under 1.5 s) but widens the window where you serve stale, wrong answers. A short TTL is always fresh but collapses the hit rate, pushing prefill — and TTFT — back over budget. There is no free setting: you tune the staleness window against the freshness SLA the product actually needs (a legal-docs corpus and a status-page corpus want very different windows). Frequently-edited docs simply should not be cached.
+</div>
+
+<h2>Stage 4 · The retrieval subsystem, co-designed (lesson 05)</h2>
+
+<p>Retrieval is not free latency you inherit — it is a system you size, on its own, inside the shared 1.5 s budget. It has two pieces with different bottlenecks (the embeddings/ANN material in <a href="../../interview_questions/search_ads_recsys/03_embeddings_ann.html">search · embeddings &amp; ANN</a>):</p>
+
+<table>
+  <thead><tr><th>Component</th><th>Bottleneck</th><th>Sizing &amp; latency</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Embedding service</strong> (encode the query)</td><td>throughput-bound encoder, short input</td><td>tiny model, batch the 500 req/s; ~5–15 ms</td></tr>
+    <tr><td><strong>ANN index</strong> (vector search)</td><td>memory-resident vectors (HNSW/IVF)</td><td>RAM-sized to the corpus; ~10–40 ms</td></tr>
+    <tr><td><strong>Reranker</strong> (score top-k)</td><td>small cross-encoder, compute-bound</td><td>rerank ~50 candidates; ~20–80 ms</td></tr>
+  </tbody>
+</table>
+
+<p>These scale <strong>independently</strong> of the LLM fleet — different hardware, different replica counts (the ANN index may be CPU/RAM-bound, not GPU-bound). They share only the latency budget, so the design rule is: keep the whole retrieval path under ~150 ms so prefill gets the lion's share of the 1.5 s. If retrieval creeps up, it directly steals headroom from prefill — the two subsystems are coupled only through that one number.</p>
+
+<div class="callout ok">
+  <div class="label">Binding constraint, final</div>
+  <strong>Prefill latency, gated by the doc-cache hit rate</strong> — with cache coherence as the tax you pay to keep that hit rate honest. Retrieval is a fixed ~150 ms slice; the variable that decides whether you clear 1.5 s is how much of the retrieved context you can serve from cached KV. So the system's real job, as in the code assistant (13), is maximizing hit rate — here complicated by documents that change underneath the cache.
+</div>
+
+<h2>Interactive · RAG TTFT budget</h2>
+
+<p>Split the 1.5 s budget between retrieval and prefill, then watch the doc-cache hit rate decide whether you are prefill-bound (cache hotter, go smaller) or retrieval-bound (the LLM is fine, optimize the index).</p>
+
+<div class="widget"><div class="title">RAG TTFT budget</div><p class="hint">prefill_tps = 990e12·0.4/(2·N·1e9). System prefix always hits the cache (prefill-once); of the retrieved tokens, only the hit fraction is cached. Uncached = total − cached; prefill_time = uncached / prefill_tps; TTFT = retrieval + prefill_time + 3 ms. Order-of-magnitude per the series' ±30% contract; single H100-equivalent of compute.</p>
+<div class="controls">
+<label class="inline">model params N (B) <input id="r-N" type="range" min="7" max="70" step="1" value="70"><span class="val" id="r-N-v">70</span></label>
+<label class="inline">retrieved context (tok) <input id="r-ctx" type="range" min="2000" max="16000" step="500" value="7000"><span class="val" id="r-ctx-v">7000</span></label>
+<label class="inline">system prefix (tok) <input id="r-sys" type="range" min="500" max="4000" step="100" value="1500"><span class="val" id="r-sys-v">1500</span></label>
+<label class="inline">doc-cache hit rate % <input id="r-hit" type="range" min="0" max="100" step="1" value="70"><span class="val" id="r-hit-v">70</span></label>
+<label class="inline">retrieval latency (ms) <input id="r-ret" type="range" min="30" max="300" step="10" value="100"><span class="val" id="r-ret-v">100</span></label>
+</div>
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">uncached tokens</div><div class="v" id="r-unc">–</div></div>
+  <div class="kpi"><div class="k">prefill time</div><div class="v" id="r-pf">–</div></div>
+  <div class="kpi"><div class="k">TTFT</div><div class="v" id="r-ttft">–</div></div>
+  <div class="kpi"><div class="k">verdict vs 1.5 s</div><div class="v" id="r-ok">–</div></div>
+</div>
+<p class="hint" id="r-note"></p></div>
+
+<h2>What this case teaches</h2>
+
+<ul>
+  <li><strong>Long retrieved context makes prefill the wall.</strong> Unlike the code assistant (near-static input) or the chatbot (cheap input, output-bound), here 8K tokens of fresh context per query dominate TTFT — and a 70B prefills it at only ~2,830 tok/s, blowing the budget cold.</li>
+  <li><strong>The two-layer prefix structure is the lever.</strong> The system prefix caches at ~100%; hot documents cache at 60–80%. Precomputing doc-KV converts most of the prefill into a cache lookup — the only reason 1.5 s is reachable.</li>
+  <li><strong>A second subsystem lives in the latency budget.</strong> Retrieval (embed + ANN + rerank) is co-designed and scaled independently of the LLM fleet, but every ms it spends is a ms prefill can't have.</li>
+  <li><strong>Freshness is a cache-coherence problem over KV.</strong> Key by <code>(doc_id, version)</code> and invalidate on edit — and accept the real tension between staleness and the hit rate the budget depends on. This wrinkle simply doesn't exist in the static-corpus cases.</li>
+  <li><strong>Smaller is often free.</strong> Prefill ∝ N and RAG quality rides on retrieval, so a 13B can be ~5× faster with little quality loss — the opposite instinct from "use the biggest model."</li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="14_case_consumer_chatbot.html"><span class="dir">Previous</span><span class="ttl">14 · Case: consumer chatbot</span></a>
+  <a class="next" href="16_case_agentic_platform.html"><span class="dir">Next</span><span class="ttl">16 · Case: agentic platform</span></a>
+</footer>
+
+<script>
+(function(){
+  const ids=['N','ctx','sys','hit','ret'];
+  const el=Object.fromEntries(ids.map(k=>[k,document.getElementById('r-'+k)]));
+  function draw(){
+    ids.forEach(k=>document.getElementById('r-'+k+'-v').textContent=el[k].value);
+    const N=+el.N.value, ctx=+el.ctx.value, sys=+el.sys.value, hit=+el.hit.value/100, ret=+el.ret.value/1000;
+    const prefillTps = 990e12*0.4/(2*N*1e9);        // compute-bound prefill, tok/s
+    const total = ctx + sys;
+    const cached = sys + ctx*hit;                    // system always hits; retrieved by hit rate
+    const uncached = Math.max(0, total - cached);
+    const pf = uncached / prefillTps;                // s
+    const ttft = ret + pf + 0.003;                   // + first decode step
+    const meets = ttft < 1.5;
+    document.getElementById('r-unc').textContent=Math.round(uncached).toLocaleString()+' tok';
+    document.getElementById('r-pf').textContent=(pf*1000).toFixed(0)+' ms';
+    document.getElementById('r-ttft').textContent=(ttft*1000).toFixed(0)+' ms';
+    const ok=document.getElementById('r-ok');
+    ok.textContent = meets ? 'meets' : 'MISS';
+    ok.style.color = meets ? 'var(--ok)' : 'var(--bad)';
+    // which term dominates?
+    const note=document.getElementById('r-note');
+    if(pf > ret){
+      note.textContent = 'Prefill-bound ('+(pf*1000).toFixed(0)+' ms prefill vs '+(ret*1000).toFixed(0)+' ms retrieval). '
+        + (meets ? 'Under budget, but headroom is in the cache — raise the doc-cache hit rate or drop model size to bank margin.'
+                 : 'Over budget: cache hotter docs (raise hit rate) and/or go to a smaller model — prefill ∝ N, so 70B→13B cuts it ~5×.');
+    } else {
+      note.textContent = 'Retrieval-bound ('+(ret*1000).toFixed(0)+' ms retrieval vs '+(pf*1000).toFixed(0)+' ms prefill). '
+        + (meets ? 'The LLM is no longer the wall — further model/cache tuning buys little. Optimize the index (ANN params, reranker depth) instead.'
+                 : 'Over budget on retrieval alone: a bigger/cheaper model won’t help — shrink the retrieval path (smaller candidate set, faster ANN, async rerank).');
+    }
+  }
+  Object.values(el).forEach(x=>x.addEventListener('input',draw));
+  draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

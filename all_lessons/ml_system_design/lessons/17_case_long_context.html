@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>17 · Case: long context</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">ml_system_design</a>
+    <span class="crumb">/</span>
+    <span class="crumb">17 · case · long context</span>
+    <span class="step-pill">lesson 17 / 18</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Case study — long-context document AI (100K–1M tokens)</h1>
+<p class="subtitle">Every prior case had <em>one</em> binding wall. This one is different: <strong>two walls bind at once, and both are driven by the same knob — sequence length.</strong> As context grows, prefill compute goes quadratic (the seq² regime of lesson 06 §6) <em>and</em> a single request's KV outgrows one GPU (lesson 02's 320 KB/token). The unusual consequence: you reach for <em>training-style parallelism</em> (lesson 07) to serve <em>one</em> request, because that one request is so big it needs the whole node.</p>
+
+<div class="callout">
+  <div class="label">The brief</div>
+  Summarize and answer questions over very long documents — legal contracts, whole codebases, books. <strong>Context:</strong> 100K–1M tokens. <strong>Output:</strong> ~1,000 tokens (a summary or answer). <strong>Traffic:</strong> low QPS — each request is enormous, so a handful of concurrent requests already saturates a node. <strong>SLO:</strong> TTFT may be seconds but is bounded — say <strong>&lt; 20 s</strong>; cost per request matters because each one is expensive. Model: a 70B dense (lesson 02 numbers — 320 KB/token KV, 140 GB weights).
+</div>
+
+<p>Run the loop. Before reading on: which wall binds — memory, bandwidth, compute, or latency? Here the honest answer is "two of them, simultaneously, and they're the same variable." That co-binding is the whole lesson.</p>
+
+<h2>Stage 0/1 · The seq² compute wall (lesson 06 §6)</h2>
+
+<p>Prefill FLOPs are <em>not</em> simply <span class="math">2N·seq</span> at this scale. Lesson 06 §6 split them: the MLP/projection term scales with <span class="math">2N·seq</span> (linear in context), but the attention score+value term scales with <span class="math">seq²·d_model</span> — quadratic. They cross when <span class="math">seq ≈ 12·d_model</span>, which for a 70B (<span class="math">d_model ≈ 8K</span>) lands near <strong>~16–24K tokens</strong>.</p>
+
+<div class="math block">
+prefill FLOPs(seq) ≈ 2N·seq &nbsp;(MLP, linear) &nbsp;+&nbsp; ≈ seq²·d_model &nbsp;(attention, quadratic)
+</div>
+
+<p>Below the crossover the <span class="math">2N</span> term dominates and our napkin math holds. <strong>Above it the seq² term takes over and prefill time grows quadratically with document length.</strong> Even ignoring the quadratic part, the linear part is already brutal. At ~40% MFU on one H100 the 2N-rate prefill throughput is</p>
+
+<div class="math block">
+990e12 · 0.4 / (2 · 70e9) ≈ 2,830 tokens/s
+</div>
+
+<p>So a 128K-token document costs <span class="math">128000 / 2830 ≈ 45 s</span> on the linear term <em>alone</em> — already over the 20 s budget — and at 128K we are well past the ~20K crossover, so the seq² term is now adding materially on top. A 1M-token document is worse than linearly worse.</p>
+
+<div class="callout warn">
+  <div class="label">Binding constraint #1 — prefill is firmly compute-bound and super-linear</div>
+  This is the opposite of the code-assistant case (lesson 13), where prefill was tiny and the problem was redundancy. Here the prefill is the dominant cost and <strong>TTFT scales worse than linearly with document length</strong>. You are deep on the right of the roofline ridge (lesson 02): more FLOPs is the only thing that helps, and there aren't enough on one GPU. This is a compute wall, and the compute tools (parallelize it, chunk it) are what apply.
+</div>
+
+<h2>Stage 2 · The KV capacity wall (lessons 02, 04)</h2>
+
+<p>The second wall arrives from the same knob. Lesson 02's <span class="math">kv_bytes/token = 2·L·H_kv·d·dtype = 320 KB/token</span> for a 70B. Multiply by context:</p>
+
+<div class="math block">
+128K request: 128000 · 320KB ≈ 41 GB of KV &nbsp;|&nbsp; 1M request: 1e6 · 320KB ≈ 320 GB of KV
+</div>
+
+<p>An H100 holds 80 GB. After 140 GB of weights (already two GPUs) there is no room for a 41 GB KV blob alongside, and a 320 GB KV exceeds <em>four</em> H100s' total memory by itself. <strong>A single request's KV no longer fits on one GPU.</strong> This breaks the assumption underlying every prior case — that one request lives on one replica and parallelism exists to serve <em>many</em> requests.</p>
+
+<div class="callout bad">
+  <div class="label">Binding constraint #2 — one request's KV exceeds one GPU</div>
+  Note what just happened: stage 1 (compute) and stage 2 (capacity) are <strong>both</strong> functions of <span class="math">seq</span>, and both go past breaking point in the same context range. You cannot relieve one without confronting the other. The capacity wall forces you to shard <em>one request's sequence</em> across GPUs — and conveniently, that same sharding spreads the seq² compute too.
+</div>
+
+<h2>Stage 3 · Sequence / context parallelism (lesson 07)</h2>
+
+<p>Lesson 07 listed sequence/context parallelism as the long-context training lever: shard the <em>sequence</em> dimension across GPUs so each holds a slice of the tokens' activations. The same axis solves serving here. Each GPU holds part of the KV and computes attention over its slice; a ring/context-parallel exchange passes the K/V slices around so every query token can attend to the whole sequence. Mechanism: <a href="../../system_ml/lessons/08_sequence_context_parallel.html">system_ml 08</a>.</p>
+
+<div class="ascii">one 320 GB KV (1M tokens) sharded across a node:
+  GPU0: tokens     0–250K   (≈80 GB KV slice)
+  GPU1: tokens 250K–500K    (≈80 GB KV slice)
+  GPU2: tokens 500K–750K    (≈80 GB KV slice)
+  GPU3: tokens 750K–1M      (≈80 GB KV slice)
+       └── ring exchange of K/V so each query attends the full sequence ──┘
+</div>
+
+<p>This is parallelism applied to a <strong>single request</strong> — unusual. Normally parallelism serves many requests (lesson 05); here one request is so big it needs the whole node to itself. Two companions from lesson 06 compose with it:</p>
+
+<ul>
+  <li><strong>Chunked prefill.</strong> A 45 s monolithic prefill would freeze everything; split it into chunks so TTFT growth is bounded and any co-resident decode isn't starved (lesson 06 §4). It does not reduce total work — the seq² FLOPs are still there — but it bounds the spike.</li>
+  <li><strong>KV quantization (fp8).</strong> Store K/V at fp8 instead of fp16 and lesson 02's KV bytes halve: the 41 GB request drops to ~20 GB, the 1M request to ~160 GB — fewer GPUs to shard across. It targets the capacity wall directly (lesson 06 §1), at a small long-context accuracy risk you gate behind evals (lesson 10).</li>
+</ul>
+
+<h2>Stage 4 · Amortize the giant prefill (lesson 06 prefix caching)</h2>
+
+<p>Here is the single biggest design win when the access pattern allows it. Often the <em>same document is queried many times</em> — a lawyer asks 20 questions of one contract, an engineer asks 50 of one codebase. Naively, each query re-prefills the whole 128K document: 20 × 45 s of pure waste. Instead, <strong>prefill the document's KV once and reuse it</strong> across every query (lesson 06 §3 prefix caching; the same hot-doc reuse as RAG in lesson 15).</p>
+
+<div class="math block">
+amortized prefill / query ≈ (one-time 45 s prefill) / queries_per_doc &nbsp;+&nbsp; cheap per-query decode
+</div>
+
+<p>At 20 queries the 45 s prefill amortizes to ~2.3 s/query — under budget, and the marginal query is just decode over a question and a 1K-token answer. The wall <em>moves</em>: it is no longer per-query prefill compute, it is the <strong>one-time prefill plus the KV storage</strong> you must keep resident (41 GB, or 20 GB at fp8) for as long as the document is hot.</p>
+
+<div class="callout ok">
+  <div class="label">Binding constraint, final — the wall moves with the access pattern</div>
+  With reuse, both stage-1 and stage-2 walls collapse from per-query to one-time costs. The system's job becomes <strong>KV residency and eviction policy</strong>: keep hot documents' KV pinned across context-parallel shards, evict cold ones. We never bought a magically faster prefill; when the document is reused we simply <em>stop repeating it</em> — and when it isn't, we shard it across the node to survive both walls at once.
+</div>
+
+<h2>Interactive · the seq² wall &amp; single-GPU KV ceiling</h2>
+
+<p>Drag context length up and watch both walls close together: prefill time goes super-linear (the seq² factor), and the KV bar blows past one GPU into a context-parallel GPU count. Then turn the amortization knob — queries per document — and watch the per-query cost collapse as the one-time prefill spreads over many cheap queries.</p>
+
+<div class="widget"><div class="title">The seq² wall &amp; single-GPU KV ceiling</div>
+<p class="hint">Assumptions: linear prefill at 2N-rate <span class="math">= 990e12·0.4/(2N)</span> tok/s; the seq² term is modeled simply as multiplying prefill time by <span class="math">(1 + ctx/crossover)</span> with crossover ≈ 12·8192 ≈ 100K (a stand-in for the quadratic attention cost — it understates 1M but captures the regime). KV/token ≈ 320 KB scaled by N/70 and by dtype/2 (fp8=1, fp16=2). Usable HBM per GPU ≈ 80 − 2N − 4. $3/GPU-hr; decode ≈ 1K tokens at the 2N decode bound. Order-of-magnitude per the series' ±30% contract.</p>
+<div class="controls">
+<label class="inline">context tokens <input id="w-ctx" type="range" min="8000" max="1000000" step="8000" value="128000"><span class="val" id="w-ctx-v">128000</span></label>
+<label class="inline">model params (B) <input id="w-N" type="range" min="7" max="70" step="1" value="70"><span class="val" id="w-N-v">70</span></label>
+<label class="inline">KV dtype <input id="w-d" type="range" min="1" max="2" step="1" value="2"><span class="val" id="w-d-v">fp16</span></label>
+<label class="inline">queries / document <input id="w-q" type="range" min="1" max="50" step="1" value="1"><span class="val" id="w-q-v">1</span></label>
+</div>
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">prefill time (seq²)</div><div class="v" id="w-pf">–</div></div>
+  <div class="kpi"><div class="k">KV size</div><div class="v" id="w-kv">–</div></div>
+  <div class="kpi"><div class="k">GPUs (weights+KV)</div><div class="v" id="w-gpu">–</div></div>
+  <div class="kpi"><div class="k">amortized $/query</div><div class="v" id="w-cost">–</div></div>
+</div>
+<p class="hint" id="w-note"></p></div>
+
+<h2>What this case teaches</h2>
+
+<ul>
+  <li><strong>Two walls, one knob.</strong> Unlike every prior case, long context binds on <em>both</em> compute and capacity at once — and both are driven by sequence length. Relieving one forces you to confront the other.</li>
+  <li><strong>The seq² compute regime is real (lesson 06 §6).</strong> Past the ~16–24K crossover for a 70B, prefill stops being <span class="math">2N·seq</span> and goes quadratic; TTFT scales worse than linearly. Long context is its own cost regime.</li>
+  <li><strong>Parallelism for a single request.</strong> When one request's KV (41 GB at 128K, 320 GB at 1M) exceeds one GPU, you shard <em>its sequence</em> across the node with context/sequence parallelism (lesson 07) — training's long-context lever, repurposed for serving one giant request.</li>
+  <li><strong>Prefill amortization is the biggest win when reuse exists.</strong> If a document is queried many times, prefill it once and reuse the KV (lesson 06 prefix caching); the wall moves from per-query prefill to one-time prefill + KV residency. Compose with chunked prefill (bound the spike) and fp8 KV (halve the bytes).</li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="16_case_agentic_platform.html"><span class="dir">Previous</span><span class="ttl">16 · Case: agentic platform</span></a>
+  <a class="next" href="18_case_batch_inference.html"><span class="dir">Next</span><span class="ttl">18 · Case: batch inference</span></a>
+</footer>
+
+<script>
+(function(){
+  const ids=['ctx','N','d','q'];
+  const el=Object.fromEntries(ids.map(k=>[k,document.getElementById('w-'+k)]));
+  const CROSS=12*8192;            // seq² crossover ≈ 100K tokens (lesson 06 §6)
+  function fmtTime(s){ return s<1 ? (s*1000).toFixed(0)+' ms' : (s<90 ? s.toFixed(1)+' s' : (s/60).toFixed(1)+' min'); }
+  function draw(){
+    document.getElementById('w-ctx-v').textContent=(+el.ctx.value).toLocaleString();
+    document.getElementById('w-N-v').textContent=el.N.value;
+    document.getElementById('w-d-v').textContent=el.d.value==='1'?'fp8':'fp16';
+    document.getElementById('w-q-v').textContent=el.q.value;
+
+    const ctx=+el.ctx.value, N=+el.N.value, d=+el.d.value, q=+el.q.value;
+    const prefillTps = 990e12*0.4/(2*N*1e9);          // 2N-rate, tokens/s
+    const seqFactor  = 1 + ctx/CROSS;                  // simple stand-in for the seq² term
+    const prefill    = ctx/prefillTps * seqFactor;     // s, super-linear
+    // KV size: 320 KB/token at 70B, scaled by N/70 and dtype (fp8=1, fp16=2)
+    const kvBytes    = ctx * (320*1024) * (N/70) * (d/2);
+    const kvGB       = kvBytes/1e9;
+    const usablePerGpu = 80 - 4;                       // ~76 GB usable/GPU after overhead
+    const totalMem     = 2*N + kvGB;                    // weights (TP-sharded) + this request's KV (CP-sharded) across the group
+    const gpus         = Math.max(1, Math.ceil(totalMem/usablePerGpu));
+    // per-query decode: ~1K output tokens at the 2N decode bound (bandwidth ~ same rate proxy)
+    const decodeTps  = prefillTps;                     // proxy: 2N bound
+    const decodeS    = 1000/decodeTps;
+    // amortized cost: one-time prefill spread over q queries, + per-query decode, on `gpus` GPUs
+    const prefillGpuHr = prefill/3600 * gpus;
+    const decodeGpuHr  = decodeS/3600 * gpus;
+    const costPerQuery = (prefillGpuHr/q + decodeGpuHr) * 3;   // $3/gpu-hr
+
+    document.getElementById('w-pf').textContent=fmtTime(prefill);
+    document.getElementById('w-kv').textContent=kvGB.toFixed(0)+' GB';
+    const gpuEl=document.getElementById('w-gpu');
+    gpuEl.textContent=gpus+(gpus>1?' (TP+CP)':'');
+    gpuEl.style.color = gpus>1 ? 'var(--bad)' : 'var(--ok)';
+    document.getElementById('w-cost').textContent='$'+costPerQuery.toFixed(3);
+
+    const note=document.getElementById('w-note');
+    let msg='';
+    if(gpus>1){
+      msg='Weights (2N='+(2*N).toFixed(0)+' GB) + this request’s KV ('+kvGB.toFixed(0)+' GB) = '+totalMem.toFixed(0)+' GB needs '+gpus+' GPUs: tensor-parallel the weights and context-parallel the sequence across the same group (lesson 07 / system_ml 08). ';
+    } else {
+      msg='Weights + KV ('+totalMem.toFixed(0)+' GB) still fit one GPU — no parallelism forced yet. ';
+    }
+    if(prefill>20){
+      msg+='Prefill '+fmtTime(prefill)+' blows the 20 s TTFT budget (seq² factor ×'+seqFactor.toFixed(1)+'). ';
+    }
+    if(q>=10){
+      msg+='High reuse (q='+q+'): the one-time prefill amortizes to $'+costPerQuery.toFixed(3)+'/query — the wall has moved from per-query prefill to KV storage. Pin the document KV resident.';
+    } else if(q===1){
+      msg+='No reuse (q=1): every query pays the full prefill. If the same document is asked repeatedly, prefill once and reuse the KV (lesson 06 prefix caching) — the single biggest win here.';
+    } else {
+      msg+='Some reuse (q='+q+'): prefill amortizing, but push reuse higher to drive $/query down further.';
+    }
+    note.textContent=msg;
+  }
+  Object.values(el).forEach(x=>x.addEventListener('input',draw));
+  draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

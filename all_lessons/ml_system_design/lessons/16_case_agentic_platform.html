@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>16 · Case: agentic platform</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">ml_system_design</a>
+    <span class="crumb">/</span>
+    <span class="crumb">16 · case · agentic</span>
+    <span class="step-pill">lesson 16 / 18</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Case study — an agentic tool-use platform</h1>
+<p class="subtitle">Every prior case bound on a property of a <em>single</em> model call: the code assistant (13) on prefill latency, the chatbot (14) on concurrency, the RAG assistant (15) on retrieval + long-context prefill. Here the wall moves up a level. A request is no longer one call — it is a <strong>sequence</strong> of them, and the binding constraint is <strong>end-to-end task latency built from sequential fan-out and tail amplification</strong> (lesson 03), compounded by <strong>statefulness</strong>: a task is pinned to its KV. This is a reliability-and-scheduling problem wearing a serving problem's clothes — not a throughput one.</p>
+
+<div class="callout">
+  <div class="label">The brief</div>
+  A platform running <strong>autonomous agents</strong>. A task = <strong>10–30 sequential model calls</strong> (think → call tool → observe → think …), each call's context = system prompt + growing history + tool outputs (history reaches <strong>20–40K tokens</strong> by the end). Tools run in sandboxes (exec, web, code) with their own latency, <strong>100 ms – several seconds</strong>. <strong>No human watches mid-task</strong> → nothing streams to a person, so token-level SLOs are irrelevant. The SLO is <strong>task p95 E2E &lt; 60 s</strong> and <strong>tasks/hour throughput</strong>. Model: an ordinary 70B. Design the platform.
+</div>
+
+<p>Run the loop. Before reading on: what binds — TTFT, TPOT, memory, throughput? None of them directly. The wall is a property of the <em>composition</em> of calls, and it forces a stateful design.</p>
+
+<h2>Stage 0 · Sequential fan-out and tail amplification (lesson 03)</h2>
+
+<p>The calls are <strong>sequential, not parallel</strong> — call <span class="math">k</span> needs call <span class="math">k−1</span>'s output (the model must see the tool result before it reasons again). So task latency is a <em>sum</em>, not a max:</p>
+
+<div class="math block">
+T_task = Σ (call_latency_k + tool_latency_k),  k = 1 … n
+</div>
+
+<p>A sum of <span class="math">n</span> calls inherits the worst of them. Lesson 03's fan-out result applies directly: the chance the task hits <em>at least one</em> p99-slow call is <span class="math">1 − 0.99ⁿ</span>. At <span class="math">n = 20</span> that is <span class="math">1 − 0.99²⁰ ≈ 18%.</span> Nearly one task in five trips a p99 call — so your <strong>call-level p99 IS your task-level typical case.</strong> Designing to call-level median is self-deception; the task sees the tail every time.</p>
+
+<div class="callout warn">
+  <div class="label">Binding constraint, stage 0</div>
+  <strong>Sequential fan-out + tail amplification.</strong> Because latencies add and the tail compounds, the only two levers on task latency are (a) <strong>cut the number of calls</strong> <span class="math">n</span> and (b) <strong>tighten per-call p99</strong> (not median). Everything else in this design serves one of those two. A median-fast / p99-slow call distribution is the failure mode — you must design and validate at call p99.
+</div>
+
+<h2>Stage 1 · Statefulness & KV residency (lessons 05, 13)</h2>
+
+<p>Now the redemption. Each call's context is the previous call's context plus the new tool output — i.e. call <span class="math">k</span>'s prompt is call <span class="math">k−1</span>'s prompt as a <strong>prefix</strong>. This is the exact prefix-caching premise from the code assistant (13) and SGLang (<a href="../../sglang/lessons/04_radix_attention.html">SGLang 04</a>), but along the <em>time</em> axis of one task. With the history KV resident, call <span class="math">k</span> re-prefills only the new tool-output + reasoning tokens (a few hundred), not the whole 30K history:</p>
+
+<div class="math block">
+prefill_warm ≈ new_tokens / 11,300 tok/s ≈ 300/11,300 ≈ 27 ms  vs.  prefill_cold ≈ 30000/11,300 ≈ 2.7 s
+</div>
+
+<p>That is a <strong>~100× collapse</strong> in the prefill component of every call after the first. But it is conditional on two things, both from lesson 05:</p>
+
+<ul>
+  <li><strong>Session-sticky / cache-aware routing.</strong> Every call of a task must land on the replica holding that task's KV. Round-robin would give a cold 30K prefill on most calls and resurrect the ~2.7 s penalty — multiplied by <span class="math">n</span>. Route by task-id, not load. Link <a href="../../sglang/lessons/05_cache_aware_scheduling.html">SGLang 05</a>.</li>
+  <li><strong>KV residency for the task's lifetime.</strong> A 30K-token history at 70B GQA-8 (~320 KB/token, lesson 02/13) is <span class="math">30000 · 320 KB ≈ 9.6 GB</span> of KV per active task — and it must stay pinned for the whole 30–60 s the task runs, not just one call. That number, not FLOPs, sets how many tasks fit a replica.</li>
+</ul>
+
+<div class="callout warn">
+  <div class="label">Binding constraint, stage 1</div>
+  <strong>KV residency per long-lived task.</strong> At ~9.6 GB/task, a TP-4 replica with ~160 GB of KV room (capstone, lesson 12) holds only ~<strong>16 concurrent tasks</strong> before eviction would force ruinous re-prefills. Residency, not compute, caps task concurrency — and routing must be sticky to use it at all.
+</div>
+
+<h2>Stage 2 · Tool latency doesn't overlap — so multiplex across tasks (lesson 04)</h2>
+
+<p>While a sandboxed tool runs (100 ms – several s), generation for that task is <strong>blocked</strong> on a sequential dependency. If a replica served one task, the GPU would sit idle for that entire tool window — pure waste. The fix is the same continuous batching from lesson 04, but applied <em>across tasks</em>: the replica decodes <em>other</em> tasks while this one waits on its tool. A replica is a multiplexer over many tasks at different stages (some thinking, most waiting on tools).</p>
+
+<p>This is why <strong>high task-concurrency per replica is good for utilization</strong> even though each task is mostly idle: with tool windows averaging, say, 2 s against ~1 s of active generation per call, a task spends ~⅔ of its life waiting — so you need ~3× the concurrent tasks just to keep the GPU busy. The 16-task residency cap from stage 1 and this multiplexing requirement are in direct tension: <strong>residency limits how many tasks you can keep warm, and you need many warm tasks to stay utilized.</strong> That tension is the heart of sizing this fleet.</p>
+
+<table>
+  <thead><tr><th>Lever</th><th>Effect on task latency</th><th>Effect on utilization / cost</th></tr></thead>
+  <tbody>
+    <tr><td>Prefix-cache the history (sticky routing)</td><td>~100× per-call prefill cut</td><td>frees compute, but pins 9.6 GB KV/task</td></tr>
+    <tr><td>Multiplex tasks across tool waits</td><td>none (per-task)</td><td>recovers the idle GPU during tool exec</td></tr>
+    <tr><td>Cut number of calls <span class="math">n</span></td><td>linear <em>and</em> tail reduction</td><td>fewer KV-pinned seconds per task</td></tr>
+  </tbody>
+</table>
+
+<h2>Stage 3 · Failure & statefulness is the hard part (lesson 11)</h2>
+
+<p>Stateless serving (cases 13–15) lets you treat replicas as cattle: drain, kill, reroute, autoscale freely. Statefulness breaks all of that.</p>
+
+<ul>
+  <li><strong>Failover blast radius.</strong> If a sticky replica dies mid-task, every task pinned there loses its KV <em>and</em> its progress. Recovery means either re-prefilling the entire 30K history (~2.7 s of compute per task, times all pinned tasks) or restoring from a checkpoint of task state (the message/tool-call transcript) and re-prefilling from there.</li>
+  <li><strong>Autoscaling can't drain instantly.</strong> You cannot scale a replica down while it holds live 30–60 s tasks; you must stop routing <em>new</em> tasks to it and wait for the in-flight ones to finish — a drain that takes as long as the longest task. Scale-down is slow by construction.</li>
+  <li><strong>Checkpoint the transcript, not the KV.</strong> KV is huge (9.6 GB) and replica-local; the transcript (system prompt + messages + tool outputs) is small and portable. Persist the transcript per task so any replica can rehydrate by re-prefilling — trading compute for recoverability.</li>
+</ul>
+
+<div class="callout bad">
+  <div class="label">Binding constraint, stage 3</div>
+  <strong>Statefulness turns a stateless-serving problem into a stateful one.</strong> Sticky routing, slow drains, and a failover blast radius proportional to tasks-per-replica are the real engineering cost of this platform — harder than any kernel. The design question stops being "how fast is a call?" and becomes "what happens to a 45-second task when its replica dies at second 40?"
+</div>
+
+<h2>Stage 4 · Levers to cut calls and tighten the tail (lessons 06, 13)</h2>
+
+<p>Stage 0 said the only levers are fewer calls and lower call p99. Concretely:</p>
+
+<ul>
+  <li><strong>Speculative decoding</strong> for the short tool-call / JSON outputs that dominate agent turns. Agent calls are small-batch and latency-critical — exactly where spec decoding pays (lesson 06): the bandwidth-bound decode of a 30-token tool call gets a draft model's free ride.</li>
+  <li><strong>Constrained / grammar decoding</strong> so every tool call is syntactically valid the first time. An invalid call is a wasted round-trip — it <em>adds a call</em> to <span class="math">n</span>, the most expensive thing you can do. Fewer retries directly shrinks the fan-out.</li>
+  <li><strong>Tiered models</strong> (like 13): a smaller/faster model for routine steps (formatting, simple tool dispatch), the 70B only for the hard reasoning steps. Most of <span class="math">n</span> calls are routine; serving them on a 7B cuts both their latency and their KV footprint.</li>
+</ul>
+
+<h2>Interactive · task latency & the tail</h2>
+
+<p>Build a task out of calls and watch the tail. Turn prefix caching off and see re-prefill of the growing history wreck both latency and cost; raise the call count and watch <span class="math">1 − 0.99ⁿ</span> push the p95 estimate past 60 s even when the median looks fine.</p>
+
+<div class="widget"><div class="title">Task latency & the tail</div><p class="hint">Per-call latency = generation + (prefix-cache off → re-prefill of the full growing history, ~30K/11.3k tok/s ≈ 2.7 s extra/call). Task median ≈ n·(call median + tool). p95 estimate adds the tail term (1−0.99ⁿ)·(call p99 − median) per lesson 03. Order-of-magnitude per the series' ±30% contract.</p>
+<div class="controls">
+<label class="inline">calls / task (n) <input id="w-n" type="range" min="5" max="40" step="1" value="20"><span class="val" id="w-n-v">20</span></label>
+<label class="inline">per-call median (ms) <input id="w-med" type="range" min="200" max="3000" step="50" value="800"><span class="val" id="w-med-v">800</span></label>
+<label class="inline">per-call p99 (ms) <input id="w-p99" type="range" min="1000" max="15000" step="250" value="5000"><span class="val" id="w-p99-v">5000</span></label>
+<label class="inline">avg tool latency (ms) <input id="w-tool" type="range" min="0" max="4000" step="100" value="1500"><span class="val" id="w-tool-v">1500</span></label>
+<label class="inline">prefix cache <input id="w-pc" type="range" min="0" max="1" step="1" value="1"><span class="val" id="w-pc-v">on</span></label>
+</div>
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">task median</div><div class="v" id="w-tmed">–</div></div>
+  <div class="kpi"><div class="k">task p95 (est.)</div><div class="v" id="w-tp95">–</div></div>
+  <div class="kpi"><div class="k">P(task hits a p99 call)</div><div class="v" id="w-ptail">–</div></div>
+  <div class="kpi"><div class="k">verdict vs 60s</div><div class="v" id="w-ok">–</div></div>
+</div>
+<p class="hint" id="w-note"></p></div>
+
+<h2>What this case teaches</h2>
+
+<ul>
+  <li><strong>The wall moved up a level — to composition.</strong> A task isn't one call; it's a sequential sum, so it inherits per-call p99 via lesson 03's <span class="math">1 − 0.99ⁿ</span>. The only levers on task latency are fewer calls and a tighter call-level tail. Validate at call p99, not median.</li>
+  <li><strong>Statefulness is the design.</strong> Prefix-caching the agent history is a ~100× win <em>conditional</em> on sticky routing + KV residency (~9.6 GB/task), which caps task concurrency and turns failover, drain, and autoscale into the hard problems (lessons 05, 11) — unlike the stateless cases 13–15.</li>
+  <li><strong>Multiplex tasks across tool waits for utilization.</strong> Sequential tool latency idles a task's GPU; continuous batching across many tasks (lesson 04) recovers it — so high per-replica task concurrency is good even though each task mostly waits, in tension with the residency cap.</li>
+  <li><strong>Contrast.</strong> Same ordinary 70B as the capstone; because the workload is a sequence of stateful calls with non-overlapping tool waits, the binding wall is end-to-end tail + statefulness — a scheduling/reliability problem, not the throughput or TTFT walls of every prior case.</li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="15_case_rag_assistant.html"><span class="dir">Previous</span><span class="ttl">15 · Case: RAG assistant</span></a>
+  <a class="next" href="17_case_long_context.html"><span class="dir">Next</span><span class="ttl">17 · Case: long context</span></a>
+</footer>
+
+<script>
+(function(){
+  const ids=['n','med','p99','tool','pc'];
+  const el=Object.fromEntries(ids.map(k=>[k,document.getElementById('w-'+k)]));
+  function draw(){
+    ids.forEach(k=>{
+      const v=document.getElementById('w-'+k+'-v');
+      v.textContent = (k==='pc') ? (el[k].value==='1'?'on':'off') : el[k].value;
+    });
+    const n=+el.n.value, med=+el.med.value/1000, p99=+el.p99.value/1000,
+          tool=+el.tool.value/1000, pc=+el.pc.value;
+    const reprefill = pc ? 0 : 30000/11300;            // s/call when cache off (70B on TP-4 ≈ 11.3k tok/s prefill)
+    const callMed = med + reprefill;
+    const tailShare = 1 - Math.pow(0.99, n);           // P(>=1 p99-slow call)
+    const tmed = n*(callMed + tool);
+    // p95 ≈ median path + expected tail excess from the p99-slow calls
+    const tp95 = tmed + tailShare*(p99 - med);
+    const meets = tp95 < 60;
+    document.getElementById('w-tmed').textContent=tmed.toFixed(1)+' s';
+    document.getElementById('w-tp95').textContent=tp95.toFixed(1)+' s';
+    document.getElementById('w-ptail').textContent=(tailShare*100).toFixed(0)+'%';
+    const ok=document.getElementById('w-ok');
+    ok.textContent = meets ? 'meets' : 'MISS';
+    ok.style.color = meets ? 'var(--ok)' : 'var(--bad)';
+    let note;
+    if(!pc){
+      note='Prefix cache OFF: each call re-prefills the full ~30K history (+'+(reprefill*1000).toFixed(0)+
+           ' ms/call, '+(n*reprefill).toFixed(1)+' s/task wasted). Even if you clear 60 s, you are burning $ re-prefilling — turn sticky routing + caching on (lesson 05).';
+    } else if(!meets){
+      note='Tail-amplified: '+(tailShare*100).toFixed(0)+'% of tasks hit a p99-slow call, dragging p95 to '+tp95.toFixed(1)+
+           ' s. Cut the number of calls (n='+n+') or tighten call p99 ('+(p99*1000).toFixed(0)+' ms) — those are the only two levers (stage 0).';
+    } else {
+      note='Within 60 s. But note p95 ('+tp95.toFixed(1)+' s) sits well above the median ('+tmed.toFixed(1)+
+           ' s) — that gap is the tail, and it grows with n. Validate at task p95, not median.';
+    }
+    document.getElementById('w-note').textContent=note;
+  }
+  Object.values(el).forEach(x=>x.addEventListener('input',draw));
+  draw();
+})();
+</script>
+
+</main>
+</body>
+</html>
