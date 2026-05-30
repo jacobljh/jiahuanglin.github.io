@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>05 · Inference at scale</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">ml_system_design</a>
+    <span class="crumb">/</span>
+    <span class="crumb">05 · at scale</span>
+    <span class="step-pill">lesson 5 / 12</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Scaling inference — replication, TP, and disaggregation</h1>
+<p class="subtitle">Lesson 04 sized <em>one</em> replica and found its KV batch ceiling. But a real service has two problems that one replica can't solve: Little's Law (lesson 03) hands you a concurrency target far bigger than one GPU's batch ceiling, and some models don't even fit on one GPU (70B = 140 GB &gt; 80 GB). This lesson is the three orthogonal axes that fix those — and the recipe for choosing between them, all in bytes, FLOPs, and dollars.</p>
+
+<div class="callout">
+  <div class="label">Three axes, three different binding constraints</div>
+  Each scaling move answers a <em>different</em> question. <strong>Replication</strong> answers "not enough QPS." <strong>Tensor parallel</strong> answers "model doesn't fit" <em>or</em> "decode too slow at batch 1." <strong>Prefill/decode disaggregation</strong> answers "long prompts are stalling my decodes." Reaching for the wrong axis wastes GPUs. The decision tree at the end picks for you.
+</div>
+
+<h2>1 · Replication — buy throughput linearly</h2>
+
+<p>The simplest axis: run <strong>N identical replicas</strong> behind a router, each holding the full model (<span class="math">2N</span> bytes from lesson 02) plus its own KV cache. A replica is exactly the single-replica design of lesson 04, copied. Replicas share nothing, so throughput scales linearly and tokens/s/GPU stays flat — this is the <em>cheap</em> axis.</p>
+
+<p>From lesson 03, Little's Law gave a concurrency target <span class="math">L = λ·W</span>. Lesson 04 gave one replica's batch ceiling (KV-limited concurrent requests). The replica count is just the ratio:</p>
+
+<div class="math block">
+replicas = ceil( target_concurrency / per_replica_capacity )
+</div>
+
+<div class="callout ok">
+  <div class="label">Worked: the chat service from lesson 03</div>
+  Lesson 03 sized a chat fleet at <span class="math">L ≈ 15,300</span> concurrent requests, and lesson 04's KV math fit ~50 such requests per H100. Replicas <span class="math">= ceil(15300/50) = 306</span>. Llama-3-70B fits one H100? No — 140 GB &gt; 80 GB. So each "replica" is itself a TP group (axis 2), and we replicate that group 306-ish times. Replication handles the <em>QPS</em>; TP handles the <em>fit</em>. They compose.
+</div>
+
+<p>Use replication alone when the model fits one GPU (7B = 14 GB) and you only need more QPS. It is the first thing to reach for and the last thing to over-think.</p>
+
+<h2>2 · Tensor parallel — shard one model across GPUs</h2>
+
+<p>When the model doesn't fit one GPU, you split each weight matrix across <em>k</em> GPUs that hold one model collaboratively — <strong>tensor parallelism</strong> (TP), detailed in <a href="../../system_ml/lessons/06_tensor_parallel.html">system_ml 06</a>. TP is needed for two distinct reasons:</p>
+
+<p><strong>(a) Weights don't fit.</strong> At <span class="math">2N</span> bytes: 70B = 140 GB needs TP ≥ 2; 405B = 810 GB needs TP ≥ 11 — which exceeds the 8 GPUs in one node, so it spills across nodes (a problem we flag below). Minimum TP to fit:</p>
+
+<div class="math block">
+TP_fit = ceil( 2N_bytes / (HBM − overhead) )
+</div>
+
+<p><strong>(b) Decode is too slow even at batch 1.</strong> From lesson 01, decode is bandwidth-bound: per-token latency ≈ <span class="math">model_bytes / BW</span>. TP splits the weights across <em>k</em> GPUs, so each GPU streams only <span class="math">2N/k</span> bytes per token — decode latency drops ~linearly with TP degree. A 70B at fp16 on one H100 streams 140 GB / 3.35 TB·s ≈ 42 ms/token; at TP=4 each GPU streams 35 GB ≈ 10 ms/token. That is how you hit a tight TPOT SLO.</p>
+
+<div class="callout warn">
+  <div class="label">TP is NVLink-bound — keep it inside a node</div>
+  TP does an <strong>all-reduce every layer</strong> (lesson 02's collectives), so it lives or dies on interconnect bandwidth. Intra-node NVLink is ~900 GB/s; inter-node InfiniBand is ~50 GB/s — the <strong>18× gap from lesson 02</strong>. Cross-node TP makes the per-layer all-reduce the bottleneck and wrecks both latency and throughput. Rule: <strong>TP ≤ 8 (one node).</strong> Models needing TP &gt; 8 (like 405B) combine TP-within-node with other parallelism — see <a href="../../system_ml/lessons/11_inference_tp_vs_replication.html">system_ml 11</a> for the full TP-vs-replication trade.
+</div>
+
+<p>The cost of TP: the per-layer all-reduce is pure overhead, so tokens/s/GPU drops slightly with TP degree (typically a few % to ~15% at TP=8). That's why <strong>TP is for fit and latency, not for cheap throughput</strong> — for throughput you replicate.</p>
+
+<h2>3 · Prefill/decode disaggregation — stop the two phases fighting</h2>
+
+<p>From lesson 01, the two phases have opposite roofline character: <strong>prefill is compute-bound</strong> (big matmuls over the whole prompt), <strong>decode is bandwidth-bound</strong> (one token, weights re-read). Co-locate them on the same GPU and a long prefill monopolizes the SMs while in-flight decodes stall — exactly the TTFT-vs-TPOT contention lesson 04 saw inside one replica.</p>
+
+<p><strong>Disaggregation</strong> runs separate GPU pools: a prefill pool and a decode pool. A request prefills on the prefill pool, then its KV cache is transferred over the network to a decode pool that streams tokens. Now a 4K-token prefill never stalls another user's decode — they're on different hardware.</p>
+
+<svg viewBox="0 0 720 220" class="diagram" role="img" aria-label="Co-located vs disaggregated prefill and decode">
+  <text x="20" y="22" font-weight="700" font-size="13">co-located: prefill blocks decode on the same GPU</text>
+  <rect x="20" y="34" width="320" height="26" fill="#2563eb88"/>
+  <text x="180" y="51" text-anchor="middle" font-size="11" fill="#fff">long prefill (compute-bound)</text>
+  <rect x="20" y="64" width="320" height="14" fill="#d9770688"/>
+  <text x="180" y="75" text-anchor="middle" font-size="10" fill="#fff">decodes wait → TPOT spikes</text>
+
+  <text x="20" y="118" font-weight="700" font-size="13">disaggregated: separate pools, KV transferred between</text>
+  <rect x="20" y="130" width="180" height="26" fill="#2563eb88"/>
+  <text x="110" y="147" text-anchor="middle" font-size="11" fill="#fff">prefill pool</text>
+  <path d="M204 143 L256 143" stroke="var(--text-dim)" stroke-width="2" marker-end="url(#a5)"/>
+  <text x="230" y="136" text-anchor="middle" font-size="9" fill="var(--text-mute)">KV</text>
+  <rect x="260" y="130" width="240" height="26" fill="#16a34a88"/>
+  <text x="380" y="147" text-anchor="middle" font-size="11" fill="#fff">decode pool (steady TPOT)</text>
+  <defs><marker id="a5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <text x="20" y="190" font-size="11" fill="var(--text-mute)">cost: one KV-cache transfer per request over the network (lesson 02's bytes/token × prompt length).</text>
+</svg>
+
+<p>Disaggregation <strong>wins when the workload has both long prompts and tight TTFT <em>and</em> TPOT SLOs</strong> — the regime where co-location forces you to choose one or the other. Its cost is the KV transfer: a 4K-token Llama-70B prompt at 320 KB/token (lesson 02) is ~1.3 GB to ship per request, so disaggregation needs fast interconnect and pays off only when the contention it removes is worse than the transfer it adds. Mechanics in <a href="../../vllm/lessons/08_pd_disaggregation.html">vLLM 08</a> and <a href="../../system_ml/lessons/12_disaggregated_serving.html">system_ml 12</a>.</p>
+
+<h2>The decision recipe</h2>
+
+<p>The three axes compose, but you apply them in order, each gated by a specific constraint:</p>
+
+<svg viewBox="0 0 720 300" class="diagram" role="img" aria-label="Scaling decision tree">
+  <defs><marker id="a5b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <rect x="250" y="14" width="220" height="34" rx="6" fill="#fff" stroke="var(--accent)" stroke-width="1.5"/>
+  <text x="360" y="35" text-anchor="middle" font-size="12">model fits one GPU (2N &lt; HBM)?</text>
+
+  <path d="M300 48 L150 80" stroke="var(--text-dim)" marker-end="url(#a5b)"/>
+  <text x="200" y="68" font-size="11" fill="var(--ok)">yes</text>
+  <rect x="40" y="82" width="220" height="34" rx="6" fill="#fff" stroke="var(--ok)" stroke-width="1.5"/>
+  <text x="150" y="103" text-anchor="middle" font-size="12">replicate to meet concurrency</text>
+
+  <path d="M420 48 L560 80" stroke="var(--text-dim)" marker-end="url(#a5b)"/>
+  <text x="500" y="68" font-size="11" fill="var(--bad)">no</text>
+  <rect x="440" y="82" width="250" height="34" rx="6" fill="#fff" stroke="var(--accent-2)" stroke-width="1.5"/>
+  <text x="565" y="103" text-anchor="middle" font-size="12">TP within node until it fits,</text>
+  <text x="565" y="116" text-anchor="middle" font-size="11" fill="var(--text-mute)">then replicate the TP group</text>
+
+  <path d="M360 116 L360 150" stroke="var(--text-dim)" marker-end="url(#a5b)"/>
+  <rect x="220" y="152" width="280" height="34" rx="6" fill="#fff" stroke="var(--accent)" stroke-width="1.5"/>
+  <text x="360" y="173" text-anchor="middle" font-size="12">TPOT SLO still missed at batch 1?</text>
+  <path d="M500 169 L640 169" stroke="var(--text-dim)" marker-end="url(#a5b)"/>
+  <rect x="540" y="190" width="160" height="30" rx="6" fill="#fff" stroke="var(--accent-2)" stroke-width="1.5"/>
+  <text x="620" y="209" text-anchor="middle" font-size="11">raise TP degree</text>
+
+  <path d="M360 186 L360 220" stroke="var(--text-dim)" marker-end="url(#a5b)"/>
+  <rect x="190" y="222" width="340" height="34" rx="6" fill="#fff" stroke="var(--accent)" stroke-width="1.5"/>
+  <text x="360" y="243" text-anchor="middle" font-size="12">long prompts + strict TTFT and TPOT?</text>
+  <path d="M530 239 L640 239" stroke="var(--text-dim)" marker-end="url(#a5b)"/>
+  <rect x="560" y="260" width="140" height="30" rx="6" fill="#fff" stroke="var(--ok)" stroke-width="1.5"/>
+  <text x="630" y="279" text-anchor="middle" font-size="11">disaggregate</text>
+</svg>
+
+<ol>
+  <li><strong>Fits one GPU?</strong> Yes → replicate. No → TP within a node until the weights fit (TP ≤ 8), then replicate that TP group for QPS.</li>
+  <li><strong>Latency SLO still missed at batch 1?</strong> → raise TP degree (more bandwidth per token, lower decode latency).</li>
+  <li><strong>Long prompts <em>and</em> strict TTFT <em>and</em> TPOT?</strong> → disaggregate prefill from decode.</li>
+</ol>
+
+<h2>Routing — which replica gets the request</h2>
+
+<p>With many replicas you need a router. Three policies:</p>
+<table>
+  <thead><tr><th>Policy</th><th>How</th><th>Best when</th></tr></thead>
+  <tbody>
+    <tr><td>Round-robin</td><td>next replica in rotation</td><td>uniform, stateless requests</td></tr>
+    <tr><td>Least-loaded</td><td>fewest in-flight / lowest queue</td><td>variable request sizes</td></tr>
+    <tr><td>Cache-aware</td><td>route by prefix → same replica</td><td>shared system prompts / agents</td></tr>
+  </tbody>
+</table>
+<p><strong>Cache-aware routing</strong> sends requests that share a prefix to the same replica so they hit its already-resident KV cache — turning a redundant prefill into a free cache read (lesson 03's prefix-sharing structure). For a fleet serving one big system prompt this can cut prefill cost dramatically; mechanics in <a href="../../sglang/lessons/05_cache_aware_scheduling.html">SGLang 05</a>.</p>
+
+<h2>Autoscaling — scale on the right signal</h2>
+
+<div class="callout bad">
+  <div class="label">Do NOT autoscale on GPU utilization</div>
+  A serving GPU that is <em>memory-bound and fully batched</em> (lesson 01: decode is bandwidth-bound) can show modest SM utilization while being completely full — every KV block taken, queue building. Naive util-based autoscaling reads "50% utilized, don't scale" and <strong>under-provisions exactly when you're saturated.</strong> Scale on <strong>queue depth, goodput, or KV-cache utilization</strong> — signals that track the real binding constraint.
+</div>
+
+<p><strong>Cold-start lag.</strong> Spinning up a new replica means loading weights into HBM: 140 GB for a 70B at, say, a few GB/s from storage is <em>minutes</em>. Demand can spike faster than you can scale. The fix is a <strong>warm pool</strong> (pre-loaded idle replicas) or over-provisioning for the autoscale-lag window — you can't scale reactively when the reaction takes minutes.</p>
+
+<h2>Multi-tenancy — many models on one fleet</h2>
+
+<p>A platform serves many models. Two structures: <strong>per-model min replicas</strong> (each model guaranteed capacity — predictable latency, wasteful for cold models) versus a <strong>shared pool</strong> (models swap in on demand — efficient, but pays cold-start lag on a miss). The cheap middle path for <em>fine-tunes</em> is <strong>LoRA multiplexing</strong>: one base model in HBM, many small low-rank adapters swapped per request — serve dozens of fine-tunes off one base model's weight bytes instead of dozens of full copies (see <a href="../../vllm/lessons/12_lora_serving.html">vLLM 12</a>).</p>
+
+<h2>Fleet cost — why replication is cheap and TP is not</h2>
+
+<p>From lesson 02, the serving unit cost:</p>
+<div class="math block">
+$/1M tok = ($/gpu-hr) / (achieved_tok_per_s_per_gpu · 3600) · 1e6
+</div>
+<p>The denominator is <strong>tokens/s/GPU</strong>. Replication copies a whole replica, so per-GPU throughput is unchanged — cost/token stays flat as you add QPS. TP splits one model and adds a per-layer all-reduce, so tokens/s/GPU drops a little — cost/token rises slightly with TP degree. <strong>The cost lesson: TP is the tax you pay for fit or latency; replication is the free axis for throughput.</strong> Never use TP to buy QPS that replication could buy more cheaply.</p>
+
+<h2>Interactive · Replicate vs TP planner</h2>
+
+<p>Pick a model and GPU, set the concurrency target from Little's Law (lesson 03), and slide the TP degree. Watch the headline flip between "model fits — replication is cheapest" and "model needs TP ≥ k to fit," and see how total GPUs and relative decode latency move.</p>
+
+<div class="widget"><div class="title">Replicate vs TP planner</div><p class="hint">Assumptions: weights = 2N bytes (fp16); ~8 GB/GPU reserved for activations + framework overhead; the rest is KV room; per-request KV footprint fixed at ~2.6 GB (lesson 02's 8K-context Llama-70B); decode latency ∝ 1/TP; $3/GPU-hr. Order-of-magnitude only.</p>
+<div class="controls">
+<label class="inline">model params N (B) <input id="p-N" type="range" min="7" max="405" step="1" value="70"><span class="val" id="p-N-v">70</span></label>
+<label class="inline">GPU HBM (GB) <input id="p-H" type="range" min="80" max="192" step="61" value="80"><span class="val" id="p-H-v">80</span></label>
+<label class="inline">target concurrency (L) <input id="p-C" type="range" min="50" max="20000" step="50" value="15300"><span class="val" id="p-C-v">15300</span></label>
+<label class="inline">TP degree (latency knob) <input id="p-T" type="range" min="0" max="8" step="1" value="0"><span class="val" id="p-T-v">auto</span></label>
+</div>
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">min TP to fit</div><div class="v" id="p-tpfit">–</div></div>
+  <div class="kpi"><div class="k">replicas</div><div class="v" id="p-reps">–</div></div>
+  <div class="kpi"><div class="k">total GPUs</div><div class="v" id="p-gpus">–</div></div>
+  <div class="kpi"><div class="k">rel. decode latency</div><div class="v" id="p-lat">–</div></div>
+</div>
+<p class="hint" id="p-note"></p></div>
+
+<h2>What carries forward</h2>
+<ul>
+  <li><strong>Three orthogonal axes:</strong> replication (throughput, cheap, flat tok/s/GPU), tensor parallel (fit + latency, NVLink-bound, slight tok/s/GPU tax), disaggregation (decouples prefill/decode contention, costs a KV transfer).</li>
+  <li><strong>The recipe:</strong> fits? replicate. Doesn't? TP within a node then replicate the group. Latency still bad? raise TP. Long prompts + tight TTFT and TPOT? disaggregate.</li>
+  <li><strong>Route</strong> cache-aware when prefixes are shared; <strong>autoscale</strong> on queue depth / goodput / KV-util, never GPU util; keep a <strong>warm pool</strong> for cold-start lag.</li>
+  <li><strong>Cost:</strong> $/1M tok ∝ 1/(tok/s/GPU). Replication keeps that flat; TP lowers it slightly — so size for throughput with replication, reach for TP only for fit or latency.</li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="04_inference_single_replica.html"><span class="dir">Previous</span><span class="ttl">04 · One serving replica</span></a>
+  <a class="next" href="06_inference_optimization.html"><span class="dir">Next</span><span class="ttl">06 · Inference optimization</span></a>
+</footer>
+
+<script>
+(function(){
+  const ids=['N','H','C','T'];
+  const el=Object.fromEntries(ids.map(k=>[k,document.getElementById('p-'+k)]));
+  const RESERVE=8;        // GB/GPU for activations + framework
+  const KV_PER_REQ=2.6;   // GB per request (lesson 02, 8K ctx Llama-70B)
+  const PRICE=3;          // $/gpu-hr
+  function draw(){
+    document.getElementById('p-N-v').textContent=el.N.value;
+    document.getElementById('p-H-v').textContent=el.H.value;
+    document.getElementById('p-C-v').textContent=(+el.C.value).toLocaleString();
+    document.getElementById('p-T-v').textContent=(+el.T.value===0?'auto':el.T.value);
+
+    const N=+el.N.value, H=+el.H.value, C=+el.C.value, Tsel=+el.T.value;
+    const wBytes=2*N;                                   // GB of weights (fp16)
+    const usable=Math.max(H-RESERVE,1);                 // GB/GPU after overhead
+    const tpFit=Math.max(1,Math.ceil(wBytes/usable));   // min TP to hold weights
+    // chosen TP: at least tpFit, at most 8 (one node); slider raises it for latency
+    const TP=Math.min(8,Math.max(tpFit,Tsel));
+    // per-GPU KV room: total group HBM minus group weights, spread over TP GPUs
+    const groupKV=Math.max(TP*usable - wBytes, 0);      // GB of KV across the group
+    const perReplicaCap=Math.max(1,Math.floor(groupKV/KV_PER_REQ));
+    const replicas=Math.ceil(C/perReplicaCap);
+    const totalGPUs=replicas*TP;
+    const relLat=(1/TP).toFixed(2);
+
+    document.getElementById('p-tpfit').textContent='TP≥'+tpFit;
+    document.getElementById('p-reps').textContent=replicas.toLocaleString();
+    document.getElementById('p-gpus').textContent=totalGPUs.toLocaleString();
+    document.getElementById('p-lat').textContent=relLat+'×';
+
+    const costHr=totalGPUs*PRICE;
+    let head;
+    if(tpFit<=1){
+      head='Model fits one GPU ('+wBytes+' GB ≤ '+usable+' GB usable) — replication is cheapest. ';
+    } else {
+      head='Model needs TP ≥ '+tpFit+' to fit ('+wBytes+' GB &gt; '+usable+' GB/GPU)'+(tpFit>8?' — TP>8 spills across nodes, breaking the NVLink rule (see system_ml 11). ':'. ');
+    }
+    let lat = Tsel>tpFit && Tsel<=8 ? 'You raised TP to '+TP+' purely for latency: decode latency ≈ '+relLat+'× the single-GPU baseline, at a small tok/s/GPU tax. ' : '';
+    document.getElementById('p-note').textContent=head+lat+'Fleet: '+totalGPUs.toLocaleString()+' GPUs ≈ $'+(costHr).toLocaleString()+'/hr ≈ $'+((costHr*730)/1e6).toFixed(2)+'M/month at $'+PRICE+'/gpu-hr.';
+  }
+  Object.values(el).forEach(x=>x.addEventListener('input',draw));
+  draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

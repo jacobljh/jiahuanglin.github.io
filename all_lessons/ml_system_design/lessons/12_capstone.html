@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>12 · Capstone</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">ml_system_design</a>
+    <span class="crumb">/</span>
+    <span class="crumb">12 · capstone</span>
+    <span class="step-pill">lesson 12 / 12</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Capstone — design a reasoning-model platform</h1>
+<p class="subtitle">One brief, threaded through every lesson. We take a reasoning model from training to RL to serving to the feedback loop, on a fixed cluster and budget, and at each stage we run the five-step loop and name the one constraint that binds. No new mechanics — just the method, applied end to end, the way a design interview or a real planning doc demands.</p>
+
+<div class="callout">
+  <div class="label">The brief</div>
+  Ship a 70B reasoning model (long chain-of-thought, average <strong>4,000 output tokens</strong>) as a product. You have <strong>1,024 H100s</strong> (128 nodes × 8, NVLink intra-node, InfiniBand between). Serving SLO: <strong>p95 TTFT &lt; 1 s, TPOT &lt; 50 ms</strong>, expected <strong>500 req/s</strong> at peak. Budget pressure is real: leadership wants <strong>$/1M tokens</strong> reported weekly. Design the platform.
+</div>
+
+<p>Before reading on, try it yourself. How many GPUs for serving alone? Which parallelism for the 70B? Is the RL loop rollout- or train-bound? The gaps between your guesses and the numbers below are exactly what this track was for.</p>
+
+<h2>Stage 0 · Requirements → numbers (lesson 03)</h2>
+
+<p>Turn the brief into the inputs the arithmetic needs. The output length is the headline: <strong>4,000 tokens</strong> is 13× a chat reply, and by Little's Law it drives everything.</p>
+
+<div class="math block">
+W ≈ TTFT + TPOT · output = 1 + 0.05 · 4000 = 201 s per request
+</div>
+
+<p>That is a <em>three-minute</em> request. Little's Law: <span class="math">L = λ·W = 500 · 201 ≈ 100,500</span> requests in flight at once. The reasoning workload has quietly turned a modest 500 req/s into a six-figure concurrency problem — the single most important number in the whole design, and it came from one workload parameter, not the model.</p>
+
+<div class="callout warn">
+  <div class="label">Binding constraint, stage 0</div>
+  <strong>Output length.</strong> Everything downstream scales with it. If product can cap "thinking" tokens or use adaptive length, that decision saves more money than any kernel. Always attack the requirement before the implementation.
+</div>
+
+<h2>Stage 1 · The serving fleet (lessons 02, 04, 05)</h2>
+
+<p><strong>Fit (02):</strong> 70B fp16 = 140 GB &gt; 80 GB, so it does not fit one H100. Minimum <span class="math">⌈140/(80−overhead)⌉ = 2</span>, but to hit the TPOT SLO we want more bandwidth per token, so use <strong>TP = 4</strong> within a node (NVLink): decode latency ≈ model_bytes / (TP · BW) drops ~4×, and the weights now occupy 35 GB/GPU, leaving ~40 GB each for KV.</p>
+
+<p><strong>Per-replica capacity (04):</strong> KV/token for 70B at GQA-8 ≈ 320 KB. A 4,000-token request that has also read, say, a 1,000-token prompt caches ~5,000 tokens ≈ 1.6 GB at its peak. Across 4 GPUs that's ~160 GB of KV room → on the order of <span class="math">160/1.6 ≈ 100</span> concurrent requests per TP-4 replica (decode-side, optimistic).</p>
+
+<p><strong>Fleet (05):</strong> <span class="math">100,500 / 100 ≈ 1,005</span> TP-4 replicas → <span class="math">~4,000 GPUs.</span> We have 1,024. <strong>The naive design is 4× over budget.</strong> This is the moment the loop earns its keep — iterate on the binding constraint instead of asking for more hardware.</p>
+
+<ul>
+  <li><strong>Disaggregate prefill/decode (05):</strong> long prompts + tight TTFT and TPOT is exactly the disaggregation case. A few prefill nodes feed many decode nodes; decode is where the 100k concurrency lives.</li>
+  <li><strong>Quantize to fp8 (06):</strong> weights 70 GB and KV/token halve → roughly double the per-replica request ceiling. Validate quality on the regression suite (10) — non-negotiable for a reasoning model.</li>
+  <li><strong>Shrink the workload (00→03):</strong> push back on the 4,000-token average; adaptive thinking that averages 2,500 halves W and thus the fleet.</li>
+</ul>
+
+<div class="callout ok">
+  <div class="label">Binding constraint, stage 1</div>
+  <strong>Decode KV memory × concurrency</strong> (not compute). fp8 + disaggregation + a length cap together bring the serving fleet from ~4,000 toward a feasible few-hundred-GPU footprint. Notice we never reached for a fancier kernel — the wall was bytes, so the fixes were byte-shaped.
+</div>
+
+<h2>Stage 2 · Training the policy (lessons 02, 07, 08)</h2>
+
+<p>Assume we continue-train / specialize the 70B (not pretrain from scratch). <strong>Memory (02, 07):</strong> 16 · 70 = 1,120 GB of train state — ~14 H100s' worth before activations. Recipe from 07: <strong>TP = 8</strong> in-node for weights/activations, <strong>FSDP/ZeRO-3</strong> across the data-parallel dimension to shard the 1,120 GB, activation checkpointing to fit long-context reasoning traces. Score by MFU; if it sits below ~40%, a collective isn't overlapping.</p>
+
+<p><strong>Data plane (08):</strong> at a 4M-token global batch and ~2 s steps, ~2M tokens/s must stream pre-tokenized from object store, double-buffered, deterministically resumable — because at this scale a node dies every few hours and a non-deterministic restart corrupts the epoch.</p>
+
+<div class="callout warn">
+  <div class="label">Binding constraint, stage 2</div>
+  <strong>Memory capacity</strong> first (forces TP×FSDP), then <strong>MFU</strong> (forces comms overlap). The data plane must not become the hidden third wall — instrument data-wait time from day one.
+</div>
+
+<h2>Stage 3 · RL post-training (lesson 09)</h2>
+
+<p>Reasoning quality comes from RL (e.g. GRPO on verifiable rewards). Now the system is inference + training in one loop. The diagnosis from 09 is decisive: rollouts generate <strong>4,000-token</strong> reasoning traces — generation dominates wall-clock, so the loop is heavily <strong>rollout-bound</strong>. Therefore most GPUs become actors (inference engines), a minority are learners.</p>
+
+<p>Balance the producer and consumer (08's framing, 09's split): size actor and learner pools so rollout tok/s ≈ train-consumed tok/s, or one side idles. GRPO drops the critic (09), saving a 70B model's worth of memory versus PPO — which is what lets policy + reference + reward + optimizer co-exist. Weight sync broadcasts the updated 140 GB policy to the actors each step; consider <strong>async RL</strong> with bounded staleness to overlap actor and learner, trading a little on-policyness for a lot of throughput.</p>
+
+<div class="callout ok">
+  <div class="label">Binding constraint, stage 3</div>
+  <strong>Rollout (generation) throughput.</strong> The fix is more actor GPUs and faster decode — i.e. every serving optimization from stage 1 pays off <em>again</em> here. Inference and RL share a bottleneck; that's why this track teaches them with one method.
+</div>
+
+<h2>Stage 4 · The feedback flywheel & production (lessons 10, 11)</h2>
+
+<p><strong>Eval (10):</strong> a reasoning model can regress silently — gate every deploy on an offline reasoning regression suite (decontaminated), use LLM-as-judge with position/length-bias controls for open-ended quality, and run online A/B with guardrails (TTFT p99, refusal rate, $/req). Production traces, filtered by the verifier, become the next RL dataset — closing the flywheel back into stage 3.</p>
+
+<p><strong>Production (11):</strong> watch queue depth and KV-utilization (not GPU util) as the leading incident signals; blue/green deploys with fast rollback wired to the guardrails; size for <span class="math">peak + k_spare + deploy_headroom</span> remembering a TP group fails as a unit; and report $/1M tokens weekly, with autoscaling for the diurnal swing so you aren't buying peak capacity 24/7.</p>
+
+<h2>The whole platform, one diagram</h2>
+
+<svg viewBox="0 0 760 300" class="diagram" role="img" aria-label="End-to-end reasoning-model platform">
+  <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <rect class="node-bg" x="20" y="40" width="150" height="56" rx="8"/>
+  <text x="95" y="64" text-anchor="middle" font-weight="600" font-size="12">TRAIN (07–08)</text>
+  <text x="95" y="82" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">TP8 · FSDP · ckpt</text>
+  <rect class="node-bg" x="210" y="40" width="150" height="56" rx="8"/>
+  <text x="285" y="64" text-anchor="middle" font-weight="600" font-size="12">RL LOOP (09)</text>
+  <text x="285" y="82" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">rollout-bound · GRPO</text>
+  <rect class="node-bg" x="400" y="40" width="150" height="56" rx="8"/>
+  <text x="475" y="64" text-anchor="middle" font-weight="600" font-size="12">SERVE (04–06)</text>
+  <text x="475" y="82" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">TP4 · PD-disagg · fp8</text>
+  <rect class="node-bg" x="590" y="40" width="150" height="56" rx="8"/>
+  <text x="665" y="64" text-anchor="middle" font-weight="600" font-size="12">EVAL+OPS (10–11)</text>
+  <text x="665" y="82" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">gate · A/B · $/tok</text>
+  <path d="M170 68 L208 68" class="edge" marker-end="url(#ar)"/>
+  <path d="M360 68 L398 68" class="edge" marker-end="url(#ar)"/>
+  <path d="M550 68 L588 68" class="edge" marker-end="url(#ar)"/>
+  <path d="M665 96 L665 150 L285 150 L285 98" class="edge" marker-end="url(#ar)"/>
+  <text x="475" y="168" text-anchor="middle" font-size="11" fill="var(--text-mute)">flywheel: production traces → verifier filter → next RL dataset (10 → 09)</text>
+  <text x="20" y="220" font-size="12" fill="var(--text)">At every arrow, one wall binds: output length → KV memory → rollout throughput → eval/cost.</text>
+  <text x="20" y="244" font-size="11.5" fill="var(--text-dim)">The model is the same 70B throughout. The system around it is four different machines because the binding constraint changes at each stage.</text>
+</svg>
+
+<h2>Interactive · the design self-test</h2>
+
+<p>Eleven questions, one per design lesson (01–11). Answer from the method, not memory — each tests whether you reach for the binding constraint first. Click to reveal.</p>
+
+<div class="widget"><div class="title">Self-test — name the binding constraint</div><p class="hint">Click a question to reveal the answer and the lesson it comes from. If you can justify the answer in bytes/FLOPs/$, you've got the method.</p>
+<div id="quiz"></div>
+<div class="kpi-grid" style="margin-top:14px"><div class="kpi"><div class="k">revealed</div><div class="v" id="q-rev">0 / 11</div></div></div>
+</div>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><strong>Down into the mechanisms.</strong> Each decision here links to the track that builds it: <a href="../../system_ml/lessons/index.html">System ML</a> (parallelism), <a href="../../vllm/lessons/index.html">vLLM</a> / <a href="../../sglang/lessons/index.html">SGLang</a> (serving), <a href="../../RL/lessons/index.html">RL Post-Training</a> (the loop), <a href="../../data_engineering/lessons/index.html">Data Engineering</a> (the plane).</li>
+  <li><strong>Back to the loop.</strong> Re-read <a href="00_orientation.html">lesson 00</a>: requirements → arithmetic → topology → bottleneck → iterate. You now have the numbers (02), the requirements language (03), and worked designs for every subsystem. That's the whole skill.</li>
+  <li><strong>Apply it cold.</strong> Pick any product — a code agent, a voice assistant, a batch document pipeline — and run the loop from a blank page. The model barely changes; the binding constraint, and therefore the system, changes completely.</li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="11_production_reliability_cost.html"><span class="dir">Previous</span><span class="ttl">11 · Production &amp; cost</span></a>
+  <a class="next" href="index.html"><span class="dir">Done →</span><span class="ttl">Back to series index</span></a>
+</footer>
+
+<script>
+(function(){
+  const Q = [
+    ['01','Single-stream decode of your 70B is at 5% of the GPU’s peak FLOP/s. What’s wrong?','Nothing — decode is bandwidth-bound (arithmetic intensity ≈1). Speed is set by model_bytes/BW, not FLOP/s. “Fixing” FLOPs does nothing; batch more requests to amortize the weight read.'],
+    ['02','Quick: memory to TRAIN a 13B model with Adam, mixed precision, no parallelism?','≈16N = 16·13 ≈ 208 GB just for weights+optimizer+grad — already 3× an H100, before activations. Hence FSDP/ZeRO.'],
+    ['03','Product wants “faster.” What do you ask back?','Faster TTFT or TPOT? They’re different phases with different fixes. And at what percentile — p50 or p99? A mean hides the tail that fan-out amplifies.'],
+    ['04','Your replica OOMs at batch 60 but the GPUs look 30% utilized. Why?','KV cache filled HBM — the batch ceiling is memory, not compute. Low SM util is normal for memory-bound decode. Shrink KV (GQA/fp8/paging) or context, not the math.'],
+    ['05','70B, fits-on-2-GPUs, you need 3× the QPS. Replicate or raise TP?','Replicate. TP is for fitting the model or cutting latency; it carries an all-reduce tax. For pure throughput, more identical replicas keep tok/s/GPU flat and cost lowest.'],
+    ['06','Batch is large and compute-bound. Will speculative decoding help?','No — it spends spare compute you don’t have. Spec decoding wins at SMALL batch (bandwidth-bound). Its gain collapses as batch approaches the roofline ridge.'],
+    ['07','Config fits memory but MFU is 22%. First suspect?','A collective not overlapping compute — often a pipeline bubble (too few microbatches) or cross-node TP over InfiniBand. Memory fitting ≠ GPUs busy.'],
+    ['08','$8M run, MFU mysteriously 60% of expected. Model or data?','Test with cached/synthetic data: if step time drops, the dataloader is starving the GPUs. Idle H100s cost the same as busy ones — the data plane is a perf system.'],
+    ['09','Your RL loop’s actors sit 40% idle. What does that tell you?','It’s train-bound at the current split — the learner can’t consume rollouts fast enough, OR (more likely for reasoning) you over-allocated learners. Rebalance so rollout tok/s ≈ train tok/s; consider async to overlap.'],
+    ['10','Offline eval jumped 4 points. Ship it?','Not yet. Offline gates what’s ALLOWED to ship; online A/B (with latency/refusal/cost guardrails) decides what DOES. Offline wins often don’t transfer — Goodhart and distribution shift.'],
+    ['11','Dashboard: GPU util 35%, all green. Are you safe?','GPU util is a trap metric. Check queue depth and KV-utilization — a fully-batched memory-bound fleet shows low util while one preemption away from breaching SLO.']
+  ];
+  const box = document.getElementById('quiz');
+  let revealed = 0;
+  Q.forEach((q,i)=>{
+    const d = document.createElement('div');
+    d.className = 'trajectory';
+    d.style.flexDirection = 'column';
+    d.style.alignItems = 'flex-start';
+    d.style.cursor = 'pointer';
+    d.innerHTML = '<div style="display:flex;gap:10px;align-items:baseline"><span class="label-l" style="width:auto">L'+q[0]+'</span><span class="text" style="word-break:normal">'+q[1]+'</span></div>'
+      + '<div class="ans" style="display:none;color:var(--text-mute);font-family:var(--sans);margin-top:8px;line-height:1.5"><strong style="color:var(--ok)">→</strong> '+q[2]+'</div>';
+    d.addEventListener('click', ()=>{
+      const a = d.querySelector('.ans');
+      const open = a.style.display !== 'none';
+      a.style.display = open ? 'none' : 'block';
+      revealed += open ? -1 : 1;
+      document.getElementById('q-rev').textContent = revealed + ' / 11';
+    });
+    box.appendChild(d);
+  });
+})();
+</script>
+
+</main>
+</body>
+</html>

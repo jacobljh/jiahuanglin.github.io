@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>09 · RL post-training</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">ml_system_design</a>
+    <span class="crumb">/</span>
+    <span class="crumb">09 · RL post-training</span>
+    <span class="step-pill">lesson 9 / 12</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Designing an RL post-training system</h1>
+<p class="subtitle">Every system so far was one shape. Serving (lessons 04–05) was an inference system: KV-bound, decode bandwidth-limited, batched. Pretraining (lesson 07) was a training system: 16N memory, FSDP/TP/PP, scored by MFU. RL post-training is the first system in this track that is <strong>both at once, wired in a loop</strong> — it generates with an inference engine, scores the output, and takes a gradient step on it, forever. So it inherits every constraint from 04–05 (the generation side) <em>and</em> every constraint from 07 (the learner side). The new, hard part — the entire reason this lesson exists — is <strong>coordinating the two</strong>.</p>
+
+<div class="callout">
+  <div class="label">The framing: two systems you already designed, now in a feedback loop</div>
+  Nothing in the rollout side is new physics — it is lesson 04's replica, decode-bound. Nothing in the learner side is new physics — it is lesson 07's 16N gradient step. What is new is that they <em>share weights</em>, run on <em>one budget</em>, and each waits on the other. The design questions are therefore all about the seam: where do the two halves live, how do updated weights get from learner to actor, and which half is the bottleneck.
+</div>
+
+<p>This loop has four roles. We tag them with the same chips the RL track uses, so the vocabulary lines up:</p>
+
+<ul>
+  <li><span class="chip role-rollout">ACTOR / ROLLOUT</span> the generation engine (vLLM/SGLang). This is pure inference — autoregressive decode, <strong>bandwidth-bound</strong>, KV-cache-limited (lesson 04). It produces trajectories.</li>
+  <li><span class="chip role-train">LEARNER / TRAINER</span> the gradient step (FSDP/Megatron). This is pure training — the <strong>16N</strong> memory bill, scored by MFU (lesson 07). It consumes trajectories.</li>
+  <li><span class="chip role-algo">REWARD / VERIFIER</span> scores each rollout — either a reward <em>model</em> (another forward pass, more weights in HBM) or a code/math <em>checker</em> (cheap CPU, runs a unit test). See <a href="../../RL/lessons/03_reward_reference.html">RL 03</a>.</li>
+  <li><span class="chip role-ref">REFERENCE</span> a frozen copy of the policy used for the KL penalty — extra <strong>read-only</strong> weights in memory, one forward pass per token scored. Also <a href="../../RL/lessons/03_reward_reference.html">RL 03</a>.</li>
+</ul>
+
+<h2>1 · The loop, and the memory bill it runs up</h2>
+
+<p>One iteration: the <span class="chip role-rollout">actor</span> generates a batch of completions, the <span class="chip role-algo">reward</span> scores them, the <span class="chip role-ref">reference</span> supplies the KL baseline, and the <span class="chip role-train">learner</span> takes one gradient step. Then the new weights must reach the actor and it all repeats. (Cluster wiring: <a href="../../RL/lessons/19_topology.html">RL 19</a>.)</p>
+
+<svg viewBox="0 0 720 170" class="diagram" role="img" aria-label="The RL post-training loop">
+  <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <rect x="20"  y="64" width="150" height="42" rx="6" fill="#2563eb22" stroke="var(--accent)"/>
+  <rect x="220" y="64" width="150" height="42" rx="6" fill="#d9770622" stroke="var(--accent-2)"/>
+  <rect x="420" y="64" width="160" height="42" rx="6" fill="#16a34a22" stroke="var(--ok)"/>
+  <text x="95"  y="80" text-anchor="middle" font-size="12">ACTOR / rollout</text>
+  <text x="95"  y="96" text-anchor="middle" font-size="10" fill="var(--accent)">decode, BW-bound</text>
+  <text x="295" y="80" text-anchor="middle" font-size="12">REWARD + REF</text>
+  <text x="295" y="96" text-anchor="middle" font-size="10" fill="var(--accent-2)">score + KL</text>
+  <text x="500" y="80" text-anchor="middle" font-size="12">LEARNER</text>
+  <text x="500" y="96" text-anchor="middle" font-size="10" fill="var(--ok)">16N, gradient step</text>
+  <line x1="170" y1="85" x2="218" y2="85" stroke="var(--text-dim)" marker-end="url(#ar)"/>
+  <text x="194" y="78" text-anchor="middle" font-size="9" fill="var(--text-mute)">trajectories</text>
+  <line x1="370" y1="85" x2="418" y2="85" stroke="var(--text-dim)" marker-end="url(#ar)"/>
+  <text x="394" y="78" text-anchor="middle" font-size="9" fill="var(--text-mute)">rewards</text>
+  <path d="M500 106 C 500 145, 95 145, 95 108" stroke="var(--bad)" fill="none" marker-end="url(#ar)"/>
+  <text x="297" y="160" text-anchor="middle" font-size="11" fill="var(--bad)">weight sync — closes the loop, 2N bytes per step (§3)</text>
+  <text x="297" y="40" text-anchor="middle" font-size="11" fill="var(--text-mute)">each iteration = one inference job + one training job, chained</text>
+</svg>
+
+<p>Now total the memory. At peak you may be holding, on the same cluster, <em>all four</em> roles' weights plus the learner's optimizer state plus the actor's KV cache. For a <strong>70B policy</strong> in bf16, using the lesson-02/07 rules:</p>
+
+<table>
+  <thead><tr><th>Tenant</th><th>Role</th><th>Bytes (70B)</th><th>Rule</th></tr></thead>
+  <tbody>
+    <tr><td>Learner train state</td><td><span class="chip role-train">LEARNER</span></td><td>1,120 GB</td><td>16N (lesson 07)</td></tr>
+    <tr><td>Reference weights</td><td><span class="chip role-ref">REFERENCE</span></td><td>140 GB</td><td>2N, read-only</td></tr>
+    <tr><td>Reward model (if a model)</td><td><span class="chip role-algo">REWARD</span></td><td>~140 GB</td><td>2N (a 70B RM)</td></tr>
+    <tr><td>Actor inference weights</td><td><span class="chip role-rollout">ACTOR</span></td><td>140 GB</td><td>2N, separate copy</td></tr>
+    <tr><td>Actor KV cache</td><td><span class="chip role-rollout">ACTOR</span></td><td>tens–hundreds GB</td><td>grows with batch·context (lesson 04)</td></tr>
+  </tbody>
+</table>
+
+<p>That sums to <strong>well over 1.5 TB before KV</strong> — far more than one 80 GB H100, far more than one 8-GPU node. RL post-training is memory-hostile in a way neither pure serving nor pure pretraining is, because it stacks both bills on top of each other.</p>
+
+<div class="callout ok">
+  <div class="label">Why GRPO exists: it deletes a whole model from the bill</div>
+  Classic <strong>PPO</strong> (<a href="../../RL/lessons/10_ppo.html">RL 10</a>) trains a <em>critic</em> — a second 70B-scale network with its own 16N optimizer state — to estimate the value baseline. That is another ~1.1 TB of train state on top of everything above. <strong>GRPO</strong> (<a href="../../RL/lessons/11_grpo.html">RL 11</a>) drops the critic entirely and computes the baseline from the <em>group</em> of sampled completions for a prompt (their mean reward). Removing the critic removes a whole model's worth of weights <em>and</em> its 16N optimizer state — the single biggest memory win available in the algorithm choice. The lesson: in RL, the algorithm is a systems decision.
+</div>
+
+<h2>2 · Placement — colocated vs disaggregated</h2>
+
+<p>Where do the <span class="chip role-rollout">actor</span> and <span class="chip role-train">learner</span> physically live? Two answers, and the trade is the central topology decision (<a href="../../RL/lessons/19_topology.html">RL 19</a>).</p>
+
+<table>
+  <thead><tr><th></th><th>Colocated</th><th>Disaggregated</th></tr></thead>
+  <tbody>
+    <tr><td>Layout</td><td>Actor and learner <strong>time-share the same GPUs</strong>: generate, then swap to train, then swap back.</td><td>Separate <strong>actor pool</strong> and <strong>learner pool</strong>, sized independently.</td></tr>
+    <tr><td>Overlap</td><td>None — the two phases are serial. While generating, the learner's GPUs are idle; while training, the actor's are.</td><td>Yes — actor generates the next batch while the learner steps on the last one.</td></tr>
+    <tr><td>Idle GPUs</td><td>No idle <em>pool</em> (one pool does both), but idle <em>time</em> within each step.</td><td>A pool sits idle when its phase isn't the bottleneck (§4).</td></tr>
+    <tr><td>Cost paid</td><td>Context switch: tear down KV cache, swap in optimizer state, reload weights — twice per step.</td><td>Ship trajectories actor→learner and weights learner→actor across the network (§3).</td></tr>
+    <tr><td>Best for</td><td>Small models (≤7B), single node, prototypes.</td><td>Multi-node, large models, production scale.</td></tr>
+  </tbody>
+</table>
+
+<p>Colocated is simplest and wastes no GPUs to an idle pool, but it can never run the two phases at once, and the swap (evict KV, load 16N optimizer state) is real overhead paid every iteration. Disaggregated buys concurrency and independent sizing at the price of inter-pool data movement and the risk that one pool idles. The choice hinges on §4.</p>
+
+<h2>3 · Weight sync — the wire that closes the loop</h2>
+
+<p>The actor runs a <strong>separate, inference-optimized copy</strong> of the policy weights (its own TP layout, maybe quantized). After each learner step those weights are stale — sample from them and you are learning from last step's policy. So every iteration the updated policy must be broadcast to every actor engine. (Mechanism and the bugs it causes: <a href="../../RL/lessons/06_weight_sync.html">RL 06</a>.)</p>
+
+<p>The cost is set by lesson 02's weight rule: the broadcast moves <span class="math">2N</span> bytes. For a 70B that is <strong>140 GB shipped every single gradient step</strong>:</p>
+
+<div class="math block">
+sync_bytes = 2N &nbsp;&nbsp;|&nbsp;&nbsp; sync_time ≈ 2N / interconnect_BW
+</div>
+
+<p>Over intra-node NVLink (~900 GB/s) that 140 GB is ~0.16 s; over inter-node InfiniBand (~50 GB/s, the 18× gap from lesson 02) the same broadcast is ~2.8 s — which can rival a whole training step. Methods, cheapest first:</p>
+
+<ul>
+  <li><strong>Shared-memory / pointer swap</strong> when colocated — actor and learner are the same process on the same GPUs, so sync is nearly free (<a href="../../RL/lessons/06_weight_sync.html">RL 06</a>).</li>
+  <li><strong>NCCL broadcast</strong> when disaggregated — gather the FSDP-sharded weights on the learner, reshard into the actor's TP layout, broadcast over a dedicated communicator.</li>
+</ul>
+
+<div class="callout warn">
+  <div class="label">Weight sync is pure overhead, and it scales with model size</div>
+  Unlike a gradient step (which buys learning) or a rollout (which buys data), the sync buys nothing — it is the tax for having two copies of the weights. It grows linearly with N and inversely with interconnect bandwidth, so for big models on slow links it can dominate. This is why frameworks overlap the sync with the next rollout's prefill, and why the colocated pattern's free pointer-swap is genuinely attractive for small models.
+</div>
+
+<h2>4 · The bottleneck diagnosis — rollout-bound or train-bound?</h2>
+
+<p>This is the central design skill of the lesson. The loop runs at the speed of its slower half. So the first question on any RL system is: <strong>is wall-clock dominated by generation or by the gradient step?</strong></p>
+
+<p><strong>Rollout</strong> = generation = decode, which is bandwidth-bound (lesson 04). Its wall-clock is set by how many output tokens you must emit, one step at a time. <strong>Train</strong> = one forward+backward+optimizer step (lesson 07), set by the batch of tokens you process in parallel. The asymmetry: generation is sequential in the output length; training sees the whole sequence at once.</p>
+
+<div class="callout bad">
+  <div class="label">Reasoning models make this lopsided — and it's Little's Law again</div>
+  A chat completion emits ~hundreds of tokens; a <strong>reasoning model</strong> emits 10,000+ thinking tokens before its answer. From lesson 03, time-in-system scales with output length, and from lesson 04 each of those tokens is a separate bandwidth-bound decode step. So generation can balloon to <strong>70–90% of loop wall-clock</strong> for long-output RL — the rollout, not the gradient, is where the time goes. Most modern reasoning-RL is heavily <em>rollout-bound</em>, which is why <strong>most of the GPUs go to actors</strong>, not learners. (Inside the rollout engine: <a href="../../RL/lessons/20_kv_paged.html">RL 20</a>; its memory: <a href="../../RL/lessons/22_memory.html">RL 22</a>.)
+</div>
+
+<p>The method is not a formula, it is a measurement: time the rollout phase and the train phase, take the split, and add GPUs to whichever dominates. If rollout is 80% of the step, doubling learner GPUs barely moves wall-clock; you want more actors.</p>
+
+<h2>5 · Async / off-policy — trade staleness for overlap</h2>
+
+<p>Synchronous RL is wasteful by construction: the actor idles while the learner steps, and the learner idles while the actor generates (in disaggregated mode; in colocated they alternate on one pool). <strong>Async RL</strong> breaks the lockstep — the actor keeps generating with <em>slightly stale</em> weights (the policy from <em>k</em> steps ago) while the learner steps on the trajectories it already has. Now both halves run continuously and overlap, which can lift throughput 2–3× (<a href="../../RL/lessons/19_topology.html">RL 19</a>).</p>
+
+<p>The cost is statistical, not computational. Trajectories sampled under <span class="math">π<sub>θ−k</sub></span> but trained against <span class="math">π<sub>θ</sub></span> are <strong>off-policy</strong> — the gradient estimator is biased, importance-sampling ratios drift, and learning can destabilize (the ratio-explosion failure mode of <a href="../../RL/lessons/06_weight_sync.html">RL 06</a>). The defenses are importance-sampling correction and a <strong>bounded staleness</strong> cap.</p>
+
+<div class="callout">
+  <div class="label">The knob: max staleness k</div>
+  <strong>k = 0</strong> is fully synchronous and on-policy — best sample quality, worst overlap. Larger <strong>k</strong> lets the actor run further ahead — better overlap and throughput, but more off-policy data. The trade is <em>throughput (overlap) vs sample quality (on-policyness)</em>, and unlike a pure systems knob, pushing it too far hurts the <em>model</em>, not just the clock. Measure final quality at fixed compute, not steps/hour.
+</div>
+
+<h2>6 · The capacity split — how many actors vs learners?</h2>
+
+<p>Given a fixed cluster, what fraction of GPUs goes to the <span class="chip role-rollout">actor</span> pool versus the <span class="chip role-train">learner</span> pool? This is lesson 08's <em>producer-must-keep-up-with-consumer</em> framing, applied to a loop: the rollout pool is the <strong>producer</strong> of trajectories, the learner is the <strong>consumer</strong>. Size the pools so neither waits.</p>
+
+<div class="math block">
+rollout_throughput = actors · rollout_tps &nbsp;&nbsp;≈&nbsp;&nbsp; learners · learn_tps = train_consumption
+</div>
+
+<p>If the actors produce <span class="math">R</span> tokens/s and the learner consumes <span class="math">T</span> tokens/s, the loop runs at <span class="math">min(R, T)</span> and the other side idles by <span class="math">1 − min(R,T)/max(R,T)</span>. The balanced split puts <span class="math">R ≈ T</span>, so no GPU class is starved. Because reasoning rollouts are slow producers (long sequential decode), balancing usually lands most of the cluster on the actor side — the same conclusion §4 reached, now as a sizing rule.</p>
+
+<h2>Interactive · rollout-bound or train-bound? + actor/learner split</h2>
+
+<p>Set the cluster size, the reasoning knob (avg output tokens), the per-GPU throughputs, and the fraction of GPUs assigned to actors. The widget computes which half is the bottleneck, how badly the other half idles, and the split that balances them.</p>
+
+<div class="widget"><div class="title">Bottleneck &amp; capacity split</div>
+<p class="hint">Assumptions: actors = GPUs·frac, learners = GPUs·(1−frac). Rollout throughput = actors·rollout_tps; train consumption = learners·learn_tps. The loop runs at min(rollout, train); the other side idles by (1 − min/max). The <em>output-tokens</em> slider is the reasoning knob: it doesn't change per-GPU rates but it's why rollout dominates — long outputs mean the actor pool must sustain far more token-seconds of sequential decode per trajectory. Optimal frac balances rollout = train. Order-of-magnitude, per lesson 02's ±30% contract.</p>
+<div class="controls">
+<label class="inline">total GPUs <input id="r-G" type="range" min="16" max="1024" step="16" value="256"><span class="val" id="r-G-v">256</span></label>
+<label class="inline">avg rollout output tokens <input id="r-O" type="range" min="256" max="16000" step="256" value="8000"><span class="val" id="r-O-v">8000</span></label>
+<label class="inline">rollout tok/s per actor-GPU <input id="r-A" type="range" min="20" max="200" step="5" value="60"><span class="val" id="r-A-v">60</span></label>
+<label class="inline">learner tok/s per learner-GPU <input id="r-L" type="range" min="500" max="5000" step="100" value="2500"><span class="val" id="r-L-v">2500</span></label>
+<label class="inline">frac GPUs to actors <input id="r-F" type="range" min="0.1" max="0.9" step="0.05" value="0.5"><span class="val" id="r-F-v">0.50</span></label>
+</div>
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">rollout tok/s</div><div class="v" id="r-roll">–</div></div>
+  <div class="kpi"><div class="k">train tok/s</div><div class="v" id="r-train">–</div></div>
+  <div class="kpi"><div class="k">bottleneck</div><div class="v" id="r-bot">–</div></div>
+  <div class="kpi"><div class="k">idle GPUs</div><div class="v" id="r-idle">–</div></div>
+</div>
+<p class="hint" id="r-note"></p></div>
+
+<h2>What carries forward</h2>
+<ul>
+  <li><strong>RL post-training is an inference system and a training system in a loop</strong> — it inherits the KV/decode constraints of 04–05 <em>and</em> the 16N/MFU constraints of 07. The design work is in the seam between them.</li>
+  <li><strong>The memory bill stacks four roles:</strong> learner 16N + reference 2N + reward (maybe 2N) + a separate actor copy 2N + KV — over 1.5 TB for a 70B before KV. GRPO's win is deleting the critic, removing a whole model and its 16N.</li>
+  <li><strong>Placement:</strong> colocated (time-share, simple, no idle pool, no overlap, pay the swap) vs disaggregated (separate pools, concurrent, independently sized, pay data/weight movement and pool idle).</li>
+  <li><strong>Weight sync is pure overhead</strong> — 2N bytes broadcast every step, ~0.16 s on NVLink but ~2.8 s on IB for a 70B. Free as a pointer swap when colocated.</li>
+  <li><strong>Diagnose rollout-bound vs train-bound by measuring the split.</strong> Long reasoning outputs push it heavily rollout-bound (70–90%), so most GPUs go to actors.</li>
+  <li><strong>Async trades on-policyness for overlap;</strong> the knob is max staleness k — more overlap, more off-policy bias. Size pools so rollout throughput ≈ train consumption (producer keeps up with consumer, lesson 08).</li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="08_training_data_system.html"><span class="dir">Previous</span><span class="ttl">08 · Training data plane</span></a>
+  <a class="next" href="10_evaluation_and_feedback.html"><span class="dir">Next</span><span class="ttl">10 · Evaluation &amp; feedback</span></a>
+</footer>
+
+<script>
+(function(){
+  const ids=['G','O','A','L','F'];
+  const el=Object.fromEntries(ids.map(k=>[k,document.getElementById('r-'+k)]));
+  function draw(){
+    document.getElementById('r-G-v').textContent=el.G.value;
+    document.getElementById('r-O-v').textContent=(+el.O.value).toLocaleString();
+    document.getElementById('r-A-v').textContent=el.A.value;
+    document.getElementById('r-L-v').textContent=(+el.L.value).toLocaleString();
+    document.getElementById('r-F-v').textContent=(+el.F.value).toFixed(2);
+
+    const G=+el.G.value, O=+el.O.value, A=+el.A.value, L=+el.L.value, F=+el.F.value;
+    const actors=Math.max(1,Math.round(G*F));
+    const learners=Math.max(1,G-actors);
+    const roll=actors*A;            // tok/s produced
+    const train=learners*L;         // tok/s consumed
+    const loop=Math.min(roll,train);
+    const slow=roll<=train;         // true => rollout is the bottleneck
+    // GPUs on the FAST side that sit idle, as a fraction of the whole cluster
+    const idleFrac = 1 - loop/Math.max(roll,train);
+    const idleGPUs = slow ? learners*idleFrac : actors*idleFrac;
+    const idlePct = (idleGPUs/G*100);
+
+    // balanced fraction: actors*A == learners*L  =>  F*G*A == (1-F)*G*L  =>  F = L/(A+L)
+    const fOpt = L/(A+L);
+
+    document.getElementById('r-roll').textContent=roll.toLocaleString()+' tok/s';
+    document.getElementById('r-train').textContent=train.toLocaleString()+' tok/s';
+    const botEl=document.getElementById('r-bot');
+    botEl.textContent = slow ? 'ROLLOUT-bound' : 'TRAIN-bound';
+    botEl.style.color = slow ? 'var(--accent)' : 'var(--ok)';
+    document.getElementById('r-idle').textContent=Math.round(idleGPUs)+' ('+idlePct.toFixed(0)+'%)';
+
+    const note=document.getElementById('r-note');
+    const longOut = O>=4000;
+    let msg;
+    if(slow){
+      msg='ROLLOUT-bound: '+actors+' actors produce '+roll.toLocaleString()+' tok/s but '+learners+' learners could eat '+train.toLocaleString()+' tok/s — ~'+Math.round(idleGPUs)+' learner GPUs idle. ';
+      msg+= longOut ? 'Long outputs ('+O.toLocaleString()+' tok) make generation dominate — add actors. ' : '';
+      msg+='Shift toward actors: balanced frac ≈ '+fOpt.toFixed(2)+'.';
+    } else {
+      msg='TRAIN-bound: '+learners+' learners want '+train.toLocaleString()+' tok/s but '+actors+' actors only feed '+roll.toLocaleString()+' tok/s — ~'+Math.round(idleGPUs)+' actor GPUs idle. ';
+      msg+= !longOut ? 'Short outputs ('+O.toLocaleString()+' tok) make rollout cheap, so the gradient step dominates — add learners or actors as below. ' : '';
+      msg+='Balanced frac ≈ '+fOpt.toFixed(2)+' (more to actors).';
+    }
+    if(Math.abs(roll-train)/Math.max(roll,train) < 0.05){
+      msg='Balanced: rollout '+roll.toLocaleString()+' ≈ train '+train.toLocaleString()+' tok/s, almost no idle GPUs. This frac ('+F.toFixed(2)+') ≈ optimal '+fOpt.toFixed(2)+' — neither producer nor consumer waits (lesson 08).';
+    }
+    note.textContent=msg;
+  }
+  Object.values(el).forEach(x=>x.addEventListener('input',draw));
+  draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>08 · Training data plane</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">ml_system_design</a>
+    <span class="crumb">/</span>
+    <span class="crumb">08 · data plane</span>
+    <span class="step-pill">lesson 8 / 12</span>
+  </div>
+</header>
+
+<main>
+
+<h1>The data plane that keeps the GPUs fed</h1>
+<p class="subtitle">Lesson 07 built a system that burns ~$8M of GPU-time to pretrain a 70B model. If the dataloader stalls 10% of steps, that is <strong>$800k of idle H100s</strong> — the data plane is not plumbing, it is a first-class performance system. The whole design reduces to one inequality: <em>data delivery throughput must exceed GPU token-consumption throughput, with margin.</em> Miss it and MFU collapses, and every parallelism decision from lesson 07 is wasted.</p>
+
+<div class="callout">
+  <div class="label">The framing: a producer–consumer race the GPU must win by losing</div>
+  Lesson 07 made the GPUs the expensive consumer: at 40% MFU on 1,024 H100s they eat tokens at a fixed rate, set by the step time. The data plane is the producer. The only acceptable design point is <strong>producer throughput &gt; consumer throughput</strong>, so the consumer never waits. Anything less and the GPUs idle at the top of every step — paying full price to do nothing.
+</div>
+
+<h2>1 · The throughput target — what the cluster eats per second</h2>
+
+<p>From lesson 07, one synchronized training step processes the <strong>global batch</strong> across all data-parallel ranks, then takes <span class="math">step_time</span> seconds. So the cluster consumes tokens at a constant, relentless rate:</p>
+
+<div class="math block">
+tokens_consumed/s = global_batch_tokens / step_time
+</div>
+
+<div class="callout ok">
+  <div class="label">Worked: the rate you must feed, forever</div>
+  Global batch <span class="math">= 4M tokens</span>, step time <span class="math">= 2 s</span> ⇒ <span class="math">4e6 / 2 = 2M tokens/s</span> must arrive — <em>pre-tokenized and shuffled</em> — every second, for the 180-day run. Converted to bytes: token IDs stored as int16/uint16 are <strong>2 bytes/token</strong>, so <span class="math">2e6 · 2 = 4 MB/s</span> of token IDs cluster-wide. That sounds trivial — and it is, <em>if you tokenized offline</em>. If you stream <em>raw text</em> and tokenize online, you read ~4–5 bytes/token of UTF-8 plus pay CPU to tokenize: the same 2M tokens/s becomes <strong>~8–10 MB/s of text reads plus a tokenization bill</strong> that competes with the dataloader for host CPU. Same token rate, very different data path.
+</div>
+
+<p>4 MB/s cluster-wide is nothing — until you remember it must be <em>random</em> (shuffled), <em>disjoint</em> across ranks (no duplicate data), and <em>resumable</em> (exact order after a crash). The bytes are easy; the access pattern is the engineering.</p>
+
+<h2>2 · Where the data lives — stream, don't download</h2>
+
+<p>A pretraining corpus is <strong>petabytes</strong> of tokens. It sits in object storage (S3/GCS), not on local NVMe — no node has a petabyte of disk, and copying the corpus to every node is absurd. So each data-parallel rank <strong>streams</strong> shards from object store on demand, reading only the shards assigned to it (<a href="../../data_engineering/lessons/04_storage_formats.html">data_engineering 04</a>, <a href="../../data_engineering/lessons/05_transformation.html">05</a>).</p>
+
+<p>The trick that makes streaming free: <strong>double-buffering</strong>. While the GPU computes step <span class="math">i</span> (2 s of compute), CPU worker threads prefetch and decode the batches for steps <span class="math">i+1, i+2, …</span> into a host-RAM queue. If the I/O for one batch finishes in well under 2 s, the data wait is fully <em>hidden behind compute</em> and the GPU never sees a stall.</p>
+
+<pre class="ascii">  GPU:   [ step i compute · 2s ][ step i+1 compute · 2s ][ step i+2 ... ]
+  CPU:   [ prefetch i+1 ][ prefetch i+2 ][ prefetch i+3 ]   ← must finish before GPU needs it
+         └── overlapped: data wait = 0 ──┘
+  BAD:   [ step i ]......WAIT......[ step i+1 ]   ← prefetch too slow → GPU idle = $ burned</pre>
+
+<p>The design rule: <strong>prefetch depth × per-batch fetch time &lt; pipeline budget</strong>, and per-batch fetch time must be &lt; step time so the queue never drains. Prefetch 2–4 batches ahead to absorb jitter in object-store latency.</p>
+
+<h2>3 · Sharding &amp; shuffle — global shuffle is impossible at PB scale</h2>
+
+<p>SGD wants i.i.d. samples, which ideally means a uniform random permutation of the whole corpus each epoch. You <em>cannot</em> globally shuffle a petabyte — it would require random reads scattered across all of object storage, destroying the sequential-read throughput that makes streaming cheap. The standard approximation is a <strong>shuffle buffer</strong>:</p>
+
+<ol>
+  <li>Pre-shuffle shard <em>order</em> once (cheap — just permute the shard list).</li>
+  <li>Fill a buffer of <span class="math">K</span> samples (e.g. K = 10,000) by reading shards sequentially.</li>
+  <li>Each step, draw randomly from the buffer; refill the drawn slot from the stream.</li>
+</ol>
+
+<p>This gives near-random sampling within a window of <span class="math">K</span> samples while keeping reads sequential. Bigger <span class="math">K</span> = better mixing, more host RAM.</p>
+
+<div class="callout warn">
+  <div class="label">Skew is a synchronized-step killer — a callback to lesson 07's collectives</div>
+  Shard assignment must be <strong>disjoint</strong> across dp ranks (a token shown twice is a silent epoch bug) and <strong>deterministic</strong> (for resumption, §5). But the subtle trap is <em>skew</em>: lesson 07's step ends in an all-reduce, a barrier where <em>every</em> rank waits for the slowest. If one rank draws an oversized shard, or its object-store read hiccups, that one rank stalls and <strong>all 1,024 GPUs wait at the collective</strong>. A straggling dataloader on a single rank taxes the entire cluster. Balance shard sizes; cap per-batch fetch time; treat the slowest rank as your real throughput.
+</div>
+
+<h2>4 · Tokenization &amp; packing — don't waste FLOPs on padding</h2>
+
+<p><strong>Offline vs online tokenization.</strong> Tokenize <em>once</em>, offline, and store token IDs (<a href="../../data_engineering/lessons/07_tokenization_packing.html">data_engineering 07</a>): the data path then streams 2 bytes/token with zero per-step CPU cost. Tokenizing <em>online</em> — running the BPE tokenizer on raw text every step — moves that CPU cost onto the training host, where it competes with the dataloader's decode threads. At 2M tokens/s a slow tokenizer can become the bottleneck that starves the GPUs, the exact failure §6 hunts for. Offline is the default; online only when the corpus changes faster than you can re-tokenize it.</p>
+
+<p><strong>Packing.</strong> Documents have varying lengths; the model trains on fixed-length sequences (say 8,192 tokens). The naive approach pads each short document up to the max length — and <em>padding tokens cost the same FLOPs as real tokens</em>. The 6N rule from lesson 02 doesn't know a token is padding.</p>
+
+<div class="callout bad">
+  <div class="label">30% padding = 30% of your $8M run spent on nothing</div>
+  If the average sequence is 30% padding, then 30% of every <span class="math">6N</span>-FLOP step computes attention over fake tokens. On the lesson 02 / 07 run that is <strong>~$2.4M of GPU-time producing zero gradient signal</strong> — worse than a 10% dataloader stall. <strong>Packing</strong> concatenates multiple documents into one fixed-length sequence (with attention masks or boundary resets so they don't attend across each other), driving padding toward 0% and recovering that compute. Packing is not a data-quality nicety; it is a first-order MFU lever.
+</div>
+
+<h2>5 · Deterministic resumption — the dataloader is part of the checkpoint</h2>
+
+<p>Lesson 07 established that at 1,000-GPU scale a node dies every few hours, so the run checkpoints and restarts constantly. A run that dies at step 40,000 must resume the <strong>exact data order</strong> it would have seen with no crash. Otherwise you re-show data (overfitting a slice) or skip data (a hole in the epoch) — both silently corrupt training and are nearly impossible to debug after the fact.</p>
+
+<p>So the <strong>dataloader state is checkpoint state</strong>, saved alongside the 16N model/optimizer bytes (<a href="../../data_engineering/lessons/09_orchestration.html">data_engineering 09</a>):</p>
+
+<ul>
+  <li><strong>shard cursor</strong> per rank — which shards consumed, position within the current shard,</li>
+  <li><strong>shuffle seed</strong> + the buffer's RNG state — so the same samples come out in the same order,</li>
+  <li><strong>epoch / global step</strong> — so the shard permutation for the next epoch is reproducible.</li>
+</ul>
+
+<p>Get this right and a restart is invisible to the loss curve. Get it wrong and you discover the corruption only when an eval number looks off, weeks later.</p>
+
+<h2>6 · Proving it's not the bottleneck — the diagnostic</h2>
+
+<p>Lesson 00's design loop ends by finding the bottleneck step. Applied to the data plane: <strong>measure data-wait time per step</strong> — GPU idle between the end of one step's compute and the start of the next. If MFU is low, the question is <em>comms (lesson 07) or data?</em> The clean experiment:</p>
+
+<div class="callout ok">
+  <div class="label">The synthetic-data test</div>
+  Replace the real dataloader with a <strong>cached or synthetic batch</strong> served from host RAM at zero I/O cost, and re-measure step time. <strong>If step time drops, the data plane was the bottleneck</strong> — fix the pipeline (more prefetch workers, faster format, offline tokenization, balanced shards). If step time is unchanged, data was already hidden behind compute and the MFU loss is comms or kernels — go back to lesson 07. This one A/B isolates the data plane from everything else and tells you exactly where to spend effort.
+</div>
+
+<h2>7 · Co-design — format trades network bytes against host CPU</h2>
+
+<p>The storage format is a knob on the producer–consumer race, and which way to turn it depends on which resource is scarce on your data path:</p>
+
+<table>
+  <thead><tr><th>Format</th><th>Compression (network)</th><th>Decode cost (host CPU)</th><th>Pick when…</th></tr></thead>
+  <tbody>
+    <tr><td><span class="tag">Parquet</span> (columnar, compressed)</td><td>high — fewest bytes off object store</td><td>higher — decompress + decode</td><td>network-bound: limited egress / many ranks</td></tr>
+    <tr><td><span class="tag">Arrow</span> (columnar, in-memory)</td><td>medium</td><td>low — zero-copy reads</td><td>CPU-bound: cheap bandwidth, scarce cores</td></tr>
+    <tr><td><span class="tag">WebDataset</span> (tar shards)</td><td>tunable</td><td>low — sequential, streaming-friendly</td><td>pure sequential streaming at scale</td></tr>
+  </tbody>
+</table>
+
+<p>More compression means fewer bytes/s off the network but more host CPU to decode — and host CPU is also what online tokenization and shuffle-buffer management consume. If you are <em>network-bound</em>, compress harder. If you are <em>CPU-bound</em> (e.g. already tokenizing online), reach for a cheaper-to-decode format and pre-tokenize. The §6 synthetic-data test plus a CPU-utilization read tells you which regime you're in.</p>
+
+<h2>Interactive · will the data plane keep up?</h2>
+
+<p>Set the consumer (global batch, step time, dp ranks) and the producer (per-rank read bandwidth, whether you tokenize online). The widget computes the required bytes/s per rank against what the rank can actually read, and shows the MFU ceiling if the GPUs end up data-starved.</p>
+
+<div class="widget"><div class="title">Data-plane feasibility / will it keep up?</div><p class="hint">Assumptions: token IDs at 2 bytes/token; online tokenization reads raw text at ~5× the byte rate and is modeled as a 5× inflation of required bytes/s; required bytes are split evenly across dp ranks; "achieved" is the sustained sequential read each rank gets from object store. If achieved &lt; required the GPUs starve, effective step time inflates by required/achieved, and the MFU ceiling falls by that ratio (lesson 07's 40% MFU baseline). Idle-cost uses 1,024 H100s × dp/512 scaling at ~$2/GPU-hr. Order-of-magnitude, per lesson 02's ±30% contract.</p>
+<div class="controls">
+<label class="inline">global batch (M tok) <input id="d-B" type="range" min="0.5" max="16" step="0.5" value="4"><span class="val" id="d-B-v">4</span></label>
+<label class="inline">step time (s) <input id="d-S" type="range" min="0.5" max="5" step="0.5" value="2"><span class="val" id="d-S-v">2</span></label>
+<label class="inline">dp ranks <input id="d-R" type="range" min="8" max="512" step="8" value="128"><span class="val" id="d-R-v">128</span></label>
+<label class="inline">per-rank read (MB/s) <input id="d-M" type="range" min="10" max="2000" step="10" value="200"><span class="val" id="d-M-v">200</span></label>
+<label class="inline">online tokenize <input id="d-O" type="range" min="0" max="1" step="1" value="0"><span class="val" id="d-O-v">off</span></label>
+</div>
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">required MB/s / rank</div><div class="v" id="d-req">–</div></div>
+  <div class="kpi"><div class="k">achieved MB/s / rank</div><div class="v" id="d-ach">–</div></div>
+  <div class="kpi"><div class="k">status</div><div class="v" id="d-stat">–</div></div>
+  <div class="kpi"><div class="k">eff. MFU ceiling</div><div class="v" id="d-mfu">–</div></div>
+</div>
+<p class="hint" id="d-note"></p></div>
+
+<h2>What carries forward</h2>
+<ul>
+  <li><strong>The data plane is a performance system, not plumbing.</strong> A 10% dataloader stall on an $8M run is $800k of idle H100s — design it to win the producer–consumer race with margin.</li>
+  <li><strong>The target: <span class="math">tokens/s = global_batch / step_time</span></strong> must arrive shuffled and disjoint, every second, forever. In bytes it is tiny (~4 MB/s at 2 B/token) — the access pattern, not the bandwidth, is the work.</li>
+  <li><strong>Stream from object store, double-buffered.</strong> Prefetch N batches so I/O hides behind the step; per-batch fetch must beat step time or the queue drains.</li>
+  <li><strong>Shuffle-buffer approximates a global shuffle;</strong> shards stay disjoint and deterministic. Skew on one rank stalls all ranks at the all-reduce.</li>
+  <li><strong>Tokenize offline; pack documents.</strong> 30% padding = 30% wasted FLOPs (~$2.4M); packing recovers it. Online tokenization can become the host-CPU bottleneck.</li>
+  <li><strong>Dataloader state (cursor, seed, buffer) is checkpoint state</strong> — exact resumption or a corrupted epoch.</li>
+  <li><strong>Diagnose with the synthetic-data A/B;</strong> co-design the format to whichever you're bound by — network (compress) or CPU (decode cheap).</li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="07_training_system.html"><span class="dir">Previous</span><span class="ttl">07 · Pretraining system</span></a>
+  <a class="next" href="09_rl_post_training_system.html"><span class="dir">Next</span><span class="ttl">09 · RL post-training</span></a>
+</footer>
+
+<script>
+(function(){
+  const ids=['B','S','R','M','O'];
+  const el=Object.fromEntries(ids.map(k=>[k,document.getElementById('d-'+k)]));
+  function draw(){
+    document.getElementById('d-B-v').textContent=el.B.value;
+    document.getElementById('d-S-v').textContent=el.S.value;
+    document.getElementById('d-R-v').textContent=el.R.value;
+    document.getElementById('d-M-v').textContent=el.M.value;
+    document.getElementById('d-O-v').textContent=el.O.value==='1'?'on':'off';
+    const B=+el.B.value*1e6, S=+el.S.value, R=+el.R.value, ach=+el.M.value, online=el.O.value==='1';
+    // tokens/s the cluster consumes
+    const tokPerS=B/S;
+    // bytes/s cluster-wide: 2 B/token IDs, ×5 if reading raw text online
+    const inflate=online?5:1;
+    const clusterBytesPerS=tokPerS*2*inflate;          // bytes/s
+    const reqPerRank=(clusterBytesPerS/R)/1e6;          // MB/s per rank
+    const ratio=ach/reqPerRank;                          // >=1 means headroom
+    const fed=ratio>=1;
+    // MFU ceiling: 40% baseline, docked by starvation (required/achieved >1 inflates step time)
+    const baseMFU=0.40;
+    const mfu=fed?baseMFU:baseMFU*ratio;                 // ratio<1 caps it
+    // idle cost when starved: GPUs scale with dp; ~1024 at dp=512 baseline
+    const gpus=Math.round(1024*(R/512));
+    const idleFrac=fed?0:(1-ratio);
+    const idleCostPerHr=gpus*2*idleFrac;                 // $/hr burned idle
+    document.getElementById('d-req').textContent=reqPerRank.toFixed(2)+' MB/s';
+    document.getElementById('d-ach').textContent=ach.toFixed(0)+' MB/s';
+    const st=document.getElementById('d-stat');
+    st.textContent=fed?'FED':'DATA-STARVED';
+    st.style.color=fed?'var(--ok)':'var(--bad)';
+    const mfuEl=document.getElementById('d-mfu');
+    mfuEl.textContent=(mfu*100).toFixed(0)+'%';
+    mfuEl.style.color=fed?'var(--ok)':'var(--bad)';
+    const note=document.getElementById('d-note');
+    if(fed){
+      note.textContent='Data plane has headroom ('+ratio.toFixed(1)+'× the requirement) — GPUs stay fed at the full 40% MFU baseline. Consume '+(tokPerS/1e6).toFixed(2)+'M tok/s = '+(clusterBytesPerS/1e6).toFixed(1)+' MB/s cluster-wide'+(online?' (online-tokenizing from raw text, 5× inflated)':' of int16 token IDs')+'. Now spend the margin on a bigger shuffle buffer or fault headroom, not more read bandwidth.';
+    } else {
+      note.textContent='DATA-STARVED: need '+reqPerRank.toFixed(1)+' MB/s/rank but only '+ach.toFixed(0)+' available — step time inflates '+(1/ratio).toFixed(1)+'×, dropping the MFU ceiling to '+(mfu*100).toFixed(0)+'%. That is ≈ $'+idleCostPerHr.toFixed(0)+'/hr of idle GPUs ('+gpus+' H100s). Fix the pipeline before the model: tokenize offline (drops the 5× text inflation), add prefetch workers, pick a cheaper-decode format, or balance shards.';
+    }
+  }
+  Object.values(el).forEach(x=>x.addEventListener('input',draw));
+  draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

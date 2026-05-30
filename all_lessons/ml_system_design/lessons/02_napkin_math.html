@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>02 · Napkin math</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">ml_system_design</a>
+    <span class="crumb">/</span>
+    <span class="crumb">02 · napkin math</span>
+    <span class="step-pill">lesson 2 / 12</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Napkin math — the numbers every design rests on</h1>
+<p class="subtitle">A system designer who can't estimate a model's cost in FLOPs, bytes, and dollars in their head is flying blind. This lesson builds the seven estimates you reuse in every later lesson: forward/training FLOPs, weight memory, optimizer memory, KV-cache bytes, activation memory, arithmetic intensity, and $/token. None of them needs more than multiplication.</p>
+
+<div class="callout">
+  <div class="label">The contract of this lesson</div>
+  These are <em>order-of-magnitude</em> estimates, accurate to maybe ±30%. That is exactly the right precision for design: it tells you "you need ~16 GPUs, not 2 and not 200" — enough to choose a topology. The last 30% is a profiler's job, after the design is right.
+</div>
+
+<h2>1 · Compute — the 2N and 6N rules</h2>
+
+<p>A transformer's compute is dominated by matrix multiplies. A matmul of an <span class="math">m×k</span> by <span class="math">k×n</span> matrix costs <span class="math">2mkn</span> FLOPs (the 2 is one multiply + one add). Summed over a model with <strong>N</strong> parameters, every parameter is touched by ~one multiply-add per token, giving the two rules you will use more than any others:</p>
+
+<div class="math block">
+forward pass: ≈ 2N FLOPs / token &nbsp;&nbsp;|&nbsp;&nbsp; training step (fwd+bwd): ≈ 6N FLOPs / token
+</div>
+
+<p>The backward pass costs about twice the forward (it computes gradients w.r.t. both inputs and weights), so <span class="math">2N + 4N = 6N</span>. These ignore attention's <span class="math">O(seq²)</span> term, which is negligible until context lengths get long — a correction we revisit in lesson 06.</p>
+
+<div class="callout ok">
+  <div class="label">Worked: cost to pretrain a 70B model on 15T tokens</div>
+  <span class="math">6 · 70e9 · 15e12 = 6.3e24 FLOPs</span>. On 1,024 H100s at 990 TFLOP/s peak and a realistic <strong>40% MFU</strong>: usable rate <span class="math">= 1024 · 990e12 · 0.4 ≈ 4.05e17 FLOP/s</span>. Time <span class="math">= 6.3e24 / 4.05e17 ≈ 1.56e7 s ≈ 180 days</span>. At ~$2/GPU-hr that's <span class="math">1024 · 24·180 · 2 ≈ $8.8M</span>. Now you understand why the parallelism choice in lesson 07 — which sets MFU — is a multi-million-dollar decision.
+</div>
+
+<h2>2 · Memory — four things live in HBM</h2>
+
+<p>GPU memory (HBM) is the scarcest resource in most designs. Four tenants compete for it. Know all four or you'll OOM in production:</p>
+
+<table>
+  <thead><tr><th>Tenant</th><th>Size</th><th>Present during…</th></tr></thead>
+  <tbody>
+    <tr><td>Weights</td><td><span class="math">2N</span> bytes (fp16/bf16); <span class="math">N</span> at int8; <span class="math">N/2</span> at int4</td><td>always</td></tr>
+    <tr><td>Optimizer + grads (Adam, mixed precision)</td><td><span class="math">≈ 12–16N</span> bytes</td><td>training only</td></tr>
+    <tr><td>Activations</td><td>depends on batch × seq × layers (see §4)</td><td>training (until bwd); small in inference</td></tr>
+    <tr><td>KV cache</td><td>grows with concurrent tokens (see §3)</td><td>inference (the big one)</td></tr>
+  </tbody>
+</table>
+
+<h3>Weights</h3>
+<p>fp16/bf16 is 2 bytes/param, so a model is <span class="math">2N</span> bytes. <strong>7B → 14 GB, 70B → 140 GB, 405B → 810 GB.</strong> Compare to an 80 GB H100: 7B fits with room for KV; 70B needs ≥2 GPUs; 405B needs ≥11. This single comparison is often the first forcing function in a design.</p>
+
+<h3>Optimizer state — why training needs ~10× the memory of inference</h3>
+<p>Standard mixed-precision Adam holds, per parameter: an fp32 master weight (4B), fp32 momentum (4B), fp32 variance (4B), plus fp16 gradient (2B) and the fp16 weight (2B). That's <strong>~16 bytes/param</strong> — eight times the weights alone.</p>
+<div class="math block">
+training memory (no parallelism) ≈ (2 + 14) · N + activations = 16N + activations
+</div>
+<p>A 70B model needs ~1.1 TB just for weights+optimizer — <strong>14× H100s' worth before a single activation.</strong> This is the entire reason FSDP/ZeRO (lesson 07) exists: shard those 16N bytes across data-parallel ranks so each holds <span class="math">16N / dp</span>.</p>
+
+<h3>KV cache — the tenant that scales with traffic</h3>
+<p>Covered next; it is what makes <em>serving</em> memory a moving target rather than a constant.</p>
+
+<h2>3 · KV cache — bytes per token</h2>
+
+<p>During decode, every past token's key and value vectors are cached so attention doesn't recompute them. Per token:</p>
+
+<div class="math block">
+kv_bytes/token = 2 · n_layers · n_kv_heads · head_dim · dtype_bytes
+</div>
+
+<p>The leading 2 is "K and V." Note <strong>n_kv_heads</strong>, not n_query_heads — this is exactly what GQA/MQA shrink (<a href="../../vllm/lessons/09_gqa_mqa.html">vLLM 09</a>). Worked for Llama-3-70B (80 layers, 8 KV heads, head_dim 128, fp16):</p>
+
+<div class="math block">
+2 · 80 · 8 · 128 · 2 = 327,680 bytes ≈ 320 KB / token
+</div>
+
+<p>So an 8K-token context holds <span class="math">8192 · 320KB ≈ 2.6 GB of KV — per request.</span> On an H100 with ~140 GB left after weights, you fit roughly <span class="math">140/2.6 ≈ 50</span> such requests. <strong>That number — not compute — is usually your batch-size ceiling in serving</strong>, and the headline reason PagedAttention (pack KV tightly) and GQA (fewer KV heads) matter. We size real replicas on this in lesson 04.</p>
+
+<div class="callout warn">
+  <div class="label">The KV cache is the serving designer's main antagonist</div>
+  Weights are a fixed admission fee; KV is the variable cost that decides how many users share a GPU. Long contexts, big batches, and many KV heads all inflate it. Half of inference optimization (lesson 06) is, at bottom, "spend fewer bytes per cached token."
+</div>
+
+<h2>4 · Activations — the training memory wildcard</h2>
+
+<p>In training you must keep layer activations around for the backward pass. A rough estimate per transformer layer is <span class="math">≈ s · b · h · (some factor ~10–35)</span> depending on what's recomputed, where <span class="math">s</span>=seq len, <span class="math">b</span>=microbatch, <span class="math">h</span>=hidden. The exact constant matters less than the scaling: activations grow with <strong>batch × sequence × layers</strong>, while weights/optimizer don't. This is why long-context training blows up memory and why <em>gradient (activation) checkpointing</em> — recompute activations in bwd instead of storing them, trading ~33% more compute for a big memory cut — is standard at scale (lesson 07).</p>
+
+<h2>5 · The roofline — are you compute- or bandwidth-bound?</h2>
+
+<p>From lesson 01: a kernel's speed is <span class="math">min(compute_roof, bandwidth_roof)</span>. The crossover is the machine's <strong>arithmetic intensity ridge</strong>:</p>
+
+<div class="math block">
+ridge (FLOP/byte) = peak_FLOPs / peak_bandwidth
+</div>
+
+<p>For an H100 bf16: <span class="math">990e12 / 3.35e12 ≈ 295 FLOP/byte.</span> A workload doing fewer than ~295 FLOPs per byte read is bandwidth-bound; more, compute-bound. <strong>Prefill</strong> (big matmuls over many tokens) sits right of the ridge → compute-bound. <strong>Decode</strong> at small batch sits far left → bandwidth-bound. Batching decode moves it rightward (more tokens per weight-read) — the whole game of lesson 04.</p>
+
+<h2>6 · The spec sheet to memorize</h2>
+
+<table>
+  <thead><tr><th>GPU</th><th>HBM</th><th>BW (TB/s)</th><th>bf16 (TFLOP/s)</th><th>ridge (F/B)</th></tr></thead>
+  <tbody>
+    <tr><td>A100 80GB</td><td>80 GB</td><td>2.0</td><td>312</td><td>~156</td></tr>
+    <tr><td>H100 SXM</td><td>80 GB</td><td>3.35</td><td>990</td><td>~295</td></tr>
+    <tr><td>H200</td><td>141 GB</td><td>4.8</td><td>990</td><td>~206</td></tr>
+    <tr><td>B200 (≈)</td><td>192 GB</td><td>8.0</td><td>~2250</td><td>~280</td></tr>
+  </tbody>
+</table>
+<p class="hint">FLOP/s are dense bf16 without sparsity; vendors quote 2× with sparsity — ignore that for design. Interconnect: NVLink ~900 GB/s intra-node (8 GPUs), InfiniBand ~400 Gb/s ≈ 50 GB/s inter-node. The 18× gap between intra- and inter-node bandwidth drives every parallelism-placement decision in lesson 07.</p>
+
+<h2>7 · Dollars — closing the loop</h2>
+
+<p>Everything reduces to GPU-hours, and GPU-hours to dollars. The two master formulas:</p>
+
+<div class="math block">
+training $ ≈ (6 · N · D) / (gpus · peak · MFU) · gpus · $/gpu-hr<br>
+serving $/1M tok ≈ $/gpu-hr / (throughput_tok_per_s_per_gpu · 3600) · 1e6
+</div>
+
+<p>Serving cost is dominated by <em>achieved tokens/sec/GPU</em>, which is set by batch size, which is capped by KV memory, which we computed in §3. The chain <strong>bytes → batch → throughput → $</strong> is the spine of every serving design. Play with it:</p>
+
+<div class="widget"><div class="title">Pretraining cost estimator</div><p class="hint">The 6ND rule turned into a bill. Watch how MFU — the single number the parallelism design controls — swings the cost by 2–3×.</p>
+<div class="controls">
+<label class="inline">params N (B) <input id="t-N" type="range" min="1" max="500" step="1" value="70"><span class="val" id="t-N-v">70</span></label>
+<label class="inline">tokens D (T) <input id="t-D" type="range" min="1" max="30" step="1" value="15"><span class="val" id="t-D-v">15</span></label>
+<label class="inline">GPUs <input id="t-G" type="range" min="64" max="8192" step="64" value="1024"><span class="val" id="t-G-v">1024</span></label>
+<label class="inline">MFU % <input id="t-M" type="range" min="15" max="60" step="1" value="40"><span class="val" id="t-M-v">40</span></label>
+<label class="inline">$/GPU-hr <input id="t-P" type="range" min="1" max="10" step="0.5" value="2"><span class="val" id="t-P-v">2</span></label>
+</div>
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">total FLOPs</div><div class="v" id="t-flops">–</div></div>
+  <div class="kpi"><div class="k">wall-clock</div><div class="v" id="t-days">–</div></div>
+  <div class="kpi"><div class="k">GPU-hours</div><div class="v" id="t-gh">–</div></div>
+  <div class="kpi"><div class="k">cost</div><div class="v" id="t-cost">–</div></div>
+</div>
+<p class="hint" id="t-note"></p></div>
+
+<div class="callout">
+  <div class="label">Carry these seven into every later lesson</div>
+  <strong>2N</strong> fwd, <strong>6N</strong> train (FLOPs/token) · <strong>2N</strong> weight bytes · <strong>~16N</strong> training bytes · <strong>2·L·H<sub>kv</sub>·d</strong> KV bytes/token · activations ∝ b·s·L · ridge = peak/BW · $ via GPU-hours. If you can reproduce these without the page open, you can size any ML system to the right order of magnitude — which is what step 2 of the loop requires.
+</div>
+
+<footer class="lesson-nav">
+  <a href="01_what_is_systems_design.html"><span class="dir">Previous</span><span class="ttl">01 · What's different</span></a>
+  <a class="next" href="03_slos_workload.html"><span class="dir">Next</span><span class="ttl">03 · SLOs &amp; workload</span></a>
+</footer>
+
+<script>
+(function(){
+  const ids=['N','D','G','M','P'];
+  const el=Object.fromEntries(ids.map(k=>[k,document.getElementById('t-'+k)]));
+  function draw(){
+    ids.forEach(k=>document.getElementById('t-'+k+'-v').textContent=el[k].value);
+    const N=+el.N.value*1e9, D=+el.D.value*1e12, G=+el.G.value, M=+el.M.value/100, P=+el.P.value;
+    const flops=6*N*D;
+    const rate=G*990e12*M;            // usable FLOP/s
+    const secs=flops/rate;
+    const days=secs/86400;
+    const gpuHours=G*secs/3600;
+    const cost=gpuHours*P;
+    document.getElementById('t-flops').textContent=(flops/1e24).toFixed(2)+'e24';
+    document.getElementById('t-days').textContent=days<1?(days*24).toFixed(1)+' h':days.toFixed(0)+' d';
+    document.getElementById('t-gh').textContent=(gpuHours/1e6).toFixed(2)+'M';
+    document.getElementById('t-cost').textContent='$'+(cost/1e6).toFixed(2)+'M';
+    document.getElementById('t-note').textContent='Drop MFU from '+el.M.value+'% to '+Math.max(15,el.M.value-20)+'% and the cost rises to $'+((gpuHours*(M/((el.M.value-20)/100))*P)/1e6).toFixed(2)+'M for the same model — the parallelism design (lesson 07) is what defends that MFU.';
+  }
+  Object.values(el).forEach(x=>x.addEventListener('input',draw));
+  draw();
+})();
+</script>
+
+</main>
+</body>
+</html>
