@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>06 · AGV scheduling</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">rl_in_practice</a>
+    <span class="crumb">/</span>
+    <span class="crumb">06 · AGV scheduling</span>
+    <span class="step-pill">lesson 6 / 20</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Smart-logistics AGV scheduling</h1>
+<p class="subtitle">A warehouse floor is a fleet of automated guided vehicles (AGVs) that must pick, carry, yield at intersections, and recharge — all while orders arrive on a schedule that drifts hour by hour. The binding difficulties of <em>this</em> domain are different from a game's: the reward is a <strong>multi-agent yielding conflict</strong> that can deadlock, the order stream is <strong>non-stationary</strong> so a fixed-horizon policy ages out by noon, path and charging are <strong>two coupled timescales</strong>, the charging queue is <strong>partially observable</strong>, and the whole thing only learns fast enough if you can keep thousands of simulators feeding a GPU. Each one names a tool.</p>
+
+<div class="callout">
+  <div class="label">The method — five steps, every lesson</div>
+  Applied RL is the same loop in every domain. <strong>(1) Formulate</strong> the MDP — state, action, reward, transition, horizon. <strong>(2) Diagnose</strong> the one or two properties that make <em>this</em> MDP hard. <strong>(3) Engineer</strong> the mechanism that removes exactly that difficulty. <strong>(4) Guard</strong> it in production — detect when it breaks and fall back. <strong>(5) Iterate.</strong> For an AGV fleet the difficulties stack — multi-agent conflict, non-stationarity, coupled timescales, partial observation, throughput — so we run the loop once per row of the table.</p>
+</div>
+
+<h2>1 · Formulate — the MDP behind a yielding, recharging AGV</h2>
+
+<p><strong>Intuition.</strong> One AGV sees its local map, the priority tags and predicted paths of nearby vehicles, its own battery, and the layout of pick aisles. It chooses how to move and when to peel off to charge. It is rewarded for making progress without forcing a higher-priority vehicle to slam on the brakes, without colliding, and without running flat. The transition is the floor physics <em>plus every other vehicle</em> — which is where the trouble starts.</p>
+
+<div class="math block">
+MDP = (S, A, R, P, γ) &nbsp;·&nbsp; maximize&nbsp; E[ Σₜ γᵗ rₜ ] &nbsp; subject to &nbsp; collision-rate ≤ ε
+</div>
+
+<table>
+  <thead><tr><th>Piece</th><th>For one AGV in the fleet</th><th>The awkward part</th></tr></thead>
+  <tbody>
+    <tr><td><strong>State</strong> S</td><td>local map + yield zones + neighbour priority vector p∈{0,1,2,3} + predicted neighbour trajectories + own battery / SOC</td><td>you only see neighbours within a comm radius → the joint state is <em>too big and partially observed</em></td></tr>
+    <tr><td><strong>Action</strong> A</td><td>continuous velocity (vₓ, v_y), plus discrete macro-actions: yield, drop-package, go-charge</td><td>atomic control and minute-long deliveries live on <em>two different timescales</em></td></tr>
+    <tr><td><strong>Reward</strong> R</td><td>progress + yield + safety (TTC) + comfort + traffic-rule terms, summed per step</td><td>"who yields to whom" is a <em>social-dilemma</em>; a flat win/loss reward is far too <em>sparse</em></td></tr>
+    <tr><td><strong>Transition</strong> P</td><td>floor dynamics + the other N−1 learning vehicles + the charging-queue server</td><td>order arrivals drift over the day → <em>non-stationary</em>; queues are hidden → <em>POMDP</em></td></tr>
+  </tbody>
+</table>
+
+<p class="hint">Same pattern as every lesson: the MDP table writes itself, and the rightmost column <em>is the lesson</em>. Each awkward row below gets the one mechanism that answers it — and nothing more.</p>
+
+<h2>2 · Reward shaping for yielding — make the social goal locally perceptible</h2>
+
+<p><strong>Intuition.</strong> If you only reward "reached the goal" (+100) and punish "crashed" (−1000), an AGV in dense traffic must stumble through an exponential number of steps before it ever sees a positive sample. Yielding is invisible to such a reward — it is just a delay with no payoff. The fix is to decompose the social goal into small, per-step, <em>perceptible</em> sub-goals: did I make progress, did I cause a high-priority vehicle to brake, am I about to collide, am I driving smoothly, did I break a rule.</p>
+
+<p><strong>Engineering detail — five per-step terms.</strong> The local reward is computed every step as a sum of five components:</p>
+
+<div class="math block">
+r = R<sub>progress</sub> + R<sub>yield</sub> + R<sub>safety</sub> + R<sub>comfort</sub> + R<sub>rule</sub>
+</div>
+
+<ul>
+  <li><strong>R<sub>progress</sub></strong>: +1 per metre of legal forward progress; −0.1 per step while stopped to yield — small enough that yielding pays off, large enough that "never move" does not.</li>
+  <li><strong>R<sub>yield</sub></strong>: with priority vector p (lower = higher priority), if your action forces a higher-priority vehicle into emergency braking (deceleration &gt; 3 m/s²), an immediate −10; if you slow <em>inside the yield zone</em> (&lt;15 m from the conflict point) so the priority vehicle never has to brake, +2.</li>
+  <li><strong>R<sub>safety</sub></strong>: a continuous time-to-collision penalty R<sub>safety</sub> = −5·exp(−TTC/1.0), active when TTC &lt; 2.5 s; a collision adds −1000 and truncates the episode.</li>
+  <li><strong>R<sub>comfort</sub></strong>: a quadratic penalty −0.05·a² − 0.02·j² on acceleration a and jerk j, clipped at −2, so the agent can't exploit "floor it" maneuvers.</li>
+  <li><strong>R<sub>rule</sub></strong>: traffic rules as boolean features — run a red light −500, fail to keep right −1 per step, turn without yielding to oncoming traffic moving &gt;5 km/h −20, fail to yield on turn −15.</li>
+</ul>
+
+<div class="callout">
+  <div class="label">Why decomposition beats a sparse reward</div>
+  The sparse version (+100 success / −1000 collision) needs exponentially many exploration steps to find a positive sample in dense urban-style traffic. Breaking "yield" into perceptible per-step targets raises sample efficiency by roughly <strong>5–10×</strong>. The shaping terms feed only the <em>state vector</em> (yield zones, priority tags, predicted neighbour trajectories from the HD map) — never future ground truth — so the reward stays causal and does not leak information the agent could not have at decision time.
+</div>
+
+<h2>3 · Safety as a constraint, not a reward weight — PPO-Lagrangian</h2>
+
+<p><strong>Intuition.</strong> You could fold "don't crash" into the reward with a big negative weight, but then the agent silently trades a little safety for a lot of efficiency whenever the arithmetic says so. In logistics that trade is unacceptable: the policy must learn to <em>not crash first</em>, then optimize throughput. That is a constrained problem, not a weighting problem.</p>
+
+<p><strong>Engineering detail.</strong> Train with <strong>PPO-Lagrangian</strong>: set the collision rate as an explicit constraint (≤ 0.1%) and introduce a Lagrange multiplier λ on the constraint. The objective becomes the usual PPO surrogate minus λ times the constraint violation, and λ is updated by gradient ascent on the dual:</p>
+
+<div class="math block">
+max<sub>θ</sub> min<sub>λ≥0</sub>  E[ A<sup>PPO</sup> ] − λ·( E[collision] − ε ) &nbsp;,&nbsp; ε = 0.001
+</div>
+
+<p>When collisions exceed the budget, λ rises and the safety terms dominate the gradient; once the policy is safe, λ relaxes and efficiency terms take over. This enforces a priority ordering that a fixed reward weight cannot. The same emitter is hot-pluggable: when a city piloted a "must-stop-on-right-turn" rule, the team added one boolean term (−50) to R<sub>rule</sub> with <em>no re-collection of data</em> — the reward function is explainable and modular, and the per-step terms plus the RSS safety envelope are written into a safety-audit log for regulatory review.</p>
+
+<h2>4 · Multi-agent conflict — mean-field neighbours and deadlock intervention</h2>
+
+<p><strong>Intuition.</strong> The transition depends on every other vehicle, and the joint action space explodes with fleet size. But one AGV does not need each neighbour individually — it needs the <em>distribution</em> of what neighbours are doing nearby. A mean-field approximation replaces "N−1 specific vehicles" with one averaged neighbour, collapsing the combinatorics.</p>
+
+<p><strong>Engineering detail — estimating the neighbour distribution.</strong> First fix the neighbour set N(i) by comm radius. Then pick an estimator by data regime: with abundant simulation, an empirical average μ₋ᵢ(a) = (1/|N(i)|) Σ I[aⱼ=a] over the batch; with limited sampling, a parameterized network μ₋ᵢ = φ_η(s_N(i)) trained end-to-end with the policy under a KL loss to the empirical distribution; and in a non-stationary floor, a momentum moving average μ₋ᵢ,ₜ₊₁ = (1−α)μ₋ᵢ,ₜ + α·batch_mean with α∈[0.01, 0.1]. Apply <code>stop-gradient</code> to μ₋ᵢ so it is a fixed target, feed the global state as an extra input to reduce local-observation bias, and importance-weight replayed neighbour actions to correct distribution drift. Acceptance: distribution error L1 = E[|μ₋ᵢ − true frequency|] &lt; 0.05, and the mean-field policy beats the independent one by ≥ 8% within three iterations.</p>
+
+<div class="callout warn">
+  <div class="label">Deadlock: detect a cycle, intervene centrally, hand control back</div>
+  Even with good local policies, a fleet can gridlock — A waits for B waits for C waits for A. Build a directed graph from the recent joint state-action sequence and run <strong>Tarjan's algorithm</strong> to find strongly-connected components; a cycle of length &gt; 10 with average reward &lt; 95% of baseline is flagged as a <em>second-degree deadlock</em>. A coordinator pushes a sub-1 KB <strong>intervention packet</strong> (&lt;50 ms to deliver): heat up exploration (ε 0.05 → 0.3 for 5 episodes), add a potential term −η·‖a − a_dead‖² that repels the most-repeated cyclic action (η = 0.1), and mask the top-2 looping actions for just 50 steps. Each agent then measures KL(π_new ‖ π_inter); when KL &lt; 0.01 and local TD-error &lt; 0.05 it sends a FIN and reverts to distributed learning. At ≥ 80% FIN the deadlock is cleared. If &lt; 80% FIN within 10 s, the coordinator <em>degrades</em>: roll the cycle's agents back to their last local checkpoint (≤ 5 MB) and exponentially back off intervention strength so throughput is never starved. Zero human intervention; in one rollout this cut deadlock frequency from ~3/day to ~1 per two weeks and lifted throughput ~12%.
+</div>
+
+<h2>5 · Non-stationarity — augment the state with time, adapt the horizon</h2>
+
+<p><strong>Intuition.</strong> Orders do not arrive at a constant rate; a lunch rush looks nothing like 3 a.m. A policy that assumes one stationary distribution is fighting the calendar. Two fixes work together: tell the agent <em>what time it is</em> so the non-stationarity becomes part of the (now stationary) augmented state, and shorten the planning horizon when the world is changing fast so stale value estimates don't poison decisions.</p>
+
+<p><strong>Engineering detail — periodic state augmentation.</strong> Encode the hour-of-day h as a 4-dim sine-cosine vector instead of a one-hot (preserves cyclic continuity, avoids dimension blow-up), and feed "same-hour volume yesterday" as an external feature so the model locks onto the periodic pattern quickly. Train with PPO on a periodically-augmented state, replaying the last 7 days in time order with γ = 0.995 (≈ 6 h half-life, so intraday decisions dominate). Online, append the current hour h_t to the state vector — no engine change — and incrementally update the value network every 30 min, hot-swapping the policy every 2 h to meet the "updated before the lunch peak" operational requirement. On a sudden promotion spike, a context-switch branch appends a "promo flag" and enters a meta-policy π(a | s, z) for hour-scale adaptation. A time-ordered A/B lifted the lunch-peak 2-hour fulfilment rate by 3.8% and cut overnight empty-running by 2.1%.</p>
+
+<p><strong>Engineering detail — change-point-driven discount.</strong> A fixed γ is wrong when the regime shifts. Run online change-point detection (a CUSUM-style statistic g_t with threshold h calibrated to FPR ≤ 1% by a Neyman-Pearson rule, plus double-window confirmation to suppress false alarms). On a detected change-point, do <em>not</em> restart the network; instead decay the discount back toward its long-horizon value as the regime stabilizes:</p>
+
+<div class="math block">
+γ_t = γ_min + (γ_max − γ_min)·exp(−λ·Δt)
+</div>
+
+<p>where Δt is frames since the change-point and λ is estimated online by Bayesian regression. Feed γ_t straight into GAE so the advantage horizon shortens automatically right after a shift and lengthens as things settle, and clear replay across the change-point so out-of-distribution samples don't inflate variance.</p>
+
+<h2>6 · Coupled timescales — options and hierarchical RL</h2>
+
+<p><strong>Intuition.</strong> "Deliver this package" is one decision to a human but thousands of 10 Hz velocity commands to a controller. Treating delivery as a sequence of atomic steps makes the horizon enormous and the reward hopelessly sparse. The <strong>options framework</strong> lets the high level pick a macro-action ("deliver") that runs a pre-trained low-level controller until a termination condition fires.</p>
+
+<p><strong>Engineering detail — defining the "deliver" option.</strong> The option is a triple ⟨initiation set, low-level policy, termination β⟩. The low-level policy acts on atomic velocities plus a discrete "drop" action, pre-trained with PPO + HER in a sub-region simulator (reward = −path-length − 10·collision − 50·package-loss) and run at 10 Hz closed-loop. The termination function β(s) = 1 iff (a) package horizontal error &lt; 20 cm and no-contact timeout &gt; 3 s, or (b) the robot has retreated &gt; 1.5 m and received a cloud "delivery confirmed" message; a hard cap T_max = 1200 steps (2 min) forces β = 1 to prevent infinite loops. At the semi-MDP level "deliver" is a macro-action taking k steps with discount γᵏ, and the <em>external</em> reward is given only at β = 1: +200 success, −50 timeout, −100 loss. Internal pseudo-rewards train the low level only and never contaminate the external return. In one deployment this compressed the average atomic-step count for a 1.8 km route from 4200 to 120 and cut training time ~38%.</p>
+
+<p><strong>Engineering detail — aligning path and charging layers.</strong> The path layer and charging layer run at different time constants. Coordinate them with a <em>potential-based shaping</em> term F = α·remaining-distance + β·battery-deviation so that the low level's per-step reward and the high level's accumulated return (e.g. 5 s later) are linearly additive — which, by the potential-shaping theorem, leaves the optimal policy unchanged while removing the cross-layer non-stationarity. The high level writes goals to a lock-free ring queue; the low level reads them zero-copy. Cross-attention fuses the two feature streams: treat battery as the Query and priority as Key-Value, Attn = softmax(QKᵀ/√d)V with d = 16, residual back into the battery channel then LayerNorm, so the critical "low-battery + high-priority" combination gets explicit weight. Ablations show that flattening priority to a raw scalar drops PPO return ~18%, and bucketizing battery slows convergence ~1.9×.</p>
+
+<h2>7 · Partial observability — believe the charging queue</h2>
+
+<p><strong>Intuition.</strong> An AGV deciding whether to wait at a charger or drive to another cannot see the full queue — only a partial image and the charger's status. Reservations, other vehicles' SOC, and power draw are hidden. That makes wait-time a belief, not a measurement.</p>
+
+<p><strong>Engineering detail.</strong> Model the charging station as a POMDP: observation = partial queue image + charger state, hidden state = reservations / power / vehicle SOC, action = predicted wait time, reward = negative absolute error plus an overtime penalty. A convolutional + GRU belief network maps raw image, text, and CAN signals to a 128-dim belief vector, then a head outputs the wait-time distribution parameters μ, σ. Train offline on counterfactually-augmented trajectories with importance sampling + Retrace(λ) to control bias, then online with recurrent DDPG (a KL regularizer keeps the actor close to the old policy), and MAML-finetune the belief net every 30 min to track non-stationary arrivals. After the prediction, a 3σ truncation safety layer recommends an alternate station when predicted wait &gt; 45 min. In one field test this cut mean absolute wait-time error from 11.4 min to 4.7 min.</p>
+
+<h2>8 · Throughput — keep the GPU fed (the central trade-off)</h2>
+
+<p><strong>Intuition.</strong> None of the above learns fast enough if your simulators can't feed the GPU. With 1000+ AGV environments the bottleneck is rarely the GPU's math — it's whether enough trajectories arrive each millisecond to keep the learner's batches full. Too few samplers and the GPU idles; too many and the experience queue overflows memory. The right number balances sampler throughput against GPU appetite, with backpressure as the safety valve.</p>
+
+<p><strong>Engineering detail.</strong> A working topology: a sampling layer of CPU servers, each process owning one AGV simulator; an inference layer of GPU nodes running a TensorRT FP16 engine (batch 128, ~3 ms); and one learner node using a decoupled A-PPO variant (minibatch 4096, gradient accumulation 8) to hold GPU-util &gt; 90%. Samplers pack (s, a, logp, r, done) into a 48-byte contiguous struct written to a lock-free POSIX-shm queue; inference reads it via CUDA-IPC and writes actions back. Dynamic speed control watches SM and Tensor-Core utilization: below 85% for 5 s, request +10% environments; when the queue exceeds a threshold, raise a <strong>backpressure</strong> signal and have samplers sleep 1 ms to keep memory bounded. For async learners, aggregate gradients over a K-window (K = 8 ≈ 120 ms at 8 GPUs), drop gradients staler than Δ_max = 80 steps (keeps drop-rate &lt; 3%), and weight by w_i = exp(−0.05·Δ_i). In a 1024-AGV / 256-dim-state task this sustained ~130k frames/s at 92–96% GPU-util, training 100M steps in ~6.5 h. The widget makes the napkin math concrete: feel how the sampler count sets GPU utilization.</p>
+
+<div class="widget"><div class="title">AGV sim throughput → GPU utilization → backpressure</div><p class="hint">The learner can only train as fast as samples arrive. More samplers raise utilization until you hit the GPU's max ingest rate — after that you only fill the queue and risk overflow. The trade-off is real frames/s vs memory pressure.</p>
+<div class="controls">
+<label class="inline">sampler processes <input id="agv-n" type="range" min="64" max="2048" step="64" value="1024"><span class="val" id="agv-n-v">1024</span></label>
+<label class="inline">per-sampler fps <input id="agv-f" type="range" min="60" max="200" step="10" value="130"><span class="val" id="agv-f-v">130</span></label>
+<label class="inline">GPU max ingest (k fps) <input id="agv-g" type="range" min="80" max="300" step="10" value="140"><span class="val" id="agv-g-v">140</span></label>
+</div>
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">offered fps</div><div class="v" id="agv-off">–</div></div>
+  <div class="kpi"><div class="k">GPU util</div><div class="v" id="agv-util">–</div></div>
+  <div class="kpi"><div class="k">queue pressure</div><div class="v" id="agv-q">–</div></div>
+  <div class="kpi"><div class="k">verdict</div><div class="v" id="agv-verd">–</div></div>
+</div>
+<p class="hint" id="agv-note"></p></div>
+
+<svg viewBox="0 0 760 250" class="diagram" role="img" aria-label="The applied-RL loop instantiated for AGV scheduling">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/>
+    </marker>
+  </defs>
+  <g data-node><rect class="node-bg" x="20"  y="40" width="130" height="64" rx="8"/>
+    <text x="85" y="64" text-anchor="middle" font-weight="600" font-size="13">1 · FORMULATE</text>
+    <text x="85" y="83" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">S, A, R, P</text>
+    <text x="85" y="97" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">fleet + charging</text></g>
+  <g data-node><rect class="node-bg" x="180" y="40" width="130" height="64" rx="8"/>
+    <text x="245" y="64" text-anchor="middle" font-weight="600" font-size="13">2 · DIAGNOSE</text>
+    <text x="245" y="83" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">conflict, drift,</text>
+    <text x="245" y="97" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">timescales, POMDP</text></g>
+  <g data-node><rect class="node-bg" x="340" y="40" width="130" height="64" rx="8"/>
+    <text x="405" y="64" text-anchor="middle" font-weight="600" font-size="13">3 · ENGINEER</text>
+    <text x="405" y="83" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">shaping, mean-field,</text>
+    <text x="405" y="97" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">options, belief net</text></g>
+  <g data-node><rect class="node-bg" x="500" y="40" width="130" height="64" rx="8"/>
+    <text x="565" y="64" text-anchor="middle" font-weight="600" font-size="13">4 · GUARD</text>
+    <text x="565" y="83" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">deadlock + fault</text>
+    <text x="565" y="97" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">injection, fallback</text></g>
+  <g data-node><rect class="node-bg" x="660" y="40" width="90" height="64" rx="8"/>
+    <text x="705" y="68" text-anchor="middle" font-weight="600" font-size="13">5 · ITERATE</text>
+    <text x="705" y="88" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">re-diagnose</text></g>
+  <path d="M150 72 L178 72" class="edge" marker-end="url(#arrow)"/>
+  <path d="M310 72 L338 72" class="edge" marker-end="url(#arrow)"/>
+  <path d="M470 72 L498 72" class="edge" marker-end="url(#arrow)"/>
+  <path d="M630 72 L658 72" class="edge" marker-end="url(#arrow)"/>
+  <path d="M705 104 L705 150 L245 150 L245 106" class="edge" marker-end="url(#arrow)"/>
+  <text x="475" y="168" text-anchor="middle" font-size="11" fill="var(--text-mute)">removing one difficulty exposes the next — re-run the loop</text>
+</svg>
+
+<h2>9 · Guard in production — robustness testing and safe degradation</h2>
+
+<p><strong>Intuition.</strong> A policy that is perfect in simulation can fail on a worn gearbox or a dead sensor. You cannot wait for production to discover this; you inject the faults during training and measure how gracefully the policy degrades.</p>
+
+<p><strong>Engineering detail — domain randomization with a curriculum.</strong> Take a real parameter like the motor reduction ratio κ: estimate its 6σ credible interval (e.g. [0.92κ₀, 1.08κ₀]) by maximum likelihood + Fisher information, write it to a JSON config, and sample it during training from a mixed distribution — a truncated normal core plus a uniform long tail. Use a <em>curriculum</em>: the first 2M steps sample only the core so the policy learns common deviations, then gradually widen the tail over the next 3M steps until the value-function variance under extreme κ stays &lt; 5%. Train with PPO-Clip + GAE(λ=0.95), and triple the sample weight of any episode whose stopping-accuracy error exceeds 10 mm to force the policy to meet the spec.</p>
+
+<div class="callout">
+  <div class="label">Worst-case return, fault injection, and graceful degradation</div>
+  <strong>Worst-case objective.</strong> Define an adversarial fault budget and solve a max-min: maximize the policy's return against an adversary that injects the worst faults within budget; an in-loop <em>adversarial critic</em> approximates the inner inf so every update targets the worst case rather than re-estimating it after the fact. Before release, run 10⁵-scale random + directed fault injection in a digital twin and require the <strong>5th-percentile return</strong> to stay above the safety red line. <strong>Degradation tiers.</strong> Embed a Safety-Critic Q<sub>safe</sub> that emits a real-time safety level; below a calibrated threshold it triggers tiers — mild: cap speed at 60% and lateral acceleration &lt; 2 m/s²; medium: hazards on, move to the rightmost lane within 5 s; severe: emergency brake at 0.9 g to a stop. <strong>Quantify it.</strong> Inject burst packet-loss on LiDAR, thermal drift on the IMU, stuck-at-0 on the camera at an ISO-26262 random-hardware-failure rate, run 10⁶ km equivalent, and report safety-rate ≥ 99.7%, mean-time-to-safe-fallback ≤ 300 ms, and ΔReturn ≥ −500 vs the nominal policy. A representative report: safety-rate 99.82%, MTTSF 247 ms, ΔReturn 95% CI [−480, −310].
+</div>
+
+<h2>10 · Iterate — the through-line</h2>
+
+<div class="callout ok">
+  <div class="label">The through-line</div>
+  Every section is one row of the MDP table turned into a mechanism: <strong>sparse social reward</strong> → five perceptible per-step terms; <strong>safety</strong> → a constraint via PPO-Lagrangian, not a weight; <strong>multi-agent conflict</strong> → mean-field neighbours + Tarjan deadlock intervention; <strong>non-stationary arrivals</strong> → sine-cosine state augmentation + change-point-driven γ; <strong>coupled timescales</strong> → the options framework with potential-based cross-layer shaping; <strong>partial observation</strong> → a convolutional-GRU belief net; <strong>throughput</strong> → shm sampling with backpressure and staleness-weighted gradient windows; <strong>robustness</strong> → curriculum randomization, worst-case training, and tiered safe degradation. You never reached for a tool until a row demanded it. Removing one difficulty exposed the next — which is the whole loop.
+</div>
+
+<h2>Further considerations</h2>
+<ul>
+  <li><strong>The yielding social dilemma.</strong> When every vehicle trains with RL, "whoever yields loses" can emerge. Add an altruism coefficient α that folds neighbours' progress reward into your own, steering the fleet toward a system-optimal Nash equilibrium rather than locally greedy gridlock.</li>
+  <li><strong>Heterogeneous agents and stale beliefs.</strong> If neighbours' action spaces differ in dimension, a shared encoder maps them to one latent space before averaging, dodging the curse of dimensionality. Under communication delay (e.g. ~20 ms jitter on 5G), model μ₋ᵢ as a delay-conditioned distribution and use an RNN/Transformer to complete the sequence. Mean-field error scales O(1/√n) in neighbour count, so for n &lt; 10 add a pairwise correction term.</li>
+  <li><strong>When periodicity is not enough.</strong> A bi-weekly promotion cycle would blow up a one-hot augmentation 336×; use a hierarchical MDP where a slow option-level variable selects sub-policies while the low level stays low-dimensional. For minute-scale spikes (a flash-sale at the top of the hour) an hour-granular embedding is too coarse — a temporal convolutional network over raw timestamps captures multi-scale periodicity. For non-periodic shocks (a sudden lockdown) periodic augmentation fails outright; pair change-point detection with meta-learning fast-finetune, or train with transition-matrix perturbations (robust RL) for unseen regimes.</li>
+  <li><strong>Dynamic options and re-planning.</strong> If a recipient changes the drop address mid-delivery, a "re-planning gate" lets the high level swap options online instead of retraining from scratch. In crowdsourced last-mile delivery, couriers and AGVs share one option space and need a shared β and joint initiation set to avoid conflicts — a centralized semi-MDP-Q can learn the coordination policy.</li>
+  <li><strong>Safety filter and forced recharge.</strong> A regulation requiring "battery &lt; 10% must force a return-to-charge" is enforced by a safety-filter layer that zeros illegal-action probabilities and renormalizes after the policy head — this leaves the policy gradient untouched yet can drive the violation rate from ~0.7% to 0. Transfer to a cold-chain sorting site (priority redefined from order-deadline to temperature-control class) by retraining only the embedding layer and freezing the CNN + attention, reusing the policy with ~5k new samples.</li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="05_industrial_control.html"><span class="dir">Previous</span><span class="ttl">05 · Industrial control &amp; parameter tuning</span></a>
+  <a class="next" href="07_congestion_control.html"><span class="dir">Next</span><span class="ttl">07 · Network congestion control</span></a>
+</footer>
+
+<script>
+(function(){
+  const n=document.getElementById('agv-n'), f=document.getElementById('agv-f'), g=document.getElementById('agv-g');
+  function draw(){
+    document.getElementById('agv-n-v').textContent=n.value;
+    document.getElementById('agv-f-v').textContent=f.value;
+    document.getElementById('agv-g-v').textContent=g.value;
+    const offered=(+n.value)*(+f.value)/1000;      // k fps offered by samplers
+    const cap=(+g.value);                           // k fps the GPU can ingest
+    const util=Math.min(100, offered/cap*100);
+    const pressure=Math.max(0, offered-cap);        // k fps that pile up in the queue
+    document.getElementById('agv-off').textContent=offered.toFixed(0)+'k';
+    document.getElementById('agv-util').textContent=util.toFixed(0)+'%';
+    document.getElementById('agv-q').textContent=pressure>0?('+'+pressure.toFixed(0)+'k'):'0';
+    const vEl=document.getElementById('agv-verd');
+    let state;
+    if(util<85){ state='gpu starved'; vEl.style.color='var(--warn)'; }
+    else if(pressure<=0){ state='saturated'; vEl.style.color='var(--ok)'; }
+    else { state='backpressure'; vEl.style.color='var(--bad)'; }
+    vEl.textContent=state;
+    const note=document.getElementById('agv-note');
+    if(util<85){
+      note.textContent='Samplers offer only '+offered.toFixed(0)+'k fps against '+cap+'k ingest — GPU-util '+util.toFixed(0)+'%, below the 85% floor. Dynamic speed control would request ~10% more environments to fill the learner.';
+    } else if(pressure<=0){
+      note.textContent='Offered '+offered.toFixed(0)+'k fps just meets '+cap+'k ingest: GPU sits at '+util.toFixed(0)+'% with no queue buildup — the sweet spot the autoscaler targets.';
+    } else {
+      note.textContent='Samplers offer '+offered.toFixed(0)+'k fps but the GPU only ingests '+cap+'k — '+pressure.toFixed(0)+'k fps pile up. The backpressure signal must fire (samplers sleep ~1 ms) or the shm queue overflows memory.';
+    }
+  }
+  [n,f,g].forEach(x=>x.addEventListener('input',draw));
+  draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

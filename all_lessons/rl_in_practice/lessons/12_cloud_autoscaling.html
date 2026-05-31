@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>12 · cloud autoscaling</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">rl_in_practice</a>
+    <span class="crumb">/</span>
+    <span class="crumb">12 · cloud autoscaling</span>
+    <span class="step-pill">lesson 12 / 20</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Cloud-resource elastic scaling</h1>
+<p class="subtitle">An autoscaler decides, every few seconds, how many container instances to run and how much CPU to grant each one — trading a latency SLA against a cloud bill. It looks like a textbook control problem, but the binding difficulties are RL-specific: a <strong>hybrid action space</strong> (how many instances × how much CPU each), a <strong>delayed transition</strong> because a new instance is not ready until it cold-starts, a <strong>two-objective reward</strong> (SLA vs. cost) that invites both reward-hacking and oscillation, <strong>non-stationary traffic</strong> that breaks the stationary-MDP assumption, and a <strong>hard budget</strong> that the policy may never violate. Each of those names a tool.</p>
+
+<div class="callout">
+  <div class="label">The method — five steps, every lesson</div>
+  Applied RL is the same loop in every domain: <strong>(1) Formulate</strong> the MDP — state, action, reward, transition, horizon. <strong>(2) Diagnose</strong> the one or two properties that make <em>this</em> MDP hard. <strong>(3) Engineer</strong> the mechanism that removes exactly that difficulty. <strong>(4) Guard</strong> it in production — detect when it breaks and fall back. <strong>(5) Iterate.</strong> For an autoscaler the table writes itself; the lesson is which row binds first and what mechanism that row forces.</p>
+</div>
+
+<h2>1 · Formulate — the MDP behind an autoscaler</h2>
+
+<p><strong>Intuition.</strong> Every few seconds the scaler reads cluster telemetry (CPU, memory, queue depth, request latency), decides to add/remove instances and reset per-container CPU limits, and is rewarded if requests stayed fast and the bill stayed low. That is a Markov Decision Process — and every difficulty below is one of these four pieces being awkward in a real cluster.</p>
+
+<div class="math block">
+MDP = (S, A, R, P, γ) &nbsp;·&nbsp; maximize&nbsp; E[ Σₜ γᵗ rₜ ] &nbsp;·&nbsp; rₜ = SLA term − cost term
+</div>
+
+<table>
+  <thead><tr><th>Piece</th><th>For an elastic autoscaler</th><th>The awkward part</th></tr></thead>
+  <tbody>
+    <tr><td><strong>State</strong> S</td><td>raw metrics from thousands of containers, fused to a ~16-dim bottleneck vector (CPU saturation, memory slope, queue depth, p99) + request-type tags</td><td>raw dim is enormous; naive tag one-hots cause a <em>curse of dimensionality</em>; predicted traffic risks <em>leaking the future</em></td></tr>
+    <tr><td><strong>Action</strong> A</td><td>a<sub>d</sub> = instance count Δ (discrete) <em>and</em> a<sub>c</sub> = per-container CPU limit (continuous)</td><td><em>hybrid</em> discrete-continuous; most options are infeasible; raw output <em>oscillates</em></td></tr>
+    <tr><td><strong>Reward</strong> R</td><td>SLA attainment (p99 ≤ target) minus weighted cost (instances × price, amortized reserved-instance discount)</td><td>two objectives in tension; sparse violations; cost has <em>lumpy discounts</em></td></tr>
+    <tr><td><strong>Transition</strong> P</td><td>add an instance now → it serves traffic only after a cold-start delay τ; traffic itself drifts daily and on promo events</td><td>action effect is <em>delayed</em>; environment is <em>non-stationary</em></td></tr>
+  </tbody>
+</table>
+
+<p class="hint">The rightmost column <em>is the lesson</em>. Each awkward part below gets a named mechanism — and we never reach for the mechanism before the row demands it.</p>
+
+<h2>2 · State — fuse it, embed it, and keep it causal</h2>
+
+<p><strong>Intuition.</strong> You cannot feed thousands of raw container metrics into a policy network — it is high-dimensional, noisy, and changes shape as containers come and go. You compress it into a small fixed-width vector that still carries the bottleneck signal: how saturated is CPU, is memory climbing, how deep is the queue, how bad is tail latency. Smaller and stabler state means faster, more reliable training.</p>
+
+<p><strong>Engineering detail — the 16-dim bottleneck vector.</strong> Per-rack metrics are aggregated (a GRU over the time series gives an 8-dim bottleneck embedding), then concatenated with container-spec and deployment-unit features into a final 16-dim state. This keeps the real-time bottleneck signal while satisfying a production rule that the PPO input dimension stay ≤ 32. In one deployment this cut training-convergence time by ~40%, and a Kolmogorov–Smirnov test showed distribution drift &lt; 0.02 — under the SRE team's ≤ 0.05 go-live threshold.</p>
+
+<p><strong>Engineering detail — request-type tags without the curse of dimensionality.</strong> Request types (API, batch, streaming, …) are categorical and can explode the one-hot width. Use a learned <strong>embedding table</strong> with hashing instead of one-hots, and adapt it to RL's distribution drift with a meta-finetune (MAML-style): each offline round samples "tasks" (different time windows), updates the embedding on a support set, computes the policy gradient on a query set, and back-propagates the second-order term <em>only</em> into the gate network — so the embedding hot-updates hourly without breaking global semantics. The whole table stays &lt; 200 MB (fits one GPU), and a lookup costs ~0.8 ms at inference.</p>
+
+<div class="callout warn">
+  <div class="label">Do not put predicted traffic in the state naively</div>
+  Predicted future load is tempting — it cures cold-start lag — but if your forecaster used <em>true</em> future values during training, the state now contains information the agent could not have at decision time. That breaks the MDP causal chain and inflates offline metrics. The red-line test: ablate "leaky state vs. compliant state"; if leaky AUC beats compliant by &gt; 3%, leakage is real. Fixes that keep the prior without leaking: <strong>(a)</strong> a rolling-window lagged truth — forecast t using real load at t−1 and earlier, and feed <em>that</em> as state; <strong>(b)</strong> model-based RL — the forecast feeds an <em>environment model</em> for planning, while the policy's state stays Markov-compliant ("plan with prediction, decide on present"). Best practice is a CI/CD gate: a tool that walks feature timestamps and DAG lineage, scans the replay buffer, and emits a leakage report — turning "we'll eyeball it" into an enforced merge check.
+</div>
+
+<h2>3 · The hybrid action space — keep the structure, mask the infeasible, damp the rest</h2>
+
+<p><strong>Intuition.</strong> "Add one instance and set its CPU limit to 2.3 cores" is two decisions of different types: <em>how many</em> instances (a discrete count) and <em>how much</em> CPU each (a continuous scalar). Flattening both into one giant menu explodes; treating both as continuous loses the count's discreteness. Keep the structure: a discrete head for the count and a count-conditioned continuous head for the CPU limit.</p>
+
+<div class="math block">
+a = (a<sub>d</sub>, a<sub>c</sub>) &nbsp;|&nbsp; a<sub>d</sub> ~ Categorical(logits) &nbsp; a<sub>c</sub> ~ 𝒩(μ, σ), input = [h ; one-hot(a<sub>d</sub>)]
+</div>
+
+<p><strong>Engineering detail — one encoder, two heads.</strong> A shared encoder emits state feature h. The discrete head is a linear layer → logits → Categorical (e.g. "scale out 1"). The continuous head takes h concatenated with one-hot(a<sub>d</sub>), passes two MLP layers, and outputs (μ, log σ) → Gaussian for the CPU limit. Sample a<sub>d</sub> first, then a<sub>c</sub>. Train with a combined objective: clipped-PPO on the continuous part with the reparameterization trick, PPO ratio on the discrete part with a Gumbel-Softmax (τ = 1.0) gradient estimator, and an entropy bonus:</p>
+
+<div class="math block">
+L = L<sub>PPO</sub><sup>discrete</sup> + L<sub>PPO</sub><sup>continuous</sup> − β · H(π)
+</div>
+
+<p><strong>Engineering detail — masking and hard penalties.</strong> Add an <strong>action mask</strong> after the logits: if free cores &lt; 4, force the probability of "scale out 2" to −∞ before softmax so it can never be sampled. Add a <strong>hard reward penalty</strong>: if CPU over-commit drives p99 &gt; 200 ms, return −1000 immediately. Deployed on a managed-Kubernetes cluster, this lifted elastic-decision accuracy by ~18%, raised CPU utilization by ~12%, and held QoS-violation rate below 0.3%.</p>
+
+<div class="callout">
+  <div class="label">Stopping oscillation — train-side, deploy-side, eval-side</div>
+  A raw policy flaps: scale out, scale in, scale out, churning instances and burning cold-starts. Damp it on three layers. <strong>Train.</strong> Add an action-difference penalty −λ‖aₜ − aₜ₋₁‖² (tune λ by grid search + Bayesian opt); tighten PPO-clip ε from 0.2 to 0.1 and use KL[π<sub>old</sub>‖π<sub>new</sub>] &lt; 0.01 as an early-stop signal; for the continuous part use TD3-style delayed actor updates (actor trains once per 2 critic updates) plus target-policy smoothing, cutting target-Q variance by &gt; 30%. <strong>Deploy.</strong> Low-pass the raw action aₜ = 0.7·aₜ₋₁ + 0.3·âₜ, then a safety layer solves min‖a − aₜ‖² s.t. |a − aₜ₋₁| ≤ Δ<sub>max</sub>, daily_change ≤ 3; quantize the continuous knob to five steps {−8,−4,0,+4,+8} to lower the back-jump probability. <strong>Eval.</strong> Estimate oscillation rate offline by importance sampling (target &lt; 3%); in canary, compare against a PID baseline and roll out fully only if p99 does not regress &gt; 5% and loop-count drops ≥ 50%. One e-commerce scaler went from ~120 daily scaling loops to ~8, oscillation rate 0.7%.
+</div>
+
+<h2>4 · Reward — two objectives, kept causal and policy-invariant</h2>
+
+<p><strong>Intuition.</strong> You want low latency <em>and</em> low cost, and the two fight: the cheapest cluster is empty and slow, the fastest is huge and expensive. You also must measure the reward the instant a request finishes (no waiting for batch stats) and you must avoid future information. The honest signal is "did we hit the SLA, at what cost," and the engineering trick is to shape it so the optimum you train toward is still the optimum you meant.</p>
+
+<p><strong>Engineering detail — a measurable, unbiased, invariant reward.</strong> The per-request latency lₜ is measurable the instant the request returns (immediacy) and depends only on past/present (no future leakage → MDP-causal). A variance term over a window m = 10 penalizes latency jitter (weight β ≈ 0.1) so the policy cannot lower the mean by blowing up the tail. The SLA, cost, and variance coefficients λ, α, β are grid-searched on the offline replay buffer with a Shapiro–Wilk normality check so the reward distribution stays roughly Gaussian — which keeps PPO's GAE estimates well-behaved.</p>
+
+<p><strong>Engineering detail — potential-based shaping keeps the optimum.</strong> The key worry with shaping is "does my added term change the optimal policy?" Potential-based shaping provably does not. Use</p>
+
+<div class="math block">
+F(s, a, s′) = γ · Φ(s′) − Φ(s), &nbsp; Φ(s) = −λ · max(0, (p99<sub>rolling</sub>(s) − p99<sub>target</sub>) / p99<sub>target</sub>)
+</div>
+
+<p>so the optimal policy is identical to the unshaped "maximize SLA attainment" objective, while the agent gets a dense gradient toward the SLA boundary. Roll out behind a config center (λ, α, β hot-updatable, no training restart): 7 days in a shadow cluster vs. a PPO baseline, then 5% → 30% → 100% canary, each stage signed off by SRE and compliance on three plots — reward curve, KL divergence, violation rate.</p>
+
+<div class="callout">
+  <div class="label">Amortizing the reserved-instance discount into per-step cost</div>
+  Reserved instances (RI) buy a year of capacity up front at a discount — a single lumpy payment that, naively, would slam one step's reward to a huge negative and starve every other step of signal. Amortize it: spread the one-time discounted cost smoothly across each step's cost term, so the per-step reward is stable and the policy converges, while the books still reconcile to the true annual spend. Extensions: make the RI amortization coefficient part of the action ("where to buy, how much") for multi-region fleets; treat the amortized RI cost as a <em>price anchor</em> and fall back from spot to RI when spot price exceeds it; carry remaining annual budget as a state feature so a large negative penalty fires as spend nears the budget red line.
+</div>
+
+<h2>5 · The cold-start delay — put it in the transition, not the algorithm</h2>
+
+<p><strong>Intuition.</strong> When the policy says "add an instance," nothing happens for a few seconds — the container must pull its image, boot, warm caches. If you pretend the capacity is available immediately, the agent learns a fantasy; it scales out, sees no relief, scales out again, and over-provisions. The honest fix is to model the delay <em>in the transition function</em> so the environment itself reflects "the action you took τ seconds ago is the one that lands now."</p>
+
+<p><strong>Engineering detail — a delay-aware transition wrapper.</strong> Augment the state with pending actions and a timer, and write the transition kernel as</p>
+
+<div class="math block">
+P(s̃<sub>t+1</sub> | s̃<sub>t</sub>, aₜ) = Σ<sub>s̃*</sub> P̂(s̃* | s̃<sub>t</sub>) · 𝟙[ Apply(aₜ, τₜ) ]
+</div>
+
+<p>where the indicator gates whether action aₜ has actually taken effect given its remaining delay τₜ. Crucially this lives in an environment <em>wrapper</em>, not the algorithm kernel — so it is compatible with DQN, PPO, SAC alike. In one large e-commerce scheduler this modeling alone brought p99 from ~480 ms to ~210 ms. If the delay is continuous and arbitrarily distributed (e.g. Weibull, because different images pull at different speeds), upgrade to an <strong>SMDP</strong> with event-driven simulation: inverse-transform-sample the next decision epoch and write V(s) = E[ ∫₀ᴰ γᵗ r(s(t)) dt + γᴰ V(s′) ]. If the delay couples to the action content, learn a parametric delay model d<sub>θ</sub>(a, s) jointly with the policy and bound the worst case with a CVaR constraint on the SLA.</p>
+
+<h2>6 · Non-stationary traffic — adapt the model, the forecast, and the discount</h2>
+
+<p><strong>Intuition.</strong> Traffic is not stationary: it has daily peaks, weekly cycles, and sudden spikes (a livestream, a flash sale). A policy trained on yesterday's distribution silently degrades today. You need to detect the shift, refresh the model safely, and let the agent's <em>time horizon</em> itself react — be far-sighted when the world is calm, short-sighted when it just lurched.</p>
+
+<p><strong>Engineering detail — hot-update with a three-step gate.</strong> Retrain offline under a trust region (KL(π<sub>new</sub>‖π<sub>old</sub>) ≤ 0.02), sign the artifact (MD5) into a Redis sentinel key. Inference nodes long-poll the key and on a new version run three checks: <strong>① numeric check</strong> — 100 random states, output μ/σ error vs. the training node &lt; 1e-3; <strong>② shadow experiment</strong> — route 5% traffic to canary pods, pass only if p99 rises &lt; 10% and cumulative return drops &lt; 2% over 3 min; <strong>③ atomic swap</strong> — replace the network behind an RCU pointer so the old model unloads at zero in-flight requests. If a canary metric goes bad, roll back within 5 s and lock the update gate for 30 min to prevent flapping. A validated deployment held end-to-end detect-to-update latency ≤ 90 s at peak, with rollback rate &lt; 0.3%.</p>
+
+<p><strong>Engineering detail — an RL corrector on top of the LSTM forecast.</strong> Keep an LSTM producing a raw forecast ŷₜ, then graft an RL corrector: a policy network takes the LSTM hidden state plus an error-window vector and outputs a Gaussian correction Δₜ; apply ẏₜ = ŷₜ + Δₜ. Train with PPO-clip offline (50 epochs, lr 3e-4, batch 2048, clip 0.2, entropy 0.01) on ~1.2×10⁷ five-minute windows; online, do incremental training every hour on only the last 4 h of data (to fight concept drift) with a 7:3 offline:online sampling mix so the distribution does not collapse. Monitor the correction rate ηₜ = |Δₜ|/ŷₜ; when ηₜ &gt; 15%, trigger human review to block "black-swan" actions. On real CDN traffic this cut forecast RMSE ~18.7% and reduced alerts ~35%.</p>
+
+<p><strong>Engineering detail — change-point-driven discount.</strong> Run online CUSUM on the discounted-return series Gₜ = Σ γᵏ rₜ₊ₖ with drift threshold h = 3σ (σ via EMA). On a detected change it emits a confidence ρ and a direction d ∈ {−1, +1} (+1 = world turned optimistic, raise γ). Adjust the discount γₜ₊₁ = clip(γₜ + d·η·ρ, 0.5, 0.995) with η = 0.02, a one-adjustment-per-episode cooldown, and a ρ ≥ 0.8 trigger. After a change, freeze the behavior policy for one batch and recompute advantages by importance sampling so the gradient direction matches the new γ; temporarily widen PPO-clip 0.2 → 0.3 for 3 batches to speed migration, then restore.</p>
+
+<div class="widget"><div class="title">SLA penalty vs. cloud bill — the autoscaler's central knob</div><p class="hint">An autoscaler trades a latency SLA against a cloud bill, and the cold-start delay decides how much headroom you must pre-provision. Move the target utilization up to save money; move it down to protect p99. The cold-start delay shifts the whole frontier — slower starts force more idle headroom.</p>
+<div class="controls">
+<label class="inline">peak demand (cores) <input id="cas-peak" type="range" min="40" max="400" step="10" value="200"><span class="val" id="cas-peak-v">200</span></label>
+<label class="inline">target utilization % <input id="cas-util" type="range" min="40" max="95" step="5" value="70"><span class="val" id="cas-util-v">70</span></label>
+<label class="inline">cold-start delay (s) <input id="cas-cold" type="range" min="0" max="120" step="5" value="30"><span class="val" id="cas-cold-v">30</span></label>
+<label class="inline">SLA penalty weight λ <input id="cas-lam" type="range" min="0" max="5" step="0.5" value="2"><span class="val" id="cas-lam-v">2</span></label>
+</div>
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">provisioned cores</div><div class="v" id="cas-prov">–</div></div>
+  <div class="kpi"><div class="k">SLA breach risk</div><div class="v" id="cas-risk">–</div></div>
+  <div class="kpi"><div class="k">relative bill</div><div class="v" id="cas-bill">–</div></div>
+  <div class="kpi"><div class="k">total reward</div><div class="v" id="cas-rew">–</div></div>
+</div>
+<p class="hint" id="cas-note"></p></div>
+
+<svg viewBox="0 0 760 250" class="diagram" role="img" aria-label="The applied-RL loop instantiated for cloud autoscaling">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/>
+    </marker>
+  </defs>
+  <g data-node><rect class="node-bg" x="20"  y="40" width="130" height="64" rx="8"/>
+    <text x="85" y="64" text-anchor="middle" font-weight="600" font-size="13">1 · FORMULATE</text>
+    <text x="85" y="83" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">16-dim state,</text>
+    <text x="85" y="97" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">hybrid action</text></g>
+  <g data-node><rect class="node-bg" x="180" y="40" width="130" height="64" rx="8"/>
+    <text x="245" y="64" text-anchor="middle" font-weight="600" font-size="13">2 · DIAGNOSE</text>
+    <text x="245" y="83" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">delayed action,</text>
+    <text x="245" y="97" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">non-stationary</text></g>
+  <g data-node><rect class="node-bg" x="340" y="40" width="130" height="64" rx="8"/>
+    <text x="405" y="64" text-anchor="middle" font-weight="600" font-size="13">3 · ENGINEER</text>
+    <text x="405" y="83" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">masks, shaping,</text>
+    <text x="405" y="97" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">delay wrapper</text></g>
+  <g data-node><rect class="node-bg" x="500" y="40" width="130" height="64" rx="8"/>
+    <text x="565" y="64" text-anchor="middle" font-weight="600" font-size="13">4 · GUARD</text>
+    <text x="565" y="83" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">budget mask,</text>
+    <text x="565" y="97" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">KL rollback</text></g>
+  <g data-node><rect class="node-bg" x="660" y="40" width="90" height="64" rx="8"/>
+    <text x="705" y="68" text-anchor="middle" font-weight="600" font-size="13">5 · ITERATE</text>
+    <text x="705" y="88" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">re-diagnose</text></g>
+  <path d="M150 72 L178 72" class="edge" marker-end="url(#arrow)"/>
+  <path d="M310 72 L338 72" class="edge" marker-end="url(#arrow)"/>
+  <path d="M470 72 L498 72" class="edge" marker-end="url(#arrow)"/>
+  <path d="M630 72 L658 72" class="edge" marker-end="url(#arrow)"/>
+  <path d="M705 104 L705 150 L245 150 L245 106" class="edge" marker-end="url(#arrow)"/>
+  <text x="475" y="168" text-anchor="middle" font-size="11" fill="var(--text-mute)">removing one difficulty exposes the next — re-run the loop</text>
+</svg>
+
+<h2>7 · Guard the budget — a constraint the policy may never break</h2>
+
+<p><strong>Intuition.</strong> Latency is a soft goal; the monthly budget is a hard wall. A reward penalty alone is not enough — a hungry policy will happily eat a penalty to chase latency and blow the budget. You enforce the budget at the sampling boundary so an infeasible action can never even be chosen, and you keep the dual machinery only to <em>speed</em> convergence, not to do the actual cutting.</p>
+
+<p><strong>Engineering detail — mask + safety-layer projection, on top of a CMDP.</strong> Carry remaining budget b in the state. Add a mask layer at the network's output: mask<sub>i</sub> = 𝟙{cᵢ ≤ b}, where cᵢ is the immediate cost of action aᵢ — for discrete actions add −∞ to the logit, for continuous actions clip the output to [0, b]; implement the operator in C++ for &lt; 0.2 ms latency. If the cost is nonlinear in the continuous action, first emit a raw action â, then analytically project a* = min(â, b / cost_per_unit) so a single decision can never overdraw; the monthly cumulative cap closes automatically through the budget-in-state loop. Train as a <strong>CMDP with PPO</strong>: cost function c(s,a) = actual spend, threshold d = monthly budget, with a Lagrange multiplier λ used only to <em>accelerate</em> convergence — the mask and safety layer already guarantee feasibility at the sampling end, so you never rely on λ for hard cutoff. One bidding-budget deployment drove the budget-overrun rate from 1.2% to 0.00% while CPM fell only ~0.8%.</p>
+
+<div class="math block">
+mask<sub>i</sub> = 𝟙{ cᵢ ≤ b } &nbsp;·&nbsp; a* = min( â, b / cost_per_unit ) &nbsp;·&nbsp; CMDP: max E[Aᵣ] s.t. E[A_c] ≤ B
+</div>
+
+<div class="callout warn">
+  <div class="label">Lagrange multipliers blow up — three guards</div>
+  Left alone, the dual variable λ can explode when constraint violations spike, swamping the reward gradient and crashing policy entropy. Tame it in three moves. <strong>(1) Low-pass the violation signal</strong> with momentum β ≈ 0.08 — effectively filtering the constraint-violation amount, which cut multiplier variance ~70% and halved entropy swings in one project. <strong>(2) Zeroth-order fallback</strong>: every 1k steps, if the violation δ &lt; ε (ε set to the business tolerance, e.g. 0.01) for 3 consecutive checks, multiply λ by 0.5 to quickly release over-penalty and avoid "multiplier stickiness" dragging down return. <strong>(3) Scheduled step size</strong>: when the constraint is time-averaged, upgrade to a differential multiplier flow dλ/dt = η·(δₜ − ε) — big η early for fast convergence, exponentially-decayed η late to prevent overshoot, with a Lyapunov stability argument before discretizing. One deployment pulled the multiplier L2 norm from ~2×10⁴ down to ~4×10², with 30 consecutive alert-free days.
+</div>
+
+<div class="callout ok">
+  <div class="label">Proving feasibility is preserved across a policy update — and the through-line</div>
+  Before promoting a new policy you owe the business a feasibility argument in three layers. <strong>Formalize</strong>: write the budget as a CMDP cost constraint J<sub>c</sub>(π) ≤ B (use a terminal/absorbing-state cost if no trajectory may ever exceed). <strong>Constrained improvement</strong>: solve max<sub>θ</sub> E[Aᵣ] s.t. KL(π<sub>θ</sub>‖π<sub>old</sub>) ≤ δ, E[A_c] ≤ B − J<sub>c</sub>(π<sub>old</sub>); because the constraint set is convex, a feasible start ⇒ feasible iterates, so a convex-feasibility theorem proves the budget is never breached. <strong>Certificate</strong>: offline, run N ≥ (z<sub>1−α</sub>·σ_c/ε)² simulated trajectories and form the (1−α) upper bound μ̂_c + ε ≤ B — a statistical certificate to hand the business, backstopped online by a safety-margin monitor that auto-rolls-back if the sliding-mean cost exceeds B·(1−η), η ≈ 3–5%. That "convex feasibility + statistical certificate + live monitor" trio mirrors the through-line of the whole lesson: <strong>16-dim state</strong> → fused/embedded/causal; <strong>hybrid action</strong> → structured heads + mask + oscillation damping; <strong>two-objective reward</strong> → potential-based shaping + amortized discount; <strong>delayed, drifting transition</strong> → delay wrapper + hot-update + adaptive γ; <strong>hard budget</strong> → mask + safety layer + tamed multiplier. Every tool answered exactly one row of the MDP table.
+</div>
+
+<h2>8 · Iterate — removing one difficulty exposes the next</h2>
+
+<p>Compress the state and the action space starts to flap; damp the oscillation and the cold-start delay surfaces as the real cause; model the delay and the non-stationary traffic dominates; adapt to drift and the budget wall becomes the binding constraint. Applied autoscaling is this loop, run until the cluster's SLA, cost, and stability all clear the SRE review in one pass.</p>
+
+<h2>Further considerations</h2>
+<ul>
+  <li><strong>Multi-task state sharing.</strong> If the same state must feed scheduling <em>and</em> capacity forecasting, add a task-specific attention mask over the shared 8-dim bottleneck vector — a tiny 2-dim per-task weight (~256 extra params) lets scheduling attend to CPU saturation while forecasting attends to the memory slope.</li>
+  <li><strong>Two-level aggregation at extreme scale.</strong> For 100k+ container clusters, compress raw metrics to 8 dims at the rack edge via RPC, then fuse a second GRU layer centrally — dropping cross-region telemetry from ~90 MB/s to ~3 MB/s. Reserve one state dimension for a "confidence score" (forecast variance) so SREs can wire data-quality alerts and operate the RL system as a white box.</li>
+  <li><strong>Discrete-action explosion.</strong> When instance types number in the dozens across availability zones, the discrete count head can reach tens of thousands of entries; switch to autoregressive discretization or a pointer network that generates the action sequence rather than enumerating the cross-product. A safety-sensitive variant adds a projection layer plus Lagrange-multiplier feedback for safe RL.</li>
+  <li><strong>Multi-tenant reward conflict.</strong> Share one global environment model (SAC) for transitions and platform-level reward, give each tenant a lightweight 2-layer Actor distilled from it (&lt; 5 ms inference), and tune Pareto weights online by EMA. Add differential-privacy noise on rewards, a circuit-breaker if inter-tenant policy cosine similarity &gt; 0.85, and federated aggregation for finance tenants whose raw rewards may not leave their domain.</li>
+  <li><strong>Sparse-violation gradient vanishing.</strong> If p99 sits comfortably at ~180 ms and violations are &lt; 0.1%, even potential-based shaping can starve the gradient; use a rarity-based reward rₜ·exp((lₜ − p99<sub>target</sub>)/τ) (τ ≈ 5 ms) to exponentially amplify the violating tail, corrected by importance sampling for unbiased off-policy evaluation.</li>
+  <li><strong>Auditability.</strong> Regulated production wants replayable reward signals: write each step's lₜ, p99<sub>target</sub>, λ/α/β to a Kafka topic bound to a trace ID, and log the per-update multiplier, KL divergence, and cost histogram so a third party can replay and verify — turning "no reward forgery" into an enforced audit hook in the training framework.</li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="11_wireless_power.html"><span class="dir">Previous</span><span class="ttl">11 · Wireless-network power allocation</span></a>
+  <a class="next" href="13_uav_path_planning.html"><span class="dir">Next</span><span class="ttl">13 · UAV path planning</span></a>
+</footer>
+
+<script>
+(function(){
+  const peak=document.getElementById('cas-peak'), util=document.getElementById('cas-util'),
+        cold=document.getElementById('cas-cold'), lam=document.getElementById('cas-lam');
+  function draw(){
+    document.getElementById('cas-peak-v').textContent=peak.value;
+    document.getElementById('cas-util-v').textContent=util.value;
+    document.getElementById('cas-cold-v').textContent=cold.value;
+    document.getElementById('cas-lam-v').textContent=(+lam.value).toFixed(1);
+    const P=+peak.value, U=(+util.value)/100, C=+cold.value, L=+lam.value;
+    // headroom you must pre-provision grows with cold-start: a slow start means
+    // demand can climb before new capacity lands, so you keep extra idle margin.
+    const coldHeadroom = 1 + C/200;                 // 0s -> 1.0x, 120s -> 1.6x
+    const prov = (P / U) * coldHeadroom;            // cores you actually run
+    // breach risk: high target utilization + slow cold-start leave no buffer.
+    let risk = (U*U) * (1 + C/60) * 0.45;           // 0..~1, monotone in U and C
+    if(risk>0.99) risk=0.99; if(risk<0) risk=0;
+    const bill = prov / P;                          // bill relative to bare peak demand
+    // reward = -cost - lambda * breach penalty (napkin units)
+    const reward = -(bill) - L*risk;
+    document.getElementById('cas-prov').textContent=prov.toFixed(0);
+    document.getElementById('cas-risk').textContent=(risk*100).toFixed(1)+'%';
+    document.getElementById('cas-bill').textContent=bill.toFixed(2)+'×';
+    const rEl=document.getElementById('cas-rew');
+    rEl.textContent=reward.toFixed(2);
+    const good = risk<0.1 && bill<1.6;
+    rEl.style.color=good?'var(--ok)':(risk<0.25?'var(--warn)':'var(--bad)');
+    const note=document.getElementById('cas-note');
+    if(risk>0.25){
+      note.textContent='Target utilization '+util.value+'% with a '+cold.value+'s cold-start leaves almost no buffer — breach risk '+(risk*100).toFixed(0)+'%. The λ='+L.toFixed(1)+' SLA penalty dominates the reward; lower the target or speed up cold-start (smaller images, pre-pulled layers, warm pools).';
+    } else if(bill>1.8){
+      note.textContent='Safe on latency but you run '+prov.toFixed(0)+' cores for '+P+' cores of demand — a '+bill.toFixed(2)+'× bill. Most of that headroom exists only to cover the '+cold.value+'s cold-start; shrink the delay and you can raise utilization and cut the bill.';
+    } else {
+      note.textContent='Balanced: ~'+(risk*100).toFixed(0)+'% breach risk at a '+bill.toFixed(2)+'× bill. This is the frontier the RL reward r = SLA − cost is trying to ride — and the cold-start delay is what bends the frontier, which is why it belongs in the transition function (section 5).';
+    }
+  }
+  [peak,util,cold,lam].forEach(x=>x.addEventListener('input',draw));
+  draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

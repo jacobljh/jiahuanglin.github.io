@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>03 · quant trading</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">rl_in_practice</a>
+    <span class="crumb">/</span>
+    <span class="crumb">03 · quant trading</span>
+    <span class="step-pill">lesson 3 / 20</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Quant-trading order execution</h1>
+<p class="subtitle">You are handed a parent order — "buy 200k shares before the close" — and an RL agent that decides, microsecond by microsecond, what to post and where. The domain looks like a clean MDP until you write it down: the state is a level-2 order book that <em>leaks the future</em> if you encode it carelessly, the action is a <strong>hybrid</strong> price-and-size decision constrained by a 500&nbsp;µs exchange round-trip, the reward conflates your own <strong>market impact</strong> with the market's noise, you can never run the policy live to evaluate it so everything rides on <strong>off-policy estimation</strong> under a non-stationary market, and every action is gated by <strong>regulation</strong> that can change at 9am. Each binding difficulty names a tool.</p>
+
+<div class="callout">
+  <div class="label">The method — five steps, every lesson</div>
+  Applied RL is not a grab-bag of tricks. Every domain in this track runs the same loop: <strong>(1) Formulate</strong> the MDP — state, action, reward, transition, horizon. <strong>(2) Diagnose</strong> the one property that makes the MDP hard. <strong>(3) Engineer</strong> the mechanism that removes <em>that</em> difficulty. <strong>(4) Guard</strong> it in production — detect when it breaks and fall back. <strong>(5) Iterate.</strong> The art is only in <em>which difficulty binds first</em>. For order execution, four bind hard: a leaky state, a hybrid latency-bounded action, an impact-confounded reward, and an unrunnable evaluation under a regulator.</p>
+</div>
+
+<h2>1 · Formulate — the MDP behind an execution agent</h2>
+
+<p><strong>Intuition.</strong> A parent order has to be sliced into hundreds of child orders over a horizon (say, the trading day). At each tick the agent sees the order book, decides where and how much to post, and is rewarded for buying cheap relative to a benchmark while not moving the price against itself. That is an MDP — but every one of the four pieces is awkward in a way that does not show up in a game.</p>
+
+<div class="math block">
+MDP = (S, A, R, P, γ) &nbsp;·&nbsp; maximize&nbsp; E[ Σₜ γᵗ rₜ ] &nbsp; subject to &nbsp; fill all Q shares by horizon H
+</div>
+
+<table>
+  <thead><tr><th>Piece</th><th>For an execution agent</th><th>The awkward part</th></tr></thead>
+  <tbody>
+    <tr><td><strong>State</strong> S</td><td>top-5 book levels per side (price+size → 20 features), inventory remaining, time left, realized volatility — a (K&times;21&times;2) causal tensor over the last K snapshots</td><td>naïve features <em>leak the future</em>; a persistent order-queue ID breaks the <em>Markov</em> property</td></tr>
+    <tr><td><strong>Action</strong> A</td><td>which price level to post at (discrete, 5–10 ticks) &times; price offset and size fraction (continuous)</td><td><em>hybrid</em> discrete-continuous, and it must clear in under the 500&nbsp;µs exchange round-trip</td></tr>
+    <tr><td><strong>Reward</strong> R</td><td>execution price vs. VWAP/arrival benchmark, minus slippage</td><td>your fill <em>moves the price</em> — reward = your impact + market noise, two confounded signals</td></tr>
+    <tr><td><strong>Transition</strong> P</td><td>the matching engine + every other participant in the book</td><td>non-stationary regime; you can never A/B the live market → evaluation is <em>off-policy only</em></td></tr>
+  </tbody>
+</table>
+
+<p class="hint">Same pattern as every domain: the MDP table writes itself and the rightmost column <em>is the lesson</em>. The four rows below become four mechanisms — causal encoding, structured masked heads, impact-separated reward, and off-policy evaluation with a regulatory guard.</p>
+
+<h2>2 · The state leaks the future — build a causal tensor</h2>
+
+<p><strong>Intuition.</strong> The order book is a snapshot of prices and sizes at ten levels on each side. If you hand the network raw prices it learns scale, not structure; worse, if any feature is computed from data that only existed <em>after</em> the decision instant, the backtest looks brilliant and the live system loses money. The whole job here is to encode the book so the network sees only the past, in a form that is stationary across price regimes.</p>
+
+<p><strong>Engineering detail.</strong> Encode each level as an <strong>incremental log</strong> relative to the mid-price, which is scale-free and stable across a stock at $5 or $500:</p>
+
+<div class="math block">
+bid_price<sub>i</sub> = ln(P<sup>bid</sup><sub>i</sub> / P<sub>mid</sub>) &nbsp;·&nbsp; bid_vol<sub>i</sub> = ln(V<sup>bid</sup><sub>i</sub> + 1) &nbsp;·&nbsp; P<sub>mid</sub> = (P<sup>bid</sup><sub>1</sub> + P<sup>ask</sup><sub>1</sub>)/2
+</div>
+
+<p>The <code>+1</code> guards against <code>log(0)</code> on an empty level. Maintain a <strong>deque</strong> of the last K=20 snapshots — <code>appendleft</code> on arrival, <code>pop</code> when full, O(1) per tick to meet the microsecond budget — and stack them into a <strong>(K, 21, 2)</strong> tensor: axis 0 is time (index 0 oldest, K−1 = now, <em>strict causal order</em>), axis 1 is the 20 book features plus a 21st channel of relative timestamps Δτ = t<sub>i</sub>−t<sub>0</sub>, and axis 2 is the price/volume channel so a 2-D CNN can convolve over (time, depth) with <code>kernel=(3,3), dilation=(2,1)</code> — a wider temporal receptive field at no extra parameters. A Transformer variant reshapes to (K, 42) and masks the upper triangle for causal self-attention.</p>
+
+<div class="callout warn">
+  <div class="label">The leakage test that must be in CI</div>
+  <strong>Look-ahead bias is the silent killer of execution backtests.</strong> Write a unit test that injects a fabricated "future limit-up price" at time t: if the network's output at t <em>changes at all</em>, the causal barrier has been breached and the build fails. Back it with offline replay on tick-by-tick historical data to confirm no feature reads across the decision boundary. And treat the order book's own structure as suspect: a <strong>persistent order-queue ID</strong> that survives across frames lets the model track a single resting order, which injects historical path information into the state and <em>violates the Markov assumption</em>. The fix is to randomly re-shuffle queue indices each frame and drop persistent IDs, substituting <em>instantaneous book shape + traded volume</em> as the Markov-safe feature; importance sampling then keeps the policy gradient unbiased. Quantify the residual leak with a χ² test on the next-frame index distribution before you ever ship.
+</div>
+
+<p><strong>Engineering detail — irregular arrivals.</strong> A tick-by-tick order feed arrives at non-uniform intervals, so absolute Δτ misleads. Replace it with an <strong>exponential time-decay encoding</strong>, decay coefficient α = 1/τ<sub>half</sub> with τ<sub>half</sub> ≈ 500&nbsp;ms, which keeps causality while expressing continuous time. On an edge inference accelerator the (K=20, 21, 2) tensor runs FP16 in under ~400&nbsp;µs — inside the sub-1&nbsp;ms order round-trip. Push K past ~40 and latency grows linearly; if you need a longer memory, <strong>distill</strong> to a student network at K=10 fed differenced inputs to retain the information at a fraction of the cost.</p>
+
+<h2>3 · The action is hybrid <em>and</em> latency-bounded — structure it, mask it, schedule it</h2>
+
+<p><strong>Intuition.</strong> "Post 30% of what's left, one tick inside the bid" is two decisions of different types: <em>which</em> price level (a choice from a menu of 5–10 ticks) and <em>how far in and how much</em> (a continuous offset and size fraction). Flattening into one giant discrete grid explodes; treating it as one continuous vector throws away the tick structure. Keep both — a discrete head for the level and conditioned continuous heads for offset and size — and never let the agent emit an action it can't legally place.</p>
+
+<div class="math block">
+a = (a<sub>level</sub>, Δp, Δq) &nbsp;|&nbsp; a<sub>level</sub> ~ Categorical(K logits) &nbsp; Δp ∈ [−0.5, 0.5]&nbsp;tick ~ TanhNormal &nbsp; Δq ∈ [0,1] ~ TanhNormal
+</div>
+
+<p><strong>Engineering detail.</strong> A shared two-layer LayerNorm+ReLU MLP (256 units → 64-dim latent) feeds a discrete head (K logits, K=5 on the main board, up to 10 on a tick-finer board) and a continuous head (2-D: price offset, size fraction). Sample the discrete part with <strong>Gumbel-Softmax</strong> (τ=0.5, straight-through one-hot forward, gradient backward) and the continuous part with a <strong>Tanh-Normal</strong>; the final order is <em>level-center price + round(Δp/tick)·tick</em> and <em>Δq × remaining quantity</em>. Critically, the replay buffer stores the <strong>raw continuous outputs, not the rounded prices</strong> — rounding before storage severs the gradient. Anneal τ linearly every ~500 steps so Gumbel-Softmax converges toward a true one-hot. The loss is policy NLL × GAE advantage + discrete entropy + continuous entropy, value MSE, and a hard compliance penalty λ·ReLU(|price − limit|) with λ=1e3 so the gradient satisfies regulation before it optimizes return. Against a TWAP baseline this lifts the information ratio by ~0.8 and cuts the cancel rate ~35%.</p>
+
+<div class="callout">
+  <div class="label">Matching the 500&nbsp;µs exchange minimum-latency floor — SMDP, not faster polling</div>
+  The exchange enforces a minimum order round-trip (~500&nbsp;µs). Firing the policy faster than that wastes compute and tempts <em>latency-arbitrage</em> behavior. Use <strong>event-driven sampling</strong>: act on book-change events, not a fixed clock. If the venue switches to <em>batch auction</em> matching and latency jumps from 500&nbsp;µs to ~5&nbsp;ms, event-driven sampling degrades to low-frequency polling — at which point promote to a <strong>multi-timescale SMDP</strong>: a macro policy steps on auction periods, a micro policy issues sub-actions on book-depth changes (hierarchical RL). For options market-making, where 500&nbsp;µs sits near the implied-vol-surface refresh, train under <strong>MAML</strong> with simulated 0–2&nbsp;ms latency jitter so the policy adapts on day one.
+</div>
+
+<h2>4 · The reward confounds your impact with the market's noise — separate them</h2>
+
+<p><strong>Intuition.</strong> When you buy, the price ticks up — partly because you pushed it (your <em>market impact</em>), partly because the market was moving anyway (<em>noise</em>). A raw price-improvement reward mixes the two, so the agent can't tell whether a bad fill was its fault or the market's. Worse, impact has two parts: a <strong>temporary</strong> component that relaxes after you stop trading, and a <strong>permanent</strong> component that stays — and the regulator wants the permanent part reported. So you separate the signal, normalize the learnable part, and keep the reportable part on the side.</p>
+
+<p><strong>Engineering detail — online impact separation.</strong> On each transition (s,a,r,s′), track the permanent-impact mean with an EWMA, take the residual as temporary impact, and standardize:</p>
+
+<div class="math block">
+μ̂<sub>perm</sub> ← (1−α)·μ̂<sub>perm</sub> + α·r &nbsp;·&nbsp; ε<sub>temp</sub> = r − μ̂<sub>perm</sub> &nbsp;·&nbsp; r̃ = ε<sub>temp</sub> / max(σ̂<sub>temp</sub>, 1e−3)
+</div>
+
+<p>The shaped reward r̃ has mean 0 and variance 1, ready for any deep-RL algorithm. Feed μ̂<sub>perm</sub> into the critic as an extra state feature so the value head only learns "de-drifted" value, while the actor's gradient uses the standardized r̃ to cut variance. For the compliance report, add — outside the Bellman target, so it stays unbiased — a logged term λ·sign(μ̂<sub>perm</sub>)·log(1+|μ̂<sub>perm</sub>|), with λ calibrated by risk control, and persist μ̂<sub>perm</sub> and σ̂<sub>temp</sub> per child order to generate the regulator's impact-cost curve.</p>
+
+<p><strong>Engineering detail — taming VWAP-deviation outliers.</strong> When the reward is deviation from VWAP, a single fat-tailed print blows up the gradient. Defend in layers: <strong>(1)</strong> <em>Winsorize</em> — linearly penalize only the part of the deviation beyond a threshold δ to cap gradient magnitude. <strong>(2)</strong> Switch exploration noise from 𝒩(0,σ²) to a <strong>truncated normal</strong> and halve σ when the anomaly rate exceeds 15%. <strong>(3)</strong> Down-weight extreme samples with importance weight w = exp(−|r|/τ) so outlier rewards decay exponentially, then map the winsorized reward through tanh into [−1,1] so the gradient is bounded but <em>never identically zero</em>. On index-constituent backtests this cuts reward variance ~62% and max drawdown ~1.8pp while leaving the information coefficient essentially unchanged.</p>
+
+<p><strong>Engineering detail — slippage discount that adapts to inventory.</strong> The slippage penalty should matter less when little is left to trade. Make the potential-shaping discount a function of remaining quantity and fold it into the advantage so the policy-gradient theorem still holds:</p>
+
+<div class="math block">
+γ<sub>slip</sub>(q<sub>rem</sub>) = γ<sub>min</sub> + (γ<sub>max</sub> − γ<sub>min</sub>)·tanh(q<sub>rem</sub>/Q) &nbsp;·&nbsp; Â<sub>t</sub> = r<sub>t</sub> + γ<sub>slip</sub>·Φ(s<sub>t+1</sub>) − Φ(s<sub>t</sub>) + γV(s<sub>t+1</sub>) − V(s<sub>t</sub>)
+</div>
+
+<p>Versus a fixed γ<sub>slip</sub>=0.9 baseline, this adaptive form cut slippage cost ~18.7% and lifted fill rate ~4.2% while holding the cancel rate under 15%. For power-law-liquidity names, swap tanh for a stretched exponential γ<sub>slip</sub> = γ<sub>min</sub> + (γ<sub>max</sub>−γ<sub>min</sub>)·exp(−α·(q<sub>rem</sub>/Q)<sup>β</sup>) and meta-learn α, β across stocks.</p>
+
+<div class="widget"><div class="title">Impact-aware execution: slice size → market impact vs. timing risk</div><p class="hint">The central tension of order execution: trade fast and you pay your own impact (the square-root law); trade slow and you eat timing risk as the price drifts away over the remaining horizon. The optimal schedule sits where the two costs balance. Slide the slice size and feel the trade-off.</p>
+<div class="controls">
+<label class="inline">order size (% ADV) <input id="qt-adv" type="range" min="1" max="40" step="1" value="12"><span class="val" id="qt-adv-v">12</span></label>
+<label class="inline">slice size (% of order/step) <input id="qt-slice" type="range" min="2" max="50" step="2" value="20"><span class="val" id="qt-slice-v">20</span></label>
+<label class="inline">volatility σ (bp/√step) <input id="qt-vol" type="range" min="5" max="80" step="5" value="30"><span class="val" id="qt-vol-v">30</span></label>
+</div>
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">impact cost</div><div class="v" id="qt-imp">–</div></div>
+  <div class="kpi"><div class="k">timing risk</div><div class="v" id="qt-tim">–</div></div>
+  <div class="kpi"><div class="k">total cost</div><div class="v" id="qt-tot">–</div></div>
+  <div class="kpi"><div class="k">verdict</div><div class="v" id="qt-verd">–</div></div>
+</div>
+<p class="hint" id="qt-note"></p></div>
+
+<svg viewBox="0 0 760 250" class="diagram" role="img" aria-label="The applied-RL loop instantiated for order execution">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/>
+    </marker>
+  </defs>
+  <g data-node><rect class="node-bg" x="20"  y="40" width="130" height="64" rx="8"/>
+    <text x="85" y="64" text-anchor="middle" font-weight="600" font-size="13">1 · FORMULATE</text>
+    <text x="85" y="83" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">causal LOB tensor,</text>
+    <text x="85" y="97" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">hybrid action</text></g>
+  <g data-node><rect class="node-bg" x="180" y="40" width="130" height="64" rx="8"/>
+    <text x="245" y="64" text-anchor="middle" font-weight="600" font-size="13">2 · DIAGNOSE</text>
+    <text x="245" y="83" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">leakage, impact,</text>
+    <text x="245" y="97" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">no live A/B</text></g>
+  <g data-node><rect class="node-bg" x="340" y="40" width="130" height="64" rx="8"/>
+    <text x="405" y="64" text-anchor="middle" font-weight="600" font-size="13">3 · ENGINEER</text>
+    <text x="405" y="83" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">masking, impact</text>
+    <text x="405" y="97" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">split, DR-OPE</text></g>
+  <g data-node><rect class="node-bg" x="500" y="40" width="130" height="64" rx="8"/>
+    <text x="565" y="64" text-anchor="middle" font-weight="600" font-size="13">4 · GUARD</text>
+    <text x="565" y="83" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">circuit breaker,</text>
+    <text x="565" y="97" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">Lagrangian λ</text></g>
+  <g data-node><rect class="node-bg" x="660" y="40" width="90" height="64" rx="8"/>
+    <text x="705" y="68" text-anchor="middle" font-weight="600" font-size="13">5 · ITERATE</text>
+    <text x="705" y="88" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">re-diagnose</text></g>
+  <path d="M150 72 L178 72" class="edge" marker-end="url(#arrow)"/>
+  <path d="M310 72 L338 72" class="edge" marker-end="url(#arrow)"/>
+  <path d="M470 72 L498 72" class="edge" marker-end="url(#arrow)"/>
+  <path d="M630 72 L658 72" class="edge" marker-end="url(#arrow)"/>
+  <path d="M705 104 L705 150 L245 150 L245 106" class="edge" marker-end="url(#arrow)"/>
+  <text x="475" y="168" text-anchor="middle" font-size="11" fill="var(--text-mute)">removing one difficulty exposes the next — re-run the loop</text>
+</svg>
+
+<h2>5 · You can never run the policy live to test it — off-policy evaluation under non-stationarity</h2>
+
+<p><strong>Intuition.</strong> You cannot A/B a new execution policy against the real market without spending real money and moving real prices. So you must estimate a new policy's value purely from logs generated by the old one — off-policy evaluation (OPE) — in a market whose statistics drift across the day. The naïve estimator (importance-weighted return) is unbiased <em>only if the market is stationary and the weights don't explode</em>; both assumptions fail, so you build an estimator that survives drift and a test that tells you when "unbiased" stops being true.</p>
+
+<p><strong>Engineering detail — IPS, then double-robust.</strong> Estimate value with importance-weighted returns over a rolling 60-day window, V̂(π₁) = (1/n)Σ ρ<sub>i</sub>R<sub>i</sub>, and tame the weights with <strong>truncation</strong> (ρ<sub>max</sub>=20) and <strong>Pareto smoothing</strong>. To detect when non-stationarity has broken unbiasedness, take the error series ε<sub>i</sub> against a same-seed simulator, run <strong>CUSUM</strong> to cut it into locally-stationary blocks, t-test each block, and control the family-wise false-discovery rate with <strong>Benjamini–Hochberg</strong> at 5%. Reduce residual variance with the <strong>double-robust</strong> estimator, where a fitted Q model only has to be approximately right:</p>
+
+<div class="math block">
+V̂<sub>DR</sub> = (1/n) Σ [ ρ<sub>i</sub>R<sub>i</sub> − ρ<sub>i</sub>Q(s<sub>i</sub>,a<sub>i</sub>) + Σ<sub>a</sub> π₁(a|s<sub>i</sub>)Q(s<sub>i</sub>,a) ]
+</div>
+
+<p>Push variance down further by estimating the Q correction with <strong>quasi-Monte-Carlo</strong> rollouts (Sobol/Halton sequences via <code>torch.quasirandom.SobolEngine</code>; Gray-code the discrete actions to preserve space-filling), giving Var(V̂<sub>DR-QMC</sub>) ≤ (1+‖ρ‖<sub>∞</sub>)²·O((log K)<sup>d</sup>/K²) + ε<sub>Q</sub>. Use the DR-QMC value as a <strong>safety gate</strong>: if a candidate policy improves the estimated value &lt;2% with variance reduction &lt;10%, reject it before any capital is risked.</p>
+
+<div class="callout warn">
+  <div class="label">The calendar-rolling replay buffer — the second place leakage hides</div>
+  Even Markov-safe features leak if the replay buffer samples the future. Maintain a block-structured buffer keyed by calendar day with a shared "max trainable day" gate T<sub>c</sub>: at each close, append today's experience to the tail block, atomically drop the head block once the window exceeds T blocks, and publish the new T<sub>c</sub>. The sampler <em>filters out every block with t &gt; T<sub>c</sub></em>, and for n-step returns it also checks that the state n steps ahead falls before T<sub>c</sub>, truncating otherwise. Monitor an <strong>information-leakage rate</strong> (samples with t&gt;T<sub>c</sub> over total; target 0), a <strong>window-utilization rate</strong> (alert below 60%), and a <strong>distribution-drift</strong> KS test comparing the last 20 days to the prior 20 — when p&lt;0.05, shrink the window or raise the discount. Feature operators carry their own timestamp t<sub>f</sub> with the invariant t<sub>f</sub> ≤ t and t<sub>f</sub> ≤ T<sub>c</sub>, so a metric computed from post-close data can never sneak in.
+</div>
+
+<h2>6 · Guard in production — the regulator is part of the environment</h2>
+
+<p><strong>Intuition.</strong> An execution policy that is profitable but non-compliant is worthless: it gets the desk's trading license pulled. Self-trading, "flickering" orders that cancel within milliseconds to fake liquidity, and breaching a price limit are all illegal, and the rules can change overnight. So compliance is not a post-hoc filter — it is wired into the action space, the loss, and a runtime circuit breaker.</p>
+
+<p><strong>Engineering detail — three layers against flickering / fake fills.</strong> <strong>(1) Reward</strong>: penalize cancels of orders that rested &lt;50&nbsp;ms. <strong>(2) Environment hard wall</strong>: the Gym <code>step()</code> embeds the matching-engine rule engine, returns a "forbidden" signal for sub-50&nbsp;ms cancels, and <em>randomizes feed latency over 0–500&nbsp;ms</em> so the policy can't stably exploit a fixed delay. <strong>(3) Conservative offline training</strong>: train with <strong>BCQ/CQL</strong> on historical flickering negatives so the policy assigns <em>low</em> value to high-cancel regions, and every 10k steps run a replay evaluation — if replay fill-rate diverges from training fill-rate by &gt;3%, auto-rollback and freeze that period's samples. Together this compresses the inflated fill rate from flickering to under 1%.</p>
+
+<p><strong>Engineering detail — a differentiable compliance mask.</strong> Build a binary mask M ∈ {0,1} over the action space marking actions that would cause self-trading (price/size in the self-cross band), set forbidden logits to zero, and renormalize the discrete distribution; for continuous actions, project the masked dimension to the nearest legal region and record the projection distance as a penalty. The total loss is L = L<sub>RL</sub> + λ·(‖a<sub>raw</sub> − a<sub>legal</sub>‖² + I<sub>self</sub>·R<sub>penalty</sub>), λ ∈ [1e2, 1e3] so compliance is satisfied before return is optimized. Register the mask in the graph (Torch FX / ONNX export) so the broker's gateway can do a simulation-vs-live consistency check with zero drift.</p>
+
+<p><strong>Engineering detail — Lagrangian multipliers that re-tune in minutes.</strong> When a rule changes, you cannot afford to retrain. Treat the constraint as a Lagrangian and update the multiplier online: each trajectory, compute mean constraint violation ĉ = (1/T)Σ g(s<sub>t</sub>,a<sub>t</sub>) − ḡ<sub>new</sub>, then λ<sub>k+1</sub> = [λ<sub>k</sub> + κ·ĉ]<sub>+</sub> through a softplus (κ=0.1 damps oscillation, softplus stops small violations from amplifying noise), λ capped by the regulator's worst-case violation cost. The actor maximizes R<sub>t</sub> − λ<sub>k+1</sub>·c<sub>t</sub> + γ·H(π) with the entropy coefficient rising as λ grows, so the policy doesn't collapse onto a degenerate "do nothing" action. Hold a sliding-window compliance rate ≥99.5% and a return drawdown &lt;2% as dual gates; tripping either rolls back to the last stable multiplier — a "gray-scale rollback" that re-calibrates to a new rule in ~15 minutes with zero offline retraining.</p>
+
+<div class="callout ok">
+  <div class="label">The through-line</div>
+  Every section above is one row of the MDP table turned into a mechanism: a <strong>leaky, non-Markov state</strong> → causal log-tensor + queue-ID shuffling + a calendar-gated buffer; a <strong>hybrid latency-bounded action</strong> → structured masked heads + event-driven SMDP scheduling; an <strong>impact-confounded reward</strong> → EWMA impact separation + winsorized VWAP shaping + inventory-adaptive slippage; an <strong>unrunnable, non-stationary evaluation under a regulator</strong> → DR-QMC off-policy estimation as a safety gate + a compliance mask, Lagrangian multipliers, and a circuit breaker. You never reached for a tool until a row of the table demanded it. That discipline is the whole track.
+</div>
+
+<h2>Further considerations</h2>
+<ul>
+  <li><strong>Message stream vs. snapshot input.</strong> Mixing raw event messages with periodic snapshots gives finer microstructure but costs you time-alignment (maintain dual event-time + processing-time axes, or off-policy IS weights diverge and gradient variance jumps an order of magnitude), storage blow-up (raw messages dwarf snapshots; use differential snapshots + protobuf deltas), and hyperparameter sensitivity (the snapshot mix ratio α is best in 0.2–0.4; above 0.5 policy entropy collapses into local optima). Monitor the KL between mixed and snapshot-only inputs and auto-rollback past ~0.02. Compliance often demands keeping the raw-message + snapshot + model-version triple for 5 years with tamper-evident hashes.</li>
+  <li><strong>Multi-instrument joint execution.</strong> Trading an ETF and an index future together stacks their book tensors along the channel axis into (K, 21, 4) over a shared CNN backbone, routed by a mixture-of-experts to per-instrument value heads — saving memory and curbing overfitting. For cross-market market-making, a Multi-Agent PPO with a central critic handles the coupled hybrid action.</li>
+  <li><strong>Belief states under partial observability.</strong> Iceberg orders and random cancels make the true book partially observable; an LSTM/attention policy can infer an approximate belief state and extend μ̂<sub>perm</sub> into a belief vector for sharper impact separation. But many risk desks <em>forbid black-box memory in production</em> and require a feature-importance report — so keep the state as Markov as you can and treat learned memory as the exception, not the default.</li>
+  <li><strong>When latency-arbitrage disappears.</strong> If exchanges compress feed latency under 100&nbsp;µs, flickering edge vanishes and the policy's alpha must move to <em>microstructure prediction</em> — multi-level queue imbalance, cancel-rate gradients, broker-ID heat — computed with asynchronous PPO and GPU feed decoding at microsecond granularity. A regulatory sandbox (live operation under injected extreme conditions, license granted only after, say, 7 consecutive days of cancel-rate &lt;30% and fill-rate error &lt;2%) is a clean way to earn the right to trade live.</li>
+  <li><strong>Time-segmented circuit breakers.</strong> If a venue adds tiered breakers (e.g. a 30% halt), the piecewise cost function becomes a non-convex constraint — reach for Lyapunov-based RL to guarantee recursive feasibility. At microsecond frequency the Safety-Layer QP solve becomes the bottleneck; pre-train a neural KKT approximator offline (a "safety mapper") to bring online projection under ~5&nbsp;µs.</li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="02_autonomous_driving.html"><span class="dir">Previous</span><span class="ttl">02 · Autonomous-driving path planning</span></a>
+  <a class="next" href="04_recsys_cold_start.html"><span class="dir">Next</span><span class="ttl">04 · Recommender-system cold start</span></a>
+</footer>
+
+<script>
+(function(){
+  const adv=document.getElementById('qt-adv'), slice=document.getElementById('qt-slice'), vol=document.getElementById('qt-vol');
+  function draw(){
+    document.getElementById('qt-adv-v').textContent=adv.value;
+    document.getElementById('qt-slice-v').textContent=slice.value;
+    document.getElementById('qt-vol-v').textContent=vol.value;
+    const Q=+adv.value;          // order size as % of ADV
+    const s=(+slice.value)/100;  // fraction of order per slice
+    const sigma=+vol.value;      // bp per sqrt(step)
+    const nSteps=Math.max(1, Math.round(1/s));
+    // Square-root market impact per slice: k * sigma * sqrt(participation), summed over slices.
+    // participation per step grows with slice size; bigger slices -> more impact each.
+    const k=0.9;
+    const impactPerStep=k*sigma*Math.sqrt(Q*s/100);
+    const impact=impactPerStep*nSteps;             // total impact cost in bp
+    // Timing risk: price can drift over the remaining horizon; more steps (slower) -> more exposure.
+    // risk ~ sigma * sqrt(total steps) scaled by average remaining inventory.
+    const timing=sigma*Math.sqrt(nSteps)*0.5;      // bp
+    const total=impact+timing;
+    document.getElementById('qt-imp').textContent=impact.toFixed(1)+' bp';
+    document.getElementById('qt-tim').textContent=timing.toFixed(1)+' bp';
+    document.getElementById('qt-tot').textContent=total.toFixed(1)+' bp';
+    const vEl=document.getElementById('qt-verd');
+    const good=total<60, mid=total<110;
+    vEl.textContent=good?'balanced':(mid?'costly':'painful');
+    vEl.style.color=good?'var(--ok)':(mid?'var(--warn)':'var(--bad)');
+    document.getElementById('qt-note').textContent=
+      impact>timing*1.6
+        ? 'Slices are too aggressive: you are paying '+impact.toFixed(0)+' bp of your own impact (square-root law) versus only '+timing.toFixed(0)+' bp of timing risk. Trade smaller slices over more steps — let the book refill between fills.'
+        : (timing>impact*1.6
+          ? 'Slices are too timid: '+timing.toFixed(0)+' bp of timing risk dwarfs '+impact.toFixed(0)+' bp of impact. The price can wander away over '+nSteps+' steps; trade faster to lock in the arrival price.'
+          : 'Near the optimum: impact ('+impact.toFixed(0)+' bp) and timing risk ('+timing.toFixed(0)+' bp) are balanced. This is the schedule an Almgren-Chriss-style frontier — and a well-trained RL agent — converges toward.');
+  }
+  [adv,slice,vol].forEach(x=>x.addEventListener('input',draw));
+  draw();
+})();
+</script>
+
+</main>
+</body>
+</html>
