@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>07 · congestion control</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">rl_in_practice</a>
+    <span class="crumb">/</span>
+    <span class="crumb">07 · congestion control</span>
+    <span class="step-pill">lesson 7 / 20</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Network congestion control</h1>
+<p class="subtitle">A congestion controller decides how fast to send into a link it cannot see, using signals — round-trip time, loss, ECN marks — that are <em>noisy, delayed, and not Markov</em>. Cast as RL, the binding difficulties of this domain are: a <strong>partially-observable, non-stationary state</strong> built from jittery measurements; an <strong>action space that must change rate without oscillating</strong>; a <strong>throughput-vs-latency reward</strong> with a hard tail-latency constraint; a <strong>multi-agent fairness</strong> requirement (don't starve the TCP flows sharing your link); and a <strong>µs-scale inference budget</strong> that lives in the kernel datapath. Each names a mechanism.</p>
+
+<div class="callout">
+  <div class="label">The method — five steps, every lesson</div>
+  Same loop as always. <strong>(1) Formulate</strong> the MDP — state, action, reward, transition, horizon. <strong>(2) Diagnose</strong> the properties that make <em>this</em> MDP hard. <strong>(3) Engineer</strong> the mechanism that removes exactly those difficulties. <strong>(4) Guard</strong> it in production — detect drift, monitor, fall back. <strong>(5) Iterate.</strong> For congestion control the first difficulty is that your "state" is an estimate of an estimate: the network is invisible, and everything you measure arrived one RTT too late.</p>
+</div>
+
+<h2>1 · Formulate — the MDP behind a learned congestion controller</h2>
+
+<p><strong>Intuition.</strong> A sender wants to push bytes as fast as the path allows without overflowing the bottleneck queue. It never sees the queue directly; it only sees what comes back — acknowledgements, their timing (RTT), losses, and ECN congestion-experienced (CE) marks. So the agent observes <em>symptoms</em>, picks a sending rate or window, and is rewarded for moving a lot of data while keeping delay low. That is an MDP, but a thin and lagged one.</p>
+
+<div class="math block">
+MDP = (S, A, R, P, γ) &nbsp;·&nbsp; maximize&nbsp; E[ Σₜ γᵗ ( throughputₜ − λ·delayₜ ) ]
+</div>
+
+<table>
+  <thead><tr><th>Piece</th><th>For a learned congestion controller</th><th>The awkward part</th></tr></thead>
+  <tbody>
+    <tr><td><strong>State</strong> S</td><td>smoothed RTT, ΔRTT, ECN mark ratio, loss flags, inflight, last action</td><td>built from <em>noisy, one-RTT-delayed</em> estimates → effectively <em>partially observable</em></td></tr>
+    <tr><td><strong>Action</strong> A</td><td>sending rate / cwnd multiplier, or a discrete throttle level</td><td>fine control <em>oscillates</em>; flipping levels every step destabilizes the link</td></tr>
+    <tr><td><strong>Reward</strong> R</td><td>throughput minus a latency penalty, under a hard tail-latency bound</td><td>two objectives that <em>trade off</em>, plus log-utility that <em>vanishes at zero</em></td></tr>
+    <tr><td><strong>Transition</strong> P</td><td>the link, the queue, and every other flow sharing the bottleneck</td><td>co-existing flows are other agents → <em>non-stationary &amp; multi-agent</em></td></tr>
+  </tbody>
+</table>
+
+<p class="hint">The rightmost column is the lesson. Unlike a game, where the engine gives you a clean frame, here even the <em>state</em> is engineering — half this lesson is just turning raw measurements into something Markov enough to learn on.</p>
+
+<h2>2 · Diagnose — the state is an estimate of an estimate</h2>
+
+<p><strong>Intuition.</strong> RTT samples bounce around: queueing, scheduling, Wi-Fi retransmits, a 4G→5G handover that adds 200&nbsp;ms in one step. If you feed raw RTT into the policy, the value function learns to chase noise. If you over-smooth, you lag real congestion and react too late. And the deepest problem: a single instantaneous reading is <em>not</em> Markov — packet-level sequences are non-stationary and grow with bandwidth, violating the MDP assumption outright. You must construct a state that is smooth, current, and Markov, all at once.</p>
+
+<p><strong>Engineering detail — adaptive smoothing with a confidence gate.</strong> Smooth RTT with an exponentially-weighted moving statistic whose gain <em>adapts</em> to the measured variance, so it tracks fast when the signal is real and damps hard when it is noise:</p>
+
+<div class="math block">
+αₜ = 1 / ( 1 + exp( −(vₜ − v_target)/κ ) ) &nbsp;·&nbsp; RTT_smoothₜ = αₜ·RTTₜ + (1−αₜ)·RTT_smoothₜ₋₁
+</div>
+
+<p>where <code>vₜ</code> is an online estimate of RTT variance and <code>v_target</code> is set by service class — roughly <strong>0.1&nbsp;ms for finance, 1&nbsp;ms for cloud gaming</strong>. Large variance shrinks αₜ (trust history, suppress noise); small variance grows it (track the true change-point). The filter lag stays under its theoretical bound of <strong>0.8 frames (&lt;16&nbsp;ms at 60&nbsp;FPS)</strong>, which is what keeps a cloud-gaming controller inside its decision deadline.</p>
+
+<p><strong>Engineering detail — the state vector itself.</strong> Don't feed one number; feed a first-order difference plus a confidence mask so the network can tell "the link changed" from "the meter is shaking":</p>
+
+<div class="math block">
+sₜ = [ RTT_smooth, ΔRTT, maskₜ ] &nbsp;·&nbsp; maskₜ = 𝟙{ σₜ &lt; σ_max }
+</div>
+
+<p>When <code>mask = 0</code> (high-noise mode) the <strong>critic lowers its bootstrap weight</strong> so a wrong TD target can't poison the value function, while the actor keeps its output scale stable via <strong>PopArt</strong> normalization. The whole pipeline runs in TensorRT at <strong>&lt;0.05&nbsp;ms</strong> GPU latency, so it costs the trainer nothing.</p>
+
+<p><strong>Engineering detail — fusing loss and ECN into the state.</strong> Loss events are sparse, so a single loss bit carries little signal. Add a saturating <em>consecutive-loss counter</em> and a learned <em>joint-confidence</em> channel so the agent reads a 4-dim summary instead of a raw packet trace:</p>
+
+<div class="math block">
+loss_cntₜ = min(loss_cntₜ₋₁ + 1, 7) &nbsp;·&nbsp; confₜ = σ( w₁·ecn_smoothₜ − w₂·loss_cntₜ ) &nbsp;·&nbsp; sₜ = [ ecn_smooth, loss_bin, loss_cnt, conf ]
+</div>
+
+<p>The weights <code>w₁, w₂</code> are found by <strong>offline Bayesian optimization over 10k real traces</strong>, with the objective being the policy's mean reward over a 10-second sliding window. The 4-dim state runs at <strong>&lt;1% CPU at 40&nbsp;Gbps line rate</strong>, and in A/B tests against Cubic it raised throughput by <strong>22% in incast scenarios while cutting queueing delay 35%</strong>.</p>
+
+<div class="callout">
+  <div class="label">Why statistics, not raw packets — the Markov argument</div>
+  If an interviewer asks "why not feed the raw packet-level sequence?", the answer is exactly the MDP assumption: a packet sequence is <strong>non-stationary and its dimension grows linearly with bandwidth</strong>, so it is not a fixed-shape Markov state. Hand-built statistics (smoothed RTT, ECN ratio, loss count) restore Markov-ness at fixed dimension, and an attention layer can re-weight them dynamically — "stay invariant by summarizing." The same logic warns against feeding a black-box BBR estimate as state: BBR's output depends on its own internal history, so KL( P(s′|s,a) ‖ P(s′|o,a) ) &gt; 0 — it is not Markov in your observation, and you should measure that information loss before trusting it.
+</div>
+
+<h2>3 · The action space — change rate without oscillating</h2>
+
+<p><strong>Intuition.</strong> If the agent can jump from 10% to 100% throttle in one step, the link rings like a bell: overshoot, mass loss, collapse, overshoot again. The art of the action space is to make <em>large</em> moves possible but <em>abrupt</em> moves rare — and to give the agent an explicit "hold" so steady state is cheap to maintain.</p>
+
+<p><strong>Engineering detail — log-spaced discretization with action inertia.</strong> Bucket the continuous rate on a <em>log</em> scale, not a linear one, so small rates get fine resolution and large rates get coarse resolution: e.g. throttle 0–100% as {0, 1, 3, 7, 15, 31, 63, 100}. This holds the bucket count to ≤16 while bounding the maximum single-step jump Δ<sub>max</sub>. Add the previous action <code>aₜ₋₁</code> to the state so the network carries an "inertia prior" that suppresses adjacent-step bucket flips.</p>
+
+<p><strong>Engineering detail — smoothing at three stages.</strong></p>
+<ul>
+  <li><strong>Training:</strong> use an <strong>IQN</strong> quantile network with <strong>Huber quantile loss</strong> instead of MSE, so neighbouring buckets' value distributions overlap and probability mass can't teleport between buckets on a gradient step. Add <strong>target-policy smoothing</strong>: perturb the chosen action's one-hot with ε-uniform noise (ε=0.1) so the value net sees "neighbour buckets" and doesn't overfit a spike.</li>
+  <li><strong>Inference:</strong> make the softmax temperature T an online-tunable knob (default T=0.5). If monitoring sees bucket-switch frequency exceed a threshold, auto-raise T→1.2 to spread the output, then low-pass it with an EMA: <code>aₜ = 0.7·aₜ₋₁ + 0.3·a_raw</code> — two lines of C, zero added latency on an edge NPU.</li>
+  <li><strong>Hold:</strong> add an explicit KEEP action so "do nothing" is a first-class choice; reusing <code>aₜ₋₁</code> when KEEP fires removes a whole class of pointless oscillation.</li>
+</ul>
+
+<p><strong>Engineering detail — integrating with the kernel state machine.</strong> The learned action must drive a real TCP stack. The pattern: an eBPF program (<code>BPF_PROG_TYPE_STRUCT_OPS</code>) hooks the congestion-control ops, computes per-step reward into a <em>per-CPU reward map</em>, and a user-space RL process pulls batches every <strong>20&nbsp;ms</strong> via the BPF skeleton for off-policy updates — completing one iteration in &lt;50&nbsp;ms. This requires <strong>no hardware change</strong> and coexists with existing kernels; reported online gains were +8.7% single-flow throughput, −11% RTT, with zero-loss restart under 8&nbsp;ms.</p>
+
+<svg viewBox="0 0 760 250" class="diagram" role="img" aria-label="The applied-RL loop instantiated for congestion control">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/>
+    </marker>
+  </defs>
+  <g data-node><rect class="node-bg" x="20"  y="40" width="130" height="64" rx="8"/>
+    <text x="85" y="64" text-anchor="middle" font-weight="600" font-size="13">1 · FORMULATE</text>
+    <text x="85" y="83" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">RTT, ECN, loss</text>
+    <text x="85" y="97" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">→ rate / cwnd</text></g>
+  <g data-node><rect class="node-bg" x="180" y="40" width="130" height="64" rx="8"/>
+    <text x="245" y="64" text-anchor="middle" font-weight="600" font-size="13">2 · DIAGNOSE</text>
+    <text x="245" y="83" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">noisy, lagged,</text>
+    <text x="245" y="97" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">non-Markov state</text></g>
+  <g data-node><rect class="node-bg" x="340" y="40" width="130" height="64" rx="8"/>
+    <text x="405" y="64" text-anchor="middle" font-weight="600" font-size="13">3 · ENGINEER</text>
+    <text x="405" y="83" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">adaptive smoothing,</text>
+    <text x="405" y="97" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">log buckets, fairness</text></g>
+  <g data-node><rect class="node-bg" x="500" y="40" width="130" height="64" rx="8"/>
+    <text x="565" y="64" text-anchor="middle" font-weight="600" font-size="13">4 · GUARD</text>
+    <text x="565" y="83" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">CUSUM reset,</text>
+    <text x="565" y="97" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">KL hot-swap</text></g>
+  <g data-node><rect class="node-bg" x="660" y="40" width="90" height="64" rx="8"/>
+    <text x="705" y="68" text-anchor="middle" font-weight="600" font-size="13">5 · ITERATE</text>
+    <text x="705" y="88" text-anchor="middle" font-size="10.5" fill="var(--text-mute)">re-diagnose</text></g>
+  <path d="M150 72 L178 72" class="edge" marker-end="url(#arrow)"/>
+  <path d="M310 72 L338 72" class="edge" marker-end="url(#arrow)"/>
+  <path d="M470 72 L498 72" class="edge" marker-end="url(#arrow)"/>
+  <path d="M630 72 L658 72" class="edge" marker-end="url(#arrow)"/>
+  <path d="M705 104 L705 150 L245 150 L245 106" class="edge" marker-end="url(#arrow)"/>
+  <text x="475" y="168" text-anchor="middle" font-size="11" fill="var(--text-mute)">removing one difficulty exposes the next — re-run the loop</text>
+</svg>
+
+<h2>4 · Reward — the throughput–latency knife-edge</h2>
+
+<p><strong>Intuition.</strong> More sending rate fills the queue, which raises delay; less rate empties the queue but wastes the link. The reward is literally <code>throughput − λ·delay</code>, and λ <em>is</em> the policy. Too small and you blow the tail-latency budget; too large and throughput collapses. You want to sit on the "knee" of the trade-off curve and stay there as conditions drift.</p>
+
+<p><strong>Engineering detail — pick the knee, then auto-tune λ slowly.</strong> Sweep λ offline and choose the <strong>knee</strong> — where throughput drops &lt;2% while 99th-percentile delay stays ≤98&nbsp;ms — giving an online starting value of <strong>λ=0.28</strong>. Then adapt λ on an hourly cadence, with a bounded step so it can't oscillate:</p>
+
+<div class="math block">
+λ = 0.28 · 1.1<sup>Δt_up</sup> · 0.95<sup>Δt_down</sup> &nbsp;·&nbsp; |Δλ| ≤ 20% per step &nbsp;·&nbsp; β = 0.01 fixed
+</div>
+
+<p>If 99p delay exceeded 99&nbsp;ms over the last 30&nbsp;min, multiply λ by 1.1 (penalize delay harder); if it fell below 95&nbsp;ms, multiply by 0.95 (let throughput breathe). Under a 100&nbsp;ms hard constraint this delivered <strong>+12–15% throughput with seven consecutive days of zero violations</strong>.</p>
+
+<div class="callout warn">
+  <div class="label">Log-utility goes to −∞ at zero throughput</div>
+  Using a <strong>log utility</strong> log(r̂) gives the right diminishing-returns economics, but a momentarily zero throughput makes the gradient explode (1/r → ∞), producing NaNs. Don't just "add an eps" — splice a robust hybrid that is C¹-continuous at the floor and degrades to <em>linear</em> below it, so the gradient is bounded at exactly 1/ε_safe:
+  <div class="math block" style="margin-top:10px">
+  L_r = log(r̂) &nbsp;if&nbsp; r ≥ ε_safe &nbsp;;&nbsp; (r/ε_safe) − 1 + log(ε_safe) &nbsp;if&nbsp; r &lt; ε_safe
+  </div>
+  Set ε_safe to the business's smallest meaningful unit; one deployment ran 20 days without a single NaN. If the business insists zero must stay zero (real reporting), switch to a bounded utility U(x)=1−e<sup>−αx</sup>, defined and finite at x=0 — but warn them the risk-aversion has changed and α must be recalibrated.
+</div>
+
+<h2>5 · Cross-flow fairness — the link is full of other agents</h2>
+
+<p><strong>Intuition.</strong> Your flow does not own the bottleneck. A purely selfish RL flow learns the optimal predator strategy: grab bandwidth until the legacy TCP flows starve. Operators forbid this — "TCP must not starve" is a hard requirement. So fairness has to be built into the reward, the action space, <em>and</em> the training distribution.</p>
+
+<p><strong>Engineering detail — three layers of "see TCP, yield."</strong></p>
+<ul>
+  <li><strong>Reward penalty.</strong> Add a term proportional to the estimated TCP rate <code>r_TCP</code> (read via eBPF from the co-existing flows' SRTT and loss), λ∈[0.8,1.2]; the gradient mask pushes "aggressive" behaviour toward zero on the backward pass.</li>
+  <li><strong>ECN back-off gate in the action space.</strong> When the agent sees CE-mark ratio &gt;5% <em>and</em> co-flow loss &gt;1%, force cwnd ×0.7 and tag the event "fairness-trigger" — injected via <code>BPF_PROG_TYPE_STRUCT_OPS</code>, no hardware change, vSwitch-compatible.</li>
+  <li><strong>Offline pre-train + online meta-learning.</strong> In a simulator, inject 30% TCP background flows and randomize BDP every episode (10–200&nbsp;Mbps, RTT 20–200&nbsp;ms) so the policy learns "see TCP, yield" up front; then a MAML inner-loop runs every 200&nbsp;ms on real co-flow features, cutting starvation risk below 5% within 1 RTT.</li>
+</ul>
+
+<p>Together these let the RL flow hand <strong>50% of bandwidth to TCP within 100&nbsp;ms</strong> at a self-throughput cost under 8%. Theoretically, when fairness is framed as a <em>potential game</em>, any global maximum of the potential Φ is a Nash equilibrium — so a centralized critic that does gradient ascent on Φ converges to a fair equilibrium, which is the foundation MAPPO/MAAC build on.</p>
+
+<h2>6 · The µs wall — inference lives in the datapath</h2>
+
+<p><strong>Intuition.</strong> At line rate there is no time to call a GPU. The decision has to happen inside the kernel, per-packet, in microseconds. A 1%-better policy that adds latency to the datapath is a net loss.</p>
+
+<p><strong>Engineering detail.</strong> Distill the policy into a tiny lookup table — e.g. 16 actions × 256 states, stored as uint16 fixed-point (Q6.10), total <strong>~8&nbsp;kB so it fits in L1</strong> and respects the eBPF 512-byte stack limit. Pin it read-only in a <code>BPF_MAP_TYPE_ARRAY</code>, sample at an XDP hook with a fully-unrolled 16-iteration loop (~38 instructions, ≈12–15 CPU cycles ≈ <strong>4–5&nbsp;µs</strong>). Measure latency with <code>bpf_ktime_get_ns</code> into a per-CPU histogram: observed <strong>P99 = 42&nbsp;µs, P50 = 28&nbsp;µs</strong>, inside a 50&nbsp;µs SLA. Online learning stays in user space: eBPF only executes high-confidence actions and ringbufs (s,a,r,s′) batches up; user space does incremental SGD every 100&nbsp;ms and atomically swaps the map via <strong>double-buffering</strong> (pointer flip &lt;1&nbsp;µs, zero-jitter hot update).</p>
+
+<div class="widget"><div class="title">Throughput–latency knee: where to set λ</div><p class="hint">Pick the link, the queue-delay penalty λ, and your tail-latency budget. The napkin model: utilization rises with offered rate but so does queue delay (≈ ρ/(1−ρ) of the base RTT). The agent's per-step reward is throughput − λ·delay; we report the reward-maximizing operating point and whether it stays under your hard 99p bound.</p>
+<div class="controls">
+<label class="inline">link capacity (Mbps) <input id="cc-cap" type="range" min="10" max="1000" step="10" value="200"><span class="val" id="cc-cap-v">200</span></label>
+<label class="inline">delay penalty λ <input id="cc-lam" type="range" min="0" max="1" step="0.01" value="0.28"><span class="val" id="cc-lam-v">0.28</span></label>
+<label class="inline">99p budget (ms) <input id="cc-bud" type="range" min="20" max="200" step="5" value="100"><span class="val" id="cc-bud-v">100</span></label>
+</div>
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">best util ρ*</div><div class="v" id="cc-rho">–</div></div>
+  <div class="kpi"><div class="k">throughput</div><div class="v" id="cc-thr">–</div></div>
+  <div class="kpi"><div class="k">99p delay</div><div class="v" id="cc-del">–</div></div>
+  <div class="kpi"><div class="k">verdict</div><div class="v" id="cc-verd">–</div></div>
+</div>
+<p class="hint" id="cc-note"></p></div>
+
+<div class="callout ok">
+  <div class="label">The through-line</div>
+  Every section is one row of the MDP table turned into a mechanism: <strong>noisy, lagged, non-Markov state</strong> → variance-adaptive smoothing + confidence-gated critic + fixed-dim statistics; <strong>oscillating action</strong> → log buckets, distributional value, EMA, an explicit KEEP; <strong>throughput–latency reward</strong> → knee selection, slow λ auto-tune, a robust log-floor; <strong>multi-agent fairness</strong> → reward penalty + ECN back-off + meta-learned "yield"; <strong>µs transition deadline</strong> → distilled eBPF table with double-buffered hot-swap. You never reached for a tool until a row demanded it.
+</div>
+
+<h2>7 · Guard &amp; iterate — production safety</h2>
+
+<p><strong>Intuition.</strong> Networks change regime without warning — a 4G→5G handover, a path flap, an adversary deliberately jittering RTT to fool you into being conservative. The controller must detect the regime change and recover, and any model swap must never drop a connection.</p>
+
+<p><strong>Engineering detail.</strong> Put online <strong>CUSUM change-point detection</strong> ahead of the smoothing layer; on a step-shift it force-resets the EWMT history moments so a stale 200&nbsp;ms "pseudo-high-latency" state can't mislead the policy. For experiment reproducibility, pin the kernel and <code>tc</code>/NetEm versions, lock CPU governor to <code>performance</code>, isolate cores, and validate that the empirical RTT CDF matches the NetEm target by KS statistic (&lt;0.01) — one such harness cut reward variance from 18.7% to 2.3%. For hot updates, use double model slots A/B with a <strong>KL gate</strong>: if KL(π_old‖π_new) &gt; 0.01 or the importance ratio exceeds 1.2, skip the swap and roll back; release the old model only 30&nbsp;s later so in-flight requests are never destructed — connection-drop rate stays at zero.</p>
+
+<h2>Further considerations</h2>
+<ul>
+  <li><strong>Multi-path QUIC blows up the state.</strong> Each subflow emits its own ECN/loss, so the state grows O(n²). Use <em>hierarchical RL</em>: a top level observes an aggregated "path-group" vector, a bottom level refines per-path decisions — bringing the state back to O(n).</li>
+  <li><strong>Wireless loss vs. congestion loss.</strong> On 5G edge links, random radio loss coexists with true ECN-marked congestion and the confidence channel fails. Add RTT-gradient as a third modality and fuse all three with a Bayesian update — one report drove misclassification from 12% to 3%.</li>
+  <li><strong>Adversarial jitter as a POMDP.</strong> An opponent who deliberately injects RTT jitter to make you over-conservative turns smoothing into belief estimation: treat the smoothed RTT as a partial observation and run a recursive Bayesian particle filter over the opponent's latency type, upgrading the problem to a POMDP belief update.</li>
+  <li><strong>Lagged observations.</strong> When the upstream estimator (e.g. BBR) lags 1–2 RTT, predict 2 steps ahead with a time-lagged generative model and let the policy act on the <em>imagined</em> state, MBRL-style.</li>
+  <li><strong>Datacenter scale &amp; explainability.</strong> Training on ~1M concurrent flows needs three-layer decoupling (sampling / transport via GPUDirect-RDMA / a two-level all-reduce tree that cut reduction from 580→42&nbsp;ms). And for auditability, log attention weights + SHAP attributions of which signal drove each rate change, so a black-box policy can still meet algorithmic-traceability rules.</li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="06_agv_scheduling.html"><span class="dir">Previous</span><span class="ttl">06 · Smart-logistics AGV scheduling</span></a>
+  <a class="next" href="08_edge_offloading.html"><span class="dir">Next</span><span class="ttl">08 · Edge-computing task offloading</span></a>
+</footer>
+
+<script>
+(function(){
+  const cap=document.getElementById('cc-cap'), lam=document.getElementById('cc-lam'), bud=document.getElementById('cc-bud');
+  const baseRTT=20; // ms, propagation floor
+  function draw(){
+    document.getElementById('cc-cap-v').textContent=cap.value;
+    document.getElementById('cc-lam-v').textContent=(+lam.value).toFixed(2);
+    document.getElementById('cc-bud-v').textContent=bud.value;
+    const C=+cap.value, L=+lam.value, B=+bud.value;
+    // sweep utilization rho in (0,1); throughput = rho*C (Mbps), queue delay = baseRTT*(1 + rho/(1-rho))
+    // reward (normalized): throughput_term - lambda*delay_term, with throughput in C-units and delay in baseRTT-units
+    let best=-1e18, brho=0, bthr=0, bdel=0;
+    for(let rho=0.50; rho<0.995; rho+=0.005){
+      const delay=baseRTT*(1+rho/(1-rho));
+      const thr=rho*C;
+      // scale both to comparable ~0..1 ranges: thr/C and delay/(big)
+      const reward = (thr/C) - L*(delay/baseRTT - 1)/10;
+      if(reward>best){ best=reward; brho=rho; bthr=thr; bdel=delay; }
+    }
+    document.getElementById('cc-rho').textContent=(brho*100).toFixed(0)+'%';
+    document.getElementById('cc-thr').textContent=bthr.toFixed(0)+' Mbps';
+    document.getElementById('cc-del').textContent=bdel.toFixed(0)+' ms';
+    const ok=bdel<=B;
+    const vEl=document.getElementById('cc-verd');
+    vEl.textContent=ok?'within budget':(bdel<=B*1.3?'over budget':'starving latency');
+    vEl.style.color=ok?'var(--ok)':(bdel<=B*1.3?'var(--warn)':'var(--bad)');
+    document.getElementById('cc-note').textContent=ok
+      ? 'At λ='+L.toFixed(2)+' the reward-optimal point sits at '+(brho*100).toFixed(0)+'% utilization, '+bdel.toFixed(0)+' ms 99p — under your '+B+' ms bound. This is the knee: raising λ buys little latency headroom but costs real throughput.'
+      : 'λ='+L.toFixed(2)+' is too small: the agent chases the last drops of throughput and lets the queue fill to '+bdel.toFixed(0)+' ms, blowing the '+B+' ms budget. Raise λ so the delay penalty bites earlier — the hourly auto-tuner would multiply it by 1.1 here.';
+  }
+  [cap,lam,bud].forEach(x=>x.addEventListener('input',draw));
+  draw();
+})();
+</script>
+
+</main>
+</body>
+</html>
