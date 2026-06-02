@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>19 · Large-scale optimization</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">search_ads_recsys</a>
+    <span class="crumb">/</span>
+    <span class="crumb">19 · large-scale optimization</span>
+    <span class="step-pill">lesson 19 / 31</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Large-scale system optimization</h1>
+<p class="subtitle">Every idea in the previous eighteen lessons quietly assumed it would scale for free. It does not. At a billion items and a hundred thousand queries per second, the model becomes a system — and four numbers (cardinality, dimension, recall, dollars) decide the whole design.</p>
+
+<h2>Scale turns ideas into arithmetic</h2>
+
+<p>Scale does not invent new ideas. It converts the ideas you already have into <em>arithmetic problems</em>, and then makes one term in the arithmetic too big to ignore. There are only three lines you ever need to write:</p>
+
+<div class="ascii">  MEMORY   =  cardinality  ×  dim  ×  bytes_per_value
+  LATENCY  =  candidates   ×  work_per_candidate
+  COST     =  QPS          ×  compute_per_query  ×  $/compute
+</div>
+
+<p>Once those three lines exist for your system, every design decision — shard or replicate, ANN or brute force, quantize or distill, cache or recompute — is just the answer to a single question: <strong>which term is too big, and which lever shrinks it?</strong> This lesson walks the funnel from <a href="04_ranking_models.html">04 · Ranking models</a> and the index from <a href="03_embeddings_ann.html">03 · Embeddings &amp; ANN</a> one rung deeper — into the numbers that bound the fleet.</p>
+
+<div class="callout">
+  <div class="label">The one-line summary you should be able to give</div>
+  At scale a recommender stops being a model and becomes a memory-and-bandwidth budgeting problem. The embedding table dominates memory, the candidate count dominates latency, and the per-query FLOPs dominate the bill. Optimization is choosing which of the three to relax, and paying for it somewhere else.
+</div>
+
+<h2>The embedding table is the elephant</h2>
+
+<p>From <a href="04_ranking_models.html">04 · Ranking models</a>, the headline fact: a modern ranker is an enormous sparse embedding store with a small dense network on top. Every high-cardinality ID — user, item, ad, author, query token — is a learned row in a table. The dense MLP is <em>megabytes</em>. The embedding table is <em>hundreds of gigabytes to terabytes</em>. Its size is pure multiplication:</p>
+
+<p class="math block">table_bytes = cardinality × dim × bytes_per_value</p>
+
+<p>A platform with <strong>1 billion users</strong> and <strong>1 billion items</strong>, each embedded as a <strong>128-dim fp32</strong> vector:</p>
+
+<p class="math block">2 × 10⁹ × 128 × 4 bytes = 1.024 × 10¹² ≈ 1 TB</p>
+
+<p>One terabyte of parameters, of which the actual network might be 200 MB — a factor of five thousand. This single imbalance reshapes everything downstream: the table cannot live where the model lives.</p>
+
+<div class="callout warn">
+  <div class="label">Why the table cannot sit on one GPU</div>
+  A trainer GPU has ~80 GB of HBM. A 1 TB table is <strong>13× too big for one GPU</strong> — and you have not yet added optimizer state, which for Adam is ~2–3× the parameters (momentum + variance), pushing the footprint to multiple terabytes. Splitting the table across machines is not an optimization; it is a precondition for the system existing at all.
+</div>
+
+<h3>Sharding the table</h3>
+
+<p>Embedding lookups are independent — a request for item <code>847,221,003</code> touches exactly one row — so the table shards cleanly by ID. Row <span class="math">i</span> lives on machine <span class="math">i mod S</span>. A forward pass gathers each example's IDs, routes each lookup to the shard that owns it, pulls the vectors back, and feeds them to the dense model; gradients scatter back the same way. This is <strong>embedding-table (model) parallelism</strong> — the reason large recommenders are a distributed key-value store of parameters, not a single checkpoint.</p>
+
+<p>The cost it creates is <em>communication</em>. Every step, every worker fetches vectors from every shard (the gather / all-to-all) and pushes gradients back (the scatter). That all-to-all traffic — not the matmuls — is the bottleneck of training a recommender at scale, and it forces the next decision.</p>
+
+<h2>Two ways to do distributed training</h2>
+
+<p>The dense model is small and identical everywhere; the embedding table is huge and split. Those two facts pull toward two different distributed-training patterns, and large recommenders use <em>both at once</em>.</p>
+
+<table>
+  <thead><tr><th></th><th>Parameter server (async)</th><th>All-reduce (sync)</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Picture</strong></td><td>Workers push / pull params to central server shards</td><td>Workers exchange gradients peer-to-peer in a ring</td></tr>
+    <tr><td><strong>Best for</strong></td><td>The huge sparse embedding table (TB, sharded by ID)</td><td>The small dense network (replicated on every worker)</td></tr>
+    <tr><td><strong>Comms cost</strong></td><td>Each worker touches only the shards holding <em>its</em> IDs — sparse, cheap</td><td>Every gradient summed across all workers — <span class="math">≈ 2(W−1)/W · model_bytes</span> per step</td></tr>
+    <tr><td><strong>Consistency</strong></td><td>Stale / async updates — tolerable for rows touched rarely</td><td>Exact, synchronous — required for shared dense weights</td></tr>
+    <tr><td><strong>Failure mode</strong></td><td>Server hot-spotting on popular IDs; staleness</td><td>One slow worker (straggler) stalls everyone</td></tr>
+  </tbody>
+</table>
+
+<p>The reason the split works: replicating a 1 TB table on every worker is impossible, but all-reduce on a 200 MB dense model is cheap. Conversely, routing every dense gradient through a central server makes the server a bottleneck, but the sparse table — where each example touches only a handful of a billion rows — is exactly what a parameter server was built for. <strong>Sparse → parameter server; dense → all-reduce.</strong> That hybrid is the standard industrial layout (TorchRec / HugeCTR for the tables, ring all-reduce for the MLP).</p>
+
+<p>The <span class="math">2(W−1)/W</span> factor is worth internalizing: ring all-reduce sends each shard of the gradient around the ring once to reduce it and once to broadcast the sum, so per-worker traffic is <span class="math">≈ 2 · model_bytes</span> regardless of how many workers <span class="math">W</span> you add. That is why all-reduce scales — comms are flat in <span class="math">W</span> — but only for a model small enough to replicate.</p>
+
+<div class="callout">
+  <div class="label">A worked communication estimate</div>
+  256 workers, dense model = 200 MB, fp16 gradients. Ring all-reduce moves <span class="math">≈ 2 · (255/256) · 200 MB ≈ 398 MB</span> per worker per step. On 50 GB/s inter-node InfiniBand that is <span class="math">≈ 8 ms</span> of pure comms — fine. Now imagine the table were dense and replicated: 1 TB × 2 ≈ 2 TB per worker per step ≈ <strong>40 seconds</strong> of comms per step. That five-thousand-fold gap is the entire argument for sharding the table instead of replicating it.
+</div>
+
+<h2>ANN at scale — because O(N·d) is a wall</h2>
+
+<p>Retrieval (the front of the funnel from <a href="03_embeddings_ann.html">03 · Embeddings &amp; ANN</a>) must turn a billion-item corpus into ~1,000 candidates in a few milliseconds. The honest way — dot-product the user vector against every item — is <strong>brute force</strong>, and its cost is unforgiving:</p>
+
+<p class="math block">brute force = N × d multiply-adds = 10⁹ × 128 ≈ 1.3 × 10¹¹ FLOPs / query</p>
+
+<p>At 100k QPS that is <span class="math">1.3 × 10¹⁶ FLOP/s</span> for retrieval <em>alone</em> — a wall of GPUs to answer the cheapest stage of the funnel. The escape is to give up exactness: <strong>Approximate Nearest Neighbor (ANN)</strong> returns <em>almost</em> the true top-K, trading a few percent of recall for two-to-three orders of magnitude of speed. Three families dominate, and they sit at different corners of the same triangle.</p>
+
+<table>
+  <thead><tr><th>Method</th><th>Idea</th><th>Query cost</th><th>Recall</th><th>Memory</th></tr></thead>
+  <tbody>
+    <tr><td><strong>IVF</strong> (inverted file)</td><td>K-means the corpus into ~<span class="math">√N</span> cells; scan only the <span class="math">nprobe</span> cells nearest the query</td><td><span class="math">O(√N · d)</span></td><td>tunable via <span class="math">nprobe</span></td><td>full vectors (high)</td></tr>
+    <tr><td><strong>PQ</strong> (product quantization)</td><td>Split each vector into <span class="math">m</span> sub-vectors; replace each with a 1-byte codebook index</td><td>cheap table-lookup distances</td><td>lossy (compression noise)</td><td><strong>tiny</strong> (see below)</td></tr>
+    <tr><td><strong>HNSW</strong> (graph)</td><td>A navigable small-world graph; greedily hop toward the query through layers</td><td><span class="math">O(log N · d)</span></td><td>very high</td><td>vectors + graph edges (highest)</td></tr>
+  </tbody>
+</table>
+
+<p>In practice they <em>compose</em>: <strong>IVF-PQ</strong> (cells to prune the search space, PQ to shrink the vectors) is the standard billion-scale recipe in FAISS; <strong>HNSW</strong> is the latency champion when RAM is plentiful and is what GPU-accelerated libraries push under 10 ms on a billion items.</p>
+
+<div class="callout warn">
+  <div class="label">The recall–latency–memory triangle</div>
+  You cannot have all three. <strong>HNSW</strong> buys recall and latency by spending memory (it stores a whole graph on top of the vectors). <strong>PQ</strong> buys memory and latency by spending recall (the codebook is lossy). <strong>IVF</strong>'s <span class="math">nprobe</span> is the dial that trades recall for latency directly. Every retrieval design is a point inside this triangle, and "improve the system" almost always means "move along one edge at the cost of another." The trap: over-tuning for speed silently drops recall on long-tail items — and the candidates that vanish are exactly the ones the funnel was supposed to surface.
+</div>
+
+<h3>Product quantization — the compression that makes it fit</h3>
+
+<p>Even with IVF pruning the search, you still have to <em>store</em> a billion vectors. A billion 128-dim fp32 vectors is <span class="math">10⁹ × 128 × 4 = 512 GB</span> — too big for one machine's RAM, let alone a GPU. PQ shrinks it. Split each 128-dim vector into <span class="math">m = 16</span> sub-vectors of 8 dims; cluster each sub-space into 256 centroids; store only the 1-byte <em>index</em> of the nearest centroid per sub-vector:</p>
+
+<p class="math block">512 bytes/vec → 16 bytes/vec ⇒ 32× compression | 512 GB → 16 GB (now fits on one GPU)</p>
+
+<p>The compression ratio is <span class="math">(d × 4) / m</span> bytes — choose <span class="math">m</span> and the codebook size to slide between memory and recall. Distances are computed against the codebook by table lookup, so PQ is fast <em>and</em> small. The price is reconstruction error — you compare against the centroid, not the original vector — which shaves a few points of recall. At a billion items, that deal is almost always worth taking.</p>
+
+<h2>Interactive · ANN recall vs latency vs RAM</h2>
+
+<p>Watch the per-query cost — and the GPU count needed to hold the QPS — collapse as you move from an exact scan to a graph index. Then watch recall and memory pay for it. The numbers are order-of-magnitude, not literal.</p>
+
+<div class="widget" id="ann-widget">
+  <div class="title">Retrieval: brute force vs ANN</div>
+  <div class="hint">Brute force is exact and unaffordable. Each ANN method relaxes a different corner of the triangle — read the diagnosis, not just the speedup.</div>
+
+  <div class="controls">
+    <label class="inline">corpus N (millions) <input id="a-N" type="range" min="1" max="2000" step="1" value="1000"><span class="val" id="a-N-v">1000</span></label>
+    <label class="inline">dim d <input id="a-d" type="range" min="32" max="512" step="16" value="128"><span class="val" id="a-d-v">128</span></label>
+    <label class="inline">QPS (thousands) <input id="a-q" type="range" min="1" max="200" step="1" value="100"><span class="val" id="a-q-v">100</span></label>
+    <label class="inline">method
+      <select id="a-m">
+        <option value="brute">brute force (exact)</option>
+        <option value="ivf">IVF (√N cells)</option>
+        <option value="ivfpq">IVF-PQ (compressed)</option>
+        <option value="hnsw" selected>HNSW (graph)</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">FLOPs / query</div><div class="v" id="a-fpq">—</div></div>
+    <div class="kpi"><div class="k">vs brute force</div><div class="v" id="a-speed">—</div></div>
+    <div class="kpi"><div class="k">index RAM</div><div class="v" id="a-ram">—</div></div>
+    <div class="kpi"><div class="k">GPUs for this QPS</div><div class="v" id="a-gpu">—</div></div>
+  </div>
+
+  <div class="callout" id="ann-explainer">
+    <div class="label" id="ann-label">Reading</div>
+    <div id="ann-text">—</div>
+  </div>
+</div>
+
+<h2>Compressing the ranking model for serving</h2>
+
+<p>Retrieval solved, the ranker (from <a href="04_ranking_models.html">04 · Ranking models</a>) now scores ~1,000 candidates per request under the latency SLO. A heavy DLRM / DCN-v2 with cross layers and attention towers is too slow to run a thousand times per query at 100k QPS. Three compression levers, each with a different accuracy bill:</p>
+
+<table>
+  <thead><tr><th>Technique</th><th>What it does</th><th>Win</th><th>Accuracy cost</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Quantization</strong></td><td>fp32 → fp16 → int8 weights &amp; activations</td><td>2–4× smaller &amp; faster; int8 uses fast integer units</td><td>tiny (fp16 ~free; int8 needs calibration)</td></tr>
+    <tr><td><strong>Distillation</strong></td><td>Train a small <em>student</em> to mimic a big <em>teacher</em>'s soft scores</td><td>10–100× fewer params, much faster</td><td>moderate — student trails teacher by a small gap</td></tr>
+    <tr><td><strong>Pruning</strong></td><td>Zero out low-importance weights / experts / heads</td><td>sparse, smaller; can drop whole sub-towers</td><td>low if gradual; needs sparse kernels to pay off</td></tr>
+  </tbody>
+</table>
+
+<p>They stack. A typical serving model is <em>distilled</em> from the offline teacher, then <em>quantized</em> to int8, then deployed with operator fusion (TensorRT). A reported real-world combination — int8 quantization plus a higher cache-hit rate — dropped ranking latency from ~120 ms to ~65 ms <em>with no measurable AUC loss</em>, which then lifts the business metric purely by serving more requests, faster.</p>
+
+<div class="callout">
+  <div class="label">Why distillation specifically fits recommenders</div>
+  The offline teacher can be enormous and slow — it only runs in training. Its job is to produce soft scores for billions of (user, item) pairs; the student learns to reproduce those scores at a fraction of the cost. You decouple <em>"how good can the model be"</em> (teacher) from <em>"how cheap must it be to serve"</em> (student). Quantization is the same trick in number-precision space: keep the learned function, spend fewer bits representing it.
+</div>
+
+<h2>Caching — the cheapest FLOP is the one you skip</h2>
+
+<p>Recommendation traffic is brutally skewed: a tiny fraction of users and items generate most requests. That skew is a gift — a small cache absorbs a large share of the work. Three layers worth caching:</p>
+
+<ul>
+  <li><strong>User-feature embeddings</strong> — a returning user's profile vector changes slowly; cache it (Redis + node-local) and skip the feature fetch.</li>
+  <li><strong>Item / ANN results</strong> — the candidate set for a popular query or trending item is the same for thousands of requests; cache the retrieval output.</li>
+  <li><strong>Full responses</strong> — for logged-out or near-duplicate contexts, cache the final ranked list with a short TTL.</li>
+</ul>
+
+<p>The arithmetic is Amdahl's law on cost: with hit-rate <span class="math">h</span> and a near-free hit, effective compute per query is <span class="math">(1 − h)</span> of the uncached cost. A 70% hit-rate on the heaviest stage cuts its bill by 70%. The tension: caching trades <strong>freshness</strong> for cost — too long a TTL and you serve stale recommendations into a fast-moving feed. The TTL is that dial.</p>
+
+<h2>The $/query bound that closes the loop</h2>
+
+<p>Everything above serves one number the business actually feels: <strong>cost per query</strong>. It is the funnel turned into a bill — sum the compute of each stage, divide by what a GPU-second buys:</p>
+
+<p class="math block">$/query = Σ_stage (FLOPs_stage / achieved_FLOP/s) × $/GPU-sec<br>GPUs = QPS × (compute/query) / (FLOP/s/GPU × utilization)</p>
+
+<p>This is why every optimization in this lesson exists, and each attacks a specific term in that sum:</p>
+
+<table>
+  <thead><tr><th>Lever</th><th>Term it shrinks</th><th>Typical factor</th></tr></thead>
+  <tbody>
+    <tr><td>Sharding</td><td>makes the table <em>fit</em> at all (memory)</td><td>system exists / doesn't</td></tr>
+    <tr><td>ANN vs brute force</td><td>retrieval's <span class="math">N·d</span></td><td>~100–1000×</td></tr>
+    <tr><td>PQ compression</td><td>index memory → fewer machines</td><td>~32×</td></tr>
+    <tr><td>Distillation + int8</td><td>ranking's compute / candidate</td><td>~10–100× × 2–4×</td></tr>
+    <tr><td>Caching</td><td>every stage, by hit-rate</td><td><span class="math">(1 − h)</span></td></tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <div class="label">GPU vs CPU serving — not automatic</div>
+  GPUs win when the work is a big, batchable matmul (dense ranking over many candidates, ANN on a billion vectors). CPUs win for small, latency-critical, branchy work and the long tail of cheap requests where a GPU sits idle waiting for a batch to fill. The right answer is usually <strong>heterogeneous</strong>: GPU for dense ranking and ANN, CPU for feature assembly, business rules, and the re-rank. "Use a GPU" is a costed design decision, not a default — the deciding question is arithmetic intensity: is this stage compute-bound enough to keep the matmul units busy?
+</div>
+
+<h2>Interview prompts you should be ready for</h2>
+
+<div class="callout">
+  <ol style="margin: 4px 0;">
+    <li>"Your model is 1 TB. Where does that come from, and how do you train it on a cluster of 80 GB GPUs?" <em>(table_bytes = cardinality × dim × bytes; it's the embedding table, not the MLP. Shard the table by ID across machines — embedding model-parallelism — all-to-all the looked-up rows, and data-parallel the small dense top with all-reduce.)</em></li>
+    <li>"Why a parameter server for the embeddings but all-reduce for the dense net?" <em>(Sparse table is too big to replicate and each example touches only a few rows → PS with cheap sharded access, staleness tolerable. Dense net is small, shared, needs exact sync → all-reduce, comms ≈ 2(W−1)/W · model_bytes, flat in W.)</em></li>
+    <li>"Estimate the comms per step for ring all-reduce on a 200 MB dense model across 256 workers." <em>(≈ 2 · (255/256) · 200 MB ≈ 398 MB per worker per step; at 50 GB/s that's ~8 ms. The point of the 2(W−1)/W factor: traffic is independent of W, which is why all-reduce scales.)</em></li>
+    <li>"Brute-force retrieval on 10⁹ items at dim 128 — why can't you ship it, and what do you ship instead?" <em>(N·d ≈ 1.3×10¹¹ FLOPs/query; × QPS = a GPU wall just for retrieval. Ship ANN — IVF-PQ or HNSW — trading a few % recall for 100–1000× speed.)</em></li>
+    <li>"Walk me through the recall–latency–memory triangle. Which method for which constraint?" <em>(HNSW: best recall+latency, costs RAM for the graph. PQ: best memory+latency, costs recall via lossy codebook. IVF nprobe: directly dials recall vs latency. Pick the corner your binding constraint allows; IVF-PQ composes two of them.)</em></li>
+    <li>"How does PQ get 32× compression, and what does it cost?" <em>(Split 128-dim vector into m=16 sub-vectors, store the 1-byte index of the nearest of 256 centroids each: 512 → 16 bytes. Cost is reconstruction error — you compare against centroids — losing a few points of recall.)</em></li>
+    <li>"Ranking is too slow at 1,000 candidates × 100k QPS. Three things you'd try, with the accuracy cost of each?" <em>(Quantize fp32→int8: 2–4× faster, tiny cost with calibration. Distill teacher→student: 10–100× fewer params, small gap. Prune weights/experts: smaller, low cost if gradual but needs sparse kernels. They stack: distill, then int8, then fuse.)</em></li>
+    <li>"You add a 60% cache hit-rate to the heaviest stage. What happens to its cost, and what's the risk?" <em>((1 − h) = 40% of the original bill on that stage. Risk is staleness — TTL trades freshness for cost; too long and you serve stale lists into a fast-moving feed.)</em></li>
+  </ol>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Scale converts every earlier idea into one of three arithmetic budgets — memory (cardinality × dim × bytes), latency (candidates × work), cost (QPS × compute × $). The embedding table blows the memory budget, so you shard it and split training into parameter-server (sparse) + all-reduce (dense). Brute-force retrieval blows the latency budget, so you approximate with ANN and compress with PQ. The ranker blows the per-query cost budget, so you distill, quantize, and cache. The interview signal is the method, not the trivia: name the binding constraint, write its arithmetic, and relax exactly the term that's too big.
+</div>
+
+<footer class="lesson-nav">
+  <a href="18_deployment_serving.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">18 · Deployment &amp; serving</span>
+  </a>
+  <a class="next" href="20_fairness_diversity.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">20 · Fairness &amp; diversity</span>
+  </a>
+</footer>
+
+<script>
+(function(){
+  const ids=['N','d','q'];
+  const el=Object.fromEntries(ids.map(k=>[k,document.getElementById('a-'+k)]));
+  const sel=document.getElementById('a-m');
+
+  function fmt(x){
+    if(x>=1e15) return (x/1e15).toFixed(2)+'e15';
+    if(x>=1e12) return (x/1e12).toFixed(2)+'e12';
+    if(x>=1e9)  return (x/1e9).toFixed(2)+'e9';
+    if(x>=1e6)  return (x/1e6).toFixed(2)+'e6';
+    return x.toFixed(0);
+  }
+  function gib(bytes){
+    if(bytes>=1e12) return (bytes/1e12).toFixed(2)+' TB';
+    if(bytes>=1e9)  return (bytes/1e9).toFixed(0)+' GB';
+    return (bytes/1e6).toFixed(0)+' MB';
+  }
+
+  function update(){
+    ids.forEach(k=>document.getElementById('a-'+k+'-v').textContent=el[k].value);
+    const N=+el.N.value*1e6, d=+el.d.value, q=+el.q.value*1e3;
+    const brute=N*d;                       // FLOPs/query, exact scan
+    const fullRAM=N*d*4;                    // fp32 vectors
+    let fpq, ram, label, color;
+    const m=sel.value;
+
+    if(m==='brute'){
+      fpq=brute; ram=fullRAM; color='var(--bad)';
+      label="Exact: every item scored against the user vector. Correct, and unaffordable — N·d FLOPs per query, multiplied by QPS, is a wall of GPUs for the cheapest stage of the funnel.";
+    } else if(m==='ivf'){
+      const cells=Math.sqrt(N), nprobe=8;
+      fpq=(cells + nprobe*(N/cells))*d; ram=fullRAM; color='var(--warn)';
+      label="IVF scans √N cell centroids plus a few (nprobe) cells. Big FLOP cut, but it still stores full fp32 vectors — memory is unchanged. Push nprobe up for recall, down for speed.";
+    } else if(m==='ivfpq'){
+      const cells=Math.sqrt(N), nprobe=8;
+      fpq=(cells + nprobe*(N/cells))*d; ram=N*16; color='var(--accent)';
+      label="IVF-PQ: same cell pruning, but each vector is 16 bytes of codebook indices instead of d×4 bytes — ~32× less RAM, so the billion-scale index fits on far fewer machines. The cost is reconstruction error, a few points of recall.";
+    } else {
+      fpq=Math.log2(N)*d*40; ram=fullRAM*1.5; color='var(--ok)';
+      label="HNSW hops through a navigable graph in ~log N steps — fastest and highest recall — but it stores the graph edges on top of the full vectors, so it is the hungriest on RAM. Great when memory is plentiful.";
+    }
+
+    const speed=brute/fpq;
+    // GPU sizing: assume ~30 TFLOP/s effective per GPU at 50% util.
+    const perGpu=30e12*0.5;
+    const gpus=(fpq*q)/perGpu;
+
+    document.getElementById('a-fpq').textContent=fmt(fpq);
+    document.getElementById('a-speed').textContent= m==='brute' ? '1×' : speed.toFixed(0)+'×';
+    document.getElementById('a-ram').textContent=gib(ram);
+    document.getElementById('a-gpu').textContent= gpus>=1 ? Math.ceil(gpus).toLocaleString() : '<1';
+
+    const box=document.getElementById('ann-explainer');
+    box.style.borderLeftColor=color;
+    document.getElementById('ann-label').textContent=
+      m==='brute' ? 'Exact — the wall' :
+      m==='ivf'   ? 'IVF — FLOPs down, memory unchanged' :
+      m==='ivfpq' ? 'IVF-PQ — the billion-scale recipe' :
+                    'HNSW — latency champion, RAM-hungry';
+    document.getElementById('ann-text').innerHTML=label;
+  }
+
+  Object.values(el).forEach(x=>x.addEventListener('input',update));
+  sel.addEventListener('change',update);
+  update();
+})();
+</script>
+
+</main>
+</body>
+</html>
