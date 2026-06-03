@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>03a · Estimating latency</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">ml_system_design</a>
+    <span class="crumb">/</span>
+    <span class="crumb">03a · estimating latency</span>
+    <span class="step-pill">lesson 3a / 20</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Estimating latency — TTFT and TPOT in milliseconds</h1>
+<p class="subtitle">Lesson 03 <em>named</em> the latency metrics and used them as SLO targets. It never told you how to predict them. This lesson does: given a model, a GPU, and a prompt, you compute TTFT and TPOT in milliseconds — before you write a line of serving code — using nothing but lesson 02's FLOPs, bytes, and the roofline. Two phases, two formulas. That's the whole lesson.</p>
+
+<div class="callout">
+  <div class="label">The one idea</div>
+  Latency is just <strong>work ÷ rate</strong>. Prefill is compute-work limited by the FLOP/s roof, so <span class="math">TTFT = compute_work / compute_rate</span>. Decode is memory-traffic limited by the bandwidth roof, so <span class="math">TPOT = bytes_moved / bandwidth</span>. The roofline from lesson 02 told you <em>which</em> roof binds each phase; here we divide by that roof to get time. Everything below is filling in the two numerators.
+</div>
+
+<h2>1 · Why two formulas, not one</h2>
+
+<p>Lesson 01 split a request into prefill then decode; lesson 02's roofline told you they live on opposite sides of the arithmetic-intensity ridge (~295 FLOP/byte on an H100). That split is the reason a single "latency" number is meaningless for an LLM — the two phases are limited by two different pieces of hardware:</p>
+
+<table>
+  <thead><tr><th>Phase</th><th>Work it does</th><th>Roof that binds</th><th>Latency it sets</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Prefill</strong></td><td>one big matmul over <em>all</em> prompt tokens at once → high arithmetic intensity</td><td>compute (FLOP/s)</td><td><strong>TTFT</strong> — time to first token</td></tr>
+    <tr><td><strong>Decode</strong></td><td>one tiny matmul per step (one token), re-reading every weight → low arithmetic intensity</td><td>memory bandwidth (B/s)</td><td><strong>TPOT</strong> — time per output token</td></tr>
+  </tbody>
+</table>
+
+<p>So we estimate them with two different rates. Get this table into your bones and the arithmetic writes itself.</p>
+
+<h2>2 · TTFT — the compute-bound estimate</h2>
+
+<p>Prefill pushes the whole prompt through one forward pass. From lesson 02, a forward pass costs <span class="math">2N</span> FLOPs per token, so a prompt of <span class="math">P</span> tokens costs <span class="math">2 · N · P</span> FLOPs. Divide by the rate the GPU <em>actually</em> achieves — peak FLOP/s scaled by MFU (you never get peak; lesson 02):</p>
+
+<div class="math block">
+TTFT_compute ≈ (2 · N · P) / (peak_FLOPs · MFU)
+</div>
+
+<div class="callout ok">
+  <div class="label">Worked: Llama-3-8B, 2,000-token prompt, one H100</div>
+  Work: <span class="math">2 · 8e9 · 2000 = 3.2e13 FLOPs</span>. Rate at 50% MFU: <span class="math">990e12 · 0.5 = 4.95e14 FLOP/s</span>. <br>
+  <span class="math">TTFT ≈ 3.2e13 / 4.95e14 ≈ 0.065 s = 65 ms</span>. A snappy "it heard me." Double the prompt to 4K → ~130 ms; the relationship is <strong>linear in prompt length</strong>, which is why TTFT is a <em>prefill</em> problem and why prefix caching (lesson 06) — which lets you skip prompt tokens you've already processed — is the highest-leverage TTFT optimization.
+</div>
+
+<p>Two corrections keep this honest, both deferred to later lessons but flagged now so you know the formula's edges:</p>
+<ul>
+  <li><strong>Queueing delay.</strong> The formula is the <em>service</em> time. Real TTFT = <span class="math">queue_wait + TTFT_compute</span>. Under load the queue wait dominates the tail — it's why p99 TTFT &gt;&gt; p50, and why admission control (lesson 04) and chunked prefill (lesson 06) exist.</li>
+  <li><strong>The seq² term.</strong> Attention adds an <span class="math">O(P²)</span> cost the <span class="math">2N·P</span> rule ignores. Negligible below a few thousand tokens; at 100K+ it dominates and prefill goes quadratic — the entire subject of <a href="17_case_long_context.html">lesson 17</a>.</li>
+</ul>
+
+<h2>3 · TPOT — the bandwidth-bound estimate</h2>
+
+<p>This is the one people get wrong, so we build it slowly. Each decode step produces <em>one</em> token per request but must read <strong>every weight</strong> out of HBM to do it. The step's latency is the time to move its bytes across memory bandwidth:</p>
+
+<div class="math block">
+TPOT ≈ bytes_read_per_step / (peak_bandwidth · MBU)
+</div>
+
+<p>What gets read per step, for a running batch of <span class="math">B</span> requests each holding a context of <span class="math">L</span> tokens?</p>
+
+<table>
+  <thead><tr><th>What's read</th><th>Bytes</th><th>Scales with</th></tr></thead>
+  <tbody>
+    <tr><td>Model weights (once, shared by the whole batch)</td><td><span class="math">2N</span> bytes (fp16) — 2 B/param, not §2's 2N <em>FLOPs</em></td><td>model size only</td></tr>
+    <tr><td>KV cache (every token of every request in the batch)</td><td><span class="math">B · L · kv_bytes_per_token</span></td><td>batch × context</td></tr>
+  </tbody>
+</table>
+
+<div class="math block">
+TPOT ≈ (2N + B · L · kv_per_tok) / (BW · MBU)
+</div>
+
+<p>MBU is "memory-bandwidth utilization," the bandwidth analogue of MFU — typically 0.6–0.8 on a well-tuned decode kernel. The leading <span class="math">2N</span> is read <em>once per step regardless of batch size</em> — that is the whole reason batching is nearly free for decode, the engine of lesson 03's throughput story (and lesson 03b's).</p>
+
+<div class="callout ok">
+  <div class="label">Worked: single-stream decode, Llama-3-8B on an H100</div>
+  At <span class="math">B = 1</span> the KV term is tiny, so weights dominate: bytes ≈ <span class="math">2N = 16e9</span>. At BW 3.35 TB/s and MBU 0.7: <span class="math">TPOT ≈ 16e9 / (3.35e12 · 0.7) ≈ 6.8 ms → ~147 tokens/s</span> for one stream. That matches what an 8B model actually does on an H100. Notice the model didn't even need its KV cache to set this number — <strong>at small batch, TPOT is just "how long to read the weights once."</strong>
+</div>
+
+<h2>4 · The two decode regimes — the flip that matters</h2>
+
+<p>The <span class="math">TPOT = (2N + B·L·kv\_per\_tok)/(BW·MBU)</span> formula has two regimes, and knowing which you're in <em>is</em> the design insight:</p>
+
+<ul>
+  <li><strong>Weight-bound (small batch):</strong> the <span class="math">2N</span> term dominates. TPOT is roughly <em>constant</em> as you add requests — you're re-reading the same weights and serving more tokens with them. This is the free-throughput zone.</li>
+  <li><strong>KV-bound (large batch / long context):</strong> the <span class="math">B·L·kv</span> term dominates. Now every added request adds real bytes, so TPOT climbs <em>linearly</em> with batch. Throughput stops being free; latency degrades for everyone.</li>
+</ul>
+
+<p>The crossover — where the KV traffic equals the weight traffic — is a number you can compute:</p>
+
+<div class="math block">
+B* = 2N / (L · kv_per_tok)
+</div>
+
+<div class="callout">
+  <div class="label">Worked: where 8B flips, at 2K context</div>
+  <span class="math">kv_per_tok</span> for Llama-3-8B is 128 KB (lesson 02/04). So <span class="math">B* = 16e9 / (2000 · 131072) ≈ 61</span>. Below ~61 concurrent requests, adding load barely moves TPOT (weight-bound — batch for free). Above it, each request measurably slows the stream (KV-bound). <strong>That single number tells you how much headroom you have before latency starts fighting back</strong> — and it drops as context <span class="math">L</span> grows, which is why long-context serving turns latency-hostile fast.
+</div>
+
+<svg viewBox="0 0 720 250" class="diagram" role="img" aria-label="TPOT versus batch size, showing weight-bound and KV-bound regimes">
+  <line x1="64" y1="200" x2="690" y2="200" class="edge" stroke="var(--text-dim)"/>
+  <line x1="64" y1="200" x2="64" y2="24" class="edge" stroke="var(--text-dim)"/>
+  <text x="380" y="232" text-anchor="middle" font-size="12" fill="var(--text-mute)">running batch B →</text>
+  <text x="20" y="115" font-size="12" fill="var(--text-mute)" transform="rotate(-90 20 115)">TPOT (ms) →</text>
+  <!-- flat-ish then rising curve -->
+  <path d="M70 176 L150 174 L240 170 L330 162 C 420 150, 520 116, 660 44" stroke="var(--accent)" stroke-width="2.5" fill="none"/>
+  <!-- crossover marker -->
+  <line x1="330" y1="200" x2="330" y2="40" stroke="var(--text-dim)" stroke-dasharray="4 4"/>
+  <circle cx="330" cy="162" r="5" fill="var(--accent-2)"/>
+  <text x="330" y="32" text-anchor="middle" font-size="11" fill="var(--accent-2)">B* — weights = KV traffic</text>
+  <text x="180" y="150" text-anchor="middle" font-size="11.5" fill="var(--text-mute)">weight-bound:</text>
+  <text x="180" y="166" text-anchor="middle" font-size="11.5" fill="var(--text-mute)">TPOT ≈ flat (batch is free)</text>
+  <text x="540" y="96" text-anchor="middle" font-size="11.5" fill="var(--text-mute)">KV-bound:</text>
+  <text x="540" y="112" text-anchor="middle" font-size="11.5" fill="var(--text-mute)">TPOT rises with B</text>
+</svg>
+
+<h2>5 · End-to-end latency</h2>
+
+<p>For a request that emits <span class="math">G</span> output tokens, stitch the two phases together — one prefill, then <span class="math">G−1</span> more decode steps after the first token:</p>
+
+<div class="math block">
+E2E ≈ TTFT + TPOT · (G − 1)
+</div>
+
+<p>The mix tells you which phase to optimize. A code-completion request (big prompt, ~10 output tokens) is <strong>TTFT-dominated</strong> — work the prefill side (<a href="13_case_code_assistant.html">lesson 13</a>). A reasoning request (short prompt, 5,000 thinking tokens) is utterly <strong>TPOT-dominated</strong>: at 7 ms/token that's 35 seconds of decode, and shaving TPOT is the only thing that matters. <em>Same model, opposite optimization targets</em> — and you can tell which before building anything, just by plugging the output length into this line.</p>
+
+<div class="callout warn">
+  <div class="label">The estimate is a floor, not a promise</div>
+  These formulas give the <strong>best case on an unloaded replica</strong>: no queueing, no prefill–decode interference, perfect MBU. Real p99 sits above them because of the queue (§2) and because a long prefill freezes everyone's decode (lesson 04's contention). Use the estimate to (a) sanity-check whether an SLO is even physically achievable, and (b) locate the binding phase. For the tail, you measure. A design that fails the napkin estimate will <em>never</em> pass in production — that's the estimate's real job.
+</div>
+
+<h2>6 · Batch / offline latency — makespan, not per-token</h2>
+
+<p>Everything above assumed a human waiting on a stream. Flip to an <strong>offline batch job</strong> — embed a 10M-document corpus, translate a dataset overnight, score every row in a warehouse table — and the latency metric changes entirely. No one watches any single response, so TTFT and TPOT stop mattering on their own. What matters is <strong>makespan</strong>: the wall-clock to drain the <em>whole</em> job.</p>
+
+<p>Makespan is just throughput wearing a clock. Run the job as back-to-back waves of <span class="math">B</span> requests:</p>
+
+<div class="math block">
+makespan ≈ ⌈N_req / B⌉ · (TTFT + TPOT·(G−1))   ≈   total_tokens / aggregate_throughput
+</div>
+
+<p>The two forms agree whenever decode dominates the wave (the per-wave TTFT is a rounding error) — and that agreement <em>is</em> the lesson: <strong>for batch work, minimizing latency means maximizing throughput</strong> (lesson 03b), the exact opposite of the online knee. You'd gladly make any single request slower if a fuller batch drained the queue sooner.</p>
+
+<div class="callout ok">
+  <div class="label">Worked: generate 100k responses offline</div>
+  100,000 requests × 500 output tokens = <span class="math">5·10⁷</span> tokens. With no SLO, push the batch to the lesson-04 memory limit (~256 on our 8B replica) and ride near the decode ceiling — <strong>~7,200 tok/s</strong>, comfortably above the online knee's ~6,300 (03b §3). <span class="math">makespan ≈ 5e7 / 7,200 ≈ 6,900 s ≈ 1.9 h</span>. Cross-check the wave form: <span class="math">⌈100000/256⌉ = 391</span> waves × (TTFT + 499·TPOT) at ~35 ms TPOT ≈ <span class="math">391 · 17.7 s ≈ 6,900 s</span> — the same number (the per-wave TTFT is a rounding error at this output length). Want it faster? <em>Raise the throughput</em> — bigger batch, fp8 KV, more GPUs — never "lower the latency."
+</div>
+
+<div class="callout warn">
+  <div class="label">The straggler tax — and why offline jobs sort</div>
+  Under <em>static</em> batching a wave can't return until its <em>longest</em> member finishes (lesson 04). Drop one 2,000-token output into a wave of 50-token ones and all the slots pay for 2,000 — makespan balloons. Offline, the fix is free because every request is in hand up front: <strong>sort or bucket by expected length</strong> so each wave is uniform. (Continuous batching removes most of the tax automatically; bucketing mops up the rest.) Pure <em>embedding</em> jobs dodge decode entirely — one forward pass per input, no token loop — so their makespan is set by <em>prefill</em> throughput, computed in <a href="03b_estimating_throughput.html">03b</a> (at corpus scale the bottleneck then moves <em>off</em> the GPU to index build — the subject of <a href="18_case_batch_inference.html">lesson 18</a>).
+</div>
+
+<h2>Interactive · latency calculator</h2>
+
+<p>Pick a model, GPU, prompt, batch, and output length. The widget runs §2–§5 and shows TTFT, TPOT, and E2E — plus which decode regime you're in and how each step's bytes split between weights and KV. Find the batch where the bar flips from blue (weight-bound) to amber (KV-bound): that's <span class="math">B*</span> (reported live in the note), and it's where your latency stops being free. Drag the prompt short and <span class="math">B*</span> shoots past the slider — that <em>is</em> the lesson: short contexts stay weight-bound, so batching never costs you latency. The <em>job-size</em> knob turns the same per-request numbers into an offline <strong>makespan</strong> (§6): raise the batch and watch a 100k-request job's wall-clock collapse — the batch latency you cut by maximizing throughput.</p>
+
+<div class="widget"><div class="title">TTFT / TPOT / E2E estimator</div>
+<p class="hint">Assumptions, stated honestly (lesson 02 precision, ±30%): weights fp16 = <span class="math">2N</span>; KV/token interpolated between lesson 02's anchors (<strong>128 KB at 8B → 320 KB at 70B</strong>); context <span class="math">L</span> = prompt + half the output (a mid-decode average — so the <span class="math">B*</span> shown below differs slightly from §4's <span class="math">L</span> = 2000 box); seq² prefill term ignored; no queueing. It's a floor.</p>
+<div class="controls">
+<label class="inline">GPU <select id="l-gpu">
+  <option value="990,3.35">H100 (990T, 3.35TB/s)</option>
+  <option value="312,2.0">A100 (312T, 2.0TB/s)</option>
+  <option value="990,4.8">H200 (990T, 4.8TB/s)</option>
+  <option value="2250,8.0">B200 (2250T, 8.0TB/s)</option>
+</select></label>
+<label class="inline">params N (B) <input id="l-N" type="range" min="1" max="70" step="1" value="8"><span class="val" id="l-N-v">8</span></label>
+<label class="inline">prompt P (tok) <input id="l-P" type="range" min="128" max="32768" step="128" value="2048"><span class="val" id="l-P-v">2048</span></label>
+<label class="inline">output G (tok) <input id="l-G" type="range" min="1" max="8000" step="1" value="300"><span class="val" id="l-G-v">300</span></label>
+<label class="inline">batch B <input id="l-B" type="range" min="1" max="256" step="1" value="1"><span class="val" id="l-B-v">1</span></label>
+<label class="inline">MFU % <input id="l-mfu" type="range" min="20" max="70" step="1" value="50"><span class="val" id="l-mfu-v">50</span></label>
+<label class="inline">MBU % <input id="l-mbu" type="range" min="40" max="90" step="1" value="70"><span class="val" id="l-mbu-v">70</span></label>
+<label class="inline">job size (reqs) <input id="l-job" type="range" min="1000" max="1000000" step="1000" value="100000"><span class="val" id="l-job-v">100000</span></label>
+</div>
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">TTFT (prefill)</div><div class="v" id="l-ttft">–</div></div>
+  <div class="kpi"><div class="k">TPOT (per token)</div><div class="v" id="l-tpot">–</div></div>
+  <div class="kpi"><div class="k">single-stream tok/s</div><div class="v" id="l-toks">–</div></div>
+  <div class="kpi"><div class="k">E2E latency · online</div><div class="v" id="l-e2e">–</div></div>
+  <div class="kpi"><div class="k">makespan · offline job</div><div class="v" id="l-mk">–</div></div>
+</div>
+<p class="hint" style="margin:14px 0 4px">decode step: bytes read = weights (blue) + KV (amber)</p>
+<div class="bar" style="height:20px"><div class="fill" id="l-barw" style="width:50%"></div></div>
+<div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:11px;color:var(--text-mute);margin-top:4px">
+  <span id="l-lblw">weights –</span><span id="l-lblk">KV –</span>
+</div>
+<p class="hint" style="margin:16px 0 4px">E2E split: prefill TTFT (green) vs decode TPOT·(G−1) (track) — drag output G and watch which phase owns the wait</p>
+<div class="bar" style="height:20px;background:#dbeafe"><div class="fill pos" id="l-bare" style="width:50%"></div></div>
+<div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:11px;color:var(--text-mute);margin-top:4px">
+  <span id="l-lblp">prefill –</span><span id="l-lbld">decode –</span>
+</div>
+<p class="hint" id="l-note" style="margin-top:12px"></p></div>
+
+<h2>What carries forward</h2>
+<ul>
+  <li><strong>Latency = work ÷ rate, once per phase.</strong> <span class="math">TTFT = 2NP / (peak·MFU)</span> (compute-bound); <span class="math">TPOT = (2N + B·L·kv) / (BW·MBU)</span> (bandwidth-bound).</li>
+  <li><strong>At small batch, TPOT ≈ 2N/BW</strong> — just the cost of reading the weights once. This is why decode batching is nearly free until <span class="math">B* = 2N/(L·kv\_per\_tok)</span>.</li>
+  <li><strong>Cross <span class="math">B*</span> and TPOT climbs linearly</strong> — latency stops being free, and longer contexts push <span class="math">B*</span> down.</li>
+  <li><strong><span class="math">E2E = TTFT + TPOT·(G−1)</span> tells you which phase to optimize</strong> from the output length alone.</li>
+  <li><strong>The estimate is a floor</strong> — add queueing and contention for the real tail. But an SLO that fails the floor is physically impossible; that check alone is worth the arithmetic.</li>
+  <li><strong>Offline/batch latency is makespan</strong> = <span class="math">⌈N/B⌉·E2E ≈ total_tokens/throughput</span> — so batch jobs are optimized by <em>maximizing throughput</em> (03b), and sorted by length to kill the straggler tax.</li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="03_slos_workload.html"><span class="dir">Previous</span><span class="ttl">03 · SLOs &amp; workload</span></a>
+  <a class="next" href="03b_estimating_throughput.html"><span class="dir">Next</span><span class="ttl">03b · Estimating throughput</span></a>
+</footer>
+
+<script>
+(function(){
+  const ids=['N','P','G','B','mfu','mbu','job'];
+  const el=Object.fromEntries(ids.map(k=>[k,document.getElementById('l-'+k)]));
+  const gpu=document.getElementById('l-gpu');
+  function fmtMs(ms){ return ms>=1000 ? (ms/1000).toFixed(1)+' s' : ms.toFixed(ms<10?1:0)+' ms'; }
+  function fmtDur(ms){ const s=ms/1000; if(s<90) return s.toFixed(s<10?1:0)+' s'; const m=s/60; if(m<90) return m.toFixed(0)+' min'; const h=m/60; return h.toFixed(h<10?1:0)+' h'; }
+  function draw(){
+    ids.forEach(k=>document.getElementById('l-'+k+'-v').textContent=el[k].value);
+    document.getElementById('l-job-v').textContent=(+el.job.value>=1000?(+el.job.value/1000)+'k':el.job.value);
+    const [peakT,bwT]=gpu.value.split(',').map(Number);
+    const peak=peakT*1e12, BW=bwT*1e12;
+    const N=+el.N.value*1e9, P=+el.P.value, G=+el.G.value, B=+el.B.value;
+    const mfu=+el.mfu.value/100, mbu=+el.mbu.value/100;
+    const kvPerTok=131072 + 196608*(N/1e9-8)/62; // KV/token, anchored to lesson 02: 128KB@8B → 320KB@70B
+    const L=P + G/2;                            // mid-decode average context
+    // TTFT (compute-bound), one prefill of P tokens
+    const ttft=(2*N*P)/(peak*mfu)*1000;         // ms
+    // TPOT (bandwidth-bound): weights once + KV for whole batch
+    const wBytes=2*N, kvBytes=B*L*kvPerTok;
+    const tpot=((wBytes+kvBytes)/(BW*mbu))*1000; // ms
+    const toks=1000/tpot;                        // per-stream tok/s
+    const e2e=ttft+tpot*(G-1);
+    document.getElementById('l-ttft').textContent=fmtMs(ttft);
+    document.getElementById('l-tpot').textContent=tpot.toFixed(tpot<10?2:1)+' ms';
+    document.getElementById('l-toks').textContent=toks.toFixed(0)+' tok/s';
+    document.getElementById('l-e2e').textContent=fmtMs(e2e);
+    // batch / offline makespan: ⌈N_req/B⌉ back-to-back waves, each ≈ one E2E (static-wave upper bound)
+    const job=+el.job.value, waves=Math.ceil(job/B), makespan=waves*e2e;
+    document.getElementById('l-mk').textContent=fmtDur(makespan);
+    // weight vs KV split bar
+    const wFrac=wBytes/(wBytes+kvBytes);
+    const bar=document.getElementById('l-barw');
+    bar.style.width=(wFrac*100).toFixed(1)+'%';
+    bar.classList.toggle('neg', wFrac<0.5);     // amber-ish 'neg' = KV-dominated overall
+    document.getElementById('l-lblw').textContent='weights '+(wBytes/1e9).toFixed(1)+' GB ('+(wFrac*100).toFixed(0)+'%)';
+    document.getElementById('l-lblk').textContent='KV '+(kvBytes/1e9).toFixed(2)+' GB ('+((1-wFrac)*100).toFixed(0)+'%)';
+    // E2E split: prefill (TTFT) vs decode (TPOT·(G−1))
+    const decodeMs=tpot*(G-1), pFrac=ttft/(ttft+decodeMs||1);
+    const bare=document.getElementById('l-bare');
+    bare.style.width=(pFrac*100).toFixed(1)+'%';
+    document.getElementById('l-lblp').textContent='prefill '+fmtMs(ttft)+' ('+(pFrac*100).toFixed(0)+'%)';
+    document.getElementById('l-lbld').textContent='decode '+fmtMs(decodeMs)+' ('+((1-pFrac)*100).toFixed(0)+'%)';
+    // regime + B*
+    const Bstar=(2*N)/(L*kvPerTok);
+    const note=document.getElementById('l-note');
+    if(B<Bstar){
+      note.textContent='Weight-bound (B='+B+' < B*≈'+Bstar.toFixed(0)+'): TPOT is dominated by the one-time weight read, so adding requests is nearly free latency — keep batching. E2E here is '+(G*tpot>1000?'TPOT-dominated ('+(tpot*(G-1)/1000).toFixed(1)+'s of decode)':'TTFT-dominated ('+ttft.toFixed(0)+'ms prefill)')+'.';
+    } else {
+      note.textContent='KV-bound (B='+B+' ≥ B*≈'+Bstar.toFixed(0)+'): KV traffic now exceeds the weight read, so every added request lifts TPOT for the whole batch. Online, you are buying throughput with latency — stop at the SLO knee (03b). Offline (no SLO), keep going: the makespan KPI keeps dropping until the lesson-04 memory limit.';
+    }
+  }
+  [...Object.values(el),gpu].forEach(x=>x.addEventListener('input',draw));
+  draw();
+})();
+</script>
+
+</main>
+</body>
+</html>

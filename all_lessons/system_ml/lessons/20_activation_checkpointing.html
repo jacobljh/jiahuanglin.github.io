@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>20 · Activation checkpointing &amp; recomputation</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">20 · Activation checkpointing</span>
+    <span class="step-pill">lesson 20 / 23</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Activation checkpointing &amp; recomputation</h1>
+<p class="subtitle">The third memory-saving axis. FSDP shards the <em>weights</em>; this shards the <em>activations</em> — not across ranks, but across <em>time</em>. Throw most of them away on the forward pass and pay to recompute them on the backward. A constant-factor compute tax buys a <span class="math">√L</span> reduction in activation memory.</p>
+
+<h2>The fourth thing in HBM</h2>
+
+<p>Lesson 01 counted three consumers of HBM: parameters, gradients, optimizer state. There is a fourth, and at long sequence lengths it is the largest of all — the <strong>activations</strong>. Every operation in the forward pass produces a tensor that the backward pass needs in order to apply the chain rule. The matmul <span class="math">Y = XW</span> needs <span class="math">X</span> to compute <span class="math">∂L/∂W = Xᵀ · ∂L/∂Y</span>. So <span class="math">X</span> cannot be freed when forward finishes with it — it has to <em>survive</em> until backward reaches that layer.</p>
+
+<p>For a transformer the per-layer activation memory scales as <span class="math">b · s · h</span> (batch × sequence × hidden), times a constant for the handful of tensors saved inside each block (the attention scores are <span class="math">b · s · s</span> — quadratic in sequence). Multiply by the number of layers <span class="math">L</span> and you get the total:</p>
+
+<p class="math block">M_act  ≈  L · b · s · (c₁·h + c₂·s)</p>
+
+<p>The thing to notice: parameters, gradients and optimizer state do <em>not</em> depend on batch or sequence. Activations depend on both. Double the context and the weights cost the same while the activations double (and the attention term quadruples). This is why a model that "fits" at 2k context OOMs at 32k — nothing about the weights changed; the activation pile grew.</p>
+
+<div class="callout">
+  <div class="label">The orthogonal-axes picture</div>
+  FSDP / ZeRO (lesson 05) attacks <strong>parameters + gradients + optimizer state</strong> by sharding them across ranks. Activation checkpointing attacks <strong>activations</strong> by not keeping them. They are independent knobs — production training of any large model turns <em>both</em>. FSDP can't help activations (they're not weights); checkpointing can't help weights (it recomputes activations, not parameters).
+</div>
+
+<h2>The idea, in one sentence</h2>
+
+<p>You do not have to <em>store</em> an activation to <em>have</em> it at backward time — you can <strong>recompute</strong> it by re-running the forward from the nearest thing you did keep. Storage and recomputation are interchangeable. So: keep a sparse set of activations (the <em>checkpoints</em>), discard everything between them, and when backward needs a discarded activation, regenerate it by replaying forward from the last checkpoint.</p>
+
+<p>The name "checkpoint" is overloaded in this series. Here it means an <em>activation</em> deliberately kept at a segment boundary so a forward replay has a starting point. Lesson 23's "checkpoint" is the whole-model snapshot written to disk. Same word, unrelated mechanisms.</p>
+
+<pre class="ascii">  WITHOUT checkpointing — store every layer's input, peak = L
+    fwd:  x0 ─▶[L0]─▶ x1 ─▶[L1]─▶ x2 ─▶[L2]─▶ x3 ─▶ ... ─▶ xL   (all xᵢ kept)
+    bwd:  every xᵢ already in HBM ────────────────────────────── no recompute
+
+  WITH checkpointing, segment size s=2 — keep only x0, x2, x4, ...
+    fwd:  x0 ▣ ─▶[L0]─▶(x1 freed)─▶[L1]─▶ x2 ▣ ─▶[L2]─▶(x3 freed)─▶[L3]─▶ x4 ▣
+    bwd:  reached L1, need x1 → REPLAY [L0] from x2's segment start → get x1 → backward
+          ▣ = activation kept (a "checkpoint")      (xᵢ freed) = discarded, will be recomputed</pre>
+
+<h2>The √L result — why segmenting wins</h2>
+
+<p>Let one layer's stored activation be one "unit". Divide the <span class="math">L</span> layers into segments of length <span class="math">s</span>, so there are <span class="math">L/s</span> segments. Two things sit in HBM at once during backward:</p>
+
+<ul>
+  <li><strong>The checkpoints</strong> — one kept activation per segment boundary: <span class="math">L/s</span> units, held for the whole backward.</li>
+  <li><strong>One segment's recompute</strong> — to backward through a segment you first replay its forward, which transiently materialises up to <span class="math">s</span> activations: <span class="math">s</span> units.</li>
+</ul>
+
+<p class="math block">M_peak(s)  =  L/s  +  s</p>
+
+<p>Minimise: <span class="math">dM/ds = −L/s² + 1 = 0 ⇒ s = √L</span>, giving <span class="math">M_peak = 2√L</span>. A 64-layer model drops from <span class="math">64</span> units of activation memory to <span class="math">2√64 = 16</span> — a 4× cut. A 1024-layer model drops 16×. The deeper the model, the bigger the win, because <span class="math">L/√L = √L</span> grows.</p>
+
+<p>And the compute cost? Every discarded activation is recomputed <em>exactly once</em>, during its segment's backward replay. That's one extra forward pass over the whole network, independent of <span class="math">s</span>. A training step is normally one forward + one backward, and backward costs ≈ 2× forward (it computes two gradients per op — w.r.t. input and w.r.t. weight). So a step is ≈ <span class="math">3F</span>; adding one recompute forward makes it <span class="math">4F</span> — a flat <strong>~33% compute tax</strong>, no matter how you choose <span class="math">s</span>.</p>
+
+<div class="callout ok">
+  <div class="label">The clean separation</div>
+  The segment size <span class="math">s</span> trades <em>memory against memory</em> (checkpoints vs recompute peak) and its optimum is <span class="math">√L</span>. The <em>decision to checkpoint at all</em> trades ~33% compute for the whole reduction. Two different knobs; don't conflate them.
+</div>
+
+<h2>Interactive · the memory curve and its √L minimum</h2>
+
+<p>Set the depth <span class="math">L</span> and slide the segment size <span class="math">s</span> from 1 (checkpoint every layer — minimal recompute peak, maximal checkpoint count) to <span class="math">L</span> (checkpoint nothing but the entrance — one giant recompute). The blue curve is peak activation memory <span class="math">L/s + s</span>; the dashed line is the no-checkpointing cost <span class="math">L</span>. Watch the curve bottom out at <span class="math">s = √L</span>.</p>
+
+<div class="widget" id="sl-widget">
+  <div class="title">Peak activation memory vs segment size · find the √L sweet spot</div>
+  <div class="hint">Units are "one layer's stored activations". The marker is your current <span class="math">s</span>; the green tick is the theoretical optimum <span class="math">√L</span>. Compute overhead stays ~flat because every layer is recomputed at most once.</div>
+
+  <div class="controls">
+    <label class="inline">depth L: <input type="range" id="sl-L" min="4" max="128" step="1" value="64"> <span class="val" id="sl-L-v">64</span></label>
+    <label class="inline">segment s: <input type="range" id="sl-s" min="1" max="64" step="1" value="8"> <span class="val" id="sl-s-v">8</span></label>
+    <button id="sl-opt">snap to √L</button>
+  </div>
+
+  <canvas id="sl-canvas" width="760" height="300" style="width:100%; height:300px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">peak memory @ s</div><div class="v" id="sl-mem">—</div></div>
+    <div class="kpi"><div class="k">vs no-checkpoint</div><div class="v" id="sl-red">—</div></div>
+    <div class="kpi"><div class="k">optimal s (√L)</div><div class="v" id="sl-os">—</div></div>
+    <div class="kpi"><div class="k">compute overhead</div><div class="v" id="sl-ovh">~33%</div></div>
+  </div>
+</div>
+
+<h2>Animated · one segment's store-then-recompute, scrubbable</h2>
+
+<p>An 8-layer model, segment size 2 (4 checkpoints). Scrub the timeline. On the forward pass, only segment-boundary activations are kept (solid) — the rest are computed and immediately freed (hollow). On the backward pass, each segment is <em>replayed forward</em> from its checkpoint (the recompute burst), regenerating its internal activations just long enough to run backward through them, then freed again. The bottom strip is the HBM curve: a low baseline of checkpoints with a sawtooth of recompute spikes — compare it to the flat-high line of no-checkpointing.</p>
+
+<div class="widget" id="rc-widget">
+  <div class="title">Activation lifecycle · store on forward, recompute on backward</div>
+  <div class="hint">8 layers · segment size 2. ▣ kept checkpoint · ▢ discarded · the moving burst is the forward replay. The dashed grey line is what HBM would sit at with no checkpointing.</div>
+
+  <div class="controls">
+    <button id="rc-play">▶ play</button>
+    <button id="rc-step">step ▷</button>
+    <button id="rc-reset">⟲ reset</button>
+    <label class="inline">time: <input type="range" id="rc-t" min="0" max="100" step="1" value="0" style="width:280px"> <span class="val" id="rc-t-v">t=0</span></label>
+    <label class="inline">speed: <input type="range" id="rc-spd" min="1" max="10" step="1" value="4"> <span class="val" id="rc-spd-v">4×</span></label>
+  </div>
+
+  <canvas id="rc-canvas" width="760" height="360" style="width:100%; height:360px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">phase</div><div class="v" id="rc-phase" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">layer</div><div class="v" id="rc-layer">—</div></div>
+    <div class="kpi"><div class="k">activations live</div><div class="v" id="rc-live">—</div></div>
+    <div class="kpi"><div class="k">recompute FLOPs spent</div><div class="v" id="rc-flop">—</div></div>
+  </div>
+</div>
+
+<h2>Selective recomputation — the modern refinement</h2>
+
+<p>Full checkpointing recomputes <em>everything</em> in a segment, paying 33% to save all activations. But not all activations are equal. Inside a transformer block, two kinds of tensor compete for that memory:</p>
+
+<table>
+  <thead><tr><th>Tensor</th><th>Memory</th><th>Cost to recompute</th><th>Verdict</th></tr></thead>
+  <tbody>
+    <tr><td>Attention scores / softmax / dropout mask</td><td><strong>large</strong> (<span class="math">b·s·s</span>, quadratic in <span class="math">s</span>)</td><td><strong>cheap</strong> (elementwise + one matmul)</td><td>recompute — great deal</td></tr>
+    <tr><td>Linear / matmul inputs (QKV, MLP)</td><td>moderate (<span class="math">b·s·h</span>)</td><td>expensive (the big GEMMs)</td><td>keep — bad deal to redo</td></tr>
+  </tbody>
+</table>
+
+<p><strong>Selective activation recomputation</strong> (Korthikanti et al., Megatron-LM, 2022) keeps the expensive-to-recompute matmul activations and drops only the cheap-to-recompute, memory-heavy attention activations. The result: most of the memory saving of full checkpointing for only ~2–5% extra compute instead of 33%. At long context — where the quadratic <span class="math">b·s·s</span> term dominates — this is close to free memory.</p>
+
+<div class="callout">
+  <div class="label">FlashAttention already does this for attention</div>
+  FlashAttention (lesson 16) never materialises the <span class="math">b·s·s</span> score matrix at all — it recomputes the attention blocks on the fly in the backward pass from <span class="math">Q, K, V</span> plus the saved output and the per-row log-sum-exp normaliser. It is, in effect, hand-coded selective recomputation for the single most expensive activation. With FlashAttention on, the attention term largely vanishes from <span class="math">M_act</span> before checkpointing even gets a vote.
+</div>
+
+<h2>How it composes with the rest of the stack</h2>
+
+<ul>
+  <li><strong>+ FSDP (lesson 05):</strong> the FSDP unit and the checkpoint segment are usually the <em>same</em> transformer block. On backward, FSDP AllGathers the block's weights and checkpointing replays the block's forward — both happen together, just-in-time, then both are freed. This is the standard Llama-class recipe.</li>
+  <li><strong>+ pipeline parallel (lesson 07):</strong> 1F1B keeps several micro-batches' activations alive at once (that's the memory the bubble "costs"). Checkpointing each stage's activations is what makes deep pipelines fit — it shrinks the per-micro-batch footprint that PP multiplies.</li>
+  <li><strong>+ tensor / sequence parallel (lessons 06, 08):</strong> SP exists precisely to shard the activations TP leaves replicated. Checkpointing and SP both target activations and are often used together at long context.</li>
+</ul>
+
+<div class="callout warn">
+  <div class="label">The one correctness trap</div>
+  Recomputation re-runs forward, so any <strong>nondeterminism</strong> in forward — dropout masks, fused-RNG kernels — must be made reproducible, or the replayed activations won't match the originals and gradients silently corrupt. Frameworks handle this by stashing and restoring the RNG state around each recomputed segment. If you write a custom checkpointed block, preserving RNG state is on you.
+</div>
+
+<h2>The decision, in order</h2>
+
+<ol>
+  <li>Activations fit → don't checkpoint. The 33% is pure loss.</li>
+  <li>Long context blowing the budget → turn on <strong>selective</strong> recomputation first; it's nearly free and kills the quadratic term.</li>
+  <li>Still over budget → <strong>full</strong> checkpointing per transformer block: keep each block's input activation, drop the dozen-odd activations <em>inside</em> the block, recompute them on backward. This is the common default — its win is killing the within-block pile, not hitting the <span class="math">√L</span> optimum (one checkpoint per block is the <span class="math">s=1</span> end of the curve above).</li>
+  <li>Want the absolute minimum activation memory → tune segment size toward <span class="math">√L</span>, and compose with FSDP + SP.</li>
+  <li>Out of <em>compute</em> budget, not memory → you've over-checkpointed; trade some back for a bigger micro-batch (lesson 21) instead.</li>
+</ol>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Activations are the HBM consumer that grows with batch and sequence, and the only one FSDP can't touch. Checkpointing trades a flat ~33% compute (or ~2–5% if selective) for a <span class="math">√L</span> collapse in activation memory by recomputing on backward instead of storing on forward. It is the technique that makes long-context and deep-model training fit — used in every large run, always alongside FSDP.
+</div>
+
+<footer class="lesson-nav">
+  <a href="19_cuda_graphs_tensorrt.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">19 · CUDA Graphs &amp; TensorRT</span>
+  </a>
+  <a class="next" href="21_gradient_accumulation.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">21 · Gradient accumulation &amp; effective batch</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+/* ─── Widget: memory vs segment size, the √L curve ─── */
+(function(){
+  const C = document.getElementById('sl-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const slL = $('sl-L'), slLv = $('sl-L-v'), slS = $('sl-s'), slSv = $('sl-s-v');
+
+  function peak(L, s){ return L/s + s; }
+
+  function render(){
+    let L = +slL.value;
+    slS.max = L;
+    let s = Math.min(+slS.value, L);
+    slLv.textContent = L; slSv.textContent = s;
+
+    const optS = Math.max(1, Math.round(Math.sqrt(L)));
+    const m = peak(L, s);
+    $('sl-mem').textContent = m.toFixed(1) + ' units';
+    $('sl-red').textContent = (L / m).toFixed(1) + '× less';
+    $('sl-os').textContent = '√' + L + ' ≈ ' + optS;
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 52, padR = 18, padT = 18, padB = 36;
+    const innerW = W - padL - padR, innerH = H - padT - padB;
+
+    // y-scale: 0 .. L (no-checkpoint reference is the top of interest)
+    const yMax = L * 1.05;
+    const x = si => padL + ((si - 1) / (L - 1)) * innerW;
+    const y = mm => padT + innerH - (mm / yMax) * innerH;
+
+    // grid + axes labels
+    ctx.strokeStyle = '#dde2ea'; ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace'; ctx.lineWidth = 1;
+    for (let g=0; g<=4; g++){
+      const yy = padT + (innerH/4)*g;
+      ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(padL+innerW, yy); ctx.stroke();
+      ctx.fillText((yMax*(1-g/4)).toFixed(0), 6, yy+3);
+    }
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('peak activation memory (units)', padL, padT-4);
+    ctx.fillText('segment size s →', padL+innerW-110, H-10);
+
+    // no-checkpoint reference line at y=L
+    ctx.strokeStyle = '#94a3b8'; ctx.setLineDash([5,4]); ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(padL, y(L)); ctx.lineTo(padL+innerW, y(L)); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#5b6573'; ctx.fillText('no checkpointing = L = '+L, padL+8, y(L)-5);
+
+    // the curve L/s + s
+    ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 2.4;
+    ctx.beginPath();
+    for (let si=1; si<=L; si++){
+      const px = x(si), py = y(Math.min(peak(L,si), yMax));
+      if (si===1) ctx.moveTo(px,py); else ctx.lineTo(px,py);
+    }
+    ctx.stroke();
+
+    // optimum tick (green)
+    const ox = x(optS), oy = y(peak(L,optS));
+    ctx.strokeStyle = '#16a34a'; ctx.lineWidth = 1.4; ctx.setLineDash([3,3]);
+    ctx.beginPath(); ctx.moveTo(ox, padT); ctx.lineTo(ox, padT+innerH); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#16a34a';
+    ctx.beginPath(); ctx.arc(ox, oy, 4, 0, 7); ctx.fill();
+    ctx.fillText('√L', ox+5, oy-6);
+
+    // current-s marker
+    const mx = x(s), my = y(Math.min(m, yMax));
+    ctx.fillStyle = '#d97706';
+    ctx.beginPath(); ctx.arc(mx, my, 5.5, 0, 7); ctx.fill();
+    ctx.strokeStyle = '#d97706'; ctx.lineWidth = 1; ctx.setLineDash([2,3]);
+    ctx.beginPath(); ctx.moveTo(mx, my); ctx.lineTo(mx, padT+innerH); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#d97706'; ctx.font='11px monospace';
+    ctx.fillText('s='+s+' → '+m.toFixed(1), Math.min(mx+8, W-90), my-6);
+  }
+
+  $('sl-opt').addEventListener('click', ()=>{ slS.value = Math.max(1, Math.round(Math.sqrt(+slL.value))); render(); });
+  [slL, slS].forEach(el=>el.addEventListener('input', render));
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: store/recompute lifecycle, scrubbable ───
+ * 8 layers, segment size 2 (segments: [0,1] [2,3] [4,5] [6,7]).
+ * Forward: for each layer compute; keep activation only at segment START (L0,L2,L4,L6).
+ * Backward: per segment (reverse), REPLAY forward from the kept start to regenerate
+ * internal activations, then backward through the segment, then free.
+ * Schedule entries: {p, l, seg} where p ∈ F_FWD, F_SAVE, F_FREE, B_RECOMP, B_BWD, B_FREE.
+ */
+(function(){
+  const C = document.getElementById('rc-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    play:$('rc-play'), step:$('rc-step'), reset:$('rc-reset'),
+    t:$('rc-t'), tv:$('rc-t-v'), spd:$('rc-spd'), spdv:$('rc-spd-v'),
+    phase:$('rc-phase'), layer:$('rc-layer'), live:$('rc-live'), flop:$('rc-flop'),
+  };
+  const L = 8, S = 2;
+  const NSEG = L / S;
+  const segStart = l => Math.floor(l / S) * S;   // first layer of l's segment
+
+  // Build schedule.
+  function build(){
+    const out = [];
+    // forward
+    for (let l=0; l<L; l++){
+      const kept = (l % S === 0);          // segment boundary kept as checkpoint
+      out.push({p:'FWD', l, kept});
+    }
+    // backward, segment by segment from the last
+    for (let seg=NSEG-1; seg>=0; seg--){
+      const start = seg*S;
+      // replay forward inside the segment to rebuild internal activations
+      for (let l=start; l<start+S; l++){
+        if (l % S !== 0) out.push({p:'RECOMP', l, seg});   // boundary already in HBM
+      }
+      // backward through the segment (high to low)
+      for (let l=start+S-1; l>=start; l--) out.push({p:'BWD', l, seg});
+      // free the segment's activations (boundary too, once its backward done)
+      out.push({p:'FREE', seg});
+    }
+    return out;
+  }
+  const SCHED = build();
+  els.t.max = SCHED.length - 1;
+
+  // Compute live activation set + recompute-FLOP counter at index idx.
+  function stateAt(idx){
+    const live = new Set();        // layer indices whose activation is in HBM
+    let recompFlops = 0;
+    const freedSeg = new Set();
+    for (let i=0; i<=idx; i++){
+      const e = SCHED[i];
+      if (e.p === 'FWD'){ if (e.kept) live.add(e.l); }
+      else if (e.p === 'RECOMP'){ live.add(e.l); recompFlops += 1; }
+      else if (e.p === 'BWD'){ /* consumes, still live until FREE */ }
+      else if (e.p === 'FREE'){
+        for (let l=e.seg*S; l<e.seg*S+S; l++) live.delete(l);
+        freedSeg.add(e.seg);
+      }
+    }
+    return { live, recompFlops, freedSeg };
+  }
+
+  // HBM (live activation count) over whole schedule, for the curve.
+  function curve(){
+    const ys = [];
+    for (let i=0; i<SCHED.length; i++) ys.push(stateAt(i).live.size);
+    return ys;
+  }
+  const CURVE = curve();
+  const maxLive = Math.max(...CURVE, L);
+
+  let playing = false, lastT = 0;
+  const PNAME = {FWD:'forward', RECOMP:'recompute (replay fwd)', BWD:'backward', FREE:'free segment'};
+
+  function render(){
+    const idx = +els.t.value;
+    els.tv.textContent = 't='+idx+'/'+(SCHED.length-1);
+    els.spdv.textContent = els.spd.value+'×';
+    const e = SCHED[idx];
+    const { live, recompFlops } = stateAt(idx);
+    els.phase.textContent = PNAME[e.p];
+    els.layer.textContent = e.p==='FREE' ? ('seg '+e.seg) : ('L'+e.l);
+    els.live.textContent = live.size + ' / ' + L;
+    els.flop.textContent = recompFlops + ' layer-fwds';
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    // top: the layer chain
+    const padL = 20, topY = 46, boxW = (W - 40) / L, boxH = 54;
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('layers (▣ kept checkpoint · ▢ discarded · ◆ live now)', padL, 26);
+
+    for (let l=0; l<L; l++){
+      const x = padL + l*boxW + 4, w = boxW - 8;
+      const isBoundary = (l % S === 0);
+      const isLive = live.has(l);
+      const isCurrent = (e.p!=='FREE' && e.l === l);
+      // base box
+      ctx.fillStyle = isLive ? '#dbeafe' : 'rgba(0,0,0,0.02)';
+      ctx.strokeStyle = isBoundary ? '#2563eb' : '#dde2ea';
+      ctx.lineWidth = isBoundary ? 2 : 1;
+      ctx.fillRect(x, topY, w, boxH); ctx.strokeRect(x, topY, w, boxH);
+      // current-op highlight
+      if (isCurrent){
+        ctx.strokeStyle = e.p==='RECOMP' ? '#d97706' : e.p==='FWD' ? '#16a34a' : '#dc2626';
+        ctx.lineWidth = 3; ctx.strokeRect(x-1, topY-1, w+2, boxH+2);
+      }
+      ctx.fillStyle = '#1f2430'; ctx.font = '12px monospace';
+      ctx.fillText('L'+l, x + w/2 - 8, topY + 20);
+      ctx.font = '15px monospace';
+      ctx.fillStyle = isLive ? '#2563eb' : '#cbd5e1';
+      ctx.fillText(isBoundary ? '▣' : (isLive ? '◆' : '▢'), x + w/2 - 6, topY + 42);
+    }
+
+    // segment brackets
+    ctx.strokeStyle = '#94a3b8'; ctx.lineWidth = 1; ctx.font = '10px monospace'; ctx.fillStyle = '#94a3b8';
+    for (let seg=0; seg<NSEG; seg++){
+      const x0 = padL + seg*S*boxW + 4, x1 = padL + (seg*S+S)*boxW - 4;
+      const yy = topY + boxH + 10;
+      ctx.beginPath(); ctx.moveTo(x0, yy); ctx.lineTo(x1, yy); ctx.stroke();
+      ctx.fillText('seg '+seg, (x0+x1)/2 - 16, yy + 12);
+    }
+
+    // bottom: HBM curve
+    const cTop = 176, cH = H - cTop - 26;
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('live activations over time (sawtooth = recompute spikes)', padL, cTop - 6);
+    const innerW = W - padL - 20;
+    const xAt = i => padL + (i/(SCHED.length-1))*innerW;
+    const yAt = v => cTop + cH - (v/maxLive)*cH;
+
+    // no-checkpoint reference (flat at L)
+    ctx.strokeStyle = '#94a3b8'; ctx.setLineDash([5,4]); ctx.lineWidth = 1.3;
+    ctx.beginPath(); ctx.moveTo(padL, yAt(L)); ctx.lineTo(padL+innerW, yAt(L)); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#94a3b8'; ctx.font='10px monospace';
+    ctx.fillText('no checkpointing ('+L+')', padL+innerW-150, yAt(L)-4);
+
+    // checkpoint baseline (NSEG)
+    ctx.strokeStyle = '#cbd5e1'; ctx.setLineDash([2,3]);
+    ctx.beginPath(); ctx.moveTo(padL, yAt(NSEG)); ctx.lineTo(padL+innerW, yAt(NSEG)); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillText('checkpoints ('+NSEG+')', padL+4, yAt(NSEG)-4);
+
+    // filled curve up to idx
+    ctx.beginPath();
+    ctx.moveTo(xAt(0), cTop+cH);
+    for (let i=0; i<=idx; i++){
+      ctx.lineTo(xAt(i), yAt(CURVE[i]));
+      if (i<idx) ctx.lineTo(xAt(i+1), yAt(CURVE[i])); // stepwise
+    }
+    ctx.lineTo(xAt(idx), cTop+cH); ctx.closePath();
+    ctx.fillStyle = 'rgba(37,99,235,0.12)'; ctx.fill();
+    // curve line
+    ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 2; ctx.beginPath();
+    for (let i=0; i<=idx; i++){
+      if (i===0) ctx.moveTo(xAt(i), yAt(CURVE[i]));
+      else { ctx.lineTo(xAt(i), yAt(CURVE[i-1])); ctx.lineTo(xAt(i), yAt(CURVE[i])); }
+    }
+    ctx.stroke();
+
+    // forward/backward boundary marker
+    const xb = xAt(L);
+    ctx.strokeStyle = '#dde2ea'; ctx.setLineDash([2,3]);
+    ctx.beginPath(); ctx.moveTo(xb, cTop); ctx.lineTo(xb, cTop+cH); ctx.stroke();
+    ctx.setLineDash([]); ctx.fillStyle = '#94a3b8';
+    ctx.fillText('fwd', padL+4, cTop+12); ctx.fillText('bwd', xb+4, cTop+12);
+  }
+
+  function step(){ els.t.value = (+els.t.value + 1) % SCHED.length; render(); }
+  function tick(ts){
+    if (!playing) return;
+    if (ts - lastT > 600/(+els.spd.value)){ step(); lastT = ts; }
+    requestAnimationFrame(tick);
+  }
+  els.play.addEventListener('click', ()=>{
+    playing = !playing; els.play.textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastT = performance.now(); requestAnimationFrame(tick); }
+  });
+  els.step.addEventListener('click', step);
+  els.reset.addEventListener('click', ()=>{ els.t.value=0; playing=false; els.play.textContent='▶ play'; render(); });
+  els.t.addEventListener('input', render);
+  els.spd.addEventListener('input', ()=>{ els.spdv.textContent = els.spd.value+'×'; });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>
