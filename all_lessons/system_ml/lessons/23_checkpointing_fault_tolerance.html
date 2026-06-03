@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>23 · Checkpointing &amp; fault tolerance</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">23 · Checkpointing &amp; fault tolerance</span>
+    <span class="step-pill">lesson 23 / 23</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Checkpointing &amp; fault tolerance — surviving the 1000-GPU run</h1>
+<p class="subtitle">At one GPU the worst case is you lose an afternoon. At ten thousand GPUs for three weeks, hardware failure isn't an edge case — it's the <em>expected</em> hourly event. The last system you have to design isn't a parallelism strategy; it's the one that lets the job die and come back having barely noticed.</p>
+
+<h2>Why failure is the common case, not the rare one</h2>
+
+<p>A single GPU is reliable — call its mean time between failures <span class="math">M_1</span>, maybe years. But failures are roughly independent across devices, so a job spanning <span class="math">G</span> GPUs fails when <em>any</em> of them does, and the rates add:</p>
+
+<p class="math block">M_job  ≈  M_1 / G</p>
+
+<p>Plug in numbers. If one accelerator (plus its host, NIC, optics, PSU) faults on average every ~50,000 GPU-hours, then a 10,000-GPU job has an effective MTBF of ~5 hours. A three-week run will be interrupted <em>dozens</em> of times. This is not pessimism — published large-model training logs report failures every few hours at scale, dominated by GPU faults, ECC errors, NIC/optics flaps, and the occasional host kernel panic. The synchronous nature of the collectives in lesson 02 makes it worse: one dead rank stalls an AllReduce, and the <em>entire</em> job hangs, not just the failed node.</p>
+
+<div class="callout bad">
+  <div class="label">The brutal arithmetic of no checkpointing</div>
+  Without checkpoints, every failure throws away <em>all</em> progress since the start. If your run is longer than <span class="math">M_job</span>, it may <strong>never finish</strong> — it crashes before it completes, restarts from zero, and crashes again. Checkpointing isn't an optimization here; it's the thing that makes long runs possible at all.
+</div>
+
+<h2>What is actually in a checkpoint</h2>
+
+<p>"Save the model" is necessary and badly insufficient. To resume <em>bitwise-equivalently</em> — as if the failure never happened — you must restore every piece of mutable training state:</p>
+
+<table>
+  <thead><tr><th>Component</th><th>Size (70B, mixed precision)</th><th>Why it must be saved</th></tr></thead>
+  <tbody>
+    <tr><td>Model parameters (bf16)</td><td>~140 GB (2 B/param)</td><td>obviously</td></tr>
+    <tr><td>Optimizer state (fp32 master + Adam m, v)</td><td>~840 GB (12 B/param)</td><td><strong>dominates</strong> — master + both moments = 6× the bf16 weights (the moments alone are 4×)</td></tr>
+    <tr><td>LR scheduler / step count</td><td>bytes</td><td>resume at the right point on the LR curve</td></tr>
+    <tr><td>RNG state (per rank)</td><td>KB</td><td>reproducible dropout, data shuffling</td></tr>
+    <tr><td>Data-loader position</td><td>bytes</td><td>resume mid-epoch without re-seeing data (lesson 22)</td></tr>
+  </tbody>
+</table>
+
+<p>The headline: a 70B checkpoint is ~<strong>980 GB</strong> (params + optimizer state — gradients are transient and not saved), and the optimizer state, not the weights, is most of it. Saving only the weights (the common "I'll just save the model" mistake) makes the checkpoint look 7× smaller and makes resumption <em>wrong</em>: you'd restart Adam's moments from zero, spiking the loss every time you resume.</p>
+
+<h2>Failures over a run — feel the rate</h2>
+
+<p>Set the cluster size and the per-GPU MTBF and watch the expected failure count over a multi-week run. The point of this widget is visceral: at small scale the timeline is empty; drag the GPU count up and it fills with interruptions.</p>
+
+<div class="widget" id="mt-widget">
+  <div class="title">Job MTBF &amp; the failure timeline</div>
+  <div class="hint">Each red tick is an expected failure over the run. <span class="math">M_job = M_1 / G</span>. The point isn't the exact placement — failures are random — it's the <em>count</em>: how many times this job will hit the floor.</div>
+
+  <div class="controls">
+    <label class="inline">GPUs G: <input type="range" id="mt-g" min="8" max="16384" step="8" value="1024"> <span class="val" id="mt-g-v">1024</span></label>
+    <label class="inline">per-GPU MTBF (kh): <input type="range" id="mt-m" min="10" max="200" step="5" value="50"> <span class="val" id="mt-m-v">50</span></label>
+    <label class="inline">run length (days): <input type="range" id="mt-d" min="1" max="60" step="1" value="21"> <span class="val" id="mt-d-v">21</span></label>
+  </div>
+
+  <canvas id="mt-canvas" width="760" height="150" style="width:100%; height:150px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">job MTBF</div><div class="v" id="mt-mtbf">—</div></div>
+    <div class="kpi"><div class="k">expected failures</div><div class="v" id="mt-fail">—</div></div>
+    <div class="kpi"><div class="k">mean uptime between</div><div class="v" id="mt-up" style="font-size:14px;">—</div></div>
+  </div>
+</div>
+
+<h2>The central tradeoff — how often to checkpoint</h2>
+
+<p>Checkpoint too rarely and each failure costs a lot of lost recompute. Checkpoint too often and you spend the whole run writing checkpoints. There is a clean optimum, and it's one of the most useful formulas in the whole series.</p>
+
+<p>Let <span class="math">C</span> = the cost (time) of writing one checkpoint, <span class="math">M</span> = the job MTBF, and <span class="math">τ</span> = the interval (compute time) between checkpoints. Two sources of waste, as fractions of useful time:</p>
+
+<ul>
+  <li><strong>Checkpoint overhead</strong> = <span class="math">C / τ</span> — you pay <span class="math">C</span> every <span class="math">τ</span> of work. Falls as <span class="math">τ</span> grows.</li>
+  <li><strong>Lost-work overhead</strong> = <span class="math">τ / 2M</span> — a failure (every <span class="math">M</span>) discards on average half an interval. Rises as <span class="math">τ</span> grows.</li>
+</ul>
+
+<p class="math block">waste(τ)  =  C/τ  +  τ/(2M)      ⇒      minimised at      τ* = √(2 C M)</p>
+
+<p>This is the <strong>Young–Daly formula</strong> (1974/2006), and it falls straight out of setting the derivative to zero. The minimum waste is <span class="math">√(2C/M)</span> — it gets worse as checkpoints get expensive (<span class="math">C↑</span>) or failures get frequent (<span class="math">M↓</span>). The whole game of the rest of this lesson is <strong>driving <span class="math">C</span> down</strong>, because a smaller <span class="math">C</span> lets you checkpoint more often <em>and</em> waste less time doing it.</p>
+
+<div class="widget" id="yd-widget">
+  <div class="title">Young–Daly · the optimal checkpoint interval</div>
+  <div class="hint">Blue = checkpoint overhead <span class="math">C/τ</span> (falling). Orange = expected lost work <span class="math">τ/2M</span> (rising). Black = their sum. The green line is the optimum <span class="math">τ* = √(2CM)</span>; drag your interval and watch total waste bottom out there.</div>
+
+  <div class="controls">
+    <label class="inline">checkpoint cost C (s): <input type="range" id="yd-c" min="5" max="600" step="5" value="120"> <span class="val" id="yd-c-v">120</span></label>
+    <label class="inline">job MTBF M (min): <input type="range" id="yd-m" min="10" max="600" step="10" value="300"> <span class="val" id="yd-m-v">300</span></label>
+    <label class="inline">your interval τ (min): <input type="range" id="yd-t" min="1" max="240" step="1" value="60"> <span class="val" id="yd-t-v">60</span></label>
+  </div>
+
+  <canvas id="yd-canvas" width="760" height="300" style="width:100%; height:300px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">optimal τ*</div><div class="v" id="yd-opt">—</div></div>
+    <div class="kpi"><div class="k">waste at τ*</div><div class="v" id="yd-wopt">—</div></div>
+    <div class="kpi"><div class="k">waste at your τ</div><div class="v" id="yd-wyou">—</div></div>
+    <div class="kpi"><div class="k">verdict</div><div class="v" id="yd-vd" style="font-size:13px;">—</div></div>
+  </div>
+</div>
+
+<h2>Driving down C — three mechanisms</h2>
+
+<p>A naïve checkpoint is a synchronous, single-writer dump: training halts while one rank streams ~1 TB to storage. At even a generous 2 GB/s that's ~8 minutes of dead time per checkpoint. With the Young–Daly lens, a huge <span class="math">C</span> forces huge intervals and large lost-work. Three ideas, stacked, take <span class="math">C</span> from minutes to seconds.</p>
+
+<h3>1 · Sharded / distributed checkpoint</h3>
+<p>Under FSDP/ZeRO (lesson 05) each rank already holds only <span class="math">1/N</span> of the state. So let each rank write <em>its own shard</em> in parallel: aggregate write bandwidth scales with the number of writers, and wall-clock write time drops by <span class="math">N×</span>. This is what <code>torch.distributed.checkpoint</code> (DCP) does. It also stores state <em>logically</em> (by parameter name + offset, not by physical rank layout), which enables the next trick.</p>
+
+<div class="callout">
+  <div class="label">Resharding — load into a different topology</div>
+  Because DCP saves logical ranges, a checkpoint written by a <span class="math">TP=8, FSDP=64</span> job can be loaded by a <span class="math">TP=4, FSDP=128</span> job. The loader maps logical parameter ranges onto the new sharding. Without this, a checkpoint is welded to the exact GPU count and parallelism layout that wrote it — and you could never resume a failed run on a differently-shaped pool of healthy nodes (or scale the run up after warm-up).
+</div>
+
+<h3>2 · Asynchronous checkpoint</h3>
+<p>Split the write into a fast <em>copy</em> and a slow <em>flush</em>. Snapshot the state from HBM into pinned host memory — bounded by PCIe at ~25 GB/s, a few seconds — then <em>resume training immediately</em> while a background thread drains host memory to storage. The training stall shrinks from "time to write to disk" down to "time to copy to RAM." The disk write still happens; it just no longer blocks the GPUs.</p>
+
+<h3>3 · In-memory / redundant checkpoint</h3>
+<p>For the fastest recovery, keep a copy of each rank's shard in a <em>peer GPU/host's</em> memory (erasure-coded or replicated, à la Gemini / CheckFreq). When a node dies, its neighbour already holds its last shard — recovery is a memory copy over NVLink/IB, not a multi-minute read from a cold object store. Disk checkpoints remain as the durable fallback for whole-cluster outages.</p>
+
+<div class="widget" id="cp-widget">
+  <div class="title">Checkpoint stall · sync vs sharded vs async</div>
+  <div class="hint">The same 70B-class checkpoint, three write strategies. The bar is the time <em>training is stalled</em> (not the total write time — async keeps writing in the background while the GPUs run).</div>
+
+  <div class="controls">
+    <label class="inline">params (B): <input type="range" id="cp-p" min="7" max="405" step="1" value="70"> <span class="val" id="cp-p-v">70</span></label>
+    <label class="inline">writer ranks N: <input type="range" id="cp-n" min="1" max="256" step="1" value="64"> <span class="val" id="cp-n-v">64</span></label>
+    <label class="inline">disk BW/writer (GB/s): <input type="range" id="cp-bw" min="1" max="10" step="1" value="2"> <span class="val" id="cp-bw-v">2</span></label>
+  </div>
+
+  <canvas id="cp-canvas" width="760" height="210" style="width:100%; height:210px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">checkpoint size</div><div class="v" id="cp-sz">—</div></div>
+    <div class="kpi"><div class="k">sync stall</div><div class="v" id="cp-sync">—</div></div>
+    <div class="kpi"><div class="k">sharded stall</div><div class="v" id="cp-shard">—</div></div>
+    <div class="kpi"><div class="k">async stall</div><div class="v" id="cp-async">—</div></div>
+  </div>
+</div>
+
+<h2>Recovery — detection, restart, and elasticity</h2>
+
+<p>A fast checkpoint is half the story; you also have to <em>come back</em>. The recovery loop:</p>
+
+<ol>
+  <li><strong>Detect.</strong> A health monitor (or a collective timeout) notices a rank is gone. Because collectives hang on a missing peer, you need an explicit watchdog — otherwise the job silently stalls forever instead of failing.</li>
+  <li><strong>Reschedule.</strong> Either swap in a hot spare node, or — with <strong>elastic</strong> training (<code>torchrun</code>/TorchElastic) — re-form the process group with the <em>surviving</em> nodes at a smaller world size. Elasticity trades a little throughput for not needing the exact node count to be available.</li>
+  <li><strong>Restore.</strong> Every rank loads the latest checkpoint (resharded to the new topology if the world size changed) and resumes from the saved step, LR position, RNG, and data offset.</li>
+</ol>
+
+<div class="callout warn">
+  <div class="label">Elasticity changes your effective batch — re-read lesson 21</div>
+  Restarting on fewer nodes shrinks <span class="math">N</span>, which shrinks <span class="math">B_eff = b·N·G</span> unless you bump accumulation <span class="math">G</span> to compensate. Silently continuing at a smaller effective batch (and now-mismatched LR) is a real way an "automatic recovery" quietly degrades a run. Robust setups pin <span class="math">B_eff</span> and re-solve <span class="math">G</span> on every reshape.
+</div>
+
+<h2>The whole picture</h2>
+
+<pre class="ascii">  ───●────────────────●────────────────✗  failure (rank dies)
+     │ checkpoint      │ checkpoint      │
+     └── τ work ───────┴── τ work ───────┘  lost: ~τ/2 of recompute
+                                          │
+                          detect (watchdog) → reschedule (spare / elastic)
+                                          │       → restore latest checkpoint
+                                          ▼          (reshard if world size changed)
+  ───────────────────────────────────────●──────▶  resume at saved step
+
+   τ* = √(2·C·M)        drive C down with: sharded write · async flush · in-mem redundancy</pre>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  At scale, <span class="math">M_job = M_1/G</span> makes failure routine, so the run must checkpoint <em>all</em> mutable state (optimizer state dominates — ~6× the weights) and recover fast. Young–Daly sets the cadence: <span class="math">τ* = √(2CM)</span>, with minimum waste <span class="math">√(2C/M)</span> — so the entire engineering effort goes into shrinking the checkpoint cost <span class="math">C</span> via sharded parallel writes, asynchronous background flush, and in-memory redundancy. Resharding-capable checkpoints plus elastic restart turn a dead node from a fatal event into a few-minute hiccup. This is what lets a three-week, ten-thousand-GPU run actually finish.
+</div>
+
+<div class="callout">
+  <div class="label">End of Part V — and the track</div>
+  You now have the full stack: the constraints (I), the six ways to shard (II), how to compose them and serve (III), the single-GPU machinery underneath (IV), and the operational glue that keeps a real run alive for weeks (V). The CUDA primitives that sit below all of it — and the serving kernels that build on them — continue in <a href="../../gpu_kernel_serving/index.html"><strong>GPU Kernels for LLM Serving</strong></a>.
+</div>
+
+<footer class="lesson-nav">
+  <a href="22_data_pipeline.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">22 · The distributed data pipeline</span>
+  </a>
+  <a class="next" href="../../gpu_kernel_serving/index.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">GPU Kernels for LLM Serving →</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+/* ─── Widget: MTBF failure timeline ─── */
+(function(){
+  const C=document.getElementById('mt-canvas'); const ctx=C.getContext('2d');
+  const $=id=>document.getElementById(id);
+  const g=$('mt-g'),gv=$('mt-g-v'),m=$('mt-m'),mv=$('mt-m-v'),d=$('mt-d'),dv=$('mt-d-v');
+
+  function fmt(h){ if(h<1) return (h*60).toFixed(0)+' min'; if(h<48) return h.toFixed(1)+' h'; return (h/24).toFixed(1)+' d'; }
+
+  function render(){
+    const G=+g.value, M1=(+m.value)*1000, D=+d.value;
+    gv.textContent=G.toLocaleString(); mv.textContent=(+m.value)+'k'; dv.textContent=D;
+    const Mjob = M1 / G;                 // hours
+    const runH = D*24;
+    const fails = runH / Mjob;
+    $('mt-mtbf').textContent = fmt(Mjob);
+    $('mt-fail').textContent = fails<1 ? fails.toFixed(2) : Math.round(fails).toString();
+    $('mt-up').textContent = fmt(Mjob);
+
+    const dpr=window.devicePixelRatio||1, W=C.clientWidth, H=C.clientHeight;
+    if(C.width!==Math.round(W*dpr)){C.width=Math.round(W*dpr);C.height=Math.round(H*dpr);}
+    ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,W,H);
+
+    const padL=16,padR=16,y=70,barH=30;
+    const iW=W-padL-padR;
+    // run bar
+    ctx.fillStyle='#dbeafe'; ctx.strokeStyle='#2563eb'; ctx.lineWidth=1;
+    ctx.fillRect(padL,y,iW,barH); ctx.strokeRect(padL,y,iW,barH);
+    ctx.fillStyle='#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('run: '+D+' days',padL,y-10);
+    ctx.fillText('0',padL,y+barH+16); ctx.fillText(D+'d',padL+iW-16,y+barH+16);
+
+    // failure ticks at ~Mjob spacing with deterministic jitter
+    const nF = Math.min(Math.round(fails), 400);
+    let seed=1234567;
+    const rnd=()=>{ seed=(seed*1103515245+12345)&0x7fffffff; return seed/0x7fffffff; };
+    ctx.strokeStyle='#dc2626'; ctx.lineWidth=1.4;
+    for(let i=0;i<nF;i++){
+      const frac = (i+0.5)/Math.max(1,fails) + (rnd()-0.5)*(1/Math.max(1,fails))*0.7;
+      if(frac<0||frac>1) continue;
+      const x=padL+frac*iW;
+      ctx.beginPath(); ctx.moveTo(x,y-6); ctx.lineTo(x,y+barH+6); ctx.stroke();
+    }
+    ctx.fillStyle='#dc2626'; ctx.font='11px monospace';
+    ctx.fillText('▼ '+ (fails<1?'< 1':Math.round(fails)) +' expected failure'+(Math.round(fails)===1?'':'s'), padL+iW-220, y-10);
+  }
+  [g,m,d].forEach(el=>el.addEventListener('input',render));
+  window.addEventListener('resize',render); render();
+})();
+</script>
+
+<script>
+/* ─── Widget: Young–Daly optimal interval ─── */
+(function(){
+  const C=document.getElementById('yd-canvas'); const ctx=C.getContext('2d');
+  const $=id=>document.getElementById(id);
+  const c=$('yd-c'),cv=$('yd-c-v'),m=$('yd-m'),mv=$('yd-m-v'),t=$('yd-t'),tv=$('yd-t-v');
+
+  function render(){
+    const Cs=+c.value;                 // checkpoint cost, seconds
+    const Mmin=+m.value;               // MTBF, minutes
+    const Cm=Cs/60;                    // checkpoint cost in minutes (common units)
+    const tau=+t.value;                // your interval, minutes
+    cv.textContent=Cs; mv.textContent=Mmin; tv.textContent=tau;
+
+    const waste = x => Cm/x + x/(2*Mmin);   // fraction of useful time
+    const tauStar = Math.sqrt(2*Cm*Mmin);
+    $('yd-opt').textContent = tauStar.toFixed(0)+' min';
+    $('yd-wopt').textContent = (waste(tauStar)*100).toFixed(1)+'%';
+    $('yd-wyou').textContent = (waste(tau)*100).toFixed(1)+'%';
+    const ratio = waste(tau)/waste(tauStar);
+    $('yd-vd').textContent = ratio<1.05?'near optimal ✓': tau<tauStar?'too frequent':'too rare';
+
+    const dpr=window.devicePixelRatio||1, W=C.clientWidth, H=C.clientHeight;
+    if(C.width!==Math.round(W*dpr)){C.width=Math.round(W*dpr);C.height=Math.round(H*dpr);}
+    ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,W,H);
+
+    const padL=46,padR=16,padT=18,padB=34, iW=W-padL-padR, iH=H-padT-padB;
+    const xmax=240;
+    const ymax=Math.min(0.6, waste(xmax)*1.05 > 0.6 ? 0.6 : Math.max(waste(2), waste(xmax))*1.1);
+    const X=x=>padL+(x/xmax)*iW;
+    const Y=v=>padT+iH-(Math.min(v,ymax)/ymax)*iH;
+
+    // grid
+    ctx.strokeStyle='#dde2ea'; ctx.lineWidth=1; ctx.fillStyle='#94a3b8'; ctx.font='10px monospace';
+    for(let p=0;p<=ymax+0.0001;p+=0.1){ const yy=Y(p); ctx.beginPath(); ctx.moveTo(padL,yy); ctx.lineTo(padL+iW,yy); ctx.stroke(); ctx.fillText((p*100).toFixed(0)+'%',6,yy+3); }
+    for(let x=0;x<=xmax;x+=60){ ctx.fillText(x+'m', X(x)-8, H-12); }
+    ctx.fillStyle='#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('checkpoint interval τ →', padL+iW-150, H-12);
+    ctx.fillText('% time wasted', 4, padT-4);
+
+    function curve(fn,color,wd){ ctx.strokeStyle=color; ctx.lineWidth=wd; ctx.beginPath(); let f=true;
+      for(let x=2;x<=xmax;x+=1){ const px=X(x),py=Y(fn(x)); if(f){ctx.moveTo(px,py);f=false;}else ctx.lineTo(px,py);} ctx.stroke(); }
+    curve(x=>Cm/x,'#2563eb',1.6);          // checkpoint overhead
+    curve(x=>x/(2*Mmin),'#d97706',1.6);    // lost work
+    curve(waste,'#1f2430',2.4);            // total
+
+    // optimum
+    const xo=X(tauStar);
+    ctx.strokeStyle='#16a34a'; ctx.setLineDash([4,4]); ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.moveTo(xo,padT); ctx.lineTo(xo,padT+iH); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle='#16a34a'; ctx.beginPath(); ctx.arc(xo,Y(waste(tauStar)),4,0,7); ctx.fill();
+    ctx.fillText('τ*', xo+4, padT+12);
+
+    // your tau
+    const xy=X(tau);
+    ctx.strokeStyle='#dc2626'; ctx.setLineDash([2,3]); ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(xy,padT); ctx.lineTo(xy,padT+iH); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle='#dc2626'; ctx.beginPath(); ctx.arc(xy,Y(waste(tau)),4.5,0,7); ctx.fill();
+
+    // legend
+    ctx.font='10px monospace';
+    ctx.fillStyle='#2563eb'; ctx.fillText('■ checkpoint C/τ', padL+8, padT+6);
+    ctx.fillStyle='#d97706'; ctx.fillText('■ lost work τ/2M', padL+8, padT+20);
+    ctx.fillStyle='#1f2430'; ctx.fillText('■ total', padL+8, padT+34);
+  }
+  [c,m,t].forEach(el=>el.addEventListener('input',render));
+  window.addEventListener('resize',render); render();
+})();
+</script>
+
+<script>
+/* ─── Widget: checkpoint stall, sync vs sharded vs async ─── */
+(function(){
+  const C=document.getElementById('cp-canvas'); const ctx=C.getContext('2d');
+  const $=id=>document.getElementById(id);
+  const p=$('cp-p'),pv=$('cp-p-v'),n=$('cp-n'),nv=$('cp-n-v'),bw=$('cp-bw'),bwv=$('cp-bw-v');
+  const PCIE=25; // GB/s host copy per rank, fixed
+
+  function render(){
+    const P=+p.value, N=+n.value, BW=+bw.value;
+    pv.textContent=P; nv.textContent=N; bwv.textContent=BW;
+    const bytesGB = P*14;                 // 14 B/param: 2 (bf16 weights) + 12 (fp32 master + Adam m,v); gradients are transient, not checkpointed
+    // sync: one writer streams whole thing
+    const syncT = bytesGB / BW;
+    // sharded: N writers in parallel
+    const shardT = (bytesGB / N) / BW;
+    // async: stall only on HBM->host copy of this rank's shard over PCIe
+    const asyncT = (bytesGB / N) / PCIE;
+    $('cp-sz').textContent = bytesGB>=1000 ? (bytesGB/1000).toFixed(2)+' TB' : bytesGB.toFixed(0)+' GB';
+    const fmt=s=> s>=60?(s/60).toFixed(1)+' min':s.toFixed(1)+' s';
+    $('cp-sync').textContent=fmt(syncT);
+    $('cp-shard').textContent=fmt(shardT);
+    $('cp-async').textContent=fmt(asyncT);
+
+    const dpr=window.devicePixelRatio||1, W=C.clientWidth, H=C.clientHeight;
+    if(C.width!==Math.round(W*dpr)){C.width=Math.round(W*dpr);C.height=Math.round(H*dpr);}
+    ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,W,H);
+
+    const rows=[
+      {l:'synchronous (1 writer)', t:syncT, c:'#dc2626'},
+      {l:'sharded ('+N+' writers)', t:shardT, c:'#d97706'},
+      {l:'async (PCIe copy only)', t:asyncT, c:'#16a34a'},
+    ];
+    const padL=180, padR=70, padT=24, iW=W-padL-padR;
+    const tmax=Math.max(syncT,1);
+    const rowH=(H-padT-16)/rows.length;
+    ctx.font='12px monospace';
+    rows.forEach((r,i)=>{
+      const y=padT+i*rowH+8;
+      ctx.fillStyle='#1f2430'; ctx.textAlign='right'; ctx.fillText(r.l, padL-10, y+rowH/2);
+      ctx.textAlign='left';
+      const w=Math.max(2,(r.t/tmax)*iW);
+      ctx.fillStyle=r.c; ctx.fillRect(padL,y,w,rowH-16);
+      ctx.fillStyle='#1f2430'; ctx.fillText(fmt(r.t), padL+w+8, y+ (rowH-16)/2+4);
+    });
+    ctx.fillStyle='#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('training stall per checkpoint (bar ∝ time)', padL, 16);
+  }
+  [p,n,bw].forEach(el=>el.addEventListener('input',render));
+  window.addEventListener('resize',render); render();
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>21 · Gradient accumulation &amp; the effective batch</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">21 · Gradient accumulation</span>
+    <span class="step-pill">lesson 21 / 23</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Gradient accumulation &amp; the effective batch</h1>
+<p class="subtitle">The optimizer cares about one number — the <em>effective batch size</em> — and the hardware imposes another — the <em>micro-batch</em> that fits in HBM. Gradient accumulation is the lever that decouples them: run several micro-batches, sum their gradients, step once. It is also where DDP's communication can be quietly cut by a factor of <span class="math">G</span>.</p>
+
+<h2>Two batch sizes that want to be different</h2>
+
+<p>There are two completely separate batch sizes in a training run, and conflating them is the most common source of "why won't my loss go down" confusion.</p>
+
+<ul>
+  <li><strong>The micro-batch <span class="math">b</span></strong> — how many samples one GPU runs through in a single forward/backward. This is a <em>hardware</em> number: it's bounded by HBM, because activations scale with <span class="math">b</span> (lesson 20). Make it too big and you OOM.</li>
+  <li><strong>The effective (global) batch <span class="math">B_eff</span></strong> — how many samples contribute to <em>one optimizer step</em>. This is an <em>optimization</em> number: it sets the gradient's signal-to-noise ratio, and the right value is a property of the problem, not the GPU.</li>
+</ul>
+
+<p>Data parallelism (lesson 04) already multiplies the micro-batch by the world size: <span class="math">N</span> ranks each run <span class="math">b</span> samples and AllReduce the gradients, so one step sees <span class="math">b·N</span> samples. Gradient accumulation multiplies it again, in time:</p>
+
+<p class="math block">B_eff  =  b  ·  N  ·  G</p>
+
+<p>where <span class="math">G</span> is the number of micro-batches accumulated before stepping. The point: if the optimizer wants <span class="math">B_eff = 4{,}096</span> but each GPU only fits <span class="math">b = 8</span> and you have <span class="math">N = 64</span> ranks, you're at <span class="math">512</span> — short by 8×. Set <span class="math">G = 8</span> and you hit the target without buying more GPUs and without OOMing.</p>
+
+<h2>The mechanic — why summing gradients just works</h2>
+
+<p>A loss averaged over a batch is the mean of per-sample losses, and the gradient is linear in the loss, so the gradient of a big batch is the average of the gradients of its parts:</p>
+
+<p class="math block">∇L(B)  =  (1/G) · Σ_{g=1}^{G} ∇L(micro-batch g)</p>
+
+<p>So you don't need all <span class="math">G·b</span> samples in memory at once. Run micro-batch 1, backward, <em>add</em> its gradients into the <code>.grad</code> buffers (PyTorch's <code>backward()</code> accumulates by default — this is why you call <code>zero_grad()</code>). Run micro-batch 2, add. … After <span class="math">G</span> of them, the buffer holds the summed gradient; scale by <span class="math">1/G</span>, take one optimizer step, zero the buffers. The activations of micro-batch <span class="math">g</span> are freed before <span class="math">g{+}1</span> starts, so peak memory is set by <span class="math">b</span>, not <span class="math">G·b</span>.</p>
+
+<div class="callout warn">
+  <div class="label">The one bug everyone writes</div>
+  The loss must be divided by <span class="math">G</span> <em>somewhere</em> — either scale each micro-batch's loss by <span class="math">1/G</span> before <code>backward()</code>, or divide the accumulated gradient before <code>step()</code>. Forget it and your effective learning rate is <span class="math">G×</span> too large; the run diverges and looks like a bad LR. (For token-averaged LM loss with uneven micro-batch token counts, the correct normaliser is total tokens, not <span class="math">G</span> — a subtler version of the same trap.)
+</div>
+
+<div class="callout">
+  <div class="label">When is it exactly equivalent to a real big batch?</div>
+  For any layer whose statistics are <em>per-sample</em> — LayerNorm, RMSNorm, attention — accumulation is numerically identical to one big batch (bf16 summation order aside). It is <strong>not</strong> identical for cross-sample ops like BatchNorm, whose statistics depend on the whole batch. Transformers use LayerNorm precisely, so for LLMs accumulation is exact. This is one quiet reason BatchNorm fell out of favour for large-scale training.
+</div>
+
+<h2>Interactive · compose the effective batch</h2>
+
+<p>Three multipliers, one product. Slide the micro-batch (bounded by what fits in HBM), the data-parallel world size, and the accumulation depth. The grid shows every sample that contributes to a single optimizer step, coloured by which rank and which accumulation pass produced it. The memory bar tracks <em>only</em> <span class="math">b</span> — notice that cranking <span class="math">G</span> grows the effective batch without moving the memory bar at all.</p>
+
+<div class="widget" id="eb-widget">
+  <div class="title">Effective batch composer · b × N × G</div>
+  <div class="hint">Each cell is one training sample feeding one optimizer step. Columns = the <span class="math">N</span> data-parallel ranks (synced by AllReduce); row-blocks = the <span class="math">G</span> accumulation passes (free, sequential in time). Within a block, height = micro-batch <span class="math">b</span>.</div>
+
+  <div class="controls">
+    <label class="inline">micro-batch b: <input type="range" id="eb-b" min="1" max="16" step="1" value="4"> <span class="val" id="eb-b-v">4</span></label>
+    <label class="inline">DP world N: <input type="range" id="eb-n" min="1" max="32" step="1" value="8"> <span class="val" id="eb-n-v">8</span></label>
+    <label class="inline">accum G: <input type="range" id="eb-g" min="1" max="16" step="1" value="4"> <span class="val" id="eb-g-v">4</span></label>
+  </div>
+
+  <canvas id="eb-canvas" width="760" height="300" style="width:100%; height:300px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">effective batch</div><div class="v" id="eb-eff">—</div></div>
+    <div class="kpi"><div class="k">memory ∝ micro-batch</div><div class="v" id="eb-mem" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">samples / GPU / step</div><div class="v" id="eb-pg">—</div></div>
+    <div class="kpi"><div class="k">step time vs G=1</div><div class="v" id="eb-time">—</div></div>
+  </div>
+</div>
+
+<h2>The free win — skipping AllReduce with <code>no_sync</code></h2>
+
+<p>Here is the systems subtlety. Naïve DDP fires an AllReduce on <em>every</em> <code>backward()</code> — it overlaps the reduction with the backward compute (lesson 04). But during accumulation, the gradients of micro-batches 1 … <span class="math">G{-}1</span> are <em>intermediate</em>: they're going to be summed locally anyway. AllReducing each one is pure waste — you'd average a partial sum across ranks, then keep adding to it, then average again. The mathematically identical and far cheaper plan is: <strong>accumulate locally and silently for the first <span class="math">G{-}1</span> passes, AllReduce only on the <span class="math">G</span>-th.</strong></p>
+
+<p>PyTorch exposes this as the <code>model.no_sync()</code> context manager (and FSDP has an equivalent). The effect on communication is exactly <span class="math">G×</span>: one AllReduce per optimizer step instead of one per micro-batch.</p>
+
+<div class="widget" id="ns-widget">
+  <div class="title">DDP accumulation · with and without no_sync</div>
+  <div class="hint">Each strip is one optimizer step made of <span class="math">G</span> micro-batches. Grey = local forward+backward (no comm). Orange = an AllReduce on the inter-rank link. Toggle <code>no_sync</code> and watch <span class="math">G{-}1</span> of the orange bars vanish.</div>
+
+  <div class="controls">
+    <label class="inline">accum G: <input type="range" id="ns-g" min="1" max="10" step="1" value="5"> <span class="val" id="ns-g-v">5</span></label>
+    <label class="inline">AllReduce cost (× a micro-step): <input type="range" id="ns-c" min="2" max="20" step="1" value="8"> <span class="val" id="ns-c-v">8</span></label>
+    <button id="ns-toggle" class="primary">no_sync: ON</button>
+  </div>
+
+  <canvas id="ns-canvas" width="760" height="220" style="width:100%; height:220px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">AllReduces / step</div><div class="v" id="ns-ar">—</div></div>
+    <div class="kpi"><div class="k">comm volume vs naïve</div><div class="v" id="ns-vol">—</div></div>
+    <div class="kpi"><div class="k">comm-bound step time</div><div class="v" id="ns-tt" style="font-size:14px;">—</div></div>
+  </div>
+</div>
+
+<div class="callout">
+  <div class="label">Why this is a real lever, not a micro-optimisation</div>
+  At large <span class="math">G</span> on an inter-node link (lesson 03, IB ~50 GB/s), the gradient AllReduce is a big fraction of step time. Cutting it <span class="math">G×</span> can be the difference between communication-bound and compute-bound. This is also why accumulation pairs so naturally with the <em>inter-node</em> dimension of HSDP and 3D layouts: do the cheap local accumulation on the slow link's schedule, sync once.
+</div>
+
+<h2>How big <em>should</em> the effective batch be? The critical batch size</h2>
+
+<p>Bigger batch → less gradient noise → you can take a larger, more confident step → fewer optimizer steps to reach a target loss. So why not make <span class="math">B_eff</span> enormous? Because the returns saturate. McCandlish et al. (2018) formalised this: there is a <strong>critical batch size <span class="math">B_crit</span></strong> set by the gradient's noise-to-signal ratio, and</p>
+
+<p class="math block">steps(B)  ≈  S_min · (1 + B_crit / B)        examples(B)  ≈  E_min · (1 + B / B_crit)</p>
+
+<p>Read the two curves against each other. Below <span class="math">B_crit</span>, gradient noise dominates: doubling the batch nearly halves the number of steps — you're "buying" wall-clock speedup almost for free (each step processes more data but the step count drops proportionally). Above <span class="math">B_crit</span>, the gradient is already clean: doubling the batch barely reduces steps but doubles the data (and compute) you burn per step. <span class="math">B_crit</span> is the knee — the most parallelism you can exploit before you're just wasting FLOPs.</p>
+
+<div class="widget" id="cb-widget">
+  <div class="title">Critical batch size · the steps-vs-compute Pareto</div>
+  <div class="hint">Blue = optimizer steps to target (you want this low for wall-clock). Orange = total examples/compute to target (you want this low for efficiency). The green line is <span class="math">B_crit</span>; the marker is your chosen <span class="math">B_eff</span>. Past the knee, blue flattens while orange climbs.</div>
+
+  <div class="controls">
+    <label class="inline">B_crit: <input type="range" id="cb-bc" min="3" max="20" step="1" value="11"> <span class="val" id="cb-bc-v">2048</span></label>
+    <label class="inline">your B_eff: <input type="range" id="cb-be" min="3" max="20" step="1" value="11"> <span class="val" id="cb-be-v">2048</span></label>
+  </div>
+
+  <canvas id="cb-canvas" width="760" height="300" style="width:100%; height:300px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">steps vs minimum</div><div class="v" id="cb-st">—</div></div>
+    <div class="kpi"><div class="k">compute vs minimum</div><div class="v" id="cb-cp">—</div></div>
+    <div class="kpi"><div class="k">regime</div><div class="v" id="cb-rg" style="font-size:13px;">—</div></div>
+  </div>
+</div>
+
+<h2>Linear LR scaling — the batch and the learning rate move together</h2>
+
+<p>You cannot change <span class="math">B_eff</span> and leave the learning rate alone. The widely-used rule of thumb (Goyal et al., 2017, "1 hour ImageNet"): in the small-batch regime, <strong>scale the learning rate linearly with the batch size</strong> — double <span class="math">B_eff</span>, double the LR — because a larger batch gives a lower-variance gradient that a bigger step can safely exploit. Two caveats that matter in practice:</p>
+
+<ul>
+  <li><strong>Warmup is mandatory at large batch.</strong> A large LR applied to the noisy, ill-conditioned dynamics of the first few hundred steps blows up. Linearly ramp the LR from ~0 over a warmup window, then apply the scaled value.</li>
+  <li><strong>Linear scaling holds only below <span class="math">B_crit</span>.</strong> Past the knee, the gradient is no longer noise-limited, the variance argument breaks, and people switch to square-root scaling or just stop increasing the batch. This is the same knee the previous widget draws.</li>
+</ul>
+
+<div class="callout warn">
+  <div class="label">Reproducibility footgun</div>
+  Because accumulation, DP world size, and micro-batch all multiply into the <em>same</em> <span class="math">B_eff</span>, a run that changes any one of them silently changes the effective batch — and therefore needs a re-scaled LR to match. Resuming a checkpoint on a different node count (lesson 23) with the same config but a different <span class="math">N</span> is a classic way to accidentally retune your optimizer. Pin <span class="math">B_eff</span> and back-solve <span class="math">G</span> from the hardware, not the other way around.
+</div>
+
+<h2>Putting it together — the sizing recipe</h2>
+
+<ol>
+  <li>Pick <span class="math">B_eff</span> from the optimization side — at or just below <span class="math">B_crit</span> for the model/data. This is a convergence decision, not a hardware one.</li>
+  <li>Find the largest micro-batch <span class="math">b</span> that fits in HBM <em>after</em> FSDP + activation checkpointing (lessons 05, 20) — that's the memory budget talking.</li>
+  <li>Read off your DP world size <span class="math">N</span> from the cluster you have.</li>
+  <li>Solve <span class="math">G = B_eff / (b·N)</span>, rounding to keep <span class="math">B_eff</span> on target. Turn on <code>no_sync</code> so the <span class="math">G{-}1</span> intermediate AllReduces disappear.</li>
+  <li>Set LR by linear scaling from a known-good small-batch baseline, with warmup.</li>
+</ol>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  The effective batch <span class="math">b·N·G</span> is an optimization target; the micro-batch is a memory constraint; accumulation <span class="math">G</span> is the slack between them — and it's nearly free (peak memory unchanged, and DDP comm cut <span class="math">G×</span> with <code>no_sync</code>). The right <span class="math">B_eff</span> sits near the critical batch size, beyond which extra batch buys steps you don't need at the price of compute you can't afford. Whatever you pick, the LR scales with it.
+</div>
+
+<footer class="lesson-nav">
+  <a href="20_activation_checkpointing.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">20 · Activation checkpointing</span>
+  </a>
+  <a class="next" href="22_data_pipeline.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">22 · The distributed data pipeline</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+/* ─── Widget: effective batch composer ─── */
+(function(){
+  const C = document.getElementById('eb-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const b=$('eb-b'),bv=$('eb-b-v'),n=$('eb-n'),nv=$('eb-n-v'),g=$('eb-g'),gv=$('eb-g-v');
+
+  function render(){
+    const B=+b.value, N=+n.value, G=+g.value;
+    bv.textContent=B; nv.textContent=N; gv.textContent=G;
+    const eff = B*N*G;
+    $('eb-eff').textContent = eff.toLocaleString();
+    $('eb-mem').textContent = 'b='+B+' (G,N free)';
+    $('eb-pg').textContent = (B*G).toString();
+    $('eb-time').textContent = G+'×';
+
+    const dpr=window.devicePixelRatio||1, W=C.clientWidth, H=C.clientHeight;
+    if(C.width!==Math.round(W*dpr)){C.width=Math.round(W*dpr);C.height=Math.round(H*dpr);}
+    ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,W,H);
+
+    const padL=70, padT=24, padR=16, padB=20;
+    const gridW=W-padL-padR, gridH=H-padT-padB;
+    const totalRows = B*G;                 // micro-batch rows stacked per accumulation block
+    const cellW = gridW / N;
+    const cellH = gridH / totalRows;
+
+    // accumulation block colors (hue per pass), rank shading within
+    for(let pass=0; pass<G; pass++){
+      const hue = 210 + pass*(140/Math.max(1,G));   // 210→350
+      for(let row=0; row<B; row++){
+        const r = pass*B + row;
+        const y = padT + r*cellH;
+        for(let rank=0; rank<N; rank++){
+          const x = padL + rank*cellW;
+          const light = 78 - (rank/Math.max(1,N-1))*26;
+          ctx.fillStyle = `hsl(${hue},70%,${light}%)`;
+          ctx.fillRect(x+0.5, y+0.5, Math.max(1,cellW-1), Math.max(1,cellH-1));
+        }
+      }
+      // pass label
+      ctx.fillStyle='#5b6573'; ctx.font='10px monospace';
+      ctx.fillText('G'+pass, 6, padT + (pass*B + B/2)*cellH + 3);
+      // separator between accumulation blocks
+      if(pass>0){
+        ctx.strokeStyle='#1f2430'; ctx.lineWidth=1;
+        const ys = padT + pass*B*cellH;
+        ctx.beginPath(); ctx.moveTo(padL,ys); ctx.lineTo(padL+gridW,ys); ctx.stroke();
+      }
+    }
+    // column (rank) separators
+    ctx.strokeStyle='rgba(255,255,255,0.5)'; ctx.lineWidth=0.6;
+    for(let rank=1; rank<N; rank++){
+      const x=padL+rank*cellW;
+      ctx.beginPath(); ctx.moveTo(x,padT); ctx.lineTo(x,padT+gridH); ctx.stroke();
+    }
+    // axes labels
+    ctx.fillStyle='#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('rank 0 … '+(N-1)+'  (AllReduce across →)', padL, padT-8);
+    ctx.save(); ctx.translate(14, padT+gridH/2); ctx.rotate(-Math.PI/2);
+    ctx.fillText('G accumulation passes (time ↓)', -90, 0); ctx.restore();
+  }
+  [b,n,g].forEach(el=>el.addEventListener('input',render));
+  window.addEventListener('resize',render); render();
+})();
+</script>
+
+<script>
+/* ─── Widget: DDP no_sync comm timeline ─── */
+(function(){
+  const C=document.getElementById('ns-canvas'); const ctx=C.getContext('2d');
+  const $=id=>document.getElementById(id);
+  const g=$('ns-g'),gv=$('ns-g-v'),c=$('ns-c'),cv=$('ns-c-v'),tg=$('ns-toggle');
+  let noSync=true;
+  tg.addEventListener('click',()=>{noSync=!noSync; tg.textContent='no_sync: '+(noSync?'ON':'OFF'); tg.classList.toggle('primary',noSync); render();});
+
+  function render(){
+    const G=+g.value, AR=+c.value;
+    gv.textContent=G; cv.textContent=AR;
+    const arCount = noSync ? 1 : G;
+    const microUnit = 1; // each micro fwd+bwd = 1 unit
+    const total = G*microUnit + arCount*AR;
+    const naive = G*microUnit + G*AR;
+    $('ns-ar').textContent = arCount + ' / ' + G;
+    $('ns-vol').textContent = (arCount/G*100).toFixed(0) + '% of naïve';
+    $('ns-tt').textContent = total + ' vs ' + naive + ' units';
+
+    const dpr=window.devicePixelRatio||1, W=C.clientWidth, H=C.clientHeight;
+    if(C.width!==Math.round(W*dpr)){C.width=Math.round(W*dpr);C.height=Math.round(H*dpr);}
+    ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,W,H);
+
+    const padL=16, padR=16, padT=30;
+    const innerW=W-padL-padR;
+    const scale = innerW / Math.max(total, naive);  // common scale so bars are comparable
+    const barH=34;
+
+    function drawStrip(y, label, doSyncEach){
+      ctx.fillStyle='#5b6573'; ctx.font='11px monospace';
+      ctx.fillText(label, padL, y-6);
+      let x=padL;
+      for(let i=0;i<G;i++){
+        // micro step
+        ctx.fillStyle='#cbd5e1'; ctx.strokeStyle='#94a3b8'; ctx.lineWidth=1;
+        ctx.fillRect(x,y,microUnit*scale,barH); ctx.strokeRect(x,y,microUnit*scale,barH);
+        ctx.fillStyle='#5b6573'; ctx.font='9px monospace';
+        if(microUnit*scale>14) ctx.fillText('μ'+i, x+3, y+barH/2+3);
+        x+=microUnit*scale;
+        const fire = doSyncEach || (i===G-1);
+        if(fire){
+          ctx.fillStyle='#fdba74'; ctx.strokeStyle='#d97706'; ctx.lineWidth=1;
+          ctx.fillRect(x,y,AR*scale,barH); ctx.strokeRect(x,y,AR*scale,barH);
+          ctx.fillStyle='#92400e'; ctx.font='10px monospace';
+          if(AR*scale>30) ctx.fillText('AllReduce', x+4, y+barH/2+3);
+          x+=AR*scale;
+        }
+      }
+      // total tick
+      ctx.fillStyle='#1f2430'; ctx.font='11px monospace';
+      ctx.fillText(((x-padL)/scale).toFixed(0)+' units', x+6, y+barH/2+4);
+    }
+
+    drawStrip(padT, noSync?'no_sync ON — accumulate local, sync once':'no_sync OFF — sync every micro-batch', !noSync);
+    drawStrip(padT+barH+44, 'naïve DDP (reference) — AllReduce every micro-batch', true);
+  }
+  [g,c].forEach(el=>el.addEventListener('input',render));
+  window.addEventListener('resize',render); render();
+})();
+</script>
+
+<script>
+/* ─── Widget: critical batch size Pareto ─── */
+(function(){
+  const C=document.getElementById('cb-canvas'); const ctx=C.getContext('2d');
+  const $=id=>document.getElementById(id);
+  const bc=$('cb-bc'),bcv=$('cb-bc-v'),be=$('cb-be'),bev=$('cb-be-v');
+  const pow=v=>Math.round(Math.pow(2,v));   // slider is log2 of batch
+
+  function render(){
+    const Bc=pow(+bc.value), Be=pow(+be.value);
+    bcv.textContent=Bc.toLocaleString(); bev.textContent=Be.toLocaleString();
+    const steps = 1 + Bc/Be;       // × S_min
+    const comp  = 1 + Be/Bc;       // × E_min
+    $('cb-st').textContent = steps.toFixed(2)+'×';
+    $('cb-cp').textContent = comp.toFixed(2)+'×';
+    $('cb-rg').textContent = Be < Bc*0.6 ? 'noise-limited (scale up)' : Be > Bc*1.8 ? 'compute-wasting' : 'near the knee ✓';
+
+    const dpr=window.devicePixelRatio||1, W=C.clientWidth, H=C.clientHeight;
+    if(C.width!==Math.round(W*dpr)){C.width=Math.round(W*dpr);C.height=Math.round(H*dpr);}
+    ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,W,H);
+
+    const padL=46,padR=16,padT=20,padB=34;
+    const iW=W-padL-padR, iH=H-padT-padB;
+    const lo=3, hi=20;                          // log2 batch range
+    const X=lg=>padL+((lg-lo)/(hi-lo))*iW;
+    // normalize both curves to a shared 0..max for plotting
+    const stepsAt=B=>1+Bc/B, compAt=B=>1+B/Bc;
+    let ymax=0;
+    for(let lg=lo;lg<=hi;lg+=0.25){const B=Math.pow(2,lg); ymax=Math.max(ymax,stepsAt(B),compAt(B));}
+    ymax=Math.min(ymax,8);
+    const Y=v=>padT+iH-(Math.min(v,ymax)/ymax)*iH;
+
+    // grid
+    ctx.strokeStyle='#dde2ea'; ctx.lineWidth=1; ctx.fillStyle='#94a3b8'; ctx.font='10px monospace';
+    for(let gy=1;gy<=Math.floor(ymax);gy++){ const yy=Y(gy); ctx.beginPath(); ctx.moveTo(padL,yy); ctx.lineTo(padL+iW,yy); ctx.stroke(); ctx.fillText(gy+'×',6,yy+3);}
+    for(let lg=lo;lg<=hi;lg+=3){ const xx=X(lg); ctx.fillText(Math.pow(2,lg)>=1024?(Math.pow(2,lg)/1024)+'k':''+Math.pow(2,lg), xx-10, H-12);}
+    ctx.fillStyle='#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('batch size (log) →', padL+iW-110, H-12);
+    ctx.fillText('× minimum', 4, padT-6);
+
+    function curve(fn,color){
+      ctx.strokeStyle=color; ctx.lineWidth=2.2; ctx.beginPath();
+      let first=true;
+      for(let lg=lo;lg<=hi;lg+=0.1){const B=Math.pow(2,lg); const px=X(lg),py=Y(fn(B)); if(first){ctx.moveTo(px,py);first=false;}else ctx.lineTo(px,py);}
+      ctx.stroke();
+    }
+    curve(stepsAt,'#2563eb');  // steps
+    curve(compAt,'#d97706');   // compute
+
+    // B_crit line
+    const xc=X(Math.log2(Bc));
+    ctx.strokeStyle='#16a34a'; ctx.setLineDash([4,4]); ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.moveTo(xc,padT); ctx.lineTo(xc,padT+iH); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle='#16a34a'; ctx.fillText('B_crit', xc+4, padT+12);
+
+    // your B_eff marker
+    const xe=X(Math.log2(Be));
+    ctx.strokeStyle='#1f2430'; ctx.setLineDash([2,3]); ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(xe,padT); ctx.lineTo(xe,padT+iH); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle='#2563eb'; ctx.beginPath(); ctx.arc(xe,Y(stepsAt(Be)),4,0,7); ctx.fill();
+    ctx.fillStyle='#d97706'; ctx.beginPath(); ctx.arc(xe,Y(compAt(Be)),4,0,7); ctx.fill();
+
+    // legend
+    ctx.font='10px monospace';
+    ctx.fillStyle='#2563eb'; ctx.fillText('■ steps to target', padL+iW-150, padT+4);
+    ctx.fillStyle='#d97706'; ctx.fillText('■ compute to target', padL+iW-150, padT+18);
+  }
+  [bc,be].forEach(el=>el.addEventListener('input',render));
+  window.addEventListener('resize',render); render();
+})();
+</script>
+
+</body>
+</html>
