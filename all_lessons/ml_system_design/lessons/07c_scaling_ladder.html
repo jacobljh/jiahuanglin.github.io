@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>07c · The scaling ladder</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">ml_system_design</a>
+    <span class="crumb">/</span>
+    <span class="crumb">07c · scaling ladder</span>
+    <span class="step-pill">lesson 7c / 20</span>
+  </div>
+</header>
+
+<main>
+
+<h1>The scaling ladder — 7B on 8 GPUs to 405B on 2,048</h1>
+<p class="subtitle">07 gave the ordered recipe, 07a the cost of each axis, 07b the limits. Now we climb the ladder in one continuous walkthrough — same model family, growing cluster — and at every rung do exactly one thing: <strong>compute the bill, find the wall that binds, add the cheapest axis that relieves it, re-check.</strong> The point isn't the four answers; it's that each new axis appears only when a number forces it. That forcing is the whole skill.</p>
+
+<div class="callout">
+  <div class="label">The loop, specialized for training</div>
+  At each rung: <strong>(1)</strong> bill = <span class="math">16N</span> state + activations (lesson 02); <strong>(2)</strong> the binding wall is whichever is true first — <em>weights don't fit</em>, <em>state doesn't fit</em>, <em>comm won't hide</em> (07a), or <em>DP is capped</em> (07b); <strong>(3)</strong> add the cheapest axis per 07's order — TP in-node → PP across nodes → FSDP across dp; <strong>(4)</strong> re-run. We never pick an axis we don't need.
+</div>
+
+<h2>Rung 0 · 7B — does it even fit on one GPU?</h2>
+
+<p>Inference fits (14 GB of weights on an 80 GB H100). Training does not: <span class="math">16·7 = 112 GB</span> of state alone, before a single activation. So even the "small" model needs ≥ 2 GPUs' worth of memory — the forcing function of lesson 07.</p>
+
+<p><strong>On 8 GPUs:</strong> the wall is memory, and the cheapest cure is the one with the rarest, most-hideable collective — <strong>FSDP/ZeRO-3 across dp=8</strong>. Each GPU holds <span class="math">16·7/8 = 14 GB</span> of sharded state, plus ~14 GB of bf16 weights gathered during compute, plus a checkpointed activation budget — comfortably under 80 GB. No TP, no PP. The only collective is the gradient sync, hidden behind the backward pass as long as local tokens clear 07a's threshold. <strong>Binding wall: memory. Axis added: FSDP. MFU: high.</strong></p>
+
+<h2>Rung 1 · 70B on one node (8 GPUs) — the wall moves</h2>
+
+<p><span class="math">16·70 = 1{,}120 GB</span> of state. Sharded across dp=8 that's 140 GB/GPU — <strong>still over 80</strong>, and that's before the bf16 weights you must hold during the matmul (140 GB ÷ 8 = 17.5 GB) and activations. FSDP alone can't save a single node here. Add the in-node lever: <strong>TP=8</strong> cuts weights <em>and</em> activations by 8× — but with tp=8, dp=1 on one node, the 16N state still lands near 140 GB/GPU. </p>
+
+<div class="callout bad">
+  <div class="label">The lesson of rung 1: 70B simply does not fit on one node</div>
+  No combination of in-node axes gets <span class="math">1{,}120 GB</span> of state under <span class="math">8 × 80 = 640 GB</span> of node memory. The arithmetic forces you off the node. This is why you never see a 70B pretrained on a single DGX — the bill exceeds the box. The question was never "which axis," it was "how many nodes," and the bill answered it: <strong>≥ 2 nodes minimum, and many more for headroom and speed.</strong>
+</div>
+
+<h2>Rung 2 · 70B on 256 GPUs — the comfortable config</h2>
+
+<p>Now there's room to compose. Apply 07's order: <strong>TP=8 inside each node</strong> (weights → 17.5 GB/GPU, on NVLink so 07a's tax is ~5%), then <strong>FSDP across dp = 256/8 = 32</strong> to shard the rest:</p>
+
+<div class="math block">
+state/GPU ≈ 16·70 / (tp·dp) = 1{,}120 / (8·32) ≈ 4.4 GB &nbsp;+&nbsp; 17.5 GB weights &nbsp;+&nbsp; ~15 GB acts (ckpt) ≈ 37 GB ✓
+</div>
+
+<p>Fits with headroom. Now check the two non-memory walls. <strong>Comm (07a):</strong> TP stays in-node, grad sync hides if local tokens ≥ ~8K — set micro-batch accordingly. <strong>DP cap (07b):</strong> global batch = <span class="math">dp · micro · seq</span>; with dp=32 and seq 8K that's well under a 2M-token critical batch, so there's room to grow dp further. <strong>Binding wall: none is tight — this is the sweet spot.</strong> This is exactly lesson 07's worked example, now justified at every step.</p>
+
+<h2>Rung 3 · 405B on 2,048 GPUs — when even TP can't hold the weights</h2>
+
+<p><span class="math">16·405 = 6{,}480 GB</span> of state; weights alone are 810 GB. Try TP=8: weights become <span class="math">810/8 ≈ 101 GB/GPU</span> — <strong>over 80 before optimizer or activations.</strong> TP maxed at the node boundary still can't hold the model. The next-cheapest axis in 07's order is the one that survives crossing nodes: <strong>pipeline parallel.</strong></p>
+
+<p>Add <strong>PP=16</strong> across nodes (each stage holds 1/16 of the layers), keep <strong>TP=8</strong> in-node, and let <strong>dp = 2,048/(8·16) = 16</strong> shard the rest with FSDP:</p>
+
+<div class="math block">
+weights/GPU ≈ 810/(8·16) ≈ 6.3 GB &nbsp;|&nbsp; state/GPU ≈ 6{,}480/(8·16·16) ≈ 3.2 GB &nbsp;|&nbsp; + acts ✓ fits
+</div>
+
+<p>Memory is solved — but PP introduced a <em>new</em> binding wall, the bubble (07/07a). With pp=16 you need many microbatches to amortize it: at M=16 the bubble is <span class="math">15/31 ≈ 48%</span> (catastrophic); push to M=64 and it's <span class="math">15/79 ≈ 19%</span>; M=128 → ~10%. <strong>Binding wall: the PP bubble. Lever: microbatch count, not memory.</strong> The design problem shifted from "does it fit" to "keep the pipe full" — a different question answered by a different knob, which is the whole reason we re-check after every axis.</p>
+
+<div class="callout warn">
+  <div class="label">Past dense 405B: when parameters outgrow the budget, go sparse</div>
+  Push the dense model bigger and the <span class="math">6N</span> compute per token (lesson 02) becomes unaffordable — every token pays for every parameter. The escape is <strong>Mixture-of-Experts</strong>: grow total parameters but route each token to a few experts, so compute per token stays flat. That adds <strong>expert parallel</strong> (07a's all-to-all) to the stack. The ladder's top rungs are sparse for exactly this reason — it's the only way to keep growing N without growing the per-token bill.
+</div>
+
+<h2>The ladder as one table</h2>
+
+<table>
+  <thead><tr><th>Rung</th><th>Model</th><th>GPUs</th><th>Binding wall</th><th>Axis added</th><th>Config</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>7B</td><td>8</td><td>state &gt; 1 GPU</td><td>FSDP/ZeRO-3</td><td>dp=8</td></tr>
+    <tr><td>1</td><td>70B</td><td>8</td><td>state &gt; 1 node</td><td>(forces multi-node)</td><td>— infeasible —</td></tr>
+    <tr><td>2</td><td>70B</td><td>256</td><td>weights/GPU</td><td>TP + FSDP</td><td>tp=8, dp=32</td></tr>
+    <tr><td>3</td><td>405B</td><td>2,048</td><td>weights &gt; TP alone</td><td>+ PP (then bubble)</td><td>tp=8, pp=16, dp=16</td></tr>
+    <tr><td>4</td><td>&gt;1T sparse</td><td>4,096+</td><td>6N compute/token</td><td>+ EP (MoE)</td><td>tp·pp·dp·ep</td></tr>
+  </tbody>
+</table>
+
+<p>Read down the "binding wall" column: it changes every rung. That is the entire message of this track applied to training — <strong>you don't memorize configs, you find the wall and relieve it with the cheapest axis, then look again.</strong> The config is an output, never an input.</p>
+
+<svg viewBox="0 0 720 230" class="diagram" role="img" aria-label="The scaling ladder, each rung adding one axis">
+  <line x1="60" y1="200" x2="690" y2="200" class="edge" stroke="var(--text-dim)"/>
+  <text x="375" y="224" text-anchor="middle" font-size="12" fill="var(--text-mute)">model size × cluster size →</text>
+
+  <g font-size="11" fill="var(--text-mute)">
+    <rect x="70"  y="150" width="120" height="40" rx="6" class="node-bg"/>
+    <text x="130" y="166" text-anchor="middle" font-weight="600" font-size="12">7B / 8</text>
+    <text x="130" y="182" text-anchor="middle">FSDP</text>
+
+    <rect x="220" y="120" width="120" height="70" rx="6" class="node-bg"/>
+    <text x="280" y="140" text-anchor="middle" font-weight="600" font-size="12">70B / 256</text>
+    <text x="280" y="158" text-anchor="middle">+ TP (in-node)</text>
+    <text x="280" y="174" text-anchor="middle">+ FSDP</text>
+
+    <rect x="370" y="80" width="120" height="110" rx="6" class="node-bg"/>
+    <text x="430" y="100" text-anchor="middle" font-weight="600" font-size="12">405B / 2048</text>
+    <text x="430" y="118" text-anchor="middle">+ TP</text>
+    <text x="430" y="134" text-anchor="middle">+ PP (cross-node)</text>
+    <text x="430" y="150" text-anchor="middle">+ FSDP</text>
+    <text x="430" y="172" text-anchor="middle" fill="var(--accent-2)">wall: bubble</text>
+
+    <rect x="520" y="40" width="130" height="150" rx="6" class="node-bg"/>
+    <text x="585" y="60" text-anchor="middle" font-weight="600" font-size="12">&gt;1T MoE / 4096</text>
+    <text x="585" y="78" text-anchor="middle">+ TP + PP</text>
+    <text x="585" y="94" text-anchor="middle">+ FSDP</text>
+    <text x="585" y="110" text-anchor="middle">+ EP (all-to-all)</text>
+    <text x="585" y="132" text-anchor="middle" fill="var(--accent-2)">wall: 6N/token</text>
+  </g>
+  <path d="M190 170 L218 162" class="edge"/>
+  <path d="M340 150 L368 140" class="edge"/>
+  <path d="M490 120 L518 112" class="edge"/>
+  <text x="60" y="30" font-size="11.5" fill="var(--text-dim)">each rung keeps the axes below it and adds exactly one — the one the new wall demands</text>
+</svg>
+
+<h2>Interactive · the topology recommender</h2>
+
+<p>Give it a model and a cluster; it climbs the ladder for you — applying 07's order until the model fits, then reporting the binding wall and a rough MFU. Try the rungs above and watch the config it picks. Then break it: ask for 405B on 64 GPUs (won't fit — it tells you the minimum), or 7B on 4,096 (fits trivially, but you're past the DP cap of 07b, so it warns the extra GPUs are wasted). The recommender is just this lesson's loop in code.</p>
+
+<div class="widget"><div class="title">Topology recommender / climb the ladder</div>
+<p class="hint">Assumptions (±30%): 80 GB H100s; greedy order TP(≤8, in-node)→PP(cross-node)→FSDP across remaining dp; bf16 weights + 16N state + checkpointed activations; PP bubble at M=64; DP capped at B_crit=2M tokens, seq 8K (07b); TP tax from 07a’s 1/h with width inferred from N. Order-of-magnitude — sizes a config, doesn’t replace a profiler.</p>
+<div class="controls">
+<label class="inline">params N (B) <input id="r-N" type="range" min="7" max="405" step="1" value="70"><span class="val" id="r-N-v">70</span></label>
+<label class="inline">cluster GPUs <input id="r-G" type="range" min="8" max="8192" step="8" value="256"><span class="val" id="r-G-v">256</span></label>
+<label class="inline">activation ckpt <input id="r-C" type="range" min="0" max="1" step="1" value="1"><span class="val" id="r-C-v">on</span></label>
+</div>
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">recommended config</div><div class="v" id="r-cfg" style="font-size:15px">–</div></div>
+  <div class="kpi"><div class="k">per-GPU memory</div><div class="v" id="r-mem">–</div></div>
+  <div class="kpi"><div class="k">binding wall</div><div class="v" id="r-wall" style="font-size:14px">–</div></div>
+  <div class="kpi"><div class="k">est. MFU</div><div class="v" id="r-mfu">–</div></div>
+</div>
+<p class="hint" id="r-note"></p></div>
+
+<h2>What carries forward</h2>
+<ul>
+  <li><strong>The config is an output of the loop, not a choice.</strong> At each scale: bill → binding wall → cheapest relieving axis → re-check. Memorize the loop, derive the config.</li>
+  <li><strong>The binding wall moves as you climb:</strong> 7B = state &gt; 1 GPU (FSDP); 70B = state &gt; 1 node (forces multi-node, then TP+FSDP); 405B = weights &gt; TP alone (forces PP, then the bubble binds); &gt;1T = 6N compute/token (forces MoE/EP).</li>
+  <li><strong>Axes are added in 07's order and never sooner:</strong> TP in-node (cheap, ≤8) → PP across nodes (survives IB) → FSDP fills dp. Each appears only when a number forces it.</li>
+  <li><strong>After each axis, a new wall appears</strong> — memory gives way to the comm tax (07a) gives way to the DP cap (07b) gives way to the bubble. Re-checking is the discipline.</li>
+  <li><strong>This is the capstone of the training arc:</strong> 07 (axes + recipe) + 07a (cost) + 07b (limits) compose into one repeatable climb you can run on any model + cluster pair.</li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="07b_scaling_ceiling.html"><span class="dir">Previous</span><span class="ttl">07b · The scaling ceiling</span></a>
+  <a class="next" href="08_training_data_system.html"><span class="dir">Next</span><span class="ttl">08 · Training data plane</span></a>
+</footer>
+
+<script>
+(function(){
+  const ids=['N','G','C'];
+  const el=Object.fromEntries(ids.map(k=>[k,document.getElementById('r-'+k)]));
+  const HBM=80, M=64, Bcrit=2e6, seq=8000;
+  function draw(){
+    document.getElementById('r-N-v').textContent=el.N.value;
+    document.getElementById('r-G-v').textContent=el.G.value;
+    document.getElementById('r-C-v').textContent=el.C.value==='1'?'on':'off';
+    const N=+el.N.value, G=+el.G.value, ckpt=el.C.value==='1';
+    const stateGB=16*N, wGB=2*N;                 // total state / weights (GB, N in B)
+    const actBase=24*(N/70)*(ckpt?0.3:1);        // GB at tp=pp=1, scaled by model, cut by ckpt
+    // greedy: try increasing TP (<=8), then PP, with dp filling the rest
+    let best=null;
+    for(let tp=1; tp<=8; tp++){
+      for(let pp=1; pp<=Math.max(1,Math.floor(G/tp)); pp++){
+        const dp=Math.floor(G/(tp*pp));
+        if(dp<1) continue;
+        if(tp*pp*dp> G) continue;
+        const wPer=wGB/(tp*pp);
+        const statePer=stateGB/(tp*pp*dp);
+        const actPer=actBase/(tp*pp);
+        const mem=wPer+statePer+actPer;
+        if(mem<=HBM){
+          // prefer the config that fits with smallest tp, then smallest pp (07's order)
+          if(!best || (tp<best.tp) || (tp===best.tp && pp<best.pp)){
+            best={tp,pp,dp,mem};
+          }
+        }
+      }
+    }
+    const cfgEl=document.getElementById('r-cfg');
+    const memEl=document.getElementById('r-mem');
+    const wallEl=document.getElementById('r-wall');
+    const mfuEl=document.getElementById('r-mfu');
+    const note=document.getElementById('r-note');
+    if(!best){
+      // minimum GPUs needed: state must fit -> tp*pp*dp >= stateGB/(HBM - wMin) roughly; report a floor
+      const minGPU=Math.ceil(stateGB/ (HBM*0.6))/1;  // rough: 60% of HBM for state
+      cfgEl.textContent='— no fit —';
+      memEl.textContent='OOM';
+      wallEl.textContent='memory';
+      mfuEl.textContent='–';
+      note.textContent=N+'B does not fit on '+G+' GPUs. The 16N state ('+stateGB.toFixed(0)+' GB) needs more memory than the cluster has. Raise the GPU count to at least ~'+Math.max(8,Math.ceil(minGPU/8)*8)+' (a multiple of 8), or shrink the model. This is rung 1’s lesson: the bill, not taste, sets the minimum cluster.';
+      return;
+    }
+    const {tp,pp,dp,mem}=best;
+    cfgEl.textContent='tp='+tp+' · pp='+pp+' · dp='+dp;
+    memEl.textContent=mem.toFixed(0)+' GB';
+    // bubble + DP cap checks
+    const bubble=pp>1?(pp-1)/(M+pp-1):0;
+    const gbatch=dp*seq;                          // micro·accum=1 seq/rank
+    const overCap=gbatch>Bcrit;
+    let mfu=0.50*(1-bubble);
+    const widthTax = (tp>1? 0.67*990e12/(900e9*(Math.sqrt(N/70)*8192)) : 0);
+    mfu*=1/(1+Math.max(0,widthTax));
+    let wall='balanced', extra='';
+    if(bubble>0.2){ wall='PP bubble'; extra='Bubble is '+(bubble*100).toFixed(0)+'% at M=64 — raise microbatches or lower pp.'; }
+    else if(overCap){ wall='DP cap (07b)'; extra='Global batch '+(gbatch/1e6).toFixed(1)+'M > B_crit 2M — dp='+dp+' is past the critical batch, so extra DP replicas waste tokens. Past the cheap zone (07b): use fewer GPUs or a bigger model.'; }
+    else if(mem>70){ wall='memory (tight)'; extra='Per-GPU '+mem.toFixed(0)+' GB — little headroom; '+(ckpt?'':'enable activation checkpointing or ')+'add a GPU.'; }
+    else { wall='none tight'; extra='Comfortable: '+mem.toFixed(0)+' GB/GPU, bubble '+(bubble*100).toFixed(0)+'%, DP within B_crit. The sweet spot of rung 2.'; }
+    wallEl.textContent=wall;
+    wallEl.style.color=(wall==='none tight')?'var(--ok)':(wall==='balanced'?'var(--text)':'var(--warn,#d97706)');
+    mfuEl.textContent=(mfu*100).toFixed(0)+'%';
+    note.textContent='Climbed the ladder: '+(tp>1?'TP='+tp+' in-node, ':'')+(pp>1?'PP='+pp+' across nodes, ':'')+'FSDP over dp='+dp+'. Fits at '+mem.toFixed(0)+' GB/GPU. Binding wall: '+wall+'. '+extra;
+  }
+  Object.values(el).forEach(x=>x.addEventListener('input',draw));
+  draw();
+})();
+</script>
+
+</main>
+</body>
+</html>
