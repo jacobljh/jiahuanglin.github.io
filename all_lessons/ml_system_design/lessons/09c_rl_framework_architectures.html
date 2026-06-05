@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>09c · Async rollout dataflow</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">ml_system_design</a>
+    <span class="crumb">/</span>
+    <span class="crumb">09c · async rollout dataflow</span>
+    <span class="step-pill">RL systems 3 / 4</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Async rollout, derived from the longest trajectory</h1>
+<p class="subtitle">09a found that rollout is usually the dominant term — ~95% of the step for reasoning RL. This lesson opens the rollout box and finds the reason async exists hiding inside one fact: <strong>a synchronous batch finishes when its <em>slowest</em> trajectory finishes, not its average one.</strong> Everything else — partial rollout, repacking, streaming queues, bounded staleness — is forced by that, and bounded by the off-policy cost of fixing it.</p>
+
+<div class="callout">
+  <div class="label">The design target</div>
+  Keep actors busy, keep the learner fed, and keep every sample traceable to the policy version that produced it. The first two are throughput; the third is correctness. Throughput without version accounting is just a faster way to train on the wrong distribution — so this lesson derives both halves and the knob between them.
+</div>
+
+<h2>1 · Why the global batch is hostage to its longest trajectory</h2>
+
+<p>A synchronous step samples <span class="math">K</span> completions per prompt and cannot start training until all of them return. So the rollout time is a <strong>max, not a mean</strong> (<a href="../../RL/lessons/22b_longtail_rollouts.html">RL 22b</a>):</p>
+
+<div class="math block">
+&tau;<sub>R</sub> = max<sub>i ∈ K</sub> &tau;<sub>traj, i</sub> &nbsp;&nbsp;(not&nbsp; mean<sub>i</sub> &tau;<sub>traj, i</sub>)
+</div>
+
+<p>This would be harmless if lengths were tight. They are not — reasoning outputs are <strong>heavy-tailed</strong>: most completions are short, a few think for 10,000+ tokens. For a length distribution with coefficient of variation <span class="math">c = σ/μ</span>, the expected maximum of <span class="math">K</span> draws grows like (lognormal extreme-value):</p>
+
+<div class="math block">
+L<sub>max</sub>(K) ≈ μ · exp( s·√(2 ln K) − s²/2 ),&nbsp;&nbsp; s = √(ln(1 + c²))
+</div>
+
+<p>Plug in the typical reasoning-RL regime — <span class="math">K = 16</span>, <span class="math">c = 1</span> — and the longest of the 16 is about <strong>5× the mean</strong>. Since decode time is roughly linear in length (lesson 04), the batch spends most of its wall-clock waiting on one straggler while 15 actors sit idle. That idle is not a tuning problem; it is the shape of the distribution. <strong>This is the entire motivation for breaking the synchronous barrier.</strong></p>
+
+<div class="callout bad">
+  <div class="label">The asymmetry that decides where to spend effort</div>
+  <span class="math">L<sub>max</sub></span> grows with <span class="math">√(ln K)</span> but with the <em>full</em> width <span class="math">c</span>. So lowering <span class="math">K</span> helps only logarithmically (halving K barely moves the max), while <strong>capping the tail width pays back nearly linearly</strong>. That is why the fixes below all attack the tail — length caps, repacking, partial rollout — rather than just shrinking the batch.
+</div>
+
+<h2>2 · The fixes are all "stop waiting for the straggler"</h2>
+
+<p>Once you see <span class="math">&tau;<sub>R</sub></span> as a max over a heavy tail, every rollout optimization is the same move — decouple the fast trajectories from the slow one so the batch boundary no longer pins the cluster. They compose multiplicatively (<a href="../../RL/lessons/22b_longtail_rollouts.html">RL 22b</a>'s ladder, relative to a static-padded baseline of 1.0×):</p>
+
+<table>
+  <thead><tr><th>Patch</th><th>What it changes</th><th>Cumulative &tau;<sub>R</sub></th></tr></thead>
+  <tbody>
+    <tr><td>Static padding (baseline)</td><td>Pad every sequence to max length, one global batch.</td><td>1.00×</td></tr>
+    <tr><td>+ paged KV + continuous batching</td><td>No padding waste; a finished slot is refilled immediately (<a href="../../RL/lessons/20_kv_paged.html">RL 20</a>).</td><td>~0.30×</td></tr>
+    <tr><td>+ length cap at p95 with soft penalty</td><td>Truncate the extreme tail; penalize instead of waiting forever.</td><td>~0.18×</td></tr>
+    <tr><td>+ dynamic K (kill settled groups)</td><td>Stop sampling a prompt once its group reward has converged.</td><td>~0.13×</td></tr>
+    <tr><td>+ fp8 rollout + logprob recompute</td><td>Faster decode; recover exact logprobs on the learner side.</td><td>~0.08×</td></tr>
+  </tbody>
+</table>
+
+<p>The endpoint of that ladder is <strong>trajectory-level asynchrony</strong>: don't wait for any batch at all. Consume each finished trajectory as it lands, repack stragglers into the next micro-batch, and let the learner step on a stream. Partial rollout (pause a long generation, train, resume it later under newer weights) is the same idea pushed into a single trajectory. But every one of these moves the data <em>off</em> the policy that will train on it — which is the cost we have to price next.</p>
+
+<h2>3 · The price of overlap — staleness, and why it is a budget</h2>
+
+<p>Break the barrier and the learner is now training on trajectories that were generated by older weights. RL corrects for this with an <strong>importance-sampling ratio</strong> (<a href="../../RL/lessons/06_weight_sync.html">RL 06</a>, <a href="../../RL/lessons/10_ppo.html">RL 10</a>): a sample generated under <span class="math">π<sub>θ−Δ</sub></span> but trained under <span class="math">π<sub>θ</sub></span> is reweighted by</p>
+
+<div class="math block">
+ρ<sub>t</sub> = π<sub>θ</sub>(y<sub>t</sub> | y<sub>&lt;t</sub>) / π<sub>θ−Δ</sub>(y<sub>t</sub> | y<sub>&lt;t</sub>),&nbsp;&nbsp; clipped to [1−ε, 1+ε]
+</div>
+
+<p>The correction is only valid while <span class="math">ρ</span> stays near 1. As staleness <span class="math">Δ</span> (in learner steps) grows, the two policies drift apart, more tokens fall outside the clip range, and the gradient becomes biased and high-variance. Empirically the <strong>freshness wall</strong> sits around <span class="math">Δ ≈ 4–8</span> steps, where the clipped fraction crosses ~20–25% and learning destabilizes (<a href="../../RL/lessons/22c_async_weight_sync.html">RL 22c</a>). So:</p>
+
+<div class="callout warn">
+  <div class="label">Async is a dial from on-policy to off-policy, not an on/off switch</div>
+  <span class="math">Δ = 0</span> is strictly synchronous: cleanest gradient, worst utilization. Larger <span class="math">Δ</span> buys overlap (the <span class="math">idle_band</span> of 09b) but spends statistical validity. The dial is bounded by the freshness wall, and unlike a pure systems knob, pushing past it hurts the <em>model</em>, not just the clock. The only honest metric is <strong>reward at fixed GPU-hours</strong> — never steps/hour, which always improves and tells you nothing.
+</div>
+
+<h2>4 · So a trajectory must carry its version — the systems object</h2>
+
+<p>Now the data schema is not bureaucracy — it is <em>derived</em>. To compute <span class="math">ρ</span> you need the logprobs and the policy version each token was sampled under; to repack and prioritize you need lengths and rewards; to debug a reward bug you need the env events. The trajectory therefore has to be a record, not a triple:</p>
+
+<pre><code>Trajectory {
+  prompt_id, task_id, curriculum_bin,
+  policy_version, reference_version,   // ← needed to compute ρ and the KL baseline
+  tokens, logprobs, masks, tool_calls, // ← logprobs are the denominator of ρ
+  env_events, reward_components, verifier_logs,
+  started_at, finished_at, actor_id, env_id,
+  length_tokens, wall_time_ms, stale_by_versions  // ← the freshness check
+}</code></pre>
+
+<p>That schema is the control surface for every optimization in §2 and §3: partial rollout, dynamic sampling, retry, reward caching, staleness admission, replay prioritization, and regression analysis all read or write fields of it. A framework that logs only "prompt + response + reward" cannot do any of them correctly.</p>
+
+<h2>5 · The async graph and where it stalls</h2>
+
+<p>Wire those records through services and you get the SOTA rollout plane: a prompt queue feeds an actor fleet, completions go to env/reward, finished trajectories stream into a versioned store, the learner pulls from the store, and a weight service pushes fresh policy back to the actors while a controller enforces admission SLOs.</p>
+
+<svg viewBox="0 0 780 310" class="diagram" role="img" aria-label="Asynchronous RL rollout dataflow">
+  <defs><marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+
+  <rect x="28" y="48" width="116" height="52" rx="8" fill="#2563eb18" stroke="var(--accent)"/>
+  <text x="86" y="70" text-anchor="middle" font-size="12">prompt queue</text>
+  <text x="86" y="88" text-anchor="middle" font-size="10" fill="var(--accent)">curriculum</text>
+
+  <rect x="190" y="48" width="126" height="52" rx="8" fill="#2563eb22" stroke="var(--accent)"/>
+  <text x="253" y="70" text-anchor="middle" font-size="12">actor fleet</text>
+  <text x="253" y="88" text-anchor="middle" font-size="10" fill="var(--accent)">vLLM / SGLang</text>
+
+  <rect x="365" y="48" width="126" height="52" rx="8" fill="#d9770622" stroke="var(--accent-2)"/>
+  <text x="428" y="70" text-anchor="middle" font-size="12">env / reward</text>
+  <text x="428" y="88" text-anchor="middle" font-size="10" fill="var(--accent-2)">tests, tools, RM</text>
+
+  <rect x="548" y="48" width="150" height="52" rx="8" fill="#7c3aed22" stroke="#7c3aed"/>
+  <text x="623" y="70" text-anchor="middle" font-size="12">trajectory store</text>
+  <text x="623" y="88" text-anchor="middle" font-size="10" fill="#7c3aed">stream + version</text>
+
+  <rect x="548" y="176" width="150" height="52" rx="8" fill="#16a34a22" stroke="var(--ok)"/>
+  <text x="623" y="198" text-anchor="middle" font-size="12">learner</text>
+  <text x="623" y="216" text-anchor="middle" font-size="10" fill="var(--ok)">PPO / GRPO / off-policy</text>
+
+  <rect x="190" y="176" width="126" height="52" rx="8" fill="#dc262622" stroke="var(--bad)"/>
+  <text x="253" y="198" text-anchor="middle" font-size="12">weight service</text>
+  <text x="253" y="216" text-anchor="middle" font-size="10" fill="var(--bad)">bucket / relay</text>
+
+  <rect x="365" y="176" width="126" height="52" rx="8" fill="#94a3b822" stroke="var(--text-dim)"/>
+  <text x="428" y="198" text-anchor="middle" font-size="12">controller</text>
+  <text x="428" y="216" text-anchor="middle" font-size="10" fill="var(--text-mute)">admission + SLO</text>
+
+  <path d="M144 74 L188 74" class="edge" marker-end="url(#a1)"/>
+  <path d="M316 74 L363 74" class="edge" marker-end="url(#a1)"/>
+  <path d="M491 74 L546 74" class="edge" marker-end="url(#a1)"/>
+  <path d="M623 101 L623 174" class="edge" marker-end="url(#a1)"/>
+  <path d="M548 202 L493 202" class="edge" marker-end="url(#a1)"/>
+  <path d="M365 202 L318 202" class="edge" marker-end="url(#a1)"/>
+  <path d="M253 176 C 253 140, 253 137, 253 102" stroke="var(--bad)" fill="none" marker-end="url(#a1)"/>
+  <path d="M428 176 C 428 132, 623 132, 623 103" stroke="#7c3aed" fill="none" marker-end="url(#a1)"/>
+
+  <text x="390" y="274" text-anchor="middle" font-size="11" fill="var(--text-mute)">SOTA frameworks optimize the queues, placement, and freshness around this loop.</text>
+</svg>
+
+<p>Each edge is a place the plane can stall, and each stall has a fix and a quality risk — the risk being the §3 staleness budget cashed out in a specific way:</p>
+
+<table>
+  <thead><tr><th>Stall</th><th>Symptom</th><th>Fix</th><th>Quality risk</th></tr></thead>
+  <tbody>
+    <tr><td>Decode wall</td><td>Actors at 100%, learner waits for tokens.</td><td>More actors, vLLM/SGLang, continuous batching, speculative decode.</td><td>Speculation must preserve the target distribution, or it is no longer on-policy.</td></tr>
+    <tr><td>Long-tail completions</td><td>A few huge responses hold the batch boundary (§1).</td><td>Partial rollout, repacking, abort/retract, length-aware sampling.</td><td>Dropping long samples biases toward short reasoning — unless tracked.</td></tr>
+    <tr><td>Environment tail</td><td>Tests/browsers/tools dominate p95.</td><td>Remote sandbox pools, cached verifiers, async reward queues, timeouts.</td><td>Timeout policy becomes a reward-design choice.</td></tr>
+    <tr><td>Store backpressure</td><td>Actors finish but can't enqueue; learner sees bursty batches.</td><td>Streaming transfer, sharded queues, priority admission.</td><td>Queue policy can silently shift the task distribution.</td></tr>
+    <tr><td>Freshness drift</td><td>Utilization rises but the reward curve gets worse.</td><td>Bounded staleness, staleness-aware PPO, recency priority, version gates.</td><td>Too much stale data turns near-on-policy RL into accidental off-policy RL.</td></tr>
+  </tbody>
+</table>
+
+<h2>6 · Backpressure and admission — the controller's SLOs</h2>
+
+<p>Async does not mean unbounded. The controller enforces a small set of SLOs that encode the §3 budget and the §1 tail directly:</p>
+
+<ul>
+  <li><strong>Max policy lag:</strong> reject or downweight trajectories older than <code>k</code> versions (the freshness wall).</li>
+  <li><strong>Max rollout wall time:</strong> abort, retract, or isolate requests past the task budget (the tail cap).</li>
+  <li><strong>Min batch quality:</strong> avoid batches dominated by one task, one reward mode, or one length bucket.</li>
+  <li><strong>Queue pressure:</strong> throttle prompt admission when the store or reward services saturate.</li>
+  <li><strong>Replay policy:</strong> decide whether old high-reward samples are allowed, and under which objective.</li>
+</ul>
+
+<div class="callout warn">
+  <div class="label">The trap async designs fall into</div>
+  Many optimize GPU utilization first, then discover the learner is training on a moving mixture of old policies, easy prompts, and short trajectories. Utilization and sample validity must be optimized <em>together</em> — which is only possible because every trajectory carries its version (§4).
+</div>
+
+<h2>SOTA patterns — each is one move on this graph</h2>
+
+<table>
+  <thead><tr><th>Pattern</th><th>System move</th><th>Seen in</th></tr></thead>
+  <tbody>
+    <tr><td>Continuous rollout serving</td><td>Treat actors as inference servers: batching, KV management, prefix reuse, pause/resume for weight updates.</td><td>OpenRLHF + vLLM; slime + SGLang; verl rollout backends.</td></tr>
+    <tr><td>Speculative RL rollout</td><td>A drafter proposes tokens, the target policy verifies — lossless, so the on-policy distribution is preserved while decode speeds up.</td><td><a href="https://arxiv.org/abs/2604.26779">NeMo-RL speculative decoding</a>.</td></tr>
+    <tr><td>Producer-consumer streaming</td><td>Rollout, reward, and learner progress through a streamed queue instead of a global phase barrier.</td><td><a href="https://arxiv.org/abs/2507.01663">AsyncFlow</a> / <a href="https://arxiv.org/abs/2604.11554">Relax</a> TransferQueue.</td></tr>
+    <tr><td>Trajectory-level asynchrony</td><td>Consume finished trajectories independently; repack stragglers instead of waiting for the slowest (§1 endpoint).</td><td><a href="https://arxiv.org/abs/2510.12633">Laminar</a> relay + repacking; <a href="https://arxiv.org/abs/2505.24298">AReaL</a> fully-async.</td></tr>
+    <tr><td>Agent-training disaggregation</td><td>Separate arbitrary agent execution from training via a unified transition interface.</td><td><a href="https://arxiv.org/abs/2508.03680">Agent Lightning</a>; OpenRLHF token-in-token-out agents.</td></tr>
+    <tr><td>Search/learning decoupling</td><td>Scale exploration actors separately from learners with a replay-compatible objective — for sparse rewards, spend compute on search, not more PPO epochs.</td><td><a href="https://arxiv.org/abs/2503.18929">Trajectory Balance with Asynchrony</a>.</td></tr>
+  </tbody>
+</table>
+
+<h2>Interactive · rollout data-plane planner</h2>
+
+<p>Compare the synchronous wall (wait for the tail) to an async plane (overlap + repack the tail, pay a freshness penalty if lag grows). Push <em>tail skew</em> up and watch the synchronous wall explode while async stays flat — that gap is §1 made visible.</p>
+
+<div class="widget"><div class="title">Async rollout planner</div>
+<p class="hint">Sync waits for rollout tail + reward tail + train + sync. Async overlaps rollout with training and repacks the tail, but multiplies by a freshness penalty once max lag passes the wall (~4). The recommendation reads the dominant term back to you.</p>
+<div class="controls">
+<label class="inline">actor GPUs <input id="r-actors" type="range" min="8" max="512" step="8" value="128"><span class="val" id="r-actors-v">128</span></label>
+<label class="inline">avg gen sec <input id="r-gen" type="range" min="20" max="900" step="20" value="240"><span class="val" id="r-gen-v">240</span></label>
+<label class="inline">tail skew × <input id="r-tail" type="range" min="1" max="6" step="0.25" value="2.5"><span class="val" id="r-tail-v">2.50</span></label>
+<label class="inline">env p95 sec <input id="r-env" type="range" min="0" max="600" step="10" value="90"><span class="val" id="r-env-v">90</span></label>
+<label class="inline">train sec <input id="r-train" type="range" min="20" max="500" step="10" value="120"><span class="val" id="r-train-v">120</span></label>
+<label class="inline">max lag Δ <input id="r-lag" type="range" min="0" max="12" step="1" value="3"><span class="val" id="r-lag-v">3</span></label>
+</div>
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">sync loop</div><div class="v" id="r-sync">-</div></div>
+  <div class="kpi"><div class="k">async loop</div><div class="v" id="r-async">-</div></div>
+  <div class="kpi"><div class="k">speedup</div><div class="v" id="r-speed">-</div></div>
+  <div class="kpi"><div class="k">design call</div><div class="v" id="r-call">-</div></div>
+</div>
+<p class="hint" id="r-note"></p></div>
+
+<h2>What carries forward</h2>
+<ul>
+  <li><strong>Rollout time is a max, not a mean:</strong> <span class="math">&tau;<sub>R</sub> = max<sub>i</sub> &tau;<sub>traj,i</sub></span>, and with heavy-tailed reasoning lengths the longest of K=16 is ~5× the mean. The synchronous batch is hostage to one straggler.</li>
+  <li><strong>Capping the tail beats shrinking K:</strong> the max grows like <span class="math">√(ln K)</span> but with the full width <span class="math">c</span> — so length caps, repacking, and partial rollout pay nearly linearly while lowering K barely helps.</li>
+  <li><strong>The endpoint is trajectory-level async</strong> — consume each finished trajectory immediately — which is why frameworks chase it.</li>
+  <li><strong>Overlap costs staleness,</strong> priced by the IS ratio <span class="math">ρ = π<sub>θ</sub>/π<sub>θ−Δ</sub></span>; the freshness wall (<span class="math">Δ ≈ 4–8</span>, clip frac ~20–25%) bounds the dial. Measure reward at fixed compute.</li>
+  <li><strong>Therefore the trajectory is a versioned record,</strong> not a triple — the logprobs and policy version are literally the inputs to the correction, and the control surface for every other optimization.</li>
+</ul>
+
+<h2>Sources used</h2>
+<table>
+  <thead><tr><th>Source</th><th>System idea used</th></tr></thead>
+  <tbody>
+    <tr><td><a href="https://arxiv.org/abs/2507.01663">AsyncFlow</a></td><td>Streaming data storage, fine-grained scheduling, producer-consumer async workflow.</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2505.24298">AReaL</a></td><td>Fully asynchronous generation/training with workload balancing and staleness-aware PPO.</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2510.12633">Laminar</a></td><td>Trajectory-level asynchrony, relay workers, and dynamic repacking for long-tail rollouts.</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2604.11554">Relax</a></td><td>TransferQueue service decoupling and continuous staleness control.</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2604.26779">NeMo-RL speculative decoding</a></td><td>System-integrated, distribution-preserving speculative decode for sync and async rollouts.</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2508.03680">Agent Lightning</a></td><td>Training-agent disaggregation and a unified interface for arbitrary agent trajectories.</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2503.18929">Trajectory Balance with Asynchrony</a></td><td>Decoupling exploration/search from learning with replay-compatible objectives.</td></tr>
+    <tr><td><a href="https://openrlhf.readthedocs.io/en/latest/async_training.html">OpenRLHF async training</a></td><td>Partial rollout, vLLM pause/resume, rollout/training overlap.</td></tr>
+    <tr><td><a href="https://sgl-project.github.io/advanced_features/sglang_for_rl.html">SGLang for RL</a></td><td>Sleep/wake, weight-update modes, long-tail rollout controls.</td></tr>
+  </tbody>
+</table>
+
+<footer class="lesson-nav">
+  <a href="09b_rl_algorithm_ladder.html"><span class="dir">Previous</span><span class="ttl">09b · Placement &amp; weight sync</span></a>
+  <a class="next" href="09d_sota_rl_playbook.html"><span class="dir">Next</span><span class="ttl">09d · Framework playbook</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const ids=['actors','gen','tail','env','train','lag'];
+  const el=Object.fromEntries(ids.map(k=>[k,document.getElementById('r-'+k)]));
+  function draw(){
+    const actors=+el.actors.value, gen=+el.gen.value, tail=+el.tail.value, env=+el.env.value, train=+el.train.value, lag=+el.lag.value;
+    ids.forEach(k=>{ document.getElementById('r-'+k+'-v').textContent = k==='tail' ? (+el[k].value).toFixed(2) : el[k].value; });
+    const syncLoop=gen*tail + env + train + 30;
+    const repackedTail=gen*(1+0.22*(tail-1));
+    const envExposed=env*0.45;
+    const lagPenalty=1 + Math.max(0, lag-4)*0.06;
+    const asyncLoop=(Math.max(repackedTail+envExposed, train)+8)*lagPenalty;
+    const speed=syncLoop/asyncLoop;
+    let call='sync is fine';
+    let note='The simple synchronous design may be acceptable. Spend effort on reward quality and trainer correctness first.';
+    if(speed>1.4 && lag<=4){
+      call='async rollout';
+      note='Async rollout is attractive: overlap and repacking recover utilization while staleness is still inside the freshness wall.';
+    } else if(speed>1.4 && lag>4){
+      call='tighten lag';
+      note='The system wants async throughput, but max lag is past the freshness wall (~4). Add version gates or staleness-aware losses before scaling actors.';
+    } else if(env > gen*0.7){
+      call='env pool';
+      note='Environment latency is exposed. Scale sandbox workers, cache deterministic checks, and isolate slow tasks.';
+    }
+    if(actors<64 && gen*tail>train*2){
+      call='more actors';
+      note='Generation is the wall and the actor pool is small. Add rollout capacity before complicating the queueing architecture.';
+    }
+    document.getElementById('r-sync').textContent=syncLoop.toFixed(0)+' s';
+    document.getElementById('r-async').textContent=asyncLoop.toFixed(0)+' s';
+    document.getElementById('r-speed').textContent=speed.toFixed(2)+'x';
+    document.getElementById('r-call').textContent=call;
+    document.getElementById('r-note').textContent=note;
+  }
+  Object.values(el).forEach(x=>x.addEventListener('input',draw));
+  draw();
+})();
+</script>
+
+</body>
+</html>

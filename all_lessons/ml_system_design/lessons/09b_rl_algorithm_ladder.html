@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>09b · Placement and weight sync</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">ml_system_design</a>
+    <span class="crumb">/</span>
+    <span class="crumb">09b · placement and weight sync</span>
+    <span class="step-pill">RL systems 2 / 4</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Placement and weight sync, from the layout mismatch up</h1>
+<p class="subtitle">09a left a term unexplained: <span class="math">&tau;<sub>S</sub></span>, the weight-sync time. This lesson derives it. The chain is short and forces everything else: the actor and the learner want <strong>physically different shardings of the same N parameters</strong>, so a conversion is unavoidable, that conversion moves bytes, and the bytes cost time on a link. Where you put the two roles — colocated, disaggregated, hybrid, relayed — is nothing more than four ways to pay or hide that one cost.</p>
+
+<div class="callout">
+  <div class="label">The question this lesson answers</div>
+  <em>Where do the actor and learner live, and how do fresh weights get from one to the other cheaply?</em> Almost every clever thing a SOTA framework does — 3D-HybridEngine resharding, bucketed updates, direct-memory sync, relay workers — is an answer to that, and which answer is right is set by a number you can compute: <span class="math">&tau;<sub>S</sub></span> as a fraction of <span class="math">&tau;<sub>step</sub></span>.
+</div>
+
+<h2>1 · Why a conversion is forced — the layout mismatch</h2>
+
+<p>The learner and the actor are the same N weights, but they are <em>sharded across GPUs differently</em>, because training and serving optimize for different things:</p>
+
+<ul>
+  <li><strong>Learner layout.</strong> FSDP/ZeRO shards <em>by parameter</em>: every GPU holds a thin slice of every layer's weights, plus that slice's gradient and optimizer state (the 16N bill of lesson 07). Megatron may instead split with tensor/pipeline/expert/context parallel. The layout is chosen to fit the <strong>16N</strong> training state and keep MFU high.</li>
+  <li><strong>Actor layout.</strong> vLLM/SGLang want tensor-parallel <em>inference</em> weights laid out for fast decode, paged KV alongside (<a href="../../RL/lessons/20_kv_paged.html">RL 20</a>), continuous batching, and often a lower precision or MoE-specialized kernel. The layout is chosen to maximize decode bandwidth, and it carries <strong>no</strong> optimizer state.</li>
+</ul>
+
+<p>These two partitions almost never coincide. A learner GPU holds "1/d of every tensor"; an actor GPU holds "all of some tensors, none of others." So handing weights from learner to actor is not a copy — it is a <strong>gather-then-reshard</strong>: reassemble each full parameter from its learner shards, then re-cut it along the actor's partition. That reshape is the irreducible reason weight sync exists, and why it is more than a memcpy.</p>
+
+<div class="math block">
+learner shard layout &nbsp;≠&nbsp; actor shard layout &nbsp;⟹&nbsp; gather + reshard required every update
+</div>
+
+<h2>2 · The byte cost, and the four operations it decomposes into</h2>
+
+<p>How big is the transfer? Lesson 02's weight rule: one full copy of the policy is <span class="math">precision × N</span> bytes, and you must deliver it to every independent actor replica:</p>
+
+<div class="math block">
+sync_bytes ≈ precision_bytes × N × actor_copies
+</div>
+
+<p>For a 70B bf16 policy one copy is <strong>~140 GB</strong>; at 405B it is <strong>~810 GB</strong>. That is the headline number, but it hides structure. The actual sync is <strong>four operations in series</strong> (<a href="../../RL/lessons/22c_async_weight_sync.html">RL 22c</a>), and each has its own lever — which is exactly why there are several "weight-sync patterns" rather than one:</p>
+
+<table>
+  <thead><tr><th>#</th><th>Operation</th><th>Bound by</th><th>Order (70B, in-node)</th><th>The lever on it</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>All-gather FSDP shards → full params</td><td>intra-node BW (NVLink)</td><td>~0.5–2 s</td><td>broadcast tree, overlap with compute</td></tr>
+    <tr><td>2</td><td>Cast dtype (bf16 → fp8)</td><td>HBM write</td><td>~0.1–0.3 s</td><td>fuse into the gather; fp8 halves the bytes downstream</td></tr>
+    <tr><td>3</td><td>Broadcast learner → every actor</td><td><strong>inter-node BW (IB)</strong></td><td>~1–5 s</td><td>bucketing, RDMA/DMA, fewer copies — the long pole</td></tr>
+    <tr><td>4</td><td>Reshard into actor TP layout</td><td>NCCL + permute</td><td>~0.5–4 s</td><td>resharding engine (HybridFlow), avoid round-trips</td></tr>
+  </tbody>
+</table>
+
+<p>Operation 3 is the long pole, and it is where lesson 02's <strong>18× gap</strong> bites: 140 GB over NVLink (~900 GB/s) is ~0.16 s, but over InfiniBand (~50 GB/s) it is ~2.8 s — which can rival a whole training step. The byte equation alone tells you the architecture: <span class="math">&tau;<sub>S</sub></span> grows linearly with N and inversely with the slowest link on the path, so the bigger the model and the slower the link, the more the design must work to avoid doing this globally every step.</p>
+
+<div class="callout warn">
+  <div class="label">Weight sync buys nothing — it is pure tax</div>
+  A gradient step buys learning; a rollout buys data; the sync buys neither. It is the cost of keeping two copies of the weights in two layouts. So unlike <span class="math">&tau;<sub>R</sub></span> or <span class="math">&tau;<sub>T</sub></span>, the goal for <span class="math">&tau;<sub>S</sub></span> is not "make it efficient" — it is "make it disappear," either by not having two copies (colocate) or by hiding it behind the next rollout's prefill.
+</div>
+
+<h2>3 · Placement = four ways to pay or hide &tau;<sub>S</sub></h2>
+
+<p>Now the placement choices are not a menu to memorize — each is a distinct answer to "what do we do about the conversion cost." Derive the idle they create. In disaggregated synchronous mode the step is <span class="math">max(&tau;<sub>R</sub>, &tau;<sub>T</sub>) + &tau;<sub>S</sub></span>, so the faster pool sits idle for the difference, plus the whole cluster waits out the sync:</p>
+
+<div class="math block">
+idle_band = |&tau;<sub>R</sub> − &tau;<sub>T</sub>| + &tau;<sub>S</sub>
+</div>
+
+<p>Every placement is an attack on one of those two terms:</p>
+
+<table>
+  <thead><tr><th>Placement</th><th>Physical shape</th><th>What it does to &tau;<sub>S</sub> / idle</th><th>Failure mode</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Colocated</strong></td><td>Actor and learner time-share the same GPUs.</td><td><span class="math">&tau;<sub>S</sub> → ~0</span>: same process, same device — sync is a pointer swap, no conversion over the wire.</td><td>No overlap (the <span class="math">|&tau;<sub>R</sub>−&tau;<sub>T</sub>|</span> term is the whole step); HBM thrash swapping KV ↔ optimizer state.</td></tr>
+    <tr><td><strong>Disaggregated</strong></td><td>Separate actor pool and learner pool.</td><td>Pays the full <span class="math">&tau;<sub>S</sub></span> broadcast, but lets <span class="math">&tau;<sub>R</sub></span> and <span class="math">&tau;<sub>T</sub></span> overlap and be sized independently.</td><td>O(model size) broadcast every step; a pool idles if the split is wrong (09a §4).</td></tr>
+    <tr><td><strong>Hybrid engine</strong></td><td>Shared workers, but train and generate <em>phases</em> reshard in place with zero redundancy.</td><td>Kills the duplicate actor copy <em>and</em> shrinks operation 4 — reshard locally instead of broadcasting a second copy.</td><td>Hard engine integration; the code must understand both training and serving layouts at once.</td></tr>
+    <tr><td><strong>Relay / parameter service</strong></td><td>Weights flow through relay workers; actors pull a fresh-enough version when ready.</td><td>Removes the <em>global</em> sync barrier entirely — <span class="math">&tau;<sub>S</sub></span> leaves the critical path, at the cost of versioned staleness.</td><td>Versioning, staleness, and failure recovery become first-class (09c).</td></tr>
+  </tbody>
+</table>
+
+<p>The decision is workload-dependent, and the byte equation decides it. A 7B experiment on one node has tiny <span class="math">&tau;<sub>S</sub></span> and should pay the complexity of nothing — colocate and pointer-swap. A 405B policy with long-CoT rollouts has an 810 GB <span class="math">&tau;<sub>S</sub></span> and slow inter-node links, so a naive global broadcast every step <em>is the bug</em>; it must reshard in place, bucket, or relay.</p>
+
+<h2>4 · The named patterns, each grounded in an operation</h2>
+
+<p>With the four operations and the idle equation in hand, the public "weight-movement patterns" stop being a list of brand names and become a map of <em>which operation each one attacks</em>:</p>
+
+<table>
+  <thead><tr><th>Pattern</th><th>Attacks</th><th>Mechanism in one line</th><th>Choose it when</th></tr></thead>
+  <tbody>
+    <tr><td>3D-HybridEngine reshard (<a href="https://arxiv.org/abs/2409.19256">HybridFlow / verl</a>)</td><td>op 4 + the duplicate copy</td><td>Reshard the actor between train and generate layouts in place, with low memory redundancy.</td><td>Colocated/hybrid is attractive but naive reloads dominate.</td></tr>
+    <tr><td>Ray + vLLM + ZeRO handoff (<a href="https://arxiv.org/abs/2405.11143">OpenRLHF</a>)</td><td>scheduling around ops 1–4</td><td>Practical disaggregated orchestration over widely-used engines.</td><td>Accessibility and flexible RLHF/RLVR workflows matter most.</td></tr>
+    <tr><td>Bucketed update (<a href="https://openlm.ai/slime/">slime</a> / SGLang)</td><td>op 3 latency</td><td>Send weights in fused buckets and overlap each bucket's transfer with the next gather.</td><td>Full monolithic reload is too slow but actors stay service-based.</td></tr>
+    <tr><td>Direct-memory sync (<a href="https://arxiv.org/abs/2505.24034">LlamaRL</a>)</td><td>op 3 copies</td><td>GPU-to-GPU RDMA writes that skip host staging.</td><td>Hundreds of billions of params and tight hardware coupling is acceptable.</td></tr>
+    <tr><td>Relay workers (<a href="https://arxiv.org/abs/2510.12633">Laminar</a>)</td><td>the global barrier itself</td><td>A parameter tier lets each rollout pull a fresh-enough version without a cluster-wide sync.</td><td>Long-tail trajectories make global sync the bottleneck.</td></tr>
+    <tr><td>TransferQueue + staleness knob (<a href="https://arxiv.org/abs/2604.11554">Relax</a> / <a href="https://arxiv.org/abs/2507.01663">AsyncFlow</a>)</td><td>moves &tau;<sub>S</sub> off the critical path</td><td>A data bus carries weights and trajectories; one knob slides from on-policy to fully async.</td><td>Multimodal/agentic roles need fault-isolated services.</td></tr>
+  </tbody>
+</table>
+
+<h2>5 · The freshness contract — staleness is a budget, not a switch</h2>
+
+<p>The moment the sync leaves the critical path (hybrid, relay, async), trajectories start being generated under <em>old</em> weights. The controller must therefore stamp every trajectory with the policy version that produced it, so the learner can decide whether to accept it — because the gradient correction depends on it (the importance ratio of <a href="../../RL/lessons/06_weight_sync.html">RL 06</a>; the full statistical story is 09c). The contract has a few discrete settings:</p>
+
+<table>
+  <thead><tr><th>Freshness mode</th><th>Rule</th><th>System effect</th><th>Statistical effect</th></tr></thead>
+  <tbody>
+    <tr><td>Strict on-policy</td><td>train update t only on version-t samples</td><td>Global barriers, low utilization on long-tail.</td><td>Cleanest gradient estimator.</td></tr>
+    <tr><td>Near-on-policy</td><td>accept samples within k versions</td><td>Actor/learner overlap; stale tail bounded.</td><td>Small off-policy bias, usually fine if monitored.</td></tr>
+    <tr><td>Fully async</td><td>queue-based admission, no global batch</td><td>Highest utilization.</td><td>Needs staleness-aware loss / IS correction.</td></tr>
+    <tr><td>Replay / search-heavy</td><td>prioritize reward or recency from a buffer</td><td>Searcher fleet scales past the learner.</td><td>Needs an off-policy-compatible objective.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout ok">
+  <div class="label">Design rule: treat staleness like a latency SLO</div>
+  It is not "async: yes/no" — it is a budget you spend. If reward at fixed GPU-hours is unchanged when you loosen <span class="math">k</span>, spend the budget to reclaim the <span class="math">idle_band</span>. If reward degrades, tighten <span class="math">k</span> <em>before</em> buying more actors. The measurement that matters is final quality at fixed compute, never steps/hour.
+</div>
+
+<h2>Interactive · sync time and freshness budget</h2>
+
+<p>Watch <span class="math">&tau;<sub>S</sub></span> grow with the model and turn from a rounding error into the architecture. The exact number is not the point — the point is the threshold where simple broadcast stops working and the design must reshard, bucket, or relay.</p>
+
+<div class="widget"><div class="title">Weight sync sizing</div>
+<p class="hint">Assumes bf16 weights, full-policy update. Effective bandwidth is below the raw link spec because it folds in protocol, reshard, and scheduling losses. Actor copies = independent inference replicas needing fresh weights. The verdict tracks <span class="math">&tau;<sub>S</sub> / &tau;<sub>step</sub></span>.</p>
+<div class="controls">
+<label class="inline">params B <input id="w-p" type="range" min="7" max="405" step="1" value="70"><span class="val" id="w-p-v">70</span></label>
+<label class="inline">actor copies <input id="w-c" type="range" min="1" max="64" step="1" value="8"><span class="val" id="w-c-v">8</span></label>
+<label class="inline">effective BW GB/s <input id="w-bw" type="range" min="25" max="900" step="25" value="100"><span class="val" id="w-bw-v">100</span></label>
+<label class="inline">train step sec <input id="w-step" type="range" min="5" max="300" step="5" value="60"><span class="val" id="w-step-v">60</span></label>
+</div>
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">one copy</div><div class="v" id="w-one">-</div></div>
+  <div class="kpi"><div class="k">full fanout</div><div class="v" id="w-full">-</div></div>
+  <div class="kpi"><div class="k">&tau;<sub>S</sub> / step</div><div class="v" id="w-tax">-</div></div>
+  <div class="kpi"><div class="k">pattern</div><div class="v" id="w-pattern">-</div></div>
+</div>
+<p class="hint" id="w-note"></p></div>
+
+<h2>What carries forward</h2>
+<ul>
+  <li><strong>The mismatch forces the cost.</strong> Learner shards by parameter (+16N state); actor shards for decode (no optimizer, paged KV). Different partitions ⟹ a gather-and-reshard every update — that is what <span class="math">&tau;<sub>S</sub></span> <em>is</em>.</li>
+  <li><strong>The bytes set the architecture:</strong> <span class="math">sync_bytes ≈ precision × N × actor_copies</span> — 140 GB at 70B, 810 GB at 405B — decomposing into all-gather → cast → broadcast → reshard, with the inter-node broadcast as the long pole (lesson 02's 18×).</li>
+  <li><strong>Placement is four ways to pay or hide it:</strong> colocate (<span class="math">&tau;<sub>S</sub>→0</span>, no overlap), disaggregate (pay it, gain overlap), hybrid (reshard in place, drop the copy), relay (take it off the critical path for staleness).</li>
+  <li><strong>Sync is pure tax,</strong> so the goal is to make it vanish, not to make it efficient — hence pointer-swap when colocated and overlap-with-prefill when not.</li>
+  <li><strong>Once sync leaves the critical path, staleness appears</strong> — a budget measured against reward at fixed compute, with version-tagged trajectories as the prerequisite. The statistics of that budget are 09c.</li>
+</ul>
+
+<h2>Sources used</h2>
+<table>
+  <thead><tr><th>Source</th><th>System idea used</th></tr></thead>
+  <tbody>
+    <tr><td><a href="https://arxiv.org/abs/2409.19256">HybridFlow / verl</a></td><td>Hybrid control and 3D-HybridEngine resharding between train and generate layouts.</td></tr>
+    <tr><td><a href="https://github.com/verl-project/verl">verl repository</a></td><td>FSDP/Megatron training + vLLM/SGLang rollout backends, RL algorithms, MoE scale.</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2405.11143">OpenRLHF</a></td><td>Ray + vLLM + DeepSpeed/ZeRO disaggregated scheduling.</td></tr>
+    <tr><td><a href="https://openlm.ai/slime/">slime</a></td><td>SGLang-native rollout, Megatron-native training, bucketed weight updates.</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2505.24034">LlamaRL</a></td><td>Async architecture and direct-memory (RDMA) weight synchronization.</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2510.12633">Laminar</a></td><td>Relay-worker parameter service that breaks the global sync barrier.</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2604.11554">Relax</a> / <a href="https://arxiv.org/abs/2507.01663">AsyncFlow</a></td><td>TransferQueue data bus, service decoupling, continuous staleness knob.</td></tr>
+  </tbody>
+</table>
+
+<footer class="lesson-nav">
+  <a href="09a_rl_capability_first_principles.html"><span class="dir">Previous</span><span class="ttl">09a · Systems first principles</span></a>
+  <a class="next" href="09c_rl_framework_architectures.html"><span class="dir">Next</span><span class="ttl">09c · Async rollout dataflow</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const ids=['p','c','bw','step'];
+  const el=Object.fromEntries(ids.map(k=>[k,document.getElementById('w-'+k)]));
+  function draw(){
+    const P=+el.p.value, C=+el.c.value, bw=+el.bw.value, step=+el.step.value;
+    document.getElementById('w-p-v').textContent=P;
+    document.getElementById('w-c-v').textContent=C;
+    document.getElementById('w-bw-v').textContent=bw;
+    document.getElementById('w-step-v').textContent=step;
+    const one=2*P;
+    const full=one*C;
+    const sec=full/bw;
+    const tax=sec/step;
+    let pattern='simple broadcast';
+    let note='Broadcast is not free, but it is probably not the first wall. Keep the simpler design unless rollout or train overlap forces disaggregation.';
+    if(tax>0.25 && tax<=1){
+      pattern='bucket / overlap';
+      note='Sync is a major tax (op 3, the inter-node broadcast). Bucket parameter updates, overlap with the next rollout prefill, or reduce actor copies before moving to a full relay service.';
+    } else if(tax>1){
+      pattern='relay / async';
+      note='A full fanout takes longer than the learner step. This is where reshard-in-place, direct-memory sync, lower precision, or a relay tier (taking sync off the critical path) become architectural, not optional.';
+    }
+    document.getElementById('w-one').textContent=one.toLocaleString()+' GB';
+    document.getElementById('w-full').textContent=full.toLocaleString()+' GB';
+    document.getElementById('w-tax').textContent=(tax*100).toFixed(0)+'%';
+    document.getElementById('w-pattern').textContent=pattern;
+    document.getElementById('w-note').textContent=note;
+  }
+  Object.values(el).forEach(x=>x.addEventListener('input',draw));
+  draw();
+})();
+</script>
+
+</body>
+</html>
