@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>03 · Triton algorithms and data structures</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">triton</a>
+    <span class="crumb">/</span>
+    <span class="crumb">03 · algorithms and data structures</span>
+    <span class="step-pill">lesson 3 / 3</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Algorithms, data structures, and the line of thinking</h1>
+<p class="subtitle">The whole skill is recognizing when a problem fits the shape Triton is good at — a regular tile, a local reduction, a cheap store — and when it doesn't, so you hand it to CUDA, CUB, cuBLAS, or PyTorch instead.</p>
+
+<div class="linear-step">
+  <div class="label">Linearized thinking</div>
+  <ol>
+    <li><strong>Represent the data structure as pointer arithmetic.</strong> A row of a matrix is <code>base + row*stride_m + arange(BLOCK)*stride_n</code>. A CSR row is <code>col_ptr + start + arange(BLOCK)</code>. A block-sparse plan is an index table <code>metadata[q_block, slot]</code>. Everything in Triton is ultimately a base pointer plus an offset tensor plus a mask.</li>
+    <li><strong>Ask the fit question.</strong> Can a single program (a) load the region it needs into a tile, possibly with masking, (b) reduce or transform it <em>locally</em> with <code>tl.sum</code> / <code>tl.max</code> / <code>tl.dot</code> / an online update, and (c) store the result with little or no cross-tile coordination?</li>
+    <li><strong>If yes, Triton fits.</strong> You write one tight kernel and fusion saves the HBM round-trips a library would pay.</li>
+    <li><strong>If no — global ordering, dynamic queues, data-dependent control flow, multi-pass coordination — prefer CUDA / CUB / cuBLAS / PyTorch.</strong> Forcing those into Triton means atomics, multiple launches, and wasted lanes. The library already solved it.</li>
+  </ol>
+</div>
+
+<h2>The fit map</h2>
+<p>Before any kernel, the interview answer is a triage. Memorize this table as the first thing you say:</p>
+
+<table>
+<thead>
+<tr><th>Pattern</th><th>Triton fit</th><th>Reasoning</th></tr>
+</thead>
+<tbody>
+<tr><td>Elementwise / fused epilogue</td><td>Excellent</td><td>Pure map: each program owns a tile, no neighbor depends on it. Fusion kills intermediate HBM traffic (bias + activation + cast in one pass).</td></tr>
+<tr><td>Row reductions (softmax, norm, max)</td><td>Excellent <em>when a row fits a tile</em></td><td>One program per row, reduce along the free axis with <code>tl.sum</code>/<code>tl.max</code>. Zero cross-program talk if the row fits <code>BLOCK_N</code>.</td></tr>
+<tr><td>Matmul-like dot</td><td>Good → Excellent</td><td><code>tl.dot</code> lowers to tensor cores. Great for fused GEMM epilogues and attention; raw peak GEMM still belongs to cuBLAS.</td></tr>
+<tr><td>Global scan / sort</td><td>Usually poor</td><td>Needs multi-pass global coordination and a deterministic order across all programs. Use CUB / Thrust.</td></tr>
+<tr><td>Graph traversal</td><td>Usually poor</td><td>Irregular frontiers, dynamic work queues, heavy atomics — that is CUDA warp-level programming, not regular tiles.</td></tr>
+<tr><td>Block-sparse attention</td><td>Good</td><td>Metadata picks a list of regular blocks, so the irregular part is precomputed and the kernel does regular block matmuls.</td></tr>
+</tbody>
+</table>
+
+<div class="callout">
+  <div class="label">THE THROUGH-LINE</div>
+  <p>Every "Excellent" row shares a property: <strong>the work each program does is independent of what other programs decide at runtime.</strong> Every "poor" row breaks it — the answer for one element depends on a global ordering or on a frontier discovered while running. Triton has no efficient story for runtime-discovered, cross-program dependencies; that is precisely the gap CUDA and CUB fill.</p>
+</div>
+
+<h2>1 · Row-wise reduction as a data-structure primitive</h2>
+
+<p>A row-major matrix <span class="math">A</span> of shape <span class="math">M×N</span> is already a data structure: the <span class="math">i</span>-th row lives at <code>A_ptr + i*stride_m</code>, and the <span class="math">j</span>-th element of that row at <code>+ j*stride_n</code>. There is no pointer chasing — the address is arithmetic. That is why row reductions are the canonical Triton win: assign <strong>one program per row</strong>, load the row into a tile, reduce.</p>
+
+<pre><code>import triton
+import triton.language as tl
+
+@triton.jit
+def row_max_kernel(A_ptr, out_ptr,
+                   M, N,
+                   stride_m, stride_n,
+                   BLOCK_N: tl.constexpr):
+    row = tl.program_id(0)                  # this program owns one row
+    if row &gt;= M:
+        return
+
+    # pointer tensor for the whole row (assumes N &lt;= BLOCK_N)
+    offs_n = tl.arange(0, BLOCK_N)
+    ptrs = A_ptr + row * stride_m + offs_n * stride_n
+    mask = offs_n &lt; N
+
+    # other=-inf so masked lanes never win the max
+    vals = tl.load(ptrs, mask=mask, other=float("-inf"))
+
+    m = tl.max(vals, axis=0)                # local reduction, no cross-program comm
+    tl.store(out_ptr + row, m)
+</code></pre>
+
+<p>The grid is <code>(M,)</code>. The crucial line is <code>other=float("-inf")</code>: masked lanes load a sentinel that can never be the maximum, so the reduction over <code>BLOCK_N</code> lanes equals the reduction over the real <span class="math">N</span> elements. Sum reductions use <code>other=0.0</code> for the same reason.</p>
+
+<div class="callout ok">
+  <div class="label">WHEN IT FITS</div>
+  <p>If <span class="math">N ≤ BLOCK_N</span> the row fits one tile, the reduction is entirely register/shared-memory local, and there is <strong>zero cross-program communication</strong>. One launch, one pass, done. This is the ideal Triton shape.</p>
+</div>
+
+<div class="callout warn">
+  <div class="label">WHEN THE ROW DOESN'T FIT</div>
+  <p>If <span class="math">N</span> is huge (say 200k), a single program can't hold the row. Split it: launch a grid of <code>(M, n_chunks)</code>, each program reduces its chunk to a <strong>partial maximum</strong>, write the partials to a scratch buffer of shape <span class="math">M×n\_chunks</span>, then a <strong>second kernel</strong> reduces the partials per row. The moment you need a second pass, you've left the cheapest regime — it still works, but you're now coordinating across programs, and that is the early-warning sign that bigger versions of the problem belong to a library.</p>
+</div>
+
+<h2>2 · Top-k for small k without sorting</h2>
+
+<p>You don't need a sort to find the largest two elements of a row. You need <code>tl.max</code>, <code>tl.argmax</code>, and a mask. The trick: find the max, record its index, overwrite that lane with <span class="math">-∞</span> using <code>tl.where</code>, find the max again.</p>
+
+<pre><code>@triton.jit
+def top2_per_row_kernel(A_ptr,
+                        v1_ptr, i1_ptr, v2_ptr, i2_ptr,
+                        M, N, stride_m, stride_n,
+                        BLOCK_N: tl.constexpr):
+    row = tl.program_id(0)
+    if row &gt;= M:
+        return
+
+    offs = tl.arange(0, BLOCK_N)
+    ptrs = A_ptr + row * stride_m + offs * stride_n
+    mask = offs &lt; N
+    vals = tl.load(ptrs, mask=mask, other=float("-inf"))
+
+    # --- first pick ---
+    v1 = tl.max(vals, axis=0)
+    i1 = tl.argmax(vals, axis=0)
+
+    # mask out the winning lane, then pick again
+    vals2 = tl.where(offs == i1, float("-inf"), vals)
+    v2 = tl.max(vals2, axis=0)
+    i2 = tl.argmax(vals2, axis=0)
+
+    tl.store(v1_ptr + row, v1)
+    tl.store(i1_ptr + row, i1)
+    tl.store(v2_ptr + row, v2)
+    tl.store(i2_ptr + row, i2)
+</code></pre>
+
+<p>Generalizing to top-<span class="math">k</span> is a loop: each iteration does one <code>tl.max</code>/<code>tl.argmax</code> over the whole row and one <code>tl.where</code> to evict the chosen lane. That is <span class="math">O(k·N)</span> work per row.</p>
+
+<div class="callout">
+  <div class="label">THE SWITCH POINT</div>
+  <p>The repeated-masking approach scans the full row once per <span class="math">k</span>. It only beats a library selection because everything stays in registers — <strong>fusion avoids the extra HBM traffic</strong> of writing scores out and reading them back into a separate selection kernel. That advantage is real for tiny <span class="math">k</span> (top-1, top-2, top-5) fused onto a row you were already touching. For larger <span class="math">k</span>, <span class="math">O(k·N)</span> rescans lose to an <span class="math">O(N + k·log k)</span> selection; defer to a real selection / sort (CUB / <code>torch.topk</code>).</p>
+</div>
+
+<h2>3 · Segmented reductions in a CSR-like layout</h2>
+
+<p>Compressed Sparse Row (CSR) is the classic irregular structure. The matrix is three arrays: <code>row_ptr</code> (length <span class="math">M+1</span>, the start offset of each row), <code>col_idx</code> (column index of each nonzero), and <code>vals</code> (the nonzeros themselves). Row <span class="math">i</span>'s nonzeros are <code>vals[row_ptr[i] : row_ptr[i+1]]</code>. A sparse-matrix × dense-vector product (SpMV) is a <em>segmented</em> reduction: one dot product per row over a variable-length segment.</p>
+
+<pre><code>@triton.jit
+def csr_spmv_kernel(row_ptr, col_idx, vals, x_ptr, y_ptr,
+                    M, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    if row &gt;= M:
+        return
+
+    start = tl.load(row_ptr + row)          # segment bounds for this row
+    end   = tl.load(row_ptr + row + 1)
+
+    # load the whole bounded segment at once (assumes nnz_per_row &lt;= BLOCK)
+    offs = tl.arange(0, BLOCK)
+    j    = start + offs
+    mask = j &lt; end
+    cols = tl.load(col_idx + j, mask=mask, other=0)
+    a    = tl.load(vals    + j, mask=mask, other=0.0)
+    xs   = tl.load(x_ptr + cols, mask=mask, other=0.0)  # gather x[col]
+
+    acc = tl.sum(a * xs, axis=0)            # segmented reduction, local
+    tl.store(y_ptr + row, acc)
+</code></pre>
+
+<p>The data structure became pointer arithmetic: <code>start = row_ptr[i]</code>, <code>j = start + arange(BLOCK)</code>, <code>mask = j &lt; end</code> kills the lanes past the segment, and <code>tl.load(x_ptr + cols)</code> is a gather that translates column indices into dense addresses.</p>
+
+<div class="callout bad">
+  <div class="label">THE LIMITATION — STATE IT EXPLICITLY</div>
+  <p>One program per row is fine only when rows are short and roughly equal length. Two failures bite:</p>
+  <ul>
+    <li><strong>Wasted lanes.</strong> <code>BLOCK</code> is fixed at compile time and sized for the worst case. A row with 3 nonzeros in a <code>BLOCK=128</code> kernel masks off 125 lanes — over 95% of the SIMT lanes do nothing.</li>
+    <li><strong>Load imbalance.</strong> If row lengths are skewed (a power-law sparsity pattern), one program owns a 10,000-nonzero row while its neighbors finish a 4-nonzero row and stall. The whole launch waits on the longest row.</li>
+  </ul>
+  <p>For unbounded or skewed row lengths, prefer a <strong>CUDA warp/block-specialized kernel</strong> (assign a warp to short rows, a whole block to long rows, balance by nonzero count) or just call <strong>cuSPARSE</strong>. Triton has no good primitive for runtime-dynamic per-row work distribution.</p>
+</div>
+
+<h2>4 · Block-sparse attention metadata</h2>
+
+<p>Attention has a beautiful property: it is <strong>regular at the block level but sparse at the sequence level</strong>. For a query block, most key/value blocks contribute nothing (they're masked out by a sliding window, a causal mask, or a learned sparsity pattern). The irregularity is <em>which</em> K/V blocks matter — and that can be precomputed into <strong>metadata</strong>: for each query block, a list of the K/V block ids it must attend to.</p>
+
+<div class="ascii">
+Q block i ---&gt; metadata[i] = [ kv_block 0, kv_block 3, kv_block 4 ]
+                                  |          |          |
+program (q_block=i, slot=0) ------+          |          |   loads kv_block 0
+program (q_block=i, slot=1) -----------------+          |   loads kv_block 3
+program (q_block=i, slot=2) ----------------------------+   loads kv_block 4
+
+  the program streams ONLY the listed blocks; the dense N x N
+  score matrix is never formed. irregular sparsity (which blocks)
+  is resolved by the lookup table; the per-block math stays regular.
+</div>
+
+<p>So a 2-D grid <code>(q_block, sparse_slot)</code> covers exactly the work that survives the mask. Each program reads its target block id from the table and does a regular dense block matmul:</p>
+
+<pre><code>@triton.jit
+def block_sparse_scores_kernel(Q_ptr, K_ptr, S_ptr,
+                               kv_block_ids,        # metadata: [n_q_blocks, MAX_SLOTS]
+                               n_slots_ptr,         # how many real slots per q_block
+                               stride_qm, stride_qd,
+                               stride_kn, stride_kd,
+                               stride_sq, stride_ss, stride_sm, stride_sn,
+                               D: tl.constexpr,
+                               BLOCK_M: tl.constexpr,
+                               BLOCK_N: tl.constexpr,
+                               MAX_SLOTS: tl.constexpr):
+    q_block = tl.program_id(0)
+    slot    = tl.program_id(1)
+
+    # skip slots beyond this query block's real fan-out
+    if slot &gt;= tl.load(n_slots_ptr + q_block):
+        return
+
+    # THE METADATA IS THE DATA STRUCTURE: one indirection picks the K/V block
+    kv_block = tl.load(kv_block_ids + q_block * MAX_SLOTS + slot)
+
+    offs_m = q_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = kv_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+
+    # load Q block [BLOCK_M, D] and K block [BLOCK_N, D]
+    q = tl.load(Q_ptr + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
+    k = tl.load(K_ptr + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd)
+
+    # regular dense block matmul: [BLOCK_M, D] x [D, BLOCK_N] -&gt; [BLOCK_M, BLOCK_N]
+    acc = tl.dot(q, tl.trans(k))            # tensor-core path
+
+    offs_sm = tl.arange(0, BLOCK_M)
+    offs_sn = tl.arange(0, BLOCK_N)
+    s_ptrs = (S_ptr + q_block * stride_sq + slot * stride_ss
+              + offs_sm[:, None] * stride_sm
+              + offs_sn[None, :] * stride_sn)
+    tl.store(s_ptrs, acc)
+</code></pre>
+
+<div class="callout ok">
+  <div class="label">THE METADATA IS THE DATA STRUCTURE</div>
+  <p>The expensive irregular decision — "which blocks interact" — is made <em>once</em>, on the host or in a cheap setup kernel, and frozen into <code>kv_block_ids</code>. The hot kernel then does nothing but regular block matmuls. This is the general recipe for making sparsity Triton-friendly: <strong>precompute an index table so the inner loop is dense.</strong></p>
+</div>
+
+<h2>5 · Online (streaming) softmax — the FlashAttention recurrence</h2>
+
+<p>The block-sparse kernel above produced score blocks. But a full attention output needs <code>softmax(QKᵀ)·V</code>, and the whole point of FlashAttention is to <strong>never materialize the full score matrix</strong>. The insight: softmax can be computed incrementally as K/V blocks stream past, keeping only <span class="math">O(1)</span> state per query row.</p>
+
+<p>Per query row the running state is the running max <span class="math">m</span>, the normalizer <span class="math">l</span>, and the accumulator <span class="math">acc</span> (a <span class="math">D</span>-vector). When a new score block arrives:</p>
+
+<pre><code># state carried across K/V blocks, per query row
+#   m   : running max of scores seen so far   (init -inf)
+#   l   : running sum of exp(score - m)        (init 0)
+#   acc : running sum of p_i * v_i             (init 0, shape [D])
+
+scores  = tl.dot(q, tl.trans(k))               # this block's [BLOCK_M, BLOCK_N] scores
+
+m_new   = tl.maximum(m, tl.max(scores, axis=1))        # new running max
+alpha   = tl.exp(m - m_new)                            # rescale factor for OLD state
+p       = tl.exp(scores - m_new[:, None])              # new block, stable exponent
+
+l_new   = l * alpha + tl.sum(p, axis=1)                # renormalize + add new mass
+acc_new = acc * alpha[:, None] + tl.dot(p, v)          # rescale old acc + add new
+
+m, l, acc = m_new, l_new, acc_new
+# ... after the last block:  out = acc / l[:, None]
+</code></pre>
+
+<div class="callout">
+  <div class="label">WHY THIS IS CORRECT</div>
+  <p>Softmax weights are <code>exp(score - max)</code>. The catch is that <em>max is a global quantity</em> you only learn after seeing every block. Online softmax fixes this with <strong>retroactive correction</strong>: when a later block reveals a larger max, the old accumulator was computed against the <em>old, too-small</em> max, so every old term is off by a factor <code>exp(m_old - m_new) = alpha</code>. Multiplying <code>acc</code> and <code>l</code> by <code>alpha</code> rescales all previously accumulated terms to the new reference max in one shot. Because <code>alpha &lt;= 1</code> exactly when the max grew, the correction is always a safe down-scaling — no overflow, full numerical stability.</p>
+</div>
+
+<div class="callout ok">
+  <div class="label">WHY IT MATTERS</div>
+  <p>This recurrence is why attention streams K/V blocks in <strong><span class="math">O(1)</span> memory per query row</strong> instead of <span class="math">O(N)</span> for the score row. It turns attention from memory-bound (materialize, write, re-read the score matrix) into compute-bound (one fused pass). It is the single most important algorithm in modern Triton kernels, and a near-certain interview question — be able to derive <code>alpha</code> from scratch.</p>
+</div>
+
+<h2>6 · Associative scan / cumsum inside a tile</h2>
+
+<p>Triton can do prefix operations <em>within</em> a tile. <code>tl.cumsum(x, axis=0)</code> gives a running sum along an axis, and <code>tl.associative_scan(x, axis, combine_fn)</code> generalizes it to any associative operator (running max, running product, segmented combinations). These are perfect for within-block running sums — e.g., computing offsets inside a compacted block, or a local prefix for a fused operation.</p>
+
+<pre><code>offs = tl.arange(0, BLOCK)
+x    = tl.load(p + offs, mask=offs &lt; N, other=0.0)
+run  = tl.cumsum(x, axis=0)        # in-tile prefix sum, no cross-program coordination
+</code></pre>
+
+<div class="callout warn">
+  <div class="label">IN-TILE ONLY</div>
+  <p><code>tl.cumsum</code> / <code>tl.associative_scan</code> stop at the tile boundary. A <strong>global</strong> prefix sum across all programs still needs the classic multi-pass scheme: per-block local scans, write block sums, scan the block sums, add the offsets back. That is exactly the multi-pass global coordination Triton is bad at orchestrating — <strong>use CUB's device-wide scan</strong>. Triton's scan is for the leaf, not the tree.</p>
+</div>
+
+<h2>7 · Seeded dropout with a Philox counter</h2>
+
+<p>Fused dropout needs per-element randomness that is (a) deterministic given a seed, so backward can regenerate the same mask without storing it, and (b) decorrelated across elements. Triton exposes <code>tl.rand(seed, offset)</code>, a Philox-style counter-based generator: the random value is a pure function of the seed and the element's global offset — no per-element state, no RNG stream to thread through.</p>
+
+<pre><code>@triton.jit
+def fused_dropout_kernel(x_ptr, out_ptr, N, p, seed,
+                         BLOCK: tl.constexpr):
+    pid  = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs &lt; N
+
+    x = tl.load(x_ptr + offs, mask=mask)
+    r = tl.rand(seed, offs)                 # deterministic per-offset uniform in [0,1)
+    keep = r &gt; p                            # Bernoulli(1 - p)
+    out  = tl.where(keep, x / (1.0 - p), 0.0)   # inverted dropout scaling
+
+    tl.store(out_ptr + offs, out, mask=mask)
+</code></pre>
+
+<p>Because the mask is reproducible from <code>(seed, offs)</code>, the backward pass recomputes it on the fly instead of reading a full mask tensor from HBM — another fusion win that removes a tensor-sized memory round-trip.</p>
+
+<h2>Where Triton is the wrong tool</h2>
+
+<table>
+<thead>
+<tr><th>Task</th><th>Reach for</th><th>One-line reason</th></tr>
+</thead>
+<tbody>
+<tr><td>Plain huge GEMM</td><td>cuBLAS</td><td>Hand-tuned for every shape and tensor-core generation; you won't beat it on raw peak.</td></tr>
+<tr><td>Sort / global scan / radix</td><td>CUB / Thrust</td><td>Needs deterministic global ordering and multi-pass coordination across all blocks.</td></tr>
+<tr><td>Highly irregular graph traversal</td><td>CUDA</td><td>Dynamic frontiers, work queues, and atomics — no regular tile to map programs onto.</td></tr>
+<tr><td>Fused custom transformer op</td><td>Triton</td><td>Regular tiles + local reductions + an epilogue; fusion saves the HBM traffic a library chain would pay.</td></tr>
+<tr><td>Prototyping a new model op</td><td>Triton</td><td>Python-level iteration speed with near-CUDA performance; no C++/build cycle.</td></tr>
+</tbody>
+</table>
+
+<h2>Interview answer template</h2>
+
+<p>When asked "would you implement <em>X</em> in Triton?", walk this ladder out loud. It demonstrates exactly the judgment the question is probing:</p>
+
+<ol>
+  <li><strong>Describe the data structure.</strong> Is it dense strides, CSR (<code>row_ptr</code>/<code>col_idx</code>/<code>vals</code>), block metadata (an index table of block ids), or a mask? Name it precisely.</li>
+  <li><strong>Choose the program owner.</strong> What does one <code>program_id</code> own — a row, a block, a tile, a sparse slot? This decides the grid.</li>
+  <li><strong>Show the pointer tensors.</strong> Write <code>base + id*stride + arange(BLOCK)*stride</code> and the <code>mask</code>. If you can't express the region as pointer arithmetic, that's the first red flag.</li>
+  <li><strong>State the local primitive.</strong> Map / <code>tl.sum</code> / <code>tl.max</code> / <code>tl.dot</code> / online softmax update. This is the work that stays in registers.</li>
+  <li><strong>Name the cross-tile issue.</strong> Does it need a second pass, an atomic, metadata scheduling, or a library fallback? Being honest here is the whole point.</li>
+  <li><strong>Decide the tool.</strong> If steps 3–4 are clean and local, Triton. If step 5 forces global ordering, dynamic queues, or peak GEMM, hand it to CUDA / CUB / cuBLAS / PyTorch — and say why.</li>
+</ol>
+
+<div class="callout ok">
+  <div class="label">THE ONE SENTENCE</div>
+  <p>"Triton fits when one program can load a regular tile, reduce or transform it locally, and store with little cross-tile coordination; the moment the problem needs runtime-discovered global ordering or dynamic work distribution, I precompute it into metadata or hand it to CUDA / CUB / cuBLAS." Say that and you've answered the whole track.</p>
+</div>
+
+<footer class="lesson-nav">
+  <a href="02_optimized_snippets.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">02 · Optimized snippets</span>
+  </a>
+  <a class="next" href="../cuda/index.html">
+    <span class="dir">Sibling track →</span>
+    <span class="ttl">CUDA interview prep</span>
+  </a>
+</footer>
+
+</main>
+
+</body>
+</html>

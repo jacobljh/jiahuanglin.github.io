@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>05 · Partitioning &amp; sharding</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">system_design</a>
+    <span class="crumb">/</span>
+    <span class="crumb">05 · partitioning &amp; sharding</span>
+    <span class="step-pill">lesson 5 / 15</span>
+  </div>
+</header>
+<main>
+
+<h1>05 · Partitioning &amp; sharding</h1>
+<p class="subtitle">Caching (lesson 04) bought you read scale by keeping a copy of hot data close. But a cache cannot hold a dataset that no longer fits on one machine, and it does nothing for write throughput. When the <em>authoritative</em> state outgrows a single box, you have no choice left: you split it. This is where distributed systems stop being convenient and start being hard.</p>
+
+<h2>1. The first principle: when one box is no longer enough</h2>
+<p>A single node has three hard ceilings. You partition when you hit any of them:</p>
+<ul>
+  <li><strong>Storage.</strong> A 4&nbsp;TB dataset will not fit on a node with 512&nbsp;GB of SSD, full stop.</li>
+  <li><strong>Write throughput.</strong> Reads scale by adding replicas (lesson 06), but every write must hit the single primary. One primary doing fsync-durable writes tops out around 10–50k writes/s; past that, the only lever is more primaries, each owning a slice of the keyspace.</li>
+  <li><strong>Working set / index in RAM.</strong> A B-tree index that no longer fits in memory turns every lookup into a disk seek — a 100&times; latency cliff (100&nbsp;ns RAM vs ~100&nbsp;&micro;s NVMe). Splitting the index across nodes keeps each shard&rsquo;s index resident.</li>
+</ul>
+<p><strong>Partitioning</strong> (a.k.a. <strong>sharding</strong>) splits the dataset into disjoint <strong>partitions</strong> (shards), each owned by a different node. It buys near-linear scaling of storage <em>and</em> write throughput: N shards &rarr; ~N&times; capacity. It is the <em>orthogonal axis</em> to replication — partitioning <em>splits</em> the data; replication <em>copies</em> each piece. Real systems do both: shard into 64 partitions, then keep 3 replicas of each.</p>
+
+<div class="callout warn">
+  <div class="label">What it costs</div>
+  Partitioning is not free scaling — it is a trade. Three new problems appear the moment you split:
+  <ul>
+    <li><strong>Cross-shard queries become scatter-gather.</strong> A query that can&rsquo;t be answered by one shard must fan out to all of them and merge results — tail latency now equals the <em>slowest</em> shard (recall lesson 02&rsquo;s tail-amplification math).</li>
+    <li><strong>Cross-shard transactions are hard.</strong> Atomicity across two primaries needs 2PC or sagas (forward-ref lesson 10). Single-shard transactions stay cheap; the design goal is to keep them single-shard.</li>
+    <li><strong>You must choose a partition key — and live with its skew.</strong> The key decides everything below. Choose wrong and you get a hot shard you cannot rebalance away.</li>
+  </ul>
+</div>
+
+<h2>2. Partitioning schemes</h2>
+<p>Three families, each a different answer to &ldquo;given a key, which shard?&rdquo;</p>
+
+<table>
+  <thead><tr><th>Scheme</th><th>Mapping</th><th>Range scans</th><th>Load spread</th><th>Main failure mode</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Range</strong></td><td>keys sorted into contiguous ranges (A–F, G–M, …)</td><td>Excellent — adjacent keys co-located</td><td>Poor — depends on key distribution</td><td>Hot spot: a monotonic key (timestamp, auto-increment id) sends <em>all</em> new writes to the last shard</td></tr>
+    <tr><td><strong>Hash</strong></td><td>partition = hash(key) mod N (or via a ring)</td><td>Dead — adjacent keys scattered, range = scatter-gather over all shards</td><td>Excellent — uniform by construction</td><td>Kills locality; cannot do efficient ORDER BY / time ranges</td></tr>
+    <tr><td><strong>Directory</strong></td><td>a lookup service stores key&nbsp;&rarr;&nbsp;shard explicitly</td><td>Whatever you encode</td><td>Tunable — you place data deliberately</td><td>Extra hop on every request; the directory is a SPOF / bottleneck if not itself replicated</td></tr>
+  </tbody>
+</table>
+
+<p><strong>Composite</strong> strategies combine them: hash a high-level prefix to pick a shard, then range-sort within it (e.g. Cassandra&rsquo;s <code>(partition_key, clustering_key)</code> — hash for spread across nodes, sort for range scans inside a partition). This recovers in-partition range scans without re-introducing global hot spots.</p>
+
+<h3>The resize problem with naive hashing</h3>
+<p>The obvious hash scheme is <code>shard = hash(key) mod N</code>. It distributes beautifully — until N changes. Add or remove one node and the modulus changes, so <em>almost every key</em> maps somewhere new. When N goes from 4&rarr;5, a key&rsquo;s shard is unchanged only if <code>h mod 4 == h mod 5</code>, which holds for a vanishing fraction. In general changing N reshuffles roughly <strong>(N&minus;1)/N</strong> of all keys &mdash; ~80% at N=5, approaching 100% as N grows.</p>
+
+<div class="callout bad">
+  <div class="label">Why a full reshuffle is catastrophic</div>
+  Reshuffling 90%+ of keys means terabytes of data crossing the network <em>and</em> every cache going cold simultaneously. The cold caches all miss to the backing store at once — a <strong>thundering herd</strong> that can topple the very database you were trying to grow. A routine &ldquo;add a node&rdquo; becomes an outage. This is the single biggest reason naive mod-N is unusable for stateful sharding.
+</div>
+
+<h2>3. Consistent hashing — the centerpiece</h2>
+<p>The fix: stop tying placement to N. Map both keys and nodes onto a fixed circular hash space (a <strong>ring</strong>, e.g. 0&hellip;2<sup>32</sup>&minus;1). A key is owned by the first node clockwise from its position. Adding or removing a node only re-homes the keys in the arc <em>between</em> that node and its predecessor — about <strong>1/N</strong> of keys, not all of them.</p>
+
+<div class="ascii">
+   Consistent hash ring (clockwise ownership)
+
+            0 / 2^32
+               |
+        N3 *···|···* N1
+          /    |    \
+         /   keyK    \        keyK hashes here ──► owned by N1
+        *     ·       *          (first node clockwise)
+       N2 \         /
+           \       /
+            *·····*
+              N4
+
+   Add N5 between N4 and N1:  ── only keys in arc (N4 → N5] move,
+   from N1 to N5. Every other key stays put. ~1/N remapped.
+</div>
+
+<p class="math block">keys&nbsp;moved&nbsp;when&nbsp;node&nbsp;added&nbsp;&asymp;&nbsp;1/N&nbsp;&nbsp;&nbsp;vs&nbsp;&nbsp;&nbsp;mod-N&nbsp;reshuffle&nbsp;&asymp;&nbsp;(N&minus;1)/N</p>
+
+<h3>Virtual nodes (vnodes): fixing the lumpiness</h3>
+<p>Plain consistent hashing has two problems. First, with few nodes the random arc lengths are <em>uneven</em> — one node may own a 2&times;-wide arc and thus 2&times; the load. Second, removing a node dumps <em>all</em> its load onto its single clockwise neighbour, doubling that node&rsquo;s burden and often cascading.</p>
+<p>The fix is <strong>virtual nodes</strong>: each physical node is hashed onto the ring at V points (e.g. V=128 or 256). Now a physical node owns 128 scattered small arcs. When it leaves, its load is sprinkled across <em>many</em> neighbours, not dumped on one. And because you&rsquo;re averaging over V&middot;N random arcs, the load skew shrinks. The standard deviation of per-node load falls like 1/&radic;V, so:</p>
+<p class="math block">load&nbsp;skew&nbsp;=&nbsp;max&nbsp;load&nbsp;/&nbsp;avg&nbsp;load&nbsp;&asymp;&nbsp;1&nbsp;+&nbsp;c&nbsp;/&nbsp;&radic;V&nbsp;&nbsp;&nbsp;(c&nbsp;&asymp;&nbsp;2&ndash;3)</p>
+<p>At V=1, skew can be 2&times; or worse; at V=256, skew is within a few percent of perfectly even. Vnodes also enable <strong>heterogeneous hardware</strong>: give a node with 2&times; the RAM 2&times; the vnodes and it carries proportionally more load automatically.</p>
+
+<div class="callout">
+  <div class="label">Worked example — adding a node, 200 shards of data</div>
+  You run N=4 shards, 200&nbsp;GB each (800&nbsp;GB total), and add a 5th node.
+  <ul>
+    <li><strong>Naive mod-N (4&rarr;5):</strong> fraction remapped = (5&minus;1)/5 = <strong>80%</strong> &rarr; 0.80 &times; 800&nbsp;GB = <strong>640&nbsp;GB</strong> moves, and ~80% of cache entries go cold at once.</li>
+    <li><strong>Consistent hashing:</strong> fraction remapped &asymp; 1/5 = <strong>20%</strong> &rarr; 0.20 &times; 800&nbsp;GB = <strong>160&nbsp;GB</strong> moves — the new node simply claims its ~1/5 slice from existing nodes. 4&times; less data, no herd.</li>
+    <li><strong>Skew, V=128:</strong> 1 + 2.5/&radic;128 &asymp; 1 + 0.22 = <strong>1.22</strong>, so the hottest shard runs ~22% above average — provision for that, not for the average.</li>
+  </ul>
+  The takeaway: consistent hashing converts an O(all-data) migration into an O(1/N) ripple. That difference is the whole reason the technique exists.
+</div>
+
+<h2>4. Choosing the shard key</h2>
+<p>The shard key is the most consequential decision in the design — it&rsquo;s effectively irreversible at scale (changing it = full re-shard). Three requirements:</p>
+<ol>
+  <li><strong>High cardinality.</strong> Many distinct values, so partitions can be split finely. <code>country</code> has ~200 values &rarr; you can never have more than 200 partitions, and the US shard dwarfs the rest. <code>user_id</code> has millions.</li>
+  <li><strong>Even distribution.</strong> No single value should dominate write/read volume.</li>
+  <li><strong>Query alignment.</strong> The dominant query should be answerable from <em>one</em> shard. If you shard by the field your hot path filters on, that read hits a single shard; otherwise it&rsquo;s scatter-gather.</li>
+</ol>
+
+<table>
+  <thead><tr><th>App: social network</th><th>Shard by <code>user_id</code></th><th>Shard by <code>hashtag</code></th></tr></thead>
+  <tbody>
+    <tr><td>Load a user&rsquo;s timeline</td><td>Single shard ✓</td><td>Scatter-gather ✗</td></tr>
+    <tr><td>&ldquo;all posts tagged #X&rdquo;</td><td>Scatter-gather ✗</td><td>Single shard ✓</td></tr>
+    <tr><td>Distribution</td><td>Even (millions of users) ✓</td><td>Skewed — a few tags are huge ✗</td></tr>
+  </tbody>
+</table>
+<p>There is no key that makes <em>every</em> query single-shard — you optimize for the dominant access pattern and pay scatter-gather (or a secondary index) for the rest.</p>
+
+<h2>5. The hot-shard / celebrity problem</h2>
+<p>Here is the catch a good hash function cannot save you from: skew at the <em>key</em> level. Hashing spreads <em>distinct</em> keys evenly, but if a <em>single</em> key is disproportionately hot — a celebrity with 100M followers, a viral product on launch day — all of its traffic lands on whatever shard owns that one key. No partition scheme distributes the load of one key, because that key lives on one shard by definition.</p>
+<div class="callout warn">
+  <div class="label">Mitigations (you will be asked for all three)</div>
+  <ul>
+    <li><strong>Split the hot key.</strong> Append a random suffix (<code>celebId#0</code>&hellip;<code>celebId#15</code>) so writes spread across 16 sub-keys / shards; reads fan out and merge. Trades single-key locality for spread.</li>
+    <li><strong>Cache it hard.</strong> A hot key is, by definition, highly cacheable — pin it in the cache tier (lesson 04) so the shard rarely sees the read traffic.</li>
+    <li><strong>Special-case it.</strong> Detect celebrities and route them through a different path — e.g. fan-out-on-read instead of fan-out-on-write (the hybrid timeline design, forward-ref the capstone, lesson 14).</li>
+  </ul>
+</div>
+
+<h2>6. Secondary indexes &amp; rebalancing</h2>
+<p>You sharded by the primary key, but queries also filter on <em>other</em> fields. Two ways to index them:</p>
+<table>
+  <thead><tr><th></th><th>Local / document-partitioned</th><th>Global / term-partitioned</th></tr></thead>
+  <tbody>
+    <tr><td>Index location</td><td>Co-located with the data on each shard</td><td>Index itself partitioned by the indexed <em>term</em></td></tr>
+    <tr><td>Write cost</td><td>Cheap — one shard, local update</td><td>Expensive — write may touch a <em>different</em> index shard (cross-shard)</td></tr>
+    <tr><td>Read cost</td><td>Scatter-gather — query every shard&rsquo;s local index</td><td>Single shard — go straight to the term&rsquo;s index partition</td></tr>
+    <tr><td>Used by</td><td>Elasticsearch, MongoDB (default), Cassandra SI</td><td>DynamoDB GSI, search systems wanting fast term lookups</td></tr>
+  </tbody>
+</table>
+<p>It&rsquo;s the same write-vs-read trade as everywhere: local indexes make writes cheap and reads fan out; global indexes make reads pinpoint and writes fan out.</p>
+
+<h3>Rebalancing without full reshuffles</h3>
+<p>Even consistent hashing benefits from a deliberate rebalancing strategy. The most robust trick: pick a <strong>fixed, large number of partitions</strong> up front (e.g. 1024), far more than nodes. Each node owns many partitions; adding a node means <em>moving whole partitions</em> to it, never re-hashing keys. (This is how Riak, Elasticsearch shards, and Kafka-style fixed partition counts work.) Avoid: hash-mod-N (full reshuffle), and unbounded dynamic splitting that thrashes. Rebalancing should move data in the background, throttled, and ideally be operator- or automation-triggered, not a surprise.</p>
+
+<div class="widget" id="ch">
+  <div class="title">Consistent-hashing remap calculator</div>
+  <div class="hint">Start with N nodes; apply a delta (add or remove nodes). <strong>Naive mod-N</strong> remaps ~(N&minus;1)/N of keys whenever N changes (any change re-mods everything) → near-total reshuffle. <strong>Consistent hashing</strong> remaps only the arcs touched: ~|delta|/(N+max(delta,0)) of keys. <strong>Load skew</strong> = max/avg per-node load ≈ 1 + 2.5/&radic;V, dropping as virtual nodes V rise. Tune V and watch the skew vs the remap cost.</div>
+  <div class="controls">
+    <label class="inline">Current nodes N
+      <input type="range" id="n" min="2" max="50" value="4" step="1">
+      <span class="val" id="nv"></span>
+    </label>
+    <label class="inline">Nodes added/removed (delta)
+      <input type="range" id="d" min="-4" max="6" value="1" step="1">
+      <span class="val" id="dv"></span>
+    </label>
+    <label class="inline">Virtual nodes per node V
+      <input type="range" id="v" min="1" max="512" value="128" step="1">
+      <span class="val" id="vv"></span>
+    </label>
+  </div>
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">mod-N keys remapped</div><div class="v" id="kmod"></div></div>
+    <div class="kpi"><div class="k">consistent-hash remapped</div><div class="v" id="kch"></div></div>
+    <div class="kpi"><div class="k">migration ratio (mod / CH)</div><div class="v" id="kratio"></div></div>
+    <div class="kpi"><div class="k">load skew (max/avg)</div><div class="v" id="kskew"></div></div>
+  </div>
+  <div class="callout" id="ch-diag"><div class="label">Diagnosis</div><span id="ch-text"></span></div>
+</div>
+
+<h2>Interview prompts you should be ready for</h2>
+<div class="callout">
+  <ol>
+    <li><strong>Why not just <code>hash(key) mod N</code>?</strong> <em>(senior answer)</em> Because changing N re-mods nearly every key — ~(N&minus;1)/N remap on a single add/remove — forcing a full data migration and a simultaneous cache-cold thundering herd. Consistent hashing pins placement to a ring so only ~1/N of keys move; or use a fixed large partition count and move whole partitions.</li>
+    <li><strong>What do virtual nodes buy you?</strong> <em>(senior answer)</em> Two things. They smooth load skew (std-dev of per-node load falls like 1/&radic;V, so skew ≈ 1 + c/&radic;V), and on node removal they spread the departing load across many neighbours instead of dumping it all on one. They also let heterogeneous nodes carry proportional load by owning more vnodes.</li>
+    <li><strong>How do you pick a shard key?</strong> <em>(senior answer)</em> High cardinality, even distribution, and alignment with the dominant query so it hits one shard. I&rsquo;d name the top query, shard to make it single-shard, and explicitly accept scatter-gather (or a secondary index) for the rest. Avoid low-cardinality keys like country — they cap partition count and create giant uneven shards.</li>
+    <li><strong>A celebrity user is overloading one shard. Now what?</strong> <em>(senior answer)</em> No partition scheme fixes a single hot <em>key</em> — it lives on one shard. Mitigate: split the key with a random suffix to spread writes across sub-keys; cache it aggressively since it&rsquo;s highly cacheable; or special-case the path (fan-out-on-read for celebrities). I&rsquo;d combine caching + special-casing.</li>
+    <li><strong>Local vs global secondary indexes?</strong> <em>(senior answer)</em> Local (document-partitioned) indexes sit with the data: cheap writes, but reads scatter-gather across all shards. Global (term-partitioned) indexes are partitioned by the indexed term: reads hit one shard, but writes may touch a different index shard. Pick by read/write ratio of the secondary query.</li>
+    <li><strong>How is partitioning different from replication?</strong> <em>(senior answer)</em> Orthogonal axes. Partitioning splits the dataset into disjoint shards (scales storage + write throughput); replication copies each shard (scales reads + provides fault tolerance). Production systems do both: shard into K partitions, then keep R replicas of each. They&rsquo;re composed, not alternatives.</li>
+    <li><strong>How do you rebalance when adding capacity without an outage?</strong> <em>(senior answer)</em> Use a fixed large partition count (≫ nodes) and move whole partitions to the new node — no key re-hashing. Throttle the background data copy, keep serving from the old owner until the new replica is caught up, then cut over. Never hash-mod-N.</li>
+    <li><strong>Estimate the data moved when going from 4 to 5 nodes on an 800&nbsp;GB dataset.</strong> <em>(senior answer)</em> Mod-N: (5&minus;1)/5 = 80% → 640&nbsp;GB moves plus a cache-cold herd. Consistent hashing: ~1/5 = 20% → 160&nbsp;GB, the new node claiming its slice. 4&times; less data and no herd — that gap is exactly why we use the ring.</li>
+  </ol>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Partition when one box can&rsquo;t hold the storage, sustain the write throughput, or keep the index in RAM — and know it costs you scatter-gather reads, hard cross-shard transactions, and a permanent shard-key commitment. Use <strong>consistent hashing with many virtual nodes</strong> so adding/removing a node remaps ~1/N of keys (not ~all) and load skew stays near 1. Choose the shard key for high cardinality, even spread, and single-shard dominant queries. Remember the one thing partitioning can&rsquo;t fix: a single hot key — handle celebrities with key-splitting, caching, and special-casing. Next, lesson 06 covers the orthogonal axis: replicating each shard.
+</div>
+
+<footer class="lesson-nav">
+  <a href="04_caching.html"><span class="dir">← Previous</span><span class="ttl">04 · Caching</span></a>
+  <a class="next" href="06_replication.html"><span class="dir">Next →</span><span class="ttl">06 · Replication</span></a>
+</footer>
+</main>
+<script>
+(function(){
+  var n=document.getElementById('n'),d=document.getElementById('d'),v=document.getElementById('v');
+  var nv=document.getElementById('nv'),dv=document.getElementById('dv'),vv=document.getElementById('vv');
+  var kmod=document.getElementById('kmod'),kch=document.getElementById('kch'),kratio=document.getElementById('kratio'),kskew=document.getElementById('kskew');
+  var box=document.getElementById('ch-diag'),txt=document.getElementById('ch-text');
+
+  function compute(){
+    var N=+n.value, delta=+d.value, V=+v.value;
+    var Nnew=Math.max(1,N+delta);
+    // mod-N: any change in N re-mods ~ (max(N,Nnew)-1)/max(N,Nnew) of keys; if delta==0, ~0
+    var Neff=Math.max(N,Nnew);
+    var modFrac = (delta===0)?0:(Neff-1)/Neff;
+    // consistent hashing: only arcs touched move ~ |delta| / Nnew
+    var chFrac = (delta===0)?0:Math.min(1, Math.abs(delta)/Nnew);
+    var skew = 1 + 2.5/Math.sqrt(V);
+    return {N:N,Nnew:Nnew,delta:delta,V:V,modFrac:modFrac,chFrac:chFrac,skew:skew};
+  }
+  function diagnose(s){
+    if(s.delta===0)
+      return ['Stable','var(--ok)','No node change → no remapping under either scheme. Move the delta slider to see what a scale event costs.'];
+    var ratio=s.chFrac>0?(s.modFrac/s.chFrac):0;
+    if(s.V<32)
+      return ['Lumpy ring','var(--warn)','Consistent hashing moves only <strong>'+(s.chFrac*100).toFixed(0)+'%</strong> of keys vs mod-N&rsquo;s <strong>'+(s.modFrac*100).toFixed(0)+'%</strong> — good. But V='+s.V+' is low: load skew ≈ <strong>'+s.skew.toFixed(2)+'×</strong>, so one shard runs '+((s.skew-1)*100).toFixed(0)+'% hot — hot-shard risk. Raise V (128–256) to even it out.'];
+    return ['Healthy','var(--ok)','Consistent hashing remaps just <strong>'+(s.chFrac*100).toFixed(0)+'%</strong> of keys vs mod-N&rsquo;s catastrophic <strong>'+(s.modFrac*100).toFixed(0)+'%</strong> ('+ratio.toFixed(1)+'× less data + no cache-cold herd). With V='+s.V+', load skew is a tight <strong>'+s.skew.toFixed(2)+'×</strong> — provision ~'+((s.skew-1)*100).toFixed(0)+'% above average.'];
+  }
+  function update(){
+    nv.textContent=n.value; dv.textContent=(d.value>0?'+':'')+d.value; vv.textContent=v.value;
+    var s=compute();
+    kmod.textContent=(s.modFrac*100).toFixed(0)+'%';
+    kch.textContent=(s.chFrac*100).toFixed(0)+'%';
+    kratio.textContent=(s.chFrac>0?(s.modFrac/s.chFrac).toFixed(1)+'×':'—');
+    kskew.textContent=s.skew.toFixed(2)+'×';
+    var dg=diagnose(s);
+    box.style.borderLeftColor=dg[1];
+    txt.innerHTML='<strong>'+dg[0]+'.</strong> '+dg[2];
+  }
+  [n,d,v].forEach(function(el){el.addEventListener('input',update);el.addEventListener('change',update);});
+  update();
+})();
+</script>
+</body>
+</html>

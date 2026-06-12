@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>01 · Triton common operations</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">triton</a>
+    <span class="crumb">/</span>
+    <span class="crumb">01 · common operations</span>
+    <span class="step-pill">lesson 1 / 3</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Common operations, declarations, call flows</h1>
+<p class="subtitle">OpenAI Triton, the kernel DSL — not the inference server. We build the mental model from first principles: a Triton kernel is a <em>program</em> that owns a <em>tile</em>, and the compiler — not you — decides how threads, warps, vectorization, and shared memory realize that tile on the GPU.</p>
+
+<div class="linear-step">
+  <div class="label">Linearized thinking</div>
+  <p>Every Triton kernel walks the same chain. Memorize it; everything else is detail.</p>
+  <ol>
+    <li><strong>Tile owner.</strong> <code>pid = tl.program_id(axis)</code> — this program instance owns one tile of work. There are <code>grid</code>-many such instances.</li>
+    <li><strong>Offsets.</strong> From the owner build a vector of element indices: <code>offs = pid * BLOCK + tl.arange(0, BLOCK)</code>.</li>
+    <li><strong>Pointers.</strong> From offsets build a tensor of addresses: <code>ptrs = base_ptr + offs * stride</code>. Pointers are tensors, not scalars.</li>
+    <li><strong>Masked load.</strong> Read the tile through a boundary mask: <code>x = tl.load(ptrs, mask=offs &lt; n, other=0.0)</code>.</li>
+    <li><strong>Compute.</strong> Do tile/array math in plain Python operators; reductions accumulate in fp32.</li>
+    <li><strong>Masked store.</strong> Write back through the same mask: <code>tl.store(out_ptrs, y, mask=offs &lt; n)</code>.</li>
+  </ol>
+</div>
+
+<h2>1. The tile programming model from first principles</h2>
+
+<p>In CUDA you write the code for <em>one thread</em>. The thread owns one scalar (or a small handful), you compute its global index from <code>blockIdx</code>, <code>blockDim</code>, and <code>threadIdx</code>, and the hardware runs tens of thousands of copies of that scalar program. You — the author — are responsible for the thread-to-data mapping, for coalescing, for staging data through shared memory, and for the warp-level choreography.</p>
+
+<p>In Triton you write the code for <em>one program</em>. A program owns a whole <strong>tile</strong>: a 1-D vector of <code>BLOCK</code> elements, or a 2-D block of <code>BLOCK_M × BLOCK_N</code>, etc. You express the math over the entire tile at once — <code>x + y</code>, <code>tl.sum(x, axis=1)</code>, <code>tl.dot(a, b)</code> — as if it were NumPy. The Triton compiler then decides:</p>
+
+<ul>
+  <li>How many threads/warps execute the tile and how the tile's lanes map onto them.</li>
+  <li>How loads vectorize and whether accesses coalesce.</li>
+  <li>When to stage operands through shared memory or registers.</li>
+  <li>How to software-pipeline loads against compute.</li>
+</ul>
+
+<div class="callout">
+  <div class="label">Key idea</div>
+  <p><strong>Triton hides threads, not the GPU.</strong> You still think in tiles, masks, memory traffic, occupancy, and reductions — the things that determine performance. What you give up is hand-placing individual threads and writing explicit <code>__shared__</code> staging. The unit of thought moves up one level: from a thread that owns a scalar to a program that owns a tile.</p>
+</div>
+
+<table>
+  <thead>
+    <tr><th>Concept</th><th>CUDA (scalar-per-thread)</th><th>Triton (tile-per-program)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Unit of code</td><td>one thread</td><td>one program instance</td></tr>
+    <tr><td>Owns</td><td>a scalar / few registers</td><td>a tile (vector or block)</td></tr>
+    <tr><td>Index math</td><td><code>blockIdx*blockDim+threadIdx</code></td><td><code>pid*BLOCK + tl.arange(...)</code></td></tr>
+    <tr><td>Thread mapping</td><td>you, explicitly</td><td>the compiler</td></tr>
+    <tr><td>Shared memory</td><td>manual <code>__shared__</code> + sync</td><td>compiler-managed staging</td></tr>
+    <tr><td>Bounds</td><td><code>if (i &lt; n)</code> per thread</td><td><code>mask = offs &lt; n</code> per tile</td></tr>
+  </tbody>
+</table>
+
+<h2>2. A minimal complete kernel: vector add</h2>
+
+<p>The "hello world" of Triton. One program owns one <code>BLOCK</code>-sized slice of the vectors; the grid covers all slices.</p>
+
+<pre><code>import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def add_kernel(
+    x_ptr,            # *fp32, first input
+    y_ptr,            # *fp32, second input
+    out_ptr,          # *fp32, output
+    n_elements,       # int, total length
+    BLOCK: tl.constexpr,   # compile-time tile size
+):
+    # 1. tile owner: which BLOCK-slice is mine?
+    pid = tl.program_id(axis=0)
+
+    # 2. offsets: the element indices this program touches
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+
+    # 3. mask: the last program may run past the end
+    mask = offs &lt; n_elements
+
+    # 4. pointers + masked loads (pointers are tensors of addresses)
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    y = tl.load(y_ptr + offs, mask=mask, other=0.0)
+
+    # 5. compute over the whole tile at once
+    out = x + y
+
+    # 6. masked store
+    tl.store(out_ptr + offs, out, mask=mask)
+
+
+def add(x: torch.Tensor, y: torch.Tensor) -&gt; torch.Tensor:
+    assert x.is_cuda and y.is_cuda and x.shape == y.shape
+    out = torch.empty_like(x)              # allocate output
+    n = x.numel()
+
+    # grid: a callable taking the meta-params, returns # of program instances
+    grid = lambda meta: (triton.cdiv(n, meta["BLOCK"]),)
+
+    # launch: kernel[grid](args..., constexpr kwargs, num_warps=...)
+    add_kernel[grid](x, y, out, n, BLOCK=1024, num_warps=4)
+    return out
+</code></pre>
+
+<p>Notes that matter at interview time:</p>
+<ul>
+  <li><code>triton.cdiv(n, BLOCK)</code> is ceiling division — it guarantees the grid covers the tail, which is exactly why the <code>mask</code> exists.</li>
+  <li><code>BLOCK</code> is passed as a keyword because it is a <code>tl.constexpr</code> compile-time constant (see §4).</li>
+  <li><code>num_warps</code> is a launch-time hint about execution resources per program — not a tile dimension (see §11).</li>
+  <li>We never wrote a thread index. The compiler maps the 1024-lane tile onto the 4 warps.</li>
+</ul>
+
+<h2>3. The call flow</h2>
+
+<p>What actually happens between <code>add(x, y)</code> and the result tensor:</p>
+
+<div class="ascii">
+Python wrapper  add(x, y)
+      |
+      v
+[ allocate output ]   out = torch.empty_like(x)
+      |
+      v
+[ choose grid ]       grid(meta) -&gt; (cdiv(n, BLOCK),)   # how many program instances
+      |
+      v
+[ launch ]            add_kernel[grid](x, y, out, n, BLOCK=1024, num_warps=4)
+      |
+      v
+[ JIT specialize ]    key = (constexprs, arg dtypes, pointer alignment, ...)
+      |                cache hit? -&gt; reuse compiled kernel
+      |                cache miss -&gt; compile a new specialization
+      v
+[ compiler lowers ]   tile ops -&gt; Triton IR -&gt; LLVM/PTX  (threads, vectorize, smem, pipeline)
+      |
+      v
+[ run on GPU ]        grid-many programs, each handles ONE BLOCK tile
+      |                  pid 0: elems [0, 1024)
+      |                  pid 1: elems [1024, 2048)
+      |                  ...
+      v
+[ return tensor ]     out   (enqueued on the current CUDA stream)
+
+  Stream ordering: the launch is async, but it is enqueued on the same
+  stream as the surrounding PyTorch ops, so the data dependency is preserved.
+  No explicit sync needed before the next stream-ordered op reads `out`.
+</div>
+
+<h2>4. constexpr and JIT specialization</h2>
+
+<p>An argument annotated <code>: tl.constexpr</code> is a <strong>compile-time constant</strong>. The compiler bakes its value into the generated code — so it can unroll loops over it, size <code>tl.arange</code>, and pick vector widths. The cost: each distinct value of a constexpr (and each distinct combination of argument dtypes / pointer-alignment classes) is a separate <strong>specialization</strong> that must be compiled.</p>
+
+<pre><code># BLOCK=1024 and BLOCK=2048 compile to two different kernels.
+add_kernel[grid](x, y, out, n, BLOCK=1024)   # specialization A
+add_kernel[grid](x, y, out, n, BLOCK=2048)   # specialization B (separate compile)
+
+# num_warps / num_stages also key the specialization:
+add_kernel[grid](x, y, out, n, BLOCK=1024, num_warps=8)   # yet another variant
+</code></pre>
+
+<div class="callout">
+  <div class="label">Cache</div>
+  <p>Triton keeps a <strong>JIT cache</strong> (in-process and on disk, under <code>~/.triton/cache</code>). The first launch with a given specialization key pays the compile cost; subsequent launches with the same key are essentially free dispatches. This is why a benchmark's first iteration is slow and why you should warm up before timing. It is also why varying <code>BLOCK</code> across thousands of distinct shapes can thrash the cache.</p>
+</div>
+
+<h2>5. Vocabulary you must be able to define</h2>
+
+<table>
+  <thead>
+    <tr><th>Triton</th><th>Meaning</th><th>Closest CUDA intuition</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>@triton.jit</code></td><td>Marks a Python function as a kernel to be JIT-compiled and launched with <code>kernel[grid](...)</code>.</td><td><code>__global__</code> function</td></tr>
+    <tr><td><code>tl.program_id(axis)</code></td><td>Index of this program instance along a grid axis (0, 1, or 2).</td><td><code>blockIdx.{x,y,z}</code> — but per <em>program</em>, not per block of threads</td></tr>
+    <tr><td><code>tl.arange(0, N)</code></td><td>A compile-time-sized vector <code>[0, 1, ..., N-1]</code>; <code>N</code> must be a constexpr power of two.</td><td>the <code>threadIdx</code> sweep, materialized as data</td></tr>
+    <tr><td><code>tl.load / tl.store</code></td><td>Read/write a tile through a tensor of pointers, under a mask.</td><td>coalesced global loads/stores (vectorization handled for you)</td></tr>
+    <tr><td><code>mask</code></td><td>Boolean tile selecting valid lanes; off lanes read <code>other</code> and are not stored.</td><td>per-thread <code>if (i &lt; n)</code> guard</td></tr>
+    <tr><td><code>num_warps</code></td><td>Warps of execution resources assigned to <em>each</em> program instance.</td><td>roughly <code>blockDim / 32</code> (threads per block)</td></tr>
+    <tr><td><code>num_stages</code></td><td>Software-pipeline depth: how many loop iterations' loads are prefetched ahead of compute.</td><td>manual double/triple buffering through shared memory</td></tr>
+    <tr><td><code>tl.constexpr</code></td><td>Compile-time constant argument; drives specialization.</td><td>a template parameter / <code>#define</code></td></tr>
+  </tbody>
+</table>
+
+<h2>6. Pointer arithmetic with strides</h2>
+
+<p>Triton does <strong>not</strong> assume your tensors are contiguous. You pass the strides explicitly and compute addresses yourself. This is what lets one kernel work on transposed views, slices, and non-contiguous layouts without a copy.</p>
+
+<p>Consider scaling each row of a matrix <code>X (M × N)</code> by a per-row scalar. One program owns one row.</p>
+
+<pre><code>@triton.jit
+def row_scale_kernel(
+    x_ptr, scale_ptr, out_ptr,
+    M, N,
+    stride_xm, stride_xn,      # element strides of X
+    stride_om, stride_on,      # element strides of OUT
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(axis=0)            # this program owns row `row`
+    if row &gt;= M:
+        return
+
+    s = tl.load(scale_ptr + row)           # scalar for this row
+
+    # sweep the columns in BLOCK_N-wide chunks
+    for start in range(0, N, BLOCK_N):
+        offs_n = start + tl.arange(0, BLOCK_N)
+        mask = offs_n &lt; N
+
+        # address = base + row*row_stride + col*col_stride
+        x_ptrs   = x_ptr   + row * stride_xm + offs_n * stride_xn
+        out_ptrs = out_ptr + row * stride_om + offs_n * stride_on
+
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+        tl.store(out_ptrs, x * s, mask=mask)
+</code></pre>
+
+<div class="callout">
+  <div class="label">Pointers are tensors</div>
+  <p><code>x_ptr + row * stride_xm + offs_n * stride_xn</code> adds a scalar offset to a <em>vector</em> <code>offs_n</code>, producing a <em>vector of addresses</em>. <code>tl.load</code> gathers from all of them at once. The compiler recognizes the affine pattern and emits coalesced, vectorized loads when the stride permits — but the address math is yours to express.</p>
+</div>
+
+<h2>7. 2-D pointer blocks via broadcasting</h2>
+
+<p>To own a 2-D tile, build two 1-D offset vectors and broadcast them into a grid of addresses with <code>None</code> (newaxis) indexing — exactly like NumPy.</p>
+
+<pre><code>@triton.jit
+def copy_block_kernel(
+    x_ptr, out_ptr,
+    M, N,
+    stride_m, stride_n,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)   # (BLOCK_M,)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)   # (BLOCK_N,)
+
+    # broadcast to a 2-D tile of addresses: (BLOCK_M, BLOCK_N)
+    ptrs = x_ptr + offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
+
+    # 2-D mask: combine two boundary checks with bitwise &amp;
+    mask = (offs_m[:, None] &lt; M) &amp; (offs_n[None, :] &lt; N)
+
+    block = tl.load(ptrs, mask=mask, other=0.0)
+
+    out_ptrs = out_ptr + offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
+    tl.store(out_ptrs, block, mask=mask)
+</code></pre>
+
+<div class="callout">
+  <div class="label">Where Triton feels different</div>
+  <p><code>offs_m[:, None]</code> has shape <code>(BLOCK_M, 1)</code> and <code>offs_n[None, :]</code> has shape <code>(1, BLOCK_N)</code>; their sum broadcasts to <code>(BLOCK_M, BLOCK_N)</code>. You are writing array math over a whole tile — no nested thread loops, no manual index arithmetic per element. The mask combines the row-bound and column-bound checks with a single <code>&amp;</code>.</p>
+</div>
+
+<h2>8. Masks and the <code>other</code> value</h2>
+
+<p>Any lane that is out of bounds, on the wrong side of a causal frontier, or otherwise invalid must be masked — both on load (so you do not read garbage / out-of-bounds memory) and on store (so you do not clobber memory you do not own). On load, <code>other=</code> supplies the value substituted for masked-off lanes.</p>
+
+<p><strong>The fill value must be the identity of the downstream reduction</strong>, or it will corrupt the result:</p>
+
+<table>
+  <thead>
+    <tr><th>Downstream op</th><th>Correct <code>other</code></th><th>Why</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>sum / mean</td><td><code>0.0</code></td><td>adding 0 leaves the sum unchanged</td></tr>
+    <tr><td>product</td><td><code>1.0</code></td><td>multiplying by 1 is the identity</td></tr>
+    <tr><td>max (e.g. softmax)</td><td><code>-float("inf")</code></td><td>−∞ never wins a max; <code>exp(-inf)=0</code> so it adds nothing to the softmax denominator</td></tr>
+    <tr><td>min</td><td><code>float("inf")</code></td><td>+∞ never wins a min</td></tr>
+  </tbody>
+</table>
+
+<div class="callout bad">
+  <div class="label">Bug</div>
+  <p>Using <code>other=0.0</code> before a <code>tl.max</code> on the padded tail of a softmax row: if every real value is negative, the padding <code>0.0</code> becomes the max and the softmax is wrong. The fill leaked into the reduction. Match <code>other</code> to the reduction's identity.</p>
+</div>
+
+<h2>9. Reductions inside a tile</h2>
+
+<p>Reductions over a tile use <code>tl.sum</code>, <code>tl.max</code>, <code>tl.min</code> (and friends) with an <code>axis</code> argument, mirroring NumPy. For a 2-D tile shaped <code>(BLOCK_M, BLOCK_N)</code>:</p>
+
+<ul>
+  <li><code>axis=0</code> reduces down the rows → a <code>(BLOCK_N,)</code> vector (one value per column).</li>
+  <li><code>axis=1</code> reduces across the columns → a <code>(BLOCK_M,)</code> vector (one value per row).</li>
+</ul>
+
+<pre><code>@triton.jit
+def row_sum_kernel(x_ptr, out_ptr, M, N,
+                   stride_m, stride_n,
+                   BLOCK_N: tl.constexpr):
+    row = tl.program_id(axis=0)
+    offs_n = tl.arange(0, BLOCK_N)
+    mask = offs_n &lt; N
+    x = tl.load(x_ptr + row * stride_m + offs_n * stride_n,
+               mask=mask, other=0.0)            # 0.0 is the identity for sum
+    acc = tl.sum(x.to(tl.float32), axis=0)      # reduce in fp32
+    tl.store(out_ptr + row, acc)
+</code></pre>
+
+<div class="callout warn">
+  <div class="label">Cross-program reductions</div>
+  <p><code>tl.sum</code> reduces only <em>within one program's tile</em>. A reduction spanning more data than one tile holds (a global sum, or a row wider than <code>BLOCK_N</code> handled by multiple programs) needs either a serial loop inside the program (as in §6) or a <strong>second launch</strong> to combine partial results. There is no global barrier inside a kernel — separate launches are Triton's equivalent of CUDA's grid-wide sync point. Common pattern: kernel 1 writes per-program partials, kernel 2 reduces them.</p>
+</div>
+
+<h2>10. dtype handling</h2>
+
+<p>Loads from a bf16/fp16 tensor return bf16/fp16 tiles. <strong>Cast to fp32 before any reduction or accumulation</strong>, then cast back to the output dtype on store.</p>
+
+<pre><code>x = tl.load(x_ptr + offs, mask=mask, other=0.0)   # bf16 tile
+acc = tl.sum(x.to(tl.float32), axis=0)            # accumulate in fp32
+tl.store(out_ptr + row, acc.to(x.dtype))          # store back as bf16
+</code></pre>
+
+<div class="callout">
+  <div class="label">Numerical reason</div>
+  <p>bf16 has ~8 bits of mantissa and fp16 ~11. Summing many such values accumulates rounding error fast — and bf16 in particular will silently stop growing once the running sum dwarfs the next addend (swamping). Accumulating in fp32 (~24-bit mantissa) keeps the partial sums accurate; the single final round-to-bf16 on store is the only lossy step. This is the same reason hardware tensor cores accumulate matmuls in fp32.</p>
+</div>
+
+<h2>11. Choosing num_warps and num_stages</h2>
+
+<ul>
+  <li><strong><code>num_warps</code></strong> — execution resources per program instance. More warps give the scheduler more in-flight work to hide memory latency, which helps for <em>large</em> tiles and memory-bound kernels. Too many warps for a small tile wastes registers and hurts occupancy. Typical: 4 or 8.</li>
+  <li><strong><code>num_stages</code></strong> — software-pipeline depth. The compiler prefetches the next stage's loads while the current stage computes, overlapping memory and math. It matters for loops with heavy compute per iteration (e.g. <code>tl.dot</code> in a matmul or attention inner loop). For tiny elementwise kernels there is nothing to overlap, so it is irrelevant — leave it at the default.</li>
+</ul>
+
+<div class="callout">
+  <div class="label">Rule of thumb</div>
+  <p>Pick <code>num_warps</code> and <code>num_stages</code> from tile size and arithmetic intensity, then <em>autotune</em> over a few candidates rather than guessing. Lesson 02 covers <code>@triton.autotune</code> and the performance reasoning in depth.</p>
+</div>
+
+<h2>12. PyTorch autograd integration</h2>
+
+<p>To make a Triton kernel differentiable, wrap forward and backward launches in a <code>torch.autograd.Function</code>. Save what backward needs in <code>ctx</code>; return one gradient per forward input.</p>
+
+<pre><code>class FusedAdd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, y):
+        out = torch.empty_like(x)
+        n = x.numel()
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK"]),)
+        add_kernel[grid](x, y, out, n, BLOCK=1024)
+        # nothing input-dependent needed for d(x+y); ctx would hold tensors otherwise
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        # d(x+y)/dx = 1, d(x+y)/dy = 1  -&gt;  both grads pass through unchanged
+        return grad_out, grad_out
+
+# usage
+z = FusedAdd.apply(x, y)
+</code></pre>
+
+<p><code>backward</code> returns a gradient for each positional input to <code>forward</code> (here <code>x</code> and <code>y</code>), in order; return <code>None</code> for non-tensor or non-differentiable inputs.</p>
+
+<div class="callout ok">
+  <div class="label">Verify</div>
+  <p>Check correctness with <code>torch.autograd.gradcheck</code> on an <strong>fp64</strong> input — the finite-difference reference needs the precision. For kernels that only run in fp32/bf16, fall back to comparing against a pure-PyTorch reference with loose tolerances (e.g. <code>torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)</code> for bf16). Never gradcheck a bf16 kernel directly; the finite differences are pure noise.</p>
+</div>
+
+<h2>Interview checklist</h2>
+
+<ol>
+  <li><strong>State what one program owns.</strong> A 1-D slice? A row? A 2-D <code>BLOCK_M × BLOCK_N</code> block? Everything else follows from this.</li>
+  <li><strong>Derive the pointer tensors</strong> from <code>tl.program_id</code> and <code>tl.arange</code>, multiplying offsets by the passed-in strides (do not assume contiguity); broadcast with <code>[:, None]</code> / <code>[None, :]</code> for 2-D.</li>
+  <li><strong>Mask every boundary</strong> on both load and store, and pick <code>other</code> to be the identity of the downstream reduction (0 for sum, −inf for max).</li>
+  <li><strong>Cast to fp32</strong> for any reduction/accumulation; store back in the output dtype.</li>
+  <li><strong>Choose <code>BLOCK</code> / <code>num_warps</code> / <code>num_stages</code></strong> from tile size and arithmetic intensity (and autotune).</li>
+  <li><strong>Say whether it reduces within one program or needs a multi-pass launch</strong> — there is no global barrier inside a kernel.</li>
+</ol>
+
+<footer class="lesson-nav">
+  <a href="index.html">
+    <span class="dir">Index</span>
+    <span class="ttl">Triton interview prep</span>
+  </a>
+  <a class="next" href="02_optimized_snippets.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">02 · Optimized snippets</span>
+  </a>
+</footer>
+
+</main>
+
+</body>
+</html>

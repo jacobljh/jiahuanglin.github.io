@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>02 · Triton optimized snippets</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">triton</a>
+    <span class="crumb">/</span>
+    <span class="crumb">02 · optimized snippets</span>
+    <span class="step-pill">lesson 2 / 3</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Highly optimized Triton snippets</h1>
+<p class="subtitle">Fusion and tile-shape choice are the two levers that make a Triton kernel fast. Everything else — autotuning, swizzling, pipelining — is refinement around a tile you have already justified.</p>
+
+<div class="linear-step">
+  <div class="label">Linearized thinking</div>
+  <p>Fast Triton is <strong>choosing the right tile</strong>. A good tile does four things at once: it <strong>reuses data</strong> (so each byte read from HBM serves many FLOPs), it carries <strong>enough work per program</strong> (so launch and scheduling overhead is amortized), it <strong>keeps the live state in the register/shared budget</strong> (so the SM does not spill or lose occupancy), and it <strong>maps cleanly onto tensor cores or wide memory transactions</strong> (so the hardware's fast paths actually fire).</p>
+  <p>So before you write a config, reason about the data flow: <strong>what stays live in registers</strong> for the duration of the program, <strong>what streams from HBM</strong> tile by tile, <strong>what is reused</strong> across iterations or across neighboring programs, and <strong>which axis is reduced</strong>. The answers fix the tile's <em>ownership</em> and rough <em>shape</em>. <em>Only then</em> do you autotune — autotuning searches a small neighborhood around a tile you already understand; it does not invent the right structure for you.</p>
+</div>
+
+<h2>Why fusion is Triton's highest-return use case</h2>
+
+<p>Chaining PyTorch operators is correct but wasteful. Each operator is its own CUDA kernel launch, and each one reads its inputs from HBM and writes its output back to HBM. Consider <code>y = gelu(x + bias)</code> written as two ops: <code>x + bias</code> reads <code>x</code>, reads <code>bias</code>, and writes a full-size temporary <code>t</code> to HBM; then <code>gelu(t)</code> reads <code>t</code> back and writes <code>y</code>. The intermediate <code>t</code> exists only to be round-tripped through memory.</p>
+
+<p>The cost that matters here is <strong>arithmetic intensity</strong>: FLOPs performed per byte moved to and from HBM. Elementwise ops have <em>tiny</em> intensity — a GELU is a handful of FLOPs per element, but each element costs a load and a store (8 bytes round trip in fp32). These kernels are <strong>memory-bound</strong>: the ALUs sit idle waiting on HBM. The only way to speed them up is to <strong>move fewer bytes</strong>.</p>
+
+<p>Fusion does exactly that. One kernel reads each input <em>once</em>, does <em>all</em> the arithmetic while the values are live in registers, and writes the result <em>once</em>. The intermediate never touches HBM, and you pay one launch instead of several.</p>
+
+<div class="callout">
+  <div class="label">Intuition</div>
+  <p>For a chain of <code>k</code> elementwise ops over an N-element tensor, the unfused cost is roughly <code>k</code> reads + <code>k</code> writes of N elements. The fused cost is 1 read of each distinct input + 1 write. As <code>k</code> grows, the win approaches a factor of <code>k</code> — and it is pure bandwidth, with no change to the math.</p>
+</div>
+
+<h2>Snippet 1 — fused bias + GELU</h2>
+
+<p>The classic transformer epilogue: add a per-column bias, then apply GELU. We fuse the add and the activation into one elementwise pass. The bias is indexed by the <em>column</em> of each element, so from a flat offset <code>offs</code> over a row-major <code>(rows, D)</code> tensor we recover the column with <code>d = offs % D</code> and gather <code>bias[d]</code>.</p>
+
+<pre><code>import triton
+import triton.language as tl
+
+@triton.jit
+def gelu(x):
+    # tanh approximation of GELU (matches torch's approximate="tanh")
+    # 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 * x**3) ))
+    c = 0.7978845608028654          # sqrt(2/pi)
+    inner = c * (x + 0.044715 * x * x * x)
+    return 0.5 * x * (1.0 + tl.tanh(inner))
+
+@triton.jit
+def bias_gelu_kernel(x_ptr, b_ptr, y_ptr,
+                     n_elements, D,
+                     BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs &lt; n_elements
+
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    d = offs % D                              # column index of each element
+    b = tl.load(b_ptr + d, mask=mask, other=0.0)
+
+    y = gelu(x + b)                           # add + activation, all in registers
+    tl.store(y_ptr + offs, y, mask=mask)
+
+
+def bias_gelu(x, bias):
+    # x: (rows, D), bias: (D,)
+    y = torch.empty_like(x)
+    n = x.numel()
+    D = x.shape[-1]
+    grid = lambda meta: (triton.cdiv(n, meta["BLOCK"]),)
+    bias_gelu_kernel[grid](x, bias, y, n, D, BLOCK=1024)
+    return y</code></pre>
+
+<div class="callout ok">
+  <div class="label">Where the win comes from</div>
+  <p>GELU's transcendentals are <em>not</em> the bottleneck and fusing them does not speed the math up — the ALU was never the limiter. The win is that we deleted the intermediate <code>x + bias</code> tensor (one full HBM write + one full HBM read removed) and collapsed two launches into one. This is a bandwidth and overhead win, which is exactly what a memory-bound op needs.</p>
+</div>
+
+<h2>Snippet 2 — numerically stable row softmax</h2>
+
+<p>Softmax over the last axis. We assign <strong>one program per row</strong>, load the whole row into registers, and do the reduction there. The naive <code>exp(x) / sum(exp(x))</code> overflows: a single large logit makes <code>exp</code> inf, and inf/inf is NaN. The fix is to subtract the row max first — mathematically a no-op (it cancels in the ratio) but it bounds every exponent at <code>exp(0) = 1</code>.</p>
+
+<pre><code>@triton.jit
+def softmax_kernel(x_ptr, y_ptr,
+                   row_stride, n_cols,
+                   BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols &lt; n_cols
+    ptrs = x_ptr + row * row_stride + cols
+
+    # other=-inf so masked lanes never win the max and contribute 0 to the sum
+    vals = tl.load(ptrs, mask=mask, other=-float("inf"))
+
+    m   = tl.max(vals, axis=0)                # row max, for stability
+    num = tl.exp(vals - m)                    # in [0, 1], no overflow
+    den = tl.sum(num, axis=0)
+    out = num / den
+
+    tl.store(y_ptr + row * row_stride + cols, out, mask=mask)</code></pre>
+
+<p>The masked-load fill is doing double duty here, and getting it right is the whole game on the edge tile (see <em>Correctness under masking</em> below). Filling with <code>-inf</code> means a padding lane can never be the max, and its <code>exp(-inf - m) = 0</code> contributes nothing to the denominator. Fill with <code>0</code> instead and the padding lanes inject <code>exp(0 - m)</code> into the sum, silently corrupting the result.</p>
+
+<div class="callout warn">
+  <div class="label">Precondition</div>
+  <p>This kernel assumes <strong>the whole row fits in one tile</strong> — i.e. <code>BLOCK &gt;= n_cols</code> (with <code>BLOCK</code> the next power of two above <code>n_cols</code>). That is fine for vocab/feature sizes up to a few tens of thousands. When a row is too large to hold in registers, you cannot take a single max and a single sum; you need the <strong>online (streaming) softmax</strong> that maintains a running max and running denominator across tiles and rescales as it goes. That is the technique behind FlashAttention — we build it in lesson 03.</p>
+</div>
+
+<h2>Snippet 3 — fused RMSNorm</h2>
+
+<p>RMSNorm normalizes each row by its root-mean-square and scales by a learned per-feature weight: <code>y = x * rsqrt(mean(x^2) + eps) * w</code>. Like softmax it is a per-row reduction, so again <strong>one program per row</strong>. The subtlety is precision.</p>
+
+<pre><code>@triton.jit
+def rmsnorm_kernel(x_ptr, w_ptr, y_ptr,
+                   row_stride, D,
+                   eps,
+                   BLOCK: tl.constexpr):
+    row  = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols &lt; D
+    ptrs = x_ptr + row * row_stride + cols
+
+    # cast to fp32 for the reduction; other=0 is sum-safe
+    x  = tl.load(ptrs, mask=mask, other=0.0).to(tl.float32)
+    ss = tl.sum(x * x, axis=0)                # sum of squares, fp32
+    inv_rms = tl.rsqrt(ss / D + eps)          # 1 / sqrt(mean(x^2) + eps)
+
+    w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    y = x * inv_rms * w
+
+    tl.store(y_ptr + row * row_stride + cols, y.to(tl.float32), mask=mask)</code></pre>
+
+<div class="callout">
+  <div class="label">Why fp32 accumulation</div>
+  <p>If <code>x</code> is bf16 or fp16, summing <code>x*x</code> in the input dtype loses precision badly: bf16 has 8 mantissa bits, so once the running sum grows past ~256x the magnitude of a new term, that term rounds away entirely. Across thousands of features the error compounds and the norm drifts. Casting to fp32 (<code>.to(tl.float32)</code>) before the reduction keeps the sum accurate; you cast back only at the store. This is the same rule we apply to matmul: <strong>accumulate reductions in fp32 regardless of the I/O dtype.</strong> The reduction is also <strong>single-pass</strong> — one load of the row, one sum, done — because the whole row is live in registers.</p>
+</div>
+
+<h2>Snippet 4 — tiled matmul with tl.dot</h2>
+
+<p>The canonical compute-bound kernel. Each program <strong>owns one <code>BM&times;BN</code> output tile</strong> of <code>C = A @ B</code>. It walks the shared K dimension in chunks of <code>BK</code>, loading an <code>A</code> tile and a <code>B</code> tile each step and accumulating their product into a register-resident accumulator.</p>
+
+<pre><code>@triton.jit
+def matmul_kernel(a_ptr, b_ptr, c_ptr,
+                  M, N, K,
+                  stride_am, stride_ak,
+                  stride_bk, stride_bn,
+                  stride_cm, stride_cn,
+                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BM + tl.arange(0, BM)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+
+    # 2D pointer grids into A (BM x BK) and B (BK x BN)
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+    acc = tl.zeros((BM, BN), dtype=tl.float32)         # lives in registers
+
+    for k in range(0, K, BK):
+        a = tl.load(a_ptrs,
+                    mask=(offs_m[:, None] &lt; M) &amp; (offs_k[None, :] &lt; (K - k)),
+                    other=0.0)
+        b = tl.load(b_ptrs,
+                    mask=(offs_k[:, None] &lt; (K - k)) &amp; (offs_n[None, :] &lt; N),
+                    other=0.0)
+        acc += tl.dot(a, b)                             # fp16/bf16 in, fp32 acc
+        a_ptrs += BK * stride_ak
+        b_ptrs += BK * stride_bk
+
+    c = acc.to(c_ptr.dtype.element_ty)
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] &lt; M) &amp; (offs_n[None, :] &lt; N)
+    tl.store(c_ptrs, c, mask=c_mask)</code></pre>
+
+<p>Map this onto the four tile properties from the opening:</p>
+<ul>
+  <li><strong>What stays live:</strong> the <code>acc</code> tile (<code>BM&times;BN</code> fp32 values) lives in registers for the entire K loop. This is the dominant register cost and the main occupancy constraint.</li>
+  <li><strong>What streams:</strong> the <code>A</code> and <code>B</code> tiles flow through the loop one <code>BK</code>-chunk at a time. They are loaded, multiplied, and discarded.</li>
+  <li><strong>What is reused:</strong> each loaded <code>A</code> tile (<code>BM&times;BK</code>) participates in <code>BN</code> output columns, and each <code>B</code> tile in <code>BM</code> rows. That reuse is exactly why a big output tile raises arithmetic intensity.</li>
+  <li><strong>What is reduced:</strong> the K axis — which is why it is the loop, not the grid.</li>
+</ul>
+
+<div class="callout ok">
+  <div class="label">tl.dot and tensor cores</div>
+  <p><code>tl.dot(a, b)</code> lowers to a tensor-core MMA instruction when the operands fit the hardware's fast path: fp16/bf16 (or tf32/fp8 on newer GPUs) inputs, fp32 accumulator, and tile dimensions that are multiples of the MMA shape (16 is the safe minimum on the contraction dim). Feed it fp32 inputs or a contraction dim of 13 and it falls back to a slow path or refuses to compile. The <code>acc = tl.zeros(..., tl.float32)</code> plus <code>acc += tl.dot(...)</code> pattern <em>is</em> the tensor-core idiom: low-precision multiply, high-precision accumulate.</p>
+</div>
+
+<h2>Snippet 5 — autotuning the tile</h2>
+
+<p>The algorithm above is fixed; what is <em>not</em> fixed is the tile shape and the launch parameters. <code>@triton.autotune</code> benchmarks a list of candidate configs and caches the winner per distinct <code>key</code>.</p>
+
+<pre><code>@triton.autotune(
+    configs=[
+        triton.Config({"BM": 128, "BN": 256, "BK": 64}, num_warps=8, num_stages=3),
+        triton.Config({"BM": 256, "BN": 128, "BK": 64}, num_warps=8, num_stages=3),
+        triton.Config({"BM": 128, "BN": 128, "BK": 32}, num_warps=4, num_stages=4),
+        triton.Config({"BM": 64,  "BN": 64,  "BK": 32}, num_warps=2, num_stages=5),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def matmul_kernel(...):   # same body as Snippet 4
+    ...</code></pre>
+
+<p>The knobs trade off against each other:</p>
+<table>
+<thead>
+<tr><th>Knob</th><th>Bigger means</th><th>Cost of bigger</th></tr>
+</thead>
+<tbody>
+<tr><td><code>BM &times; BN</code></td><td>more reuse per loaded tile, higher arithmetic intensity</td><td>larger fp32 accumulator in registers &rarr; fewer concurrent programs (lower occupancy), risk of spills</td></tr>
+<tr><td><code>BK</code></td><td>more work per K-iteration, fewer iterations, fewer pointer updates</td><td>larger A/B tiles in shared memory and registers per step</td></tr>
+<tr><td><code>num_warps</code></td><td>more parallel lanes per program to cover the tile</td><td>each warp needs registers; too many starves occupancy</td></tr>
+<tr><td><code>num_stages</code></td><td>deeper load/compute pipeline, more HBM latency hidden</td><td>each stage buffers a K-tile in shared memory; useless for non-dot kernels</td></tr>
+</tbody>
+</table>
+
+<div class="callout">
+  <div class="label">Tune the tile, not the algorithm</div>
+  <p>Autotuning explores a <em>neighborhood</em> of configs around a structure you already chose. It will not turn a memory-bound elementwise kernel into a tensor-core kernel, and it will not discover that you should have fused two ops. Fix the algorithm and the tile <em>ownership</em> by reasoning first; then let autotune pick the exact sizes for the hardware. Note autotune <strong>re-benchmarks for every distinct value of <code>key</code></strong> — here <code>(M, N, K)</code> — so a workload with many shapes pays the search cost repeatedly. Keep <code>key</code> to the dimensions that actually change the optimal tile.</p>
+</div>
+
+<h2>Snippet 6 — grouped / swizzled program ordering for L2 reuse</h2>
+
+<p>With a 2D grid, the default program order sweeps a full row of output tiles before moving to the next row. Along that row every program loads a fresh <code>B</code> column tile but the <em>same</em> <code>A</code> row tile — so the <code>B</code> tiles a program needs were loaded by far-away programs long ago and have been evicted from L2. We can keep the math identical but change the <strong>visitation order</strong> so that programs running close together in time touch overlapping <code>B</code> tiles, which then stay hot in L2.</p>
+
+<pre><code>@triton.jit
+def matmul_grouped(a_ptr, b_ptr, c_ptr, M, N, K, ...,
+                   BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                   GROUP_M: tl.constexpr):
+    pid = tl.program_id(0)                    # 1D launch this time
+    num_pid_m = tl.cdiv(M, BM)
+    num_pid_n = tl.cdiv(N, BN)
+
+    # remap a flat pid into (pid_m, pid_n) grouped along M
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    # ... identical tile body using pid_m, pid_n ...</code></pre>
+
+<div class="callout">
+  <div class="label">It is only a schedule, not new math</div>
+  <p>Instead of marching across an entire output row, we process a <code>GROUP_M</code>-tall <em>block of rows</em> together before advancing in N. Programs in the same group reuse the same set of <code>B</code> column tiles within a short window, so those tiles are served from L2 instead of HBM. The result <code>C</code> is byte-for-byte identical — we only reordered which program computes which tile and when. This is one of the cheapest large wins in a matmul kernel.</p>
+</div>
+
+<h2>The software pipeline and num_stages</h2>
+
+<p>Inside the K loop there are two phases: <strong>load</strong> the next A/B tiles from HBM, and <strong>compute</strong> the <code>tl.dot</code>. Done naively they serialize — the SM stalls on the load before it can multiply. The Triton compiler can instead <strong>prefetch</strong>: issue the load for K-tile <em>i+1</em> while the tensor cores are still chewing on K-tile <em>i</em>. That overlap hides HBM latency behind useful compute. <code>num_stages</code> is how many K-tiles deep this prefetch pipeline runs.</p>
+
+<div class="ascii">
+no pipeline (num_stages=1):
+  | load0 | dot0 | load1 | dot1 | load2 | dot2 |     &lt;- compute waits on every load
+
+pipelined (num_stages=3):
+  | load0 | load1 | load2 | load3 | load4 | ...
+  |       | dot0  | dot1  | dot2  | dot3  | ...      &lt;- dot_i overlaps load_(i+1)
+          steady state: HBM latency hidden under tensor-core work
+</div>
+
+<div class="callout warn">
+  <div class="label">Pipelining helps dot-heavy loops only</div>
+  <p>The prefetch overlap pays off when there is real compute to hide the load behind — i.e. a <code>tl.dot</code> loop. For a tiny elementwise kernel there is no loop and almost no compute, so extra stages just burn shared memory for nothing. Set <code>num_stages</code> high for matmul/attention; leave it at the default (or 1) for elementwise and simple reductions.</p>
+</div>
+
+<h2>Correctness under masking</h2>
+
+<p>When a tensor dimension is not a multiple of the tile, the boundary tile reads and writes out-of-range addresses unless masked. Two rules:</p>
+
+<ol>
+  <li><strong>Mask every load and every store.</strong> An unmasked load past the end reads garbage (or faults); an unmasked store past the end corrupts neighboring memory. The mask on the store must match the valid region of the output tile.</li>
+  <li><strong>The <code>other</code> fill must be reduction-safe.</strong> The value masked-out lanes take has to be the <em>identity</em> of whatever reduction consumes it: <code>0.0</code> for a sum (and for sum-of-squares), <code>-inf</code> for a max, <code>+inf</code> for a min. A wrong fill does not crash — it quietly poisons only the edge tiles, so the kernel looks correct on power-of-two shapes and fails on the others.</li>
+</ol>
+
+<div class="callout bad">
+  <div class="label">Silent corruption</div>
+  <p>In the softmax kernel, loading padding lanes with <code>other=0.0</code> instead of <code>-inf</code> compiles, runs, and gives correct answers whenever <code>n_cols</code> is a power of two (no padding lanes exist). The moment <code>n_cols</code> is, say, 1000 with <code>BLOCK=1024</code>, the 24 padding lanes each add <code>exp(0 - m)</code> to the denominator and every probability in that row comes out too small. No error, no NaN — just wrong numbers on exactly the inputs your unit test on shape 1024 never exercised.</p>
+</div>
+
+<h2>Pitfalls</h2>
+
+<div class="callout bad">
+  <div class="label">Pitfalls</div>
+  <ul>
+    <li><strong>BLOCK should be a power of two.</strong> <code>tl.arange</code> and the tile machinery assume power-of-two extents; pick the next power of two above your true size and mask the remainder.</li>
+    <li><strong><code>tl.arange</code> bounds must be <code>tl.constexpr</code>.</strong> The range is resolved at compile time — <code>tl.arange(0, BLOCK)</code> needs <code>BLOCK</code> to be a constexpr, never a runtime value.</li>
+    <li><strong>Large tensors need int64 offsets.</strong> Offsets default to int32; once <code>row * row_stride + col</code> exceeds ~2.1 billion the index silently overflows and wraps. Compute offsets in int64 (e.g. cast the base index) for big tensors.</li>
+    <li><strong><code>tl.dot</code> wants the contraction dim a multiple of 16.</strong> That is the tensor-core MMA granularity; an off-multiple K either compiles to a slow path or errors. Pad or pick <code>BK</code> accordingly.</li>
+    <li><strong>Non-contiguous tensors need real strides.</strong> If you index assuming row-major but the tensor is transposed or sliced, you read the wrong elements. Either call <code>.contiguous()</code> first or pass the actual <code>tensor.stride(i)</code> values into the kernel and use them everywhere.</li>
+  </ul>
+</div>
+
+<h2>Snippet 7 — benchmarking correctly</h2>
+
+<p>A kernel is only "optimized" relative to a measured baseline, on the right unit. Use <code>triton.testing.do_bench</code>, which warms up the GPU and the autotune cache, then times many reps and returns the median milliseconds.</p>
+
+<pre><code>import torch, triton
+
+def bench_matmul(M, N, K, dtype=torch.float16):
+    a = torch.randn((M, K), device="cuda", dtype=dtype)
+    b = torch.randn((K, N), device="cuda", dtype=dtype)
+
+    ms_triton = triton.testing.do_bench(lambda: matmul(a, b),
+                                        warmup=25, rep=100)
+    ms_torch  = triton.testing.do_bench(lambda: torch.matmul(a, b),
+                                        warmup=25, rep=100)
+
+    # matmul is compute-bound: count FLOPs = 2*M*N*K (one mul + one add per term)
+    flops = 2 * M * N * K
+    tflops_triton = flops / (ms_triton * 1e-3) / 1e12
+    tflops_torch  = flops / (ms_torch  * 1e-3) / 1e12
+    print(f"triton {tflops_triton:7.1f} TFLOP/s   torch {tflops_torch:7.1f} TFLOP/s")
+
+
+def bench_rmsnorm(rows, D, dtype=torch.float16):
+    x = torch.randn((rows, D), device="cuda", dtype=dtype)
+    w = torch.randn((D,),      device="cuda", dtype=dtype)
+    ms = triton.testing.do_bench(lambda: rmsnorm(x, w), warmup=25, rep=100)
+
+    # memory-bound: count bytes moved = read x + read w + write y
+    bytes_moved = x.numel() * x.element_size() \
+                + w.numel() * w.element_size() \
+                + x.numel() * x.element_size()
+    gbps = bytes_moved / (ms * 1e-3) / 1e9
+    print(f"rmsnorm {gbps:7.1f} GB/s")</code></pre>
+
+<div class="callout">
+  <div class="label">Pick the denominator that matches the bottleneck</div>
+  <p>Report <strong>TFLOP/s</strong> for compute-bound kernels (matmul: <code>2*M*N*K</code> FLOPs) and compare against the GPU's peak tensor-core throughput. Report <strong>GB/s</strong> for memory-bound kernels (count every byte read <em>and</em> written) and compare against peak HBM bandwidth. Quoting GB/s for a matmul or TFLOP/s for a softmax tells you nothing about whether you are near the roofline. Always benchmark against torch with the <em>same</em> dtype, shape, and warmup so the comparison is honest.</p>
+</div>
+
+<h2>Optimization answer template</h2>
+
+<p>When asked to make a Triton kernel fast (in an interview or in real life), walk this in order:</p>
+
+<ol>
+  <li><strong>Classify the op.</strong> Elementwise, reduction, dot (matmul/attention), or a fused epilogue on top of one of those? This decides whether you are memory-bound or compute-bound, and therefore which lever matters.</li>
+  <li><strong>Choose tile ownership.</strong> Decide what one program is responsible for — a block of flat elements (elementwise), one row (per-row reduction like softmax/RMSNorm), or one <code>BM&times;BN</code> output tile (matmul). This follows directly from which axis is reduced.</li>
+  <li><strong>Pick tile sizes from reuse.</strong> Reason about what stays live in registers, what streams from HBM, and what is reused, then size the tile big enough to amortize launches and feed tensor cores but small enough to stay in the register/shared budget.</li>
+  <li><strong>Get correctness with masks and strides.</strong> Mask every load and store, choose reduction-safe <code>other</code> fills, accumulate reductions in fp32, and use real strides (or <code>.contiguous()</code>) so non-contiguous inputs are read correctly.</li>
+  <li><strong>Autotune nearby configs.</strong> Fix the algorithm first, then search a small neighborhood of <code>BM/BN/BK</code>, <code>num_warps</code>, <code>num_stages</code> with <code>@triton.autotune</code> keyed on the dimensions that change the optimum.</li>
+  <li><strong>Measure the right unit.</strong> <code>do_bench</code> with warmup, GB/s for memory-bound and TFLOP/s for compute-bound, compared against a same-dtype torch baseline and the hardware roofline.</li>
+</ol>
+
+<footer class="lesson-nav">
+  <a href="01_common_operations.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">01 · Common operations</span>
+  </a>
+  <a class="next" href="03_algorithms_data_structures.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">03 · Algorithms and data structures</span>
+  </a>
+</footer>
+
+</main>
+
+</body>
+</html>
