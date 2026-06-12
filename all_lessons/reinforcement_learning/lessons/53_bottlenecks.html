@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>27 · Throughput bottlenecks, optimizations, and how to find them</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">reinforcement learning</a>
+    <span class="crumb">/</span>
+    <span class="crumb">53 · Throughput bottlenecks, the usual optimizations, and how to identify them</span>
+    <span class="step-pill">lesson 53 / 87</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Throughput bottlenecks, the usual optimizations, and how to identify them</h1>
+<p class="subtitle">An RL training step is a pipeline of five distinct workloads. Each has different hardware physics, different memory pressure, and different failure modes. This lesson is the systems-level answer: where the wall-clock goes, which knob moves it, and how you'd diagnose any of it on a real cluster.</p>
+
+<p>This lesson zooms in on the <em>cost</em> pressure from <a href="51_why_rl_today.html">lesson 51</a>'s three-forces frame. Whichever combination of signal + estimator you've picked, the cost question is the same: five workloads, one critical path, where does the wall-clock actually go and how do we move it?</p>
+
+<h2>Where the wall-clock goes — the typical step</h2>
+
+<p>One training step touches five workloads. The visualization below is a stacked-bar timeline (one step, in seconds) for a representative 7B-parameter run on 8× H100 in a disaggregated topology. Click any segment to see the physics of that workload.</p>
+
+<svg viewBox="0 0 720 220" class="diagram" id="timeline-diagram">
+  <!-- Total bar background -->
+  <rect x="40" y="80" width="640" height="50" fill="var(--code-bg)" stroke="var(--border)"/>
+
+  <!-- Segments -->
+  <g data-seg="rollout">
+    <rect x="40" y="80" width="384" height="50" fill="#dbeafe" stroke="var(--accent)" style="cursor: pointer;"/>
+    <text x="232" y="110" text-anchor="middle" font-size="13" font-weight="600">ROLLOUT 60%</text>
+    <text x="232" y="125" text-anchor="middle" font-size="11" fill="var(--text-mute)">decode-bound</text>
+  </g>
+  <g data-seg="ref">
+    <rect x="424" y="80" width="64" height="50" fill="#fef3c7" stroke="var(--warn)" style="cursor: pointer;"/>
+    <text x="456" y="110" text-anchor="middle" font-size="11" font-weight="600">REF 10%</text>
+  </g>
+  <g data-seg="algo">
+    <rect x="488" y="80" width="32" height="50" fill="#f3e8ff" stroke="#7c3aed" style="cursor: pointer;"/>
+    <text x="504" y="110" text-anchor="middle" font-size="10">ALGO 5%</text>
+  </g>
+  <g data-seg="train">
+    <rect x="520" y="80" width="128" height="50" fill="#dcfce7" stroke="var(--ok)" style="cursor: pointer;"/>
+    <text x="584" y="110" text-anchor="middle" font-size="12" font-weight="600">TRAIN 20%</text>
+    <text x="584" y="125" text-anchor="middle" font-size="10" fill="var(--text-mute)">compute-bound</text>
+  </g>
+  <g data-seg="sync">
+    <rect x="648" y="80" width="32" height="50" fill="#fecaca" stroke="var(--bad)" style="cursor: pointer;"/>
+    <text x="664" y="110" text-anchor="middle" font-size="10">SYNC 5%</text>
+  </g>
+
+  <!-- Axis -->
+  <line x1="40" y1="150" x2="680" y2="150" stroke="var(--text-dim)" stroke-width="1"/>
+  <text x="40" y="170" font-size="11" fill="var(--text-mute)">0s</text>
+  <text x="360" y="170" font-size="11" fill="var(--text-mute)">step midpoint</text>
+  <text x="680" y="170" text-anchor="end" font-size="11" fill="var(--text-mute)">end of step</text>
+
+  <text x="40" y="50" font-size="13" font-weight="600">A typical RL step's wall-clock budget</text>
+  <text x="40" y="68" font-size="11" fill="var(--text-mute)">click a segment to learn its bottleneck physics</text>
+
+  <text x="40" y="200" id="timeline-detail" font-size="12" fill="var(--text-mute)">Hover or click any segment to see the physics.</text>
+</svg>
+
+<p>The shape is consistent across published profiles: <strong>rollout is 60–80% of wall-clock</strong>, training is 10–26%, reference and sync sit in the low single-digit percent each. Any optimization budget should be spent in proportion to that distribution.</p>
+
+<h2>Bottleneck 1 · Rollout — memory-bandwidth-bound decode</h2>
+
+<p>The rollout engine spends nearly all its time in autoregressive decode: emit one token at a time, each time reading the full set of model weights and the full KV cache so far. The compute per token is trivial; the bandwidth dominates. Concrete numbers, 7B model on H100:</p>
+
+<div class="math block">
+weight read &nbsp;≈&nbsp; 14 GB / decode step &nbsp;(amortized across the batch)
+KV read at L=2048, B=32, GQA(8 KV heads) &nbsp;≈&nbsp; 32 × 2048 × 131 KB ≈ 8.6 GB total
+HBM bandwidth &nbsp;3.35 TB/s &nbsp;⟹&nbsp; aggregate cluster throughput ≈ 3–4k tokens/s (≈100 tok/s/seq at B=32)
+</div>
+
+<p>That ceiling tells you where to look for slack: anything that reduces bytes-moved-per-token, or that hides one stream under another, is a real optimization. The most-cited ones, in order of leverage:</p>
+
+<table>
+  <thead><tr><th>Optimization</th><th>Where it lives</th><th>Win on typical RL</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Prefix caching</strong> — share the prompt's KV across K rollouts</td><td>vLLM APC, SGLang RadixAttention</td><td>3–10× on K-rollout RL (depends on prompt/completion ratio)</td></tr>
+    <tr><td><strong>Continuous batching</strong> — admit new sequences into freed slots</td><td>vLLM default since 2023</td><td>2–20× over padded static batching (more when length variance is high)</td></tr>
+    <tr><td><strong>Paged KV cache</strong> — block-granular allocation, no fragmentation</td><td>vLLM, SGLang</td><td>2–4× max-batch over contiguous</td></tr>
+    <tr><td><strong>Chunked prefill</strong> — interleave long prefills with ongoing decodes</td><td>vLLM scheduler flag</td><td>10–20% on long-prompt workloads</td></tr>
+    <tr><td><strong>Speculative decoding</strong> — draft K tokens, verify in one batch</td><td>EAGLE-2/3, Medusa</td><td>1.5–3× at greedy/low T (high draft acceptance); degrades toward ~1× as T rises and acceptance drops</td></tr>
+    <tr><td><strong>KV cache quantization (int8/fp8)</strong> — halve KV bytes</td><td>vLLM kv_cache_dtype flag</td><td>1.5–2× decode; needs log-prob match audit</td></tr>
+    <tr><td><strong>GQA / MQA</strong> — fewer KV heads</td><td>Model architecture</td><td>4–8× smaller KV; baked into modern models</td></tr>
+    <tr><td><strong>Tensor parallel decode</strong> — shard weights across GPUs</td><td>vLLM tp_size</td><td>shrinks per-GPU weight read; adds collective overhead</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <div class="label">The single highest-leverage RL-specific optimization</div>
+  Prefix caching. K-rollout sampling (K=4–64) means K trajectories share the entire prompt. Without sharing: K prefills + K decodes. With sharing: 1 prefill + K decodes. For prompt:completion ratios where prompt &gt; completion (math, code, multi-turn), this lands as 3–10× rollout speedup. If your rollout engine doesn't have it on, turn it on before doing anything else.
+</div>
+
+<h2>Bottleneck 2 · Training — compute-bound, but memory-fragile</h2>
+
+<p>The trainer is the opposite shape: one forward+backward over the packed batch. Forward does one matmul per linear layer (~2·P·tokens FLOPs); backward does two matmuls per linear layer (one for ∂L/∂W, one for ∂L/∂x → ~4·P·tokens FLOPs). Hence the canonical "6·P·tokens" rule per step. At 7B with packed batch of 32k tokens: 1.3 PFLOPs per step. An H100 sustains ~800 TFLOPs/s real-world bf16, so a single H100 takes ~1.6 s; 8× FSDP brings that to ~0.2 s plus all-gather overhead.</p>
+
+<p>The bottleneck flips between two regimes depending on sequence length:</p>
+
+<ul>
+  <li><strong>Compute-bound</strong> at short L: matmul throughput dominates. Optimization is "use TF32/BF16/FP8 well" and "minimize FSDP all-gather waste".</li>
+  <li><strong>Memory-bound</strong> at long L: activation memory (∝ N·L·d for residuals, plus L² for attention) crowds out parameters and gradients. Optimization is "checkpoint activations, shard sequence dim, kill the (B,T,V) logits tensor".</li>
+</ul>
+
+<table>
+  <thead><tr><th>Optimization</th><th>What it does</th><th>When it pays</th></tr></thead>
+  <tbody>
+    <tr><td><strong>FSDP / ZeRO-3</strong></td><td>Shard params, grads, optimizer state across DP group. All-gather weights for forward.</td><td>Always above one GPU.</td></tr>
+    <tr><td><strong>Activation checkpointing</strong></td><td>Don't store all activations; recompute on backward.</td><td>Any sequence past ~2k tokens. ~33% extra forward FLOPs for ~10× activation memory.</td></tr>
+    <tr><td><strong>Chunked cross-entropy</strong></td><td>Compute log_softmax + gather in chunks over V, never materialize (B,T,V).</td><td>Any vocab ≥ 50k. ~30–50% trainer-forward memory savings.</td></tr>
+    <tr><td><strong>Packed varlen attention</strong></td><td>Pack many short trajectories into one (B=1, T_total) tensor with cu_seqlens.</td><td>Variable-length rollouts (always, in RL). 30–60% fewer FLOPs vs padded.</td></tr>
+    <tr><td><strong>Sequence parallel</strong></td><td>Shard the sequence dim across TP group for very long L.</td><td>Long-context RL (32k+ tokens).</td></tr>
+    <tr><td><strong>Gradient accumulation</strong></td><td>Multiple forwards before one optimizer step.</td><td>When effective batch &gt; what fits.</td></tr>
+    <tr><td><strong>BF16 forward + FP32 master + BF16 grad reduction</strong></td><td>Mixed precision the safe way.</td><td>Default; halves activation + grad memory vs FP32.</td></tr>
+  </tbody>
+</table>
+
+<h2>Bottleneck 3 · Reference — forward-only, often hideable</h2>
+
+<p>Reference scoring is one forward pass per trajectory. No backward, no optimizer state. Cost is small in absolute terms; the question is whether it lands on the critical path. Three options:</p>
+
+<ul>
+  <li><strong>Run ref inline</strong> on the trainer GPUs after rollout. Simplest, but it serializes with everything else.</li>
+  <li><strong>Run ref on a separate pool</strong> overlapped with rollout. Costs a pool of GPUs but takes ref off the critical path entirely.</li>
+  <li><strong>Fuse ref into the trainer's forward.</strong> Either via a shared trunk + two heads, or by computing ref_logp during the same packed forward.</li>
+</ul>
+
+<p>For algorithms that need ref every step (PPO, GRPO with KL), the inline cost is ~10% of step time at 7B. For larger models, a separate pool wins.</p>
+
+<h2>Bottleneck 4 · Weight sync — bandwidth-bound, hideable</h2>
+
+<p>Every step, fresh trainer weights have to reach the rollout engine. The mechanics, from <a href="50_kernels_for_rl.html">lesson 50</a>:</p>
+
+<ol>
+  <li>FSDP <strong>all-gather</strong> on the trainer (turn sharded weights into full ones).</li>
+  <li><strong>Dtype cast</strong> from BF16 master to the inference dtype (BF16 / FP8).</li>
+  <li><strong>NCCL broadcast</strong> from trainer rank 0 to all rollout ranks.</li>
+  <li><strong>Reshard</strong> into the rollout engine's TP layout.</li>
+</ol>
+
+<p>For 70B BF16: 140 GB of weights moving across the cluster. Over NVLink (~600 GB/s) this is ~1 s; over InfiniBand (~50 GB/s) it's 3–20 s depending on fabric topology and contention. At 5–10 second total step times, that's already a significant fraction.</p>
+
+<table>
+  <thead><tr><th>Optimization</th><th>Why it pays</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Sync less often</strong> (every N steps)</td><td>Drops cost linearly. Costs you a growing π_old vs π gap; clip fires more, but if your training is otherwise stable this is a free win.</td></tr>
+    <tr><td><strong>Overlap sync with the next rollout's prefill</strong></td><td>Hides sync entirely. Requires careful layer-boundary swap to avoid mid-forward inconsistency.</td></tr>
+    <tr><td><strong>Fused dtype cast inside the broadcast</strong></td><td>One HBM round-trip instead of two.</td></tr>
+    <tr><td><strong>Async pipelines with versioned weights</strong></td><td>Sync runs on its own cadence; trainer and rollout both stay busy. Cost: off-policy bookkeeping.</td></tr>
+    <tr><td><strong>IPC handoff (colocated)</strong></td><td>If rollout and trainer share GPUs, the "sync" is a pointer swap. ~zero copy.</td></tr>
+  </tbody>
+</table>
+
+<h2>Bottleneck 5 · Algorithm + verifier — usually free, sometimes a long tail</h2>
+
+<p>Computing advantages, group statistics, KL — the actual loss math — is microseconds on modern GPUs. <em>Except</em> when the verifier is slow. Code execution can take 0.1–5 s per rollout; web verifiers can take 5–60 s. At K=64 rollouts per prompt these become the wall-clock anchor regardless of how fast the GPU is.</p>
+
+<p>The fix is uniformly architectural: <strong>verifier dispatcher</strong>. Maintain a CPU/CPU-pool that runs verifiers asynchronously while the GPU continues generating <em>other</em> trajectories. The GPU never blocks on a verifier.</p>
+
+<h2>Interactive · the budget allocator</h2>
+
+<p>The widget below lets you set the percentages of step time spent in each role, then choose which optimizations to apply, and reports the new step time + the recipe-level win. Use it to see why "prefix caching first" is the right opening move.</p>
+
+<div class="widget" id="budget-widget">
+  <div class="title">Optimization-budget allocator</div>
+  <div class="hint">Sliders set baseline percentages (must add to 100). Toggle optimizations on/off. The bar chart updates and the bottom KPI reports the resulting step-time reduction.</div>
+
+  <div class="controls">
+    <label class="inline">rollout %: <input type="range" id="b-rol" min="20" max="90" step="5" value="60"><span class="val" id="b-rol-v">60</span></label>
+    <label class="inline">train %: <input type="range" id="b-tr" min="5" max="50" step="5" value="20"><span class="val" id="b-tr-v">20</span></label>
+    <label class="inline">ref %: <input type="range" id="b-rf" min="0" max="30" step="5" value="10"><span class="val" id="b-rf-v">10</span></label>
+    <label class="inline">sync %: <input type="range" id="b-sy" min="0" max="30" step="5" value="5"><span class="val" id="b-sy-v">5</span></label>
+  </div>
+
+  <div class="controls" style="margin-top:8px;">
+    <label class="inline"><input type="checkbox" id="opt-prefix" checked> prefix caching <span style="color:var(--text-dim);font-size:11px;">(rollout × 0.4)</span></label>
+    <label class="inline"><input type="checkbox" id="opt-cb" checked> continuous batching <span style="color:var(--text-dim);font-size:11px;">(rollout × 0.6)</span></label>
+    <label class="inline"><input type="checkbox" id="opt-spec"> speculative decoding <span style="color:var(--text-dim);font-size:11px;">(rollout × 0.7)</span></label>
+    <label class="inline"><input type="checkbox" id="opt-fp8"> FP8 inference <span style="color:var(--text-dim);font-size:11px;">(rollout × 0.7)</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline"><input type="checkbox" id="opt-cce" checked> chunked CE <span style="color:var(--text-dim);font-size:11px;">(train × 0.8)</span></label>
+    <label class="inline"><input type="checkbox" id="opt-pack" checked> packed varlen <span style="color:var(--text-dim);font-size:11px;">(train × 0.7)</span></label>
+    <label class="inline"><input type="checkbox" id="opt-fsdp" checked> FSDP+ckpt <span style="color:var(--text-dim);font-size:11px;">(train × 0.85)</span></label>
+    <label class="inline"><input type="checkbox" id="opt-overlap"> async sync overlap <span style="color:var(--text-dim);font-size:11px;">(sync → 0)</span></label>
+    <label class="inline"><input type="checkbox" id="opt-syncN"> sync every 5 steps <span style="color:var(--text-dim);font-size:11px;">(sync × 0.2)</span></label>
+    <label class="inline"><input type="checkbox" id="opt-refpool"> separate ref pool <span style="color:var(--text-dim);font-size:11px;">(ref → 0)</span></label>
+  </div>
+
+  <canvas id="budget-canvas" class="dist-canvas" height="200" style="margin-top: 12px;"></canvas>
+
+  <div class="kpi-grid" style="margin-top: 10px;">
+    <div class="kpi"><div class="k">Baseline step time</div><div class="v" id="b-base">100s</div></div>
+    <div class="kpi"><div class="k">Optimized step time</div><div class="v" id="b-opt">—</div></div>
+    <div class="kpi"><div class="k">Speedup</div><div class="v" id="b-speed">—</div></div>
+    <div class="kpi"><div class="k">Largest remaining slice</div><div class="v" id="b-bot" style="font-size:14px;">—</div></div>
+  </div>
+</div>
+
+<h2>How to identify the bottleneck in practice</h2>
+
+<p>An RL training run is a multi-process distributed system. "It's slow" can mean any of a dozen things. The diagnosis playbook, in the order a real engineer follows it:</p>
+
+<h3>Step 1 — wall-clock attribution per role</h3>
+
+<p>The first piece of code in any RL job should be per-role timing. From <a href="../../../RL/framework/controller.py">controller.py</a>:</p>
+
+<pre><code>t0 = time.time();  trajs = rollout.generate(env, K);  t_rollout = time.time() - t0
+t0 = time.time();  reference.score(trajs);            t_ref     = time.time() - t0
+t0 = time.time();  algorithm.compute_advantages(...)  t_algo    = time.time() - t0
+t0 = time.time();  trainer.train_step(batch, loss)    t_train   = time.time() - t0
+t0 = time.time();  weight_syncer.sync(trainer, ...)   t_sync    = time.time() - t0
+log_to_wandb({"t/rollout": t_rollout, "t/ref": t_ref, ...})</code></pre>
+
+<p>Run for ~20 steps. Look at the wandb breakdown. Anything that's not 60–75% rollout means the system is unusual (good or bad). Don't optimize past this step.</p>
+
+<h3>Step 2 — GPU utilization vs memory occupancy</h3>
+
+<p><code>nvidia-smi -l 1</code> in a side window during training. Two diagnostic signatures:</p>
+
+<ul>
+  <li><strong>GPU util ≈ 40–60% but memory ≈ 80%+:</strong> You're memory-bound (rollout decode). Look at KV cache size, batch size, prefix caching status.</li>
+  <li><strong>GPU util ≈ 90%+ but memory ≈ 30%:</strong> You're compute-bound (trainer or prefill). Increase batch size or pack more.</li>
+  <li><strong>GPU util oscillating between 0% and 100% with periodicity:</strong> You're sync-bound (waiting on weight broadcast) or verifier-bound (waiting on tool-output).</li>
+</ul>
+
+<h3>Step 3 — torch profiler for the slow role</h3>
+
+<p>Once you know which role to look at, drop in <code>torch.profiler</code> for a few steps of that role only:</p>
+
+<pre><code>from torch.profiler import profile, ProfilerActivity, schedule
+with profile(activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU],
+             schedule=schedule(wait=1, warmup=1, active=3, repeat=1),
+             on_trace_ready=lambda p: p.export_chrome_trace("trace.json")) as prof:
+    for _ in range(5):
+        trainer.train_step(batch, loss)
+        prof.step()</code></pre>
+
+<p>Open trace.json in chrome://tracing or Perfetto. Look for:</p>
+<ul>
+  <li><strong>NCCL kernels (ncclKernel_AllGather, ncclKernel_Broadcast)</strong> taking a noticeable fraction of the timeline → FSDP or sync is the bottleneck.</li>
+  <li><strong>Attention kernels (FlashAttn variants)</strong> dominating → expected. Compare to expected FLOPs.</li>
+  <li><strong>log_softmax / cross_entropy</strong> &gt; 10% of train time → chunked CE not on. Easy win.</li>
+  <li><strong>Empty / idle stretches</strong> on the GPU timeline → CPU stalls (tokenization, verifier, Python overhead).</li>
+</ul>
+
+<h3>Step 4 — memory peak</h3>
+
+<pre><code>torch.cuda.reset_peak_memory_stats()
+trainer.train_step(batch, loss)
+peak = torch.cuda.max_memory_allocated() / 1e9
+log_to_wandb({"mem/peak_gb": peak})</code></pre>
+
+<p>If peak ≫ allocated, activations are dominating and checkpointing or chunked CE will help. If peak ≈ allocated and high, you're at the memory ceiling and need FSDP or sharding.</p>
+
+<h3>Step 5 — Nsight Systems for the cross-GPU story</h3>
+
+<p>For multi-node distributed bottlenecks (FSDP all-gather, NCCL broadcast), <code>nsys</code> is the right tool:</p>
+
+<pre><code>nsys profile -t cuda,nvtx,nccl -o trace python train.py
+# open trace.nsys-rep in Nsight Systems UI</code></pre>
+
+<p>You'll see per-GPU timelines aligned with NCCL collective bars. Look for misalignment (some ranks waiting for a slow one) and bubble time (gaps between kernels).</p>
+
+<h2>Correctness canaries — the bugs that masquerade as performance</h2>
+
+<p>Before you optimize anything, make sure the run is correct. A slow-looking run is sometimes a broken run; you don't want to spend a week speeding up training that isn't actually learning. Three canaries worth monitoring every step:</p>
+
+<ul>
+  <li><strong>Log <em>ρ</em> histogram</strong>. The PPO ratio should be centered on 1 with light tails. If it skews systematically or the tails grow, you have a log-prob match bug (<a href="50_kernels_for_rl.html">lesson 50</a>) — rollout and trainer aren't agreeing on what π says.</li>
+  <li><strong>frac_clipped</strong>. From <a href="48_recipes.html">lesson 48</a>'s failure-mode taxonomy: &gt; 30% means π_old has drifted too far from π_θ (stale sync, async without versioning, or a kernel mismatch).</li>
+  <li><strong>KL(π_θ ‖ π_ref) trajectory</strong>. Should grow smoothly. A sudden spike means the policy lurched (entropy collapse, reward hacking, or numerics bug).</li>
+</ul>
+
+<h2 id="ops">Long-run failure modes — what fails on day 10</h2>
+
+<p>Long RL runs always fail. The diagnostic playbook above covers <em>"step 1 is slow"</em>. This section covers <em>"step 10000 broke"</em> — the reliability checklist the engineer (<a href="49_engineer_role.html">lesson 49</a>) owns.</p>
+
+<table>
+  <thead><tr><th>Failure mode</th><th>Detection signal</th><th>Mitigation</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>KV cache fragmentation creep</td>
+      <td>Rollout tokens/sec drifts down 20%+ over days; engine reports paged-block hit rate falling</td>
+      <td>Restart engine on a cadence; or upgrade to a paged allocator that compacts</td>
+    </tr>
+    <tr>
+      <td>Verifier slowdown</td>
+      <td>Reward call p99 latency creeping up; verifier queue backing up</td>
+      <td>Async dispatcher, GPU-accelerated verifier, or hot-reload of stale sandbox VMs</td>
+    </tr>
+    <tr>
+      <td>Reward hacking</td>
+      <td>Train reward up, held-out eval flat or down</td>
+      <td>Held-out eval at every K steps; flag divergence; review verifier for exploits</td>
+    </tr>
+    <tr>
+      <td>NCCL / network partition</td>
+      <td>One rank stuck in all-reduce; step time spikes</td>
+      <td>NCCL timeout + watchdog; auto-restart with rank-aware checkpointing</td>
+    </tr>
+    <tr>
+      <td>One rollout worker OOMs on adversarial prompt</td>
+      <td>Single-worker crash; if not isolated, brings down the trainer</td>
+      <td>Detached process groups, request-level circuit breakers, dead-letter queue for bad prompts</td>
+    </tr>
+    <tr>
+      <td>Optimizer state corruption / sharded checkpoint mismatch</td>
+      <td>Loss spike on resume; gradient norm jumps</td>
+      <td>Versioned sharded checkpoints (params + optimizer + RNG + sync gen_id); statistically-equivalent resume test</td>
+    </tr>
+    <tr>
+      <td>Throughput regression after a sync</td>
+      <td>Step time creeps up after weight sync; ratio histogram skews</td>
+      <td>Compare attention kernels between rollout and trainer; audit log-prob match (canaries above)</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>The minimum reliability surface — anything the engineer should ship before a multi-day run:</p>
+
+<ol>
+  <li><strong>Component health metrics</strong>: per-step rollout tok/s, trainer step time, weight-sync latency, ref forward time, reward distribution, KL to reference, gradient norm. Per-trajectory: length distribution, tool error rate, verifier latency.</li>
+  <li><strong>Sharded checkpointing</strong>: trainer params + optimizer + RNG + rollout-engine snapshot + sync generation. Resume should yield a statistically equivalent next step. (Bitwise determinism is broken by NCCL nondeterminism and verifier sandboxes in practice.)</li>
+  <li><strong>Failure isolation</strong>: a rollout worker dying doesn't take the trainer with it. Detached process groups, request-level circuit breakers, dead-letter queues.</li>
+  <li><strong>Held-out eval cadence</strong>: every K steps, run a held-out eval; flag when reward goes up but eval flat. This is the canary for reward hacking.</li>
+  <li><strong>Throughput regression alarms</strong>: a sudden 20% step-time creep is the cheapest signal you'll get for KV fragmentation, verifier degradation, or network contention.</li>
+</ol>
+
+<h2>The ROI-ordered playbook</h2>
+
+<p>Combining everything: when an engineer joins a slow RL run, the order of attack is:</p>
+
+<ol>
+  <li><strong>Profile first.</strong> Wall-clock per role. Anything not ~60–75% rollout means the profile is wrong or the setup is unusual.</li>
+  <li><strong>Prefix caching</strong> on the rollout engine. Single highest-leverage RL optimization.</li>
+  <li><strong>Continuous batching + chunked prefill.</strong> Pad-free, decode-prefill mix. Easy 2× rollout.</li>
+  <li><strong>Chunked cross-entropy</strong> on the trainer. Memory win that unlocks longer sequences.</li>
+  <li><strong>Packed varlen attention.</strong> 30–60% fewer FLOPs in train.</li>
+  <li><strong>Log-prob match audit.</strong> Fix this <em>before</em> chasing speed — it's the silent correctness bug surface.</li>
+  <li><strong>Speculative decoding</strong> for low-T rollouts. Conditional 1.5–2×.</li>
+  <li><strong>Sync overlap</strong> (or sync-every-N). Multi-node win.</li>
+  <li><strong>KV cache quantization (int8/fp8)</strong> with explicit log-prob match audit.</li>
+  <li><strong>Custom fused PPO / KL kernel.</strong> Marginal. Do last.</li>
+</ol>
+
+<div class="callout ok">
+  <div class="label">Takeaway — the three answers</div>
+  <p style="margin: 4px 0;"><strong>Where do bottlenecks land?</strong> Rollout decode (60–80%), trainer compute and activation memory (10–26%), the rest (sync + ref + algo, ~10% combined). Verifiers can balloon to dominate if they're slow.</p>
+  <p style="margin: 4px 0;"><strong>What are the usual optimizations?</strong> Per role: prefix caching, continuous batching, paged KV, chunked prefill, spec decode, KV quant, GQA (rollout); FSDP, activation checkpointing, chunked CE, packed varlen, sequence parallel (trainer); separate pool (ref); async overlap, sync-less-often (sync). System-wide: disaggregated topology and async pipelines.</p>
+  <p style="margin: 4px 0;"><strong>How do you find them?</strong> Per-role wall-clock timing first, then nvidia-smi for util-vs-memory signatures, then torch.profiler on the slow role, then memory peak, then Nsight for the cross-GPU story, and always log the ρ-histogram to catch silent correctness bugs masquerading as performance bugs.</p>
+</div>
+
+<footer class="lesson-nav">
+  <a href="52_missing_concepts.html"><span class="dir">← Previous</span><span class="ttl">52 · Missing concepts</span></a>
+  <a class="next" href="54_recsys_1.html"><span class="dir">Next →</span><span class="ttl">54 · Recommendation systems (上)</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  // Timeline interaction
+  const detail = document.getElementById('timeline-detail');
+  const segDescriptions = {
+    rollout: 'ROLLOUT — autoregressive decode. Memory-bandwidth-bound (3.35 TB/s HBM ceiling on H100). Optimized by prefix caching, continuous batching, paged KV, spec decode.',
+    ref: 'REF — one forward over completed trajectories. Forward-only, no optimizer state. Often hidden by a separate pool overlapped with rollout.',
+    algo: 'ALGO — advantage computation, KL, loss math. Microseconds; never the bottleneck unless the verifier is slow.',
+    train: 'TRAIN — forward + backward + step. Compute-bound at short L (matmul-limited), memory-bound at long L (activations). Optimized by FSDP, activation checkpointing, chunked CE.',
+    sync: 'SYNC — all-gather + cast + NCCL broadcast + reshard. Bandwidth-bound; can be hidden under the next rollout step.',
+  };
+  document.querySelectorAll('#timeline-diagram [data-seg]').forEach(g => {
+    g.addEventListener('mouseenter', () => { detail.textContent = segDescriptions[g.dataset.seg]; });
+    g.addEventListener('click', () => { detail.textContent = segDescriptions[g.dataset.seg]; });
+  });
+
+  // Budget widget
+  const rolRng = document.getElementById('b-rol');
+  const trRng = document.getElementById('b-tr');
+  const rfRng = document.getElementById('b-rf');
+  const syRng = document.getElementById('b-sy');
+
+  const rolV = document.getElementById('b-rol-v');
+  const trV = document.getElementById('b-tr-v');
+  const rfV = document.getElementById('b-rf-v');
+  const syV = document.getElementById('b-sy-v');
+
+  const optPrefix = document.getElementById('opt-prefix');
+  const optCB = document.getElementById('opt-cb');
+  const optSpec = document.getElementById('opt-spec');
+  const optFp8 = document.getElementById('opt-fp8');
+  const optCCE = document.getElementById('opt-cce');
+  const optPack = document.getElementById('opt-pack');
+  const optFsdp = document.getElementById('opt-fsdp');
+  const optOverlap = document.getElementById('opt-overlap');
+  const optSyncN = document.getElementById('opt-syncN');
+  const optRefpool = document.getElementById('opt-refpool');
+
+  const canvas = document.getElementById('budget-canvas');
+  const ctx = canvas.getContext('2d');
+
+  function update(){
+    const rol = parseFloat(rolRng.value);
+    const tr  = parseFloat(trRng.value);
+    const rf  = parseFloat(rfRng.value);
+    const sy  = parseFloat(syRng.value);
+    const algo = Math.max(0, 100 - rol - tr - rf - sy);  // implicit
+
+    rolV.textContent = rol; trV.textContent = tr; rfV.textContent = rf; syV.textContent = sy;
+
+    // Apply optimizations
+    let rolOpt = rol;
+    if (optPrefix.checked) rolOpt *= 0.4;
+    if (optCB.checked) rolOpt *= 0.6;
+    if (optSpec.checked) rolOpt *= 0.7;
+    if (optFp8.checked) rolOpt *= 0.7;
+
+    let trOpt = tr;
+    if (optCCE.checked) trOpt *= 0.8;
+    if (optPack.checked) trOpt *= 0.7;
+    if (optFsdp.checked) trOpt *= 0.85;
+
+    let rfOpt = optRefpool.checked ? 0 : rf;
+
+    let syOpt = sy;
+    if (optOverlap.checked) syOpt = 0;
+    else if (optSyncN.checked) syOpt *= 0.2;
+
+    const algoOpt = algo;  // not optimized in this toy
+    const optTotal = rolOpt + trOpt + rfOpt + syOpt + algoOpt;
+    const base = rol + tr + rf + sy + algo;
+    const speedup = base / Math.max(0.01, optTotal);
+
+    document.getElementById('b-base').textContent = base.toFixed(1) + 's';
+    document.getElementById('b-opt').textContent = optTotal.toFixed(1) + 's';
+    document.getElementById('b-speed').textContent = speedup.toFixed(2) + '×';
+
+    // Identify largest slice
+    const slices = [
+      {name: 'rollout', v: rolOpt},
+      {name: 'train', v: trOpt},
+      {name: 'ref', v: rfOpt},
+      {name: 'sync', v: syOpt},
+      {name: 'algo', v: algoOpt},
+    ];
+    const top = slices.reduce((a,b) => a.v > b.v ? a : b);
+    document.getElementById('b-bot').textContent = top.name + ' (' + ((top.v/optTotal)*100).toFixed(0) + '%)';
+
+    draw([
+      {label: 'Baseline', segs: [
+        {name: 'rollout', v: rol,  fill: '#dbeafe', stroke: '#2563eb'},
+        {name: 'ref',     v: rf,   fill: '#fef3c7', stroke: '#d97706'},
+        {name: 'algo',    v: algo, fill: '#f3e8ff', stroke: '#7c3aed'},
+        {name: 'train',   v: tr,   fill: '#dcfce7', stroke: '#16a34a'},
+        {name: 'sync',    v: sy,   fill: '#fecaca', stroke: '#dc2626'},
+      ]},
+      {label: 'Optimized', segs: [
+        {name: 'rollout', v: rolOpt,  fill: '#dbeafe', stroke: '#2563eb'},
+        {name: 'ref',     v: rfOpt,   fill: '#fef3c7', stroke: '#d97706'},
+        {name: 'algo',    v: algoOpt, fill: '#f3e8ff', stroke: '#7c3aed'},
+        {name: 'train',   v: trOpt,   fill: '#dcfce7', stroke: '#16a34a'},
+        {name: 'sync',    v: syOpt,   fill: '#fecaca', stroke: '#dc2626'},
+      ]},
+    ]);
+  }
+
+  function draw(rows){
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W*dpr) { canvas.width = W*dpr; canvas.height = H*dpr; }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 100, padR = 20, padT = 20, padB = 30;
+    const rowH = 40;
+    const scale = (W - padL - padR) / 100;
+
+    rows.forEach((row, i) => {
+      const y = padT + i*(rowH + 14);
+      ctx.fillStyle = '#5b6573';
+      ctx.font = '12px ' + (getComputedStyle(document.body).getPropertyValue('--sans') || 'sans-serif');
+      ctx.textAlign = 'right';
+      ctx.fillText(row.label, padL - 10, y + rowH/2 + 4);
+
+      let x = padL;
+      row.segs.forEach(seg => {
+        const w = seg.v * scale;
+        if (w > 0.5) {
+          ctx.fillStyle = seg.fill;
+          ctx.fillRect(x, y, w, rowH);
+          ctx.strokeStyle = seg.stroke;
+          ctx.lineWidth = 1;
+          ctx.strokeRect(x+0.5, y+0.5, w-1, rowH-1);
+          if (w > 30) {
+            ctx.fillStyle = '#1f2430';
+            ctx.font = '11px ' + 'monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText(seg.name + ' ' + seg.v.toFixed(0), x + w/2, y + rowH/2 + 4);
+          }
+        }
+        x += w;
+      });
+
+      // Total time label
+      const tot = row.segs.reduce((s,seg) => s + seg.v, 0);
+      ctx.fillStyle = '#1f2430';
+      ctx.font = '11px monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText(tot.toFixed(1) + 's', x + 8, y + rowH/2 + 4);
+    });
+
+    // Axis
+    ctx.strokeStyle = '#94a3b8';
+    ctx.beginPath();
+    ctx.moveTo(padL, padT + 2*(rowH + 14));
+    ctx.lineTo(padL + 100*scale, padT + 2*(rowH + 14));
+    ctx.stroke();
+
+    ctx.fillStyle = '#5b6573';
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('0', padL, padT + 2*(rowH + 14) + 14);
+    ctx.textAlign = 'right';
+    ctx.fillText('100s baseline', padL + 100*scale, padT + 2*(rowH + 14) + 14);
+  }
+
+  [rolRng, trRng, rfRng, syRng,
+   optPrefix, optCB, optSpec, optFp8,
+   optCCE, optPack, optFsdp,
+   optOverlap, optSyncN, optRefpool].forEach(el => {
+    el.addEventListener('input', update);
+    el.addEventListener('change', update);
+  });
+  update();
+})();
+</script>
+
+</body>
+</html>
