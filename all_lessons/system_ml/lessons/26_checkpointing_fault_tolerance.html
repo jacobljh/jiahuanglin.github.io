@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>23 · Checkpointing &amp; fault tolerance</title>
+<title>26 · Checkpointing &amp; fault tolerance</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -12,8 +12,8 @@
   <div class="inner">
     <a class="crumb-link" href="index.html">system_ml</a>
     <span class="crumb">/</span>
-    <span class="crumb">23 · Checkpointing &amp; fault tolerance</span>
-    <span class="step-pill">lesson 23 / 23</span>
+    <span class="crumb">26 · Checkpointing &amp; fault tolerance</span>
+    <span class="step-pill">lesson 26 / 26</span>
   </div>
 </header>
 
@@ -24,9 +24,9 @@
 
 <h2>Why failure is the common case, not the rare one</h2>
 
-<p>A single GPU is reliable — call its mean time between failures <span class="math">M_1</span>, maybe years. But failures are roughly independent across devices, so a job spanning <span class="math">G</span> GPUs fails when <em>any</em> of them does, and the rates add:</p>
+<p>A single GPU is reliable — call its mean time between failures <span class="math">M_1</span>, maybe years. But failures are roughly independent across devices, so a job spanning <span class="math">N</span> GPUs fails when <em>any</em> of them does, and the rates add:</p>
 
-<p class="math block">M_job  ≈  M_1 / G</p>
+<p class="math block">M_job  ≈  M_1 / N</p>
 
 <p>Plug in numbers. If one accelerator (plus its host, NIC, optics, PSU) faults on average every ~50,000 GPU-hours, then a 10,000-GPU job has an effective MTBF of ~5 hours. A three-week run will be interrupted <em>dozens</em> of times. This is not pessimism — published large-model training logs report failures every few hours at scale, dominated by GPU faults, ECC errors, NIC/optics flaps, and the occasional host kernel panic. The synchronous nature of the collectives in lesson 02 makes it worse: one dead rank stalls an AllReduce, and the <em>entire</em> job hangs, not just the failed node.</p>
 
@@ -46,7 +46,7 @@
     <tr><td>Optimizer state (fp32 master + Adam m, v)</td><td>~840 GB (12 B/param)</td><td><strong>dominates</strong> — master + both moments = 6× the bf16 weights (the moments alone are 4×)</td></tr>
     <tr><td>LR scheduler / step count</td><td>bytes</td><td>resume at the right point on the LR curve</td></tr>
     <tr><td>RNG state (per rank)</td><td>KB</td><td>reproducible dropout, data shuffling</td></tr>
-    <tr><td>Data-loader position</td><td>bytes</td><td>resume mid-epoch without re-seeing data (lesson 22)</td></tr>
+    <tr><td>Data-loader position</td><td>bytes</td><td>resume mid-epoch without re-seeing data (lesson 25)</td></tr>
   </tbody>
 </table>
 
@@ -58,10 +58,10 @@
 
 <div class="widget" id="mt-widget">
   <div class="title">Job MTBF &amp; the failure timeline</div>
-  <div class="hint">Each red tick is an expected failure over the run. <span class="math">M_job = M_1 / G</span>. The point isn't the exact placement — failures are random — it's the <em>count</em>: how many times this job will hit the floor.</div>
+  <div class="hint">Each red tick is an expected failure over the run. <span class="math">M_job = M_1 / N</span>. The point isn't the exact placement — failures are random — it's the <em>count</em>: how many times this job will hit the floor.</div>
 
   <div class="controls">
-    <label class="inline">GPUs G: <input type="range" id="mt-g" min="8" max="16384" step="8" value="1024"> <span class="val" id="mt-g-v">1024</span></label>
+    <label class="inline">GPUs N: <input type="range" id="mt-g" min="8" max="16384" step="8" value="1024"> <span class="val" id="mt-g-v">1024</span></label>
     <label class="inline">per-GPU MTBF (kh): <input type="range" id="mt-m" min="10" max="200" step="5" value="50"> <span class="val" id="mt-m-v">50</span></label>
     <label class="inline">run length (days): <input type="range" id="mt-d" min="1" max="60" step="1" value="21"> <span class="val" id="mt-d-v">21</span></label>
   </div>
@@ -159,8 +159,96 @@
 </ol>
 
 <div class="callout warn">
-  <div class="label">Elasticity changes your effective batch — re-read lesson 21</div>
+  <div class="label">Elasticity changes your effective batch — re-read lesson 11</div>
   Restarting on fewer nodes shrinks <span class="math">N</span>, which shrinks <span class="math">B_eff = b·N·G</span> unless you bump accumulation <span class="math">G</span> to compensate. Silently continuing at a smaller effective batch (and now-mismatched LR) is a real way an "automatic recovery" quietly degrades a run. Robust setups pin <span class="math">B_eff</span> and re-solve <span class="math">G</span> on every reshape.
+</div>
+
+<h2>Detecting the failure — the recovery loop starts here</h2>
+
+<p>All the write machinery above is dead weight if you can't tell something broke — and detection at thousand-GPU scale is the part everyone underestimates. The naïve mental model is "a process crashes, the OS notices, you restart." Reality is uglier: the common failure mode is not a clean crash but a <strong>hang</strong>. One rank dies or slows, and every <em>other</em> rank blocks indefinitely inside a collective. This is a direct consequence of <a href="02_collectives.html">lesson 02</a>: a collective only returns when <em>all</em> ranks have called it. If rank 743's GPU faults mid-step, ranks 0–742 and 744–8191 all enter the next AllReduce, wait for a peer that will never arrive, and sit there — burning power, holding the allocation, making zero progress, and emitting no error. A run can be "alive" by every process-liveness check while being thoroughly, silently dead.</p>
+
+<p>So you need explicit mechanisms that turn a silent hang into a loud, localized fault:</p>
+
+<ul>
+  <li><strong>Collective timeout.</strong> NCCL/PyTorch arm a watchdog on every collective (<code>TORCH_NCCL_BLOCKING_WAIT</code> / the async error-handling path). The default timeout is generous — on the order of 10–30 minutes — because legitimate collectives can be slow. But 30 minutes of a 10,000-GPU cluster idling on every failure is enormous wasted goodput, so you tune it <em>down</em> (to minutes) once you know your steps' real latency. Too low and a slow-but-healthy step trips a false abort; too high and you pay for the stall. It's a tuning knob, not a default to leave alone.</li>
+  <li><strong>The NCCL flight recorder.</strong> Setting <code>TORCH_NCCL_TRACE_BUFFER_SIZE</code> keeps a ring buffer of the last <span class="math">k</span> collectives each rank issued — op type, sizes, sequence numbers, and which completed. When the watchdog fires it dumps these traces. The diagnostic gold is the <em>mismatch</em>: 8191 ranks have issued AllReduce #40,118 and are waiting; one rank's last recorded op is #40,117. That rank is your culprit — it stopped calling collectives, so it's where the GPU/host died. Without the flight recorder you know <em>that</em> the job hung; with it you know <em>which node</em> to power-cycle or evict.</li>
+  <li><strong>Heartbeat / watchdog process.</strong> A side process (per node, plus a job-level coordinator) emits a heartbeat on an interval. Miss <span class="math">n</span> beats and it's declared dead, independent of whether its collectives are stuck. This catches the case where the GPU is wedged but the kernel and NIC are fine, so lower-level timeouts haven't fired.</li>
+</ul>
+
+<p>The reason for all three is that you must distinguish three distinct fault classes, because they route to <em>different</em> responses:</p>
+
+<table>
+  <thead><tr><th>Class</th><th>Symptom</th><th>Root cause</th><th>Response</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Dead rank</strong></td><td>process gone / GPU fell off the bus; peers hang in the next collective</td><td>hardware: GPU fault, ECC, NIC/optics flap, host panic</td><td>evict the node, restore from checkpoint, reschedule (spare or elastic)</td></tr>
+    <tr><td><strong>Desync</strong></td><td>ranks issued <em>different</em> collectives (mismatched op/shape) → deadlock or shape error</td><td>software/data: a control-flow branch that diverges across ranks, a ragged batch</td><td>do <strong>not</strong> just restart — it'll re-deadlock; this is a code/data bug to fix</td></tr>
+    <tr><td><strong>Straggler</strong></td><td>step time spikes on one rank; everyone else waits at the barrier; <em>no</em> timeout fires</td><td>a slow-but-alive GPU: thermal throttle, a degraded NVLink, a noisy neighbour</td><td>detect via per-rank step-time outlier, then evict the slow node proactively</td></tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <div class="label">A straggler is the failure that never trips your alarm</div>
+  A dead rank eventually trips the collective timeout. A straggler never does — it <em>does</em> call every collective, just late, so the whole job runs at the speed of its slowest member with no error anywhere. One GPU throttling to 60% drags an 8000-GPU step to 60% goodput indefinitely. You only catch it by watching the <em>distribution</em> of per-rank step times and flagging the outlier, not by waiting for something to break.
+</div>
+
+<h2>Checkpoint durability — the checkpoint itself can be poison</h2>
+
+<p>Here is the failure mode that turns your safety net into the thing that kills the run: a crash <em>during</em> a checkpoint write. Failures are routine (<span class="math">M_job = M_1/N</span>), and a checkpoint write takes seconds-to-minutes, so eventually a node will die <em>while</em> a checkpoint is being written. The result is a <strong>torn</strong> checkpoint — a file (or a shard) that is half-old, half-new, or truncated. If the canonical "latest" name now points at that partial blob, the next restart loads garbage, and either crashes immediately (best case) or silently corrupts the run by restoring inconsistent state across shards (worst case). The thing you built to survive failures has become the failure.</p>
+
+<p>The defenses are cheap and non-negotiable:</p>
+
+<ul>
+  <li><strong>Atomic publish via temp-path + rename.</strong> Write to a scratch path (<code>step_40000.tmp/</code>), <code>fsync</code> it, and only then <code>os.rename</code> it to the canonical name (or flip a <code>latest</code> pointer/symlink). <code>rename</code> within a filesystem is atomic, so the canonical name <em>only ever</em> resolves to a fully-written checkpoint. A crash mid-write leaves a stray <code>.tmp</code> you garbage-collect on restart — it never poisons the pointer.</li>
+  <li><strong>Keep the last <span class="math">N</span> checkpoints; delete late.</strong> Do not delete checkpoint <span class="math">k-1</span> until checkpoint <span class="math">k</span> has been written <em>and verified</em>. Retaining a small ring (say 3–5) costs storage but means a single torn or unreadable write never leaves you with <em>zero</em> good checkpoints — you fall back one step.</li>
+  <li><strong>Checksum / verify-load before trusting.</strong> Store a checksum per shard and validate on load; better, in async mode (where a background thread is doing the flush anyway), do a trial deserialize of the just-written checkpoint and only advance the <code>latest</code> pointer once it loads clean. A checkpoint you've never successfully read is a hope, not a backup.</li>
+  <li><strong>History buys rollback depth.</strong> The newest checkpoint can be valid-on-disk yet semantically poisoned — e.g., it captured a NaN (next section). Keeping history lets you roll back past the most recent <em>two or three</em> checkpoints to the last point the math was healthy, not just the last point the bytes were intact.</li>
+</ul>
+
+<div class="callout bad">
+  <div class="label">The single-checkpoint trap</div>
+  Overwriting one <code>latest.pt</code> in place, with no temp-rename and no history, is the most common way a "checkpointed" run still loses everything: one crash during that write and the only copy is corrupt. Atomicity and a small ring of history are what make the checkpoint trustworthy — not just present.
+</div>
+
+<h2>When the math dies — NaN as a fault</h2>
+
+<p>Close the loop with <a href="24_numerical_stability.html">lesson 24</a>: a loss spike or a NaN is a failure too — and the powerful realization is that it reuses the <em>exact same machinery</em> as a dead GPU. There are two ways a training step can stop being useful: <strong>"a GPU died"</strong> (hardware) and <strong>"the math died"</strong> (a NaN/Inf propagated into the weights). Both route into one path: detect, roll back to the last good checkpoint, resume. You do not need a separate recovery system for numerical failure; you need to feed it into the one you already built.</p>
+
+<ul>
+  <li><strong>Detect collectively.</strong> Each rank computes a local <code>isfinite</code> flag over its loss/gradients and you <code>all-reduce</code> it (a max, or a sum) across all ranks. The single resulting bit answers "did <em>any</em> rank see a NaN this step?" — which matters because a NaN on one shard will, after the next AllReduce of gradients, contaminate <em>every</em> rank's weights. One global flag, one branch.</li>
+  <li><strong>Roll back.</strong> If the flag is set, discard the current (now-poisoned) state and reload the last <em>known-good</em> checkpoint — which is exactly why durability and history (previous section) matter: the checkpoint written 30 seconds ago may already contain the NaN, so you may need to step back two or three.</li>
+  <li><strong>Skip and/or de-risk before resuming.</strong> Often a specific data shard triggered the spike (a pathological batch). Using <a href="25_data_pipeline.html">lesson 25</a>'s resumable data offset, you can resume <em>past</em> the offending shard so you don't immediately re-trigger the same NaN, and/or lower the LR (or re-warm it) for a few hundred steps to ride through the unstable region before restoring full LR.</li>
+</ul>
+
+<div class="callout">
+  <div class="label">"A GPU died" vs "the math died" → one restore path</div>
+  Hardware fault and numerical fault are detected differently (watchdog/timeout vs. all-reduced finite-check) but recover identically: reload the last good checkpoint and resume from the saved step, RNG, and data offset. Treating NaN as just another fault — rather than a special case that aborts the run for a human to babysit — is what keeps an unattended three-week run unattended.
+</div>
+
+<h2>Goodput — optimize the whole loop, not just the write</h2>
+
+<p>Young–Daly's cost term <span class="math">C</span> is seductively narrow: it's easy to read it as "checkpoint write time" and declare victory once async flush has driven the stall to a few seconds. But a <em>real failure</em> costs far more than the write. The end-to-end recovery cost is:</p>
+
+<p class="math block">C_recover  =  detect  +  reschedule  +  reload  +  recompute_since_last_checkpoint</p>
+
+<p>Each term is real and independently large. <strong>Detect</strong> is the timeout/heartbeat latency from the first section — if your collective timeout is 20 minutes, every failure burns 20 minutes of the whole cluster before recovery even <em>begins</em>. <strong>Reschedule</strong> is getting a replacement node — instant if you have a warm hot spare, minutes-to-tens-of-minutes if the scheduler has to find and boot one. <strong>Reload</strong> is reading the (now cold) checkpoint back. <strong>Recompute</strong> is the Young–Daly lost work, ~<span class="math">τ/2</span>. The write being cheap does nothing for the first three.</p>
+
+<p>The metric that captures all of it is <strong>ML goodput</strong>:</p>
+
+<p class="math block">goodput  =  useful_training_wall_clock / total_wall_clock</p>
+
+<p>Useful wall-clock is time spent doing forward/backward passes that <em>survive</em> to the final model; everything else — checkpoint stalls, detection latency, rescheduling, reloads, and recomputed-then-discarded work — is in the denominator but not the numerator. The trap: you can have a near-zero checkpoint write cost and <em>still</em> bleed goodput, because frequent small failures with slow detection dominate. At a 5-hour job MTBF with a 20-minute detect-and-reschedule per failure, a three-week run eating ~100 failures loses ~33 hours to detection alone — independent of how fast the write is. Optimizing <span class="math">C</span>'s write term while ignoring detect/reschedule is optimizing the wrong term.</p>
+
+<p>This reframes the engineering targets:</p>
+
+<ul>
+  <li><strong>Hot-spare pool sizing.</strong> Run with <span class="math">N + s</span> nodes where <span class="math">s</span> idle spares stand ready. Sizing <span class="math">s</span> is a goodput calculation against <a href="01_why_distributed.html">lesson 01</a>'s <span class="math">M_job = M_1/N</span>: too few spares and recovery stalls waiting for the scheduler; too many and you're paying for idle GPUs. You size <span class="math">s</span> so the expected concurrent-failure count rarely exceeds it.</li>
+  <li><strong>Fast re-formation.</strong> When a node dies, the job has to re-form. The scheduler (SLURM / Kubernetes) requeues or swaps the node, and <code>torchrun</code>/elastic uses a <strong>rendezvous backend</strong> (c10d/etcd) to re-establish the process group — surviving ranks plus the replacement re-handshake into a fresh world. If a spare isn't available, elastic re-forms at a <em>smaller</em> world size, which (as the lesson's elastic-restart note covers) shrinks <span class="math">N</span> and forces a re-solve of <span class="math">B_eff</span> / accumulation <span class="math">G</span> so the effective batch — and thus the LR schedule — stays pinned across the reshape.</li>
+  <li><strong>Detection is a goodput lever, not just a safety feature.</strong> Cutting the collective timeout from 20 minutes to 3 directly multiplies surviving wall-clock at high failure rates. The flight recorder pays for itself the same way: fast <em>localization</em> means you evict the right node on the first try instead of restart-looping.</li>
+</ul>
+
+<div class="callout ok">
+  <div class="label">Goodput is the real objective</div>
+  Young–Daly minimizes the steady-state write+lost-work waste; goodput is the honest, whole-loop version that also charges you for detection, rescheduling, and reload. The same <span class="math">M_1/N</span> arithmetic from <a href="01_why_distributed.html">lesson 01</a> that says failures are routine also says the recovery <em>loop</em> — not the write alone — is what determines whether a 10,000-GPU run spends its weeks training or thrashing.
 </div>
 
 <h2>The whole picture</h2>
@@ -178,22 +266,22 @@
 
 <div class="callout ok">
   <div class="label">Takeaway</div>
-  At scale, <span class="math">M_job = M_1/G</span> makes failure routine, so the run must checkpoint <em>all</em> mutable state (optimizer state dominates — ~6× the weights) and recover fast. Young–Daly sets the cadence: <span class="math">τ* = √(2CM)</span>, with minimum waste <span class="math">√(2C/M)</span> — so the entire engineering effort goes into shrinking the checkpoint cost <span class="math">C</span> via sharded parallel writes, asynchronous background flush, and in-memory redundancy. Resharding-capable checkpoints plus elastic restart turn a dead node from a fatal event into a few-minute hiccup. This is what lets a three-week, ten-thousand-GPU run actually finish.
+  At scale, <span class="math">M_job = M_1/N</span> makes failure routine, so the run must checkpoint <em>all</em> mutable state (optimizer state dominates — ~6× the weights) and recover fast. Young–Daly sets the cadence: <span class="math">τ* = √(2CM)</span>, with minimum waste <span class="math">√(2C/M)</span> — so the entire engineering effort goes into shrinking the checkpoint cost <span class="math">C</span> via sharded parallel writes, asynchronous background flush, and in-memory redundancy. Resharding-capable checkpoints plus elastic restart turn a dead node from a fatal event into a few-minute hiccup. This is what lets a three-week, ten-thousand-GPU run actually finish.
 </div>
 
 <div class="callout">
-  <div class="label">End of Part V — and the track</div>
-  You now have the full stack: the constraints (I), the six ways to shard (II), how to compose them and serve (III), the single-GPU machinery underneath (IV), and the operational glue that keeps a real run alive for weeks (V). The CUDA primitives that sit below all of it — and the serving kernels that build on them — continue in <a href="../../gpu_kernel_serving/index.html"><strong>GPU Kernels for LLM Serving</strong></a>.
+  <div class="label">End of Part VI — and the track</div>
+  You now have the full stack: the constraints (I), the six ways to shard (II), the training-memory &amp; effective-batch math (III), how to compose them and serve (IV), the single-GPU machinery underneath (V), and the operational glue that keeps a real run alive for weeks (VI). The CUDA primitives that sit below all of it — and the serving kernels that build on them — continue in <a href="../../gpu_kernel_serving/index.html"><strong>GPU Kernels for LLM Serving</strong></a>.
 </div>
 
 <footer class="lesson-nav">
-  <a href="22_data_pipeline.html">
+  <a href="25_data_pipeline.html">
     <span class="dir">← Previous</span>
-    <span class="ttl">22 · The distributed data pipeline</span>
+    <span class="ttl">25 · The data pipeline</span>
   </a>
-  <a class="next" href="../../gpu_kernel_serving/index.html">
-    <span class="dir">Next →</span>
-    <span class="ttl">GPU Kernels for LLM Serving →</span>
+  <a class="next" href="index.html">
+    <span class="dir">↑ Index</span>
+    <span class="ttl">Back to contents</span>
   </a>
 </footer>
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>11 · Inference — TP vs replication</title>
+<title>14 · Inference — TP vs replication</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -12,15 +12,15 @@
   <div class="inner">
     <a class="crumb-link" href="index.html">system_ml</a>
     <span class="crumb">/</span>
-    <span class="crumb">11 · TP vs replication</span>
-    <span class="step-pill">lesson 11 / 23</span>
+    <span class="crumb">14 · TP vs replication</span>
+    <span class="step-pill">lesson 14 / 26</span>
   </div>
 </header>
 
 <main>
 
 <h1>Inference — TP for latency, replicas for throughput</h1>
-<p class="subtitle">Same hardware, opposite goals. Training cares about the gradient AllReduce; inference cares about per-token decode time. The math behind "TP=8 or 8× replicas?" comes down to whether the workload is memory-bound or compute-bound.</p>
+<p class="subtitle">Same hardware, opposite goals. Training cares about the gradient AllReduce; inference cares about per-token decode time. The math behind "TP=8 or 8× replicas?" comes down to whether the workload is memory-bound or compute-bound. Beyond the TP-vs-replicas split, the other levers on single-replica decode speed — the KV cache, quantization, and speculative decoding — all fall out of the same memory-bound math, and we cover them here too.</p>
 
 <h2>What changes at inference time</h2>
 
@@ -32,6 +32,31 @@
 </ul>
 
 <p>This is the core asymmetry. Training and prefill scale on compute; decode scales on HBM bandwidth. Most of inference's tokens-per-second is set by decode. So the question becomes: <em>how fast can we read weights from HBM, per output token, per request?</em></p>
+
+<h2>What the KV cache is — and why it sets the memory wall</h2>
+
+<p>Decode keeps mentioning a "KV cache." Here is what it is, from first principles. Attention at step <span class="math">t</span> needs the keys and values of <em>every past token</em> — the new query attends over all of <span class="math">1..t</span>. If you recomputed all those K and V every step, decoding a sequence of length <span class="math">T</span> would cost <span class="math">O(T^2)</span> work in attention alone. Instead, each layer <strong>caches</strong> the K and V it produced for every token seen so far. The new token computes its own <span class="math">K, V</span> once, appends them, and does <span class="math">O(t)</span> attention against the stored cache. That is what makes per-step decode <span class="math">O(1)</span> in prompt length for everything except the attention dot-product itself — and it is why the weights, read once per step, dominate the cost.</p>
+
+<p>The cache is not free. Its size grows linearly with sequence length and batch:</p>
+
+<div class="math block">
+  KV_bytes &nbsp;=&nbsp; 2 · n_layers · n_kv_heads · d_head · seq · batch · bytes_per_elt
+</div>
+
+<p>The leading <span class="math">2</span> is the K <em>and</em> the V. Plug in Llama-3-70B (<span class="math">n_layers=80</span>, <span class="math">n_kv_heads=8</span> with GQA, <span class="math">d_head=128</span>, bf16 = 2 B):</p>
+
+<table>
+  <thead><tr><th>Quantity</th><th>Math</th><th>Size</th></tr></thead>
+  <tbody>
+    <tr><td>Per token</td><td>2 · 80 · 8 · 128 · 2</td><td>≈ 328 kB/token</td></tr>
+    <tr><td>One 8k-token request</td><td>328 kB · 8192</td><td>≈ 2.6 GB</td></tr>
+    <tr><td>Batch of 32 such requests</td><td>2.6 GB · 32</td><td>≈ 84 GB</td></tr>
+  </tbody>
+</table>
+
+<p>84 GB of KV cache will not fit alongside the weights on a single 80 GB GPU. This is the punchline: on a serving GPU it is <strong>the KV cache, not the weights, that caps batch size and context length</strong>. The weights are a fixed cost; the KV cache is the variable cost that scales with how much concurrency and context you want.</p>
+
+<p>The KV cache shards across TP ranks by <em>KV head</em>: with TP=8 and 8 KV heads, each rank holds one head's K/V, so per-rank KV drops 8×. This is the same constraint that caps honest TP at the KV-head count (the GQA wrinkle discussed later in this lesson and in <a href="06_tensor_parallel.html">lesson 06</a>) — push TP past 8 here and you must replicate KV state, undoing the capacity win. How the cache is physically stored without fragmentation (paged attention) is in the <a href="../../vllm/lessons/index.html">vLLM track</a>; how it is moved between a prefill box and a decode box is <a href="15_disaggregated_serving.html">lesson 15</a>.</p>
 
 <h2>The decode latency calculation</h2>
 
@@ -141,6 +166,41 @@
 
 <p>This is why some serving stacks use TP=4 even when TP=8 would be available — the marginal latency improvement saturates because the AllReduce cost is no longer dwarfed by compute.</p>
 
+<h2>Quantization — buying decode speed by reading fewer bytes</h2>
+
+<p>TP and replicas move work between GPUs but never change the total bytes read. Quantization changes the bytes themselves. Recall the decode floor from this lesson: per-token time <span class="math">≈ bytes_read / HBM_BW</span>. Decode is HBM-bandwidth-bound, so <strong>halving the bytes per weight roughly halves decode latency</strong>. That makes quantization a <em>bandwidth</em> optimization first and a memory-capacity optimization second — the capacity win (more room for weights and KV cache) is real but secondary to the per-token speedup.</p>
+
+<h3>Weight-only quantization (GPTQ, AWQ)</h3>
+
+<p>Store the weights in INT4 or INT8 with per-group scales, and dequantize inside the matmul kernel just before the multiply — activations stay at higher precision (bf16/fp16). The matmul still happens in high precision; you have only changed how the weights are <em>transported</em> from HBM. Carry the number through: a 70B model at bf16 is 140 GB → 42 ms/tok floor (this lesson's own calc). At INT4 the weights are ~35 GB, so the floor drops to <span class="math">35 / 3350 ≈ 21 ms/tok</span> — roughly half, exactly because you read half the bytes.</p>
+
+<h3>fp8 weights + activations</h3>
+
+<p>On Hopper, fp8 (the E4M3 / E5M2 formats from <a href="17_mixed_precision.html">lesson 17</a>) quantizes both weights and activations, so the matmul itself runs on fp8 tensor cores. This wins on bandwidth <em>and</em> compute, which matters once batching pushes decode toward the compute-bound regime.</p>
+
+<h3>KV-cache quantization</h3>
+
+<p>Quantize the KV cache itself to fp8 or int4. This shrinks the Section-1 memory wall directly: an fp8 KV cache halves the ~328 kB/token, so the same 80 GB GPU holds 2× the batch or 2× the context. It is the cheapest way to buy back the concurrency the KV wall takes away.</p>
+
+<p>The cost of all of this is accuracy loss. It is managed, not eliminated: per-channel or per-group scales instead of one global scale, calibration on real data (AWQ picks scales that protect the most salient weight channels), and keeping the sensitive layers — notably the LM head and sometimes the first/last blocks — in higher precision. Done well, INT4/fp8 inference is within a fraction of a point of the bf16 model on most evals.</p>
+
+<h2>Speculative decoding — verifying many tokens for the price of one</h2>
+
+<p>Here is the trick that falls straight out of "decode is memory-bound." A forward pass that processes <span class="math">k</span> candidate tokens reads the weights <em>once</em> — the same HBM traffic as processing a single token, because the weights, not the tokens, dominate the read. So if you can guess the next <span class="math">k</span> tokens cheaply, the big model can <strong>verify all <span class="math">k</span> in one forward pass</strong> and accept the longest correct prefix. You amortize one expensive weight read over many tokens.</p>
+
+<h3>Mechanism</h3>
+
+<p>A cheap <em>drafter</em> proposes <span class="math">k</span> tokens — options include a small draft model (e.g. a 1B drafting for a 70B target), Medusa heads bolted onto the target, EAGLE (drafting in feature space), or even n-gram / prompt-lookup with no model at all. The target model then runs <em>one</em> forward over the <span class="math">k+1</span> positions, scoring all of them in parallel. You accept each drafted token that matches the target's own sampling and reject at the first mismatch, keeping the verified prefix plus one extra "free" token from the target. Expected accepted tokens per step rises with the acceptance rate <span class="math">α</span>; in practice this lands around a <strong>2–3× end-to-end decode speedup</strong>.</p>
+
+<h3>It is exact, not an approximation</h3>
+
+<p>The crucial property: with the right accept/reject rule (rejection sampling against the target's distribution), the output distribution is <strong>identical</strong> to plain autoregressive sampling from the target. Speculative decoding is a pure latency win — you get the same tokens you would have gotten, sooner. It is not a quality trade like quantization.</p>
+
+<div class="callout warn">
+  <div class="label">SCOPE</div>
+  Speculative decoding helps <em>latency</em> (the memory-bound single-stream case). It does little for <em>throughput at large batch</em>: there the GPU is already busy doing real arithmetic per step, the weight read is already amortized across the batch, and the extra drafted positions just add work. Use it for low-latency serving, not for bulk batched jobs.
+</div>
+
 <h2>Animated · Amdahl ladder · TP scaling, sublinear because of comm</h2>
 
 <p>Pure HBM-bandwidth math says decode latency falls linearly with TP. In practice the curve flattens because (a) every TP step costs an AllReduce on NVLink, (b) at higher batch sizes some of the work becomes compute-bound and stops benefiting from more HBM lanes. The widget below traces latency as you sweep TP from 1 to 16; move the batch-size slider to watch the curve bend.</p>
@@ -221,13 +281,13 @@
 </div>
 
 <footer class="lesson-nav">
-  <a href="10_3d_parallelism.html">
+  <a href="13_comm_compute_overlap.html">
     <span class="dir">← Previous</span>
-    <span class="ttl">10 · 3D parallelism</span>
+    <span class="ttl">13 · Comm–compute overlap</span>
   </a>
-  <a class="next" href="12_disaggregated_serving.html">
+  <a class="next" href="15_disaggregated_serving.html">
     <span class="dir">Next →</span>
-    <span class="ttl">12 · Disaggregated prefill/decode</span>
+    <span class="ttl">15 · Disaggregated serving</span>
   </a>
 </footer>
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>22 · The distributed data pipeline</title>
+<title>25 · The distributed data pipeline</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -12,8 +12,8 @@
   <div class="inner">
     <a class="crumb-link" href="index.html">system_ml</a>
     <span class="crumb">/</span>
-    <span class="crumb">22 · The data pipeline</span>
-    <span class="step-pill">lesson 22 / 23</span>
+    <span class="crumb">25 · The data pipeline</span>
+    <span class="step-pill">lesson 25 / 26</span>
   </div>
 </header>
 
@@ -121,7 +121,7 @@
 
 <div class="callout">
   <div class="label">The two extra tricks beyond worker count</div>
-  <strong>Pinned memory + async copy:</strong> stage the batch in page-locked host memory so the host→device DMA overlaps the previous step's compute on a separate CUDA stream (lesson 15) — the H2D transfer hides for free. <strong>Double buffering:</strong> while the GPU computes on batch <span class="math">k</span>, batch <span class="math">k{+}1</span> is already on the device. Together they turn "load then compute" into "load <em>while</em> compute," which is what the formula above assumes is happening.
+  <strong>Pinned memory + async copy:</strong> stage the batch in page-locked host memory so the host→device DMA overlaps the previous step's compute on a separate CUDA stream (lesson 18) — the H2D transfer hides for free. <strong>Double buffering:</strong> while the GPU computes on batch <span class="math">k</span>, batch <span class="math">k{+}1</span> is already on the device. Together they turn "load then compute" into "load <em>while</em> compute," which is what the formula above assumes is happening.
 </div>
 
 <h2>The throughput sanity check</h2>
@@ -133,7 +133,7 @@
 <p>For a large pretraining run — say <span class="math">B_eff = 4</span>M tokens/step at one step every ~2 s — that's ~2M tokens/s. At ~2 bytes/token of <em>tokenized</em> data that's a few MB/s of token IDs, trivially served. But if the pipeline reads <em>raw</em> data and tokenizes on the fly, the figure is the raw bytes — often 5–20× larger — and now you're asking a network filesystem for hundreds of MB/s to GB/s, sustained, split across every node. This is exactly why production pipelines pre-tokenize and pack offline: it collapses the bytes the hot path has to move. If demand exceeds your storage bandwidth, no number of workers saves you — the bottleneck is the wire.</p>
 
 <div class="callout warn">
-  <div class="label">Determinism &amp; resumption — the bridge to lesson 23</div>
+  <div class="label">Determinism &amp; resumption — the bridge to lesson 26</div>
   When a 1000-GPU run dies and restarts (next lesson), it must resume <em>mid-epoch</em> at the exact data position — otherwise it re-trains on data it already saw or skips data it didn't. That means the checkpoint has to capture the data pipeline's state: the epoch number (to reproduce the shuffle seed) and how far into the permutation each rank had consumed. A pipeline that can't report "I am here" can't be resumed correctly, only restarted from the epoch boundary — throwing away up to a full epoch of progress on every failure.
 </div>
 
@@ -148,19 +148,111 @@
   <li><strong>Profile it</strong> — if GPU utilization sits below ~95% and the kernels themselves are fast, suspect the input pipeline before you touch the model.</li>
 </ol>
 
+<h2>Packing — don't pad, concatenate</h2>
+
+<p>Documents have wildly different lengths. The naive fix is to pad every short document up to the fixed sequence length <span class="math">L</span> the model expects, then mask the pad tokens in the loss. The problem is that the GPU still <em>computes</em> on every pad token — attention, MLP, the works — and then you throw the result away. A batch that is 40% padding is a batch where 40% of the FLOPs heat the room for nothing.</p>
+
+<p><strong>Packing</strong> kills the padding instead of masking it: concatenate multiple documents end-to-end until you fill one length-<span class="math">L</span> sequence. A 200-token doc, a 350-token doc, and a 450-token doc become one packed 1000-token row — zero pad tokens.</p>
+
+<pre class="ascii">  PADDED   (3 rows, L=1000):           PACKED  (1 row, L=1000):
+    [docA 200 | pad 800 .............]   [docA 200 | docB 350 | docC 450]
+    [docB 350 | pad 650 .........]       └── one sequence, 0 pad tokens ──┘
+    [docC 450 | pad 550 .......]
+    useful 1000 / total 3000 = 33%       useful 1000 / total 1000 = 100%</pre>
+
+<p>The catch is correctness: in a packed row, tokens of document A must <strong>not</strong> attend to document B, or you leak context across unrelated documents and corrupt the loss. A plain full-attention kernel would let them. So you record the per-document boundaries as a cumulative-offset array <code>cu_seqlens</code> (e.g. <code>[0, 200, 550, 1000]</code>) and hand it to a <strong>variable-length attention kernel</strong> — FlashAttention's <code>varlen</code> path — which makes attention <strong>block-diagonal</strong>: each document attends only within its own segment. The varlen mechanics live in the <a href="../../gpu_kernel_serving/index.html">gpu_kernel_serving</a>/vLLM tracks; here the point is that packing is only legal because the kernel enforces the boundaries.</p>
+
+<p>Define packing efficiency as the fraction of computed tokens that are real:</p>
+
+<p class="math block">η  =  useful_tokens / total_tokens</p>
+
+<p>This is a throughput lever, not a data-engineering footnote. If you do <em>not</em> pack and your corpus packs to <span class="math">η ≈ 0.6</span>, you are paying for <span class="math">1/0.6 ≈ 1.67×</span> the GPUs to train the same number of real tokens — a 67% overhead that no kernel tuning or worker-count change in this lesson can recover. The fix is upstream, in how you build the sequences.</p>
+
+<div class="callout">
+  <div class="label">Packing is offline work</div>
+  Decide the packing during the same offline pass that tokenizes (next section): emit fixed-length packed rows with their <code>cu_seqlens</code> baked into the shard. The hot path then reads a ready-made packed row and never bin-packs documents on the fly.
+</div>
+
+<h2>Resumable loader state — the actual mechanism</h2>
+
+<p>A 3-week run checkpoints periodically and resumes after every preemption. The model weights and optimizer state are the obvious things to persist; the data loader is the part people forget, and getting it wrong means you silently <em>re-show</em> data (overweighting it) or <em>skip</em> data (never training on it). Neither throws an error. To resume at the exact byte the run died on, the checkpoint must capture:</p>
+
+<ul>
+  <li><strong>(a) Epoch + global RNG seed.</strong> The seed drives the shuffle (the <code>base_seed + epoch</code> from the DistributedSampler section). Without it you cannot reproduce the permutation, so you cannot know what order the remaining samples come in.</li>
+  <li><strong>(b) Per-rank shard cursor.</strong> Which shard file each rank was reading.</li>
+  <li><strong>(c) Within-shard sample offset.</strong> How many samples into that shard it had consumed.</li>
+  <li><strong>(d) Shuffle-buffer contents / RNG state.</strong> If you use the streaming approximate shuffle (last section), the buffer is mutable state — its current contents and the PRNG that draws from it must be restored, or the post-resume order diverges from what a non-interrupted run would have seen.</li>
+  <li><strong>(e) Count of in-flight prefetched batches.</strong> The number of batches sitting in the prefetch queue, produced but not yet stepped on.</li>
+</ul>
+
+<p>That last item hides the real subtlety. With asynchronous prefetch, <strong>"samples consumed by the model" ≠ "samples pulled from disk."</strong> The loader's read head runs ahead of the optimizer by the full depth of the in-flight queue (<span class="math">W</span> workers × prefetch_factor batches). If you checkpoint the loader's read offset, you over-count — you record positions for batches that were fetched but whose gradients never reached <code>optimizer.step()</code>. On resume you'd skip exactly those queued-but-unstepped batches.</p>
+
+<p>The rule: <strong>checkpoint the offset of the last batch the optimizer actually stepped on, not the loader's read head.</strong> In practice you tag each batch with its global sample offset as it leaves the loader, and the checkpoint records the tag of the batch that was live at the <code>step()</code> call — so the in-flight tail is correctly discarded and re-fetched on resume. This is precisely the pipeline state that <a href="26_checkpointing_fault_tolerance.html">lesson 26</a> persists alongside the weights; a loader that cannot report "I am here, on the stepped batch" can only restart at an epoch boundary, throwing away progress on every failure.</p>
+
+<h2>The storage tier</h2>
+
+<p>Where the bytes physically live reshapes the whole pipeline. The three tiers, fastest-but-smallest last:</p>
+
+<table>
+  <thead><tr><th>Tier</th><th>Characteristic</th><th>Consequence for the pipeline</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Object store</strong> (S3/GCS)</td><td>High latency, effectively unbounded capacity, cheap.</td><td>You cannot random-access; you <em>stream</em> in large shards and shuffle with a buffer.</td></tr>
+    <tr><td><strong>Parallel filesystem</strong> (Lustre/GPFS)</td><td>Huge aggregate bandwidth across nodes.</td><td>Metadata server is the bottleneck — millions of small files stall on <code>open()</code>/<code>stat()</code>, not on bytes. Use few large files.</td></tr>
+    <tr><td><strong>Local NVMe cache</strong></td><td>Fastest, but capacity-limited per node.</td><td>Stage hot shards here; fall back to the tier above when the working set exceeds the disk.</td></tr>
+  </tbody>
+</table>
+
+<p>There is a free speedup hiding in the OS: the <strong>page cache</strong>. Epoch 1 is disk-bound because every shard is read cold from storage. If the working set fits in host RAM, later epochs hit the cached pages and the loader speeds up sharply — sometimes the difference between input-bound and compute-bound is just "is epoch 1 over yet." (Single-epoch pretraining never gets this gift; see the last section.)</p>
+
+<p>The decisive move is to <strong>pre-tokenize offline</strong> into large binary shards — a <code>.bin</code>/<code>.idx</code> memmap pair, or WebDataset tar shards — so training reads are large sequential reads of token IDs, not millions of small random reads of raw text, and the CPU on the hot path does <em>no</em> tokenization. This collapses the bytes moved (token IDs are ~2 bytes each vs. ~4–5 bytes/char of raw UTF-8) and turns random I/O into streaming I/O, which is what every tier above is fastest at.</p>
+
+<p>Before committing to a tier, run the demand-bandwidth check:</p>
+
+<p class="math block">required GB/s  =  global_tokens_per_sec · bytes_per_token</p>
+
+<p>Compute the left side from your global batch and step time, then ask whether the chosen tier sustains it <em>split across every node</em>. If demand exceeds the storage bandwidth, no number of workers helps — the wire is the bottleneck, and the answer is pre-tokenized shards plus an NVMe cache, not more CPU.</p>
+
+<h2>Worker &amp; host budgeting</h2>
+
+<p>The starvation discussion gave the worker count to keep the GPU fed: <span class="math">W ≈ T_l / T_c</span>. That formula sizes the number of data-loading <em>processes</em>, but it assumes the host can actually run them. The real ceiling is hardware: <strong>CPU cores per GPU</strong> and <strong>host RAM</strong>.</p>
+
+<p>Each worker holds its own in-flight batches, so memory scales with the worker count and prefetch depth:</p>
+
+<p class="math block">host RAM needed  ≈  num_workers · prefetch_factor · batch_bytes</p>
+
+<p>And this competes for the same RAM as the <strong>pinned-memory</strong> staging buffers that make the async H2D copy work (the page-locked buffers from <a href="18_caching_allocator.html">lesson 18</a>) — pinned pages are non-pageable, so they are RAM the OS cannot reclaim under pressure. Over-provision workers and you don't just waste cores; you can push the host into swap or OOM.</p>
+
+<div class="callout bad">
+  <div class="label">Failure mode: too many workers is slower, not faster</div>
+  Past the saturation point, extra workers thrash the cores and RAM — context-switching, cache eviction, and memory pressure make per-batch loading <em>slower</em>, so the pipeline regresses even though the GPU is already fed. Too few workers and you starve the GPU. The cost curve is U-shaped, and the bottom is narrow.
+</div>
+
+<p><strong>Rule of thumb:</strong> take the cores allotted per GPU (total host cores / GPUs-per-node), reserve a couple for the main training process and the NCCL/communication threads, and split the rest across workers. On an 8-GPU node with 96 cores that's ~12 cores/GPU; leaving headroom, ~8–10 workers per GPU is a sane starting point — then measure GPU utilization and adjust, rather than maxing the slider.</p>
+
+<h2>Shuffle quality at scale</h2>
+
+<p>You cannot load a web-scale dataset into RAM to shuffle it — it's trillions of tokens. Streaming loaders use an <strong>approximate shuffle</strong>: maintain a buffer of size <span class="math">B</span>, draw a random element from it to emit, and refill the vacated slot from the stream. Larger <span class="math">B</span> approaches a true global shuffle but costs more RAM and makes resume heavier (the buffer is checkpoint state — item (d) two sections up); smaller <span class="math">B</span> only locally reorders.</p>
+
+<p>The pretraining reality changes what "good shuffle" even means. Data is seen <strong>roughly once</strong> — a single epoch over trillions of tokens — so there is no per-epoch reshuffle to smooth out a weak ordering. What matters instead is the <strong>global shard ordering and inter-shard mixing</strong>: if the data is blocked by source (all of Wikipedia, then all of GitHub, then all of arXiv, contiguous), the model trains on long correlated runs, the gradient estimate stops looking i.i.d., and convergence suffers — a slow, expensive problem you can't reshuffle your way out of mid-run. Interleave sources at shard-build time and shuffle shard order globally; the in-buffer shuffle only polishes the local mix.</p>
+
+<div class="callout warn">
+  <div class="label">Unequal batch counts deadlock the step</div>
+  Tie this back to <a href="02_collectives.html">lesson 02</a>: if approximate-shuffle bookkeeping or uneven shard assignment leaves ranks with <em>different</em> numbers of batches, the rank that runs out finishes early and stops calling the AllReduce at step end — and every other rank blocks forever on a collective that will never complete. The run hangs with no error. Pad or truncate so every rank steps the same number of times, exactly as the DistributedSampler does for divisibility.
+</div>
+
 <div class="callout ok">
   <div class="label">Takeaway</div>
   The data pipeline does two things: hand each rank a disjoint, reshuffled-per-epoch slice (DistributedSampler over a seeded shared permutation), and deliver batches faster than the GPU eats them (enough prefetch workers that <span class="math">T_l/W ≤ T_c</span>, plus pinned-memory double buffering). Both failure modes are silent — duplicated/skipped data still trains, a starved GPU still trains — so they cost money and quality without throwing an error. The input pipeline is the cheapest place to leave performance on the floor and the easiest to forget to check.
 </div>
 
 <footer class="lesson-nav">
-  <a href="21_gradient_accumulation.html">
+  <a href="24_numerical_stability.html">
     <span class="dir">← Previous</span>
-    <span class="ttl">21 · Gradient accumulation</span>
+    <span class="ttl">24 · Numerical stability</span>
   </a>
-  <a class="next" href="23_checkpointing_fault_tolerance.html">
+  <a class="next" href="26_checkpointing_fault_tolerance.html">
     <span class="dir">Next →</span>
-    <span class="ttl">23 · Checkpointing &amp; fault tolerance</span>
+    <span class="ttl">26 · Checkpointing & fault tolerance</span>
   </a>
 </footer>
 

@@ -1,0 +1,650 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>24 · Numerical stability &amp; convergence</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">24 · numerical stability</span>
+    <span class="step-pill">lesson 24 / 26</span>
+  </div>
+</header>
+<main>
+
+<h1>Numerical stability &amp; convergence</h1>
+<p class="subtitle">Parts I–V made the run fast. This lesson keeps it from diverging. At 70B / trillions-of-tokens / three weeks, a single loss spike can torch days of compute — so convergence is active defensive engineering, not luck.</p>
+
+<h2>The thing you are actually afraid of</h2>
+
+<p>Lesson 23 taught you to diagnose a run that is <em>slow</em>. This one teaches you to survive a run that goes <em>divergent</em>. They are different emergencies. A slow run wastes money at a steady rate; a divergent run can throw away every step since the last good checkpoint in a single update. On a 1024-GPU job that has been grinding for a week, "the loss went to NaN at 3am" is not a curiosity — it is the most expensive event in the lifecycle of the run.</p>
+
+<p>Here is the shape of it. You are watching the loss tick down — 2.41, 2.40, 2.40 — and then one step posts <strong>2.40 → 11.7</strong>, or <strong>2.40 → NaN</strong>. Two outcomes follow. Sometimes the loss recovers over the next few hundred steps and rejoins its old trajectory, as if nothing happened (a <em>survivable spike</em>). Sometimes it never comes back: the loss pins flat-high, or every subsequent step is NaN because a NaN in the weights poisons every matmul forever (a <em>fatal spike</em>). The whole job is now generating garbage gradients on garbage weights, and it will keep doing so, burning $X00/hour, until a human notices.</p>
+
+<p>What causes a spike? It is almost always one of a small set of dynamic-range failures:</p>
+
+<ul>
+  <li><strong>An outlier batch.</strong> A handful of pathological sequences — a 100k-token run of a single repeated byte, a corrupt shard, a document that is all whitespace — produces an enormous loss and therefore an enormous gradient.</li>
+  <li><strong>A large gradient on its own.</strong> Even on clean data, the tail of the gradient-norm distribution is heavy. Occasionally a step lands a gradient 50× the running norm.</li>
+  <li><strong>A precision overflow.</strong> fp16 has only ~65k of headroom; a big activation or gradient overflows to <code>inf</code>, and <code>inf − inf = NaN</code> spreads from there. fp8 is even tighter. (This is the lesson-17 dynamic-range story, now as a stability problem.)</li>
+  <li><strong>An attention-logit blowup.</strong> A query·key dot product grows without bound during training; the pre-softmax logits hit the format's ceiling; the softmax saturates and the gradient dies or explodes.</li>
+  <li><strong>A drifting softmax normalizer.</strong> Over a 128k-vocab head, the log-sum-exp normalizer <span class="math">log Z</span> wanders away from zero and the cross-entropy arithmetic loses precision.</li>
+  <li><strong>Dead optimizer state.</strong> A near-zero Adam second moment <span class="math">v</span> in the denominator turns a normal gradient into a giant step.</li>
+</ul>
+
+<p>The rest of the lesson is the standard kit of defenses, each aimed at one of these. None of them is exotic. The expensive mistake is not knowing which one you forgot to turn on — and, in a distributed run, getting one of them subtly wrong so that every rank does something slightly different.</p>
+
+<h2>Defense 1 · Global gradient-norm clipping</h2>
+
+<p>The workhorse. Before the optimizer step, measure the L2 norm of the entire gradient vector and, if it exceeds a threshold <span class="math">c</span>, scale the whole vector down so its norm is exactly <span class="math">c</span>:</p>
+
+<div class="math block">
+  g &nbsp;←&nbsp; g · min(1, &nbsp;c / ‖g‖₂)
+</div>
+
+<p>with <span class="math">c ≈ 1.0</span> for most LM pretraining. Two properties make this the right tool. First, it caps the worst case: no single step can move the weights further than <span class="math">η · c</span> in norm, no matter how violent the batch. Second, it preserves <em>direction</em> — it scales the entire gradient by one scalar, so the relative sizes of per-parameter updates are untouched. You are throttling the magnitude of one bad step, not reshaping it.</p>
+
+<p>The word doing all the work is <strong>global</strong>. <span class="math">‖g‖₂</span> is the norm over <em>all</em> parameters at once:</p>
+
+<div class="math block">
+  ‖g‖₂ &nbsp;=&nbsp; sqrt( Σ<sub>p</sub> Σ<sub>i</sub> g<sub>p,i</sub>² )
+</div>
+
+<p>— one number for the whole model, summed across every parameter <span class="math">p</span> and every element <span class="math">i</span> within it.</p>
+
+<div class="callout warn">
+  <div class="label">The systems trap</div>
+  Under FSDP (lesson 05) and tensor parallel (lesson 06), the parameters — and therefore the gradients — are <strong>sharded across ranks</strong>. No single rank holds the full gradient vector, so no single rank can compute <span class="math">‖g‖₂</span> by itself. The global norm is the square root of a sum that lives on every rank. Computing it is therefore <em>itself a collective</em>: each rank sums the squares of <em>its</em> shard, and those partial sums are AllReduced (lesson 02).
+</div>
+
+<p>Written out, the correct distributed clip is a three-line dance:</p>
+
+<div class="math block">
+  local_sq &nbsp;=&nbsp; Σ<sub>i ∈ shard</sub> g<sub>i</sub>²<br>
+  global_norm &nbsp;=&nbsp; sqrt( AllReduce<sub>sum</sub>(local_sq) )<br>
+  g<sub>i</sub> &nbsp;←&nbsp; g<sub>i</sub> · min(1, &nbsp;c / global_norm)
+</div>
+
+<p>The AllReduce in the middle is the whole point. Each rank contributes a single scalar (its local sum of squares), gets back the global sum, takes the square root, and now every rank has bit-identical <span class="math">global_norm</span> and applies bit-identical scaling to its own shard. Skip the collective and clip on the <em>local</em> norm instead, and every rank computes a different scale factor. The "model" the optimizer then steps is no longer a single coherent model — each shard has been throttled by a different amount. Nothing crashes. The loss just quietly stops converging, or converges to something worse, and you spend two days bisecting your config before you find it. This is one of the most common silent bugs in a from-scratch trainer; the framework helpers (<code>torch.nn.utils.clip_grad_norm_</code> under FSDP, Megatron's clip) exist precisely to get the collective right for you.</p>
+
+<p>Cost-wise the clip is cheap: one AllReduce of a single scalar per step. Latency-bound (lesson 02's <span class="math">α</span> term), negligible bytes. You will not see it in the MFU budget. You will absolutely see its absence in the loss curve.</p>
+
+<h3>Watching one spike happen, in numbers</h3>
+
+<p>Make it concrete. Say the model has been training with a healthy gradient norm hovering around <span class="math">‖g‖ ≈ 0.8</span> and a learning rate <span class="math">η = 3 × 10⁻⁴</span>. Each step therefore nudges the weights by roughly <span class="math">η · ‖g‖ ≈ 2.4 × 10⁻⁴</span> in norm — small, steady, exactly what convergence wants. Now an outlier batch arrives and produces <span class="math">‖g‖ = 40</span> (a 50× spike — well inside the tail you will actually see over millions of steps).</p>
+
+<p>Without clipping, that one step moves the weights by <span class="math">η · 40 ≈ 1.2 × 10⁻²</span> in norm — fifty times the usual jump, in a direction set by a single pathological batch. That is enough to fling the parameters out of the basin the optimizer had been carefully descending. The next forward pass runs on those displaced weights, produces an even larger loss, and therefore an even larger gradient; the step after that is larger still. This is the positive-feedback loop that turns one bad batch into a runaway: <em>big step → worse weights → bigger gradient → bigger step.</em> A few iterations of that and an activation overflows to <code>inf</code>, the <code>inf</code> contaminates a matmul, and the loss is NaN for the rest of the run.</p>
+
+<p>With clipping at <span class="math">c = 1.0</span>, the same spike is scaled by <span class="math">min(1, 1.0/40) = 0.025</span> before the step. The update norm becomes <span class="math">η · 1.0 = 3 × 10⁻⁴</span> — back in the normal range. The bad batch still nudges the weights in its (bad) direction, but only by a normal-sized amount, which the next few good batches easily absorb. The spike shows up as a one-step blip in the loss and then vanishes. <strong>The clip converted a fatal event into a non-event by capping a single scalar.</strong> That is the entire value proposition, and it is why <span class="math">c</span> is one of the few hyperparameters you should set conservatively (≈ 1.0) and rarely touch.</p>
+
+<p>Note what clipping does <em>not</em> do: it does not change the <em>direction</em> of the update, only its length. All parameters are scaled by the same <span class="math">0.025</span>, so the relative shape of the step is identical to the unclipped step — you are stepping the same way, just less far. That direction-preservation is why global-norm clipping is gentle enough to leave on for the entire run without hurting convergence, unlike per-element gradient <em>value</em> clipping (clamping each <span class="math">g<sub>i</sub></span> to <span class="math">[−c, c]</span> independently), which distorts the direction and is rarely used for large LMs.</p>
+
+<h2>Defense 2 · The learning-rate schedule</h2>
+
+<p>A constant learning rate is a stability liability at both ends of training, for two different reasons. The schedule — <strong>warmup, then decay</strong> — fixes both.</p>
+
+<h3>Warmup: why the first thousand steps are dangerous</h3>
+
+<p>Early in training two things are simultaneously true. The model is at a random initialization, far from any good basin, so the gradient direction is noisy and frequently bad. And Adam's second-moment estimate <span class="math">v</span> — the running average of squared gradients that sits in the denominator of the update — has only seen a few batches, so it is a poor estimate of the true gradient scale. A full learning rate multiplied by a confidently-wrong direction with a mis-calibrated adaptive scale is exactly the recipe for a step that launches the weights out of the sensible region and never recovers.</p>
+
+<p>Warmup ramps the LR linearly from (near) zero up to its peak over the first few hundred to few thousand steps:</p>
+
+<div class="math block">
+  η(t) &nbsp;=&nbsp; η<sub>peak</sub> · min(1, &nbsp;t / t<sub>warmup</sub>) &nbsp;&nbsp; for &nbsp; t ≤ t<sub>warmup</sub>
+</div>
+
+<p>This buys time. The early steps are tiny, so even bad directions barely move the weights; by the time the LR reaches its peak, the second moments have stabilized and the model sits somewhere reasonable. Typical warmup is 1–3% of total steps (a 500B-token run might warm up over ~2000 steps). Skipping warmup is one of the classic ways to make a large model diverge in the first 100 steps — it is not a luxury, it is load-bearing.</p>
+
+<h3>Decay: cosine vs WSD</h3>
+
+<p>Late in training you want the opposite: a <em>small</em> LR so the optimizer settles into a minimum instead of bouncing around it. Two schedules dominate.</p>
+
+<ul>
+  <li><strong>Cosine.</strong> After warmup, anneal the LR along a half-cosine from <span class="math">η<sub>peak</sub></span> down to a floor (often <span class="math">0.1·η<sub>peak</sub></span> or 0) over the whole run: <span class="math">η(t) = η<sub>min</sub> + ½(η<sub>peak</sub>−η<sub>min</sub>)(1+cos(π·t/T))</span>. Smooth, well-understood, and the long-time default. Its flaw is that the shape is welded to a <em>fixed</em> total length <span class="math">T</span> — decide to train longer and the curve you already ran is the wrong curve.</li>
+  <li><strong>WSD (warmup–stable–decay).</strong> Warm up, then hold the LR <em>constant</em> for the bulk of training, then decay sharply over the final ~10–20% of steps. The constant middle is the operationally pleasant part: you can stop, checkpoint, branch, or extend the run from any point in the stable phase without having committed to a horizon, because the LR there does not depend on <span class="math">T</span>. The sharp final decay recovers most of the loss that cosine spends its whole tail collecting. WSD (and its cousins) is increasingly preferred for exactly this checkpoint-/continuation-friendliness at frontier scale.</li>
+</ul>
+
+<div class="callout">
+  <div class="label">Connection to lesson 11 (gradient accumulation)</div>
+  The peak LR is coupled to the global batch size. The familiar rule — scale LR linearly with batch — is an <em>SGD</em> result and only weakly true for AdamW, where the dependence is closer to a square-root and the constants are recipe-specific. Two further wrinkles bite in practice: the largest batch you can use efficiently (the <em>critical</em> batch size <span class="math">B<sub>crit</sub></span>) <em>grows</em> as the loss falls, so a batch that is fine at the end may be too large at the start; and a bigger batch averages out gradient noise, which makes spikes <em>rarer</em> but each surviving spike <em>larger</em>. Treat LR and batch as one jointly-tuned knob, not two independent ones.
+</div>
+
+<h2>Defense 3 · Bounding the logits</h2>
+
+<p>The softmax is the single most overflow-prone operation in a transformer, and it appears in two load-bearing places: the attention scores and the final vocabulary projection. Both involve an exponential of a dot product, and an exponential of an unbounded input is an overflow waiting to happen.</p>
+
+<h3>z-loss: pin the softmax normalizer</h3>
+
+<p>Cross-entropy over a vocabulary computes <span class="math">log Z = log Σ<sub>v</sub> e<sup>x<sub>v</sub></sup></span>, the log of the softmax normalizer. Mathematically the loss is invariant to adding a constant to all logits, so nothing in the objective stops <span class="math">log Z</span> from <em>drifting</em> — the logits can all creep upward together over training while the predicted distribution stays the same. That drift is harmless in exact arithmetic and dangerous in low precision: a large <span class="math">Z</span> summed over 128k+ vocabulary entries in bf16 (with its 8-bit exponent but only 7 mantissa bits) loses precision in the sum, and in the worst case <span class="math">e<sup>x<sub>v</sub></sup></span> overflows outright.</p>
+
+<p>z-loss adds a tiny auxiliary penalty that gives the model a reason to keep <span class="math">log Z</span> near zero:</p>
+
+<div class="math block">
+  L &nbsp;=&nbsp; L<sub>CE</sub> &nbsp;+&nbsp; α · (log Z)²
+</div>
+
+<p>with <span class="math">α</span> small (≈ 10⁻⁴). It barely touches the loss value, but it actively pulls the normalizer back to a sane magnitude every step, which keeps the exponentials in range. This is standard in large-vocab LM heads and is <em>essential</em> for the MoE router (lesson 09): the router is a tiny softmax over experts whose logits, if left unconstrained, drift until routing collapses or overflows. A router z-loss is one of the first things you add when MoE training gets unstable.</p>
+
+<div class="callout">
+  <div class="label">Why large vocab + bf16 is the specific risk</div>
+  bf16 keeps fp32's <em>range</em> (it won't overflow as easily as fp16) but has only 7 mantissa bits. The danger over a 128k-vocab softmax is not a single overflow so much as <em>precision loss in the reduction</em>: summing 128k exponentials of wildly different magnitudes in 7-bit-mantissa arithmetic, the small terms vanish and <span class="math">log Z</span> is computed inaccurately. Best practice is to compute the LM-head logits and the softmax/cross-entropy in fp32 (lesson 17's "keep reductions in higher precision" rule) <em>and</em> add z-loss to stop the drift in the first place. Belt and suspenders.
+</div>
+
+<h3>Attention soft-capping and QK-norm</h3>
+
+<p>For the attention logits, two related stabilizers cap the dot products before the softmax sees them:</p>
+
+<ul>
+  <li><strong>Logit soft-capping</strong> (Gemma-style): pass the pre-softmax scores through <span class="math">cap · tanh(scores / cap)</span>. The <span class="math">tanh</span> squashes any score into <span class="math">(−cap, +cap)</span>, so no logit can run away, but small scores pass through almost linearly so you barely perturb normal attention.</li>
+  <li><strong>QK-norm</strong>: apply a normalization (e.g. RMSNorm) to the query and key vectors before the dot product. This bounds the <em>magnitude</em> of each vector, which bounds their dot product, which keeps the logits in a controlled range without a hard cap. Increasingly the preferred fix because it has no cap hyperparameter to tune and composes cleanly with the rest of the block.</li>
+</ul>
+
+<p>All three — z-loss, soft-capping, QK-norm — are the same idea applied in different spots: <em>do not let a quantity that gets exponentiated grow without bound.</em></p>
+
+<h2>Defense 4 · The mixed-precision interaction</h2>
+
+<p>Lesson 17 was about the formats. Here is how each one behaves under the <em>stability</em> lens, because precision choice and spike-proneness are the same conversation.</p>
+
+<table>
+  <thead><tr><th>Format</th><th>Spike profile</th><th>Required defense</th></tr></thead>
+  <tbody>
+    <tr><td>bf16</td><td>Mostly fine — full fp32 8-bit exponent, so gradients rarely overflow or underflow</td><td>Keep reductions (norm, softmax, LM head) in fp32; no scaler needed</td></tr>
+    <tr><td>fp16</td><td>Underflow-prone (5-bit exponent); small gradients flush to zero</td><td><strong>Dynamic loss scaling</strong> (below) — non-optional</td></tr>
+    <tr><td>fp8</td><td>Most spike-prone — tiny range; weights/grads can overflow per-tensor</td><td>Per-tensor / per-block scaling; keep norms, router, LM head in higher precision</td></tr>
+  </tbody>
+</table>
+
+<p><strong>fp16 → dynamic loss scaling.</strong> Multiply the loss by a scale <span class="math">S</span> (start ~2¹⁵) before backward so gradients land in fp16's healthy range instead of underflowing; unscale by <span class="math">S</span> before the optimizer step. The "dynamic" part is itself a stability mechanism: if any gradient overflows to <code>inf</code>, <code>GradScaler</code> detects it, <em>skips the entire step</em>, and halves <span class="math">S</span>; after many clean steps it doubles <span class="math">S</span> back up. That "skip the step on overflow" reflex is the same recovery instinct as Defense 5 — fp16 just bakes it into the scaler.</p>
+
+<p><strong>bf16 → mostly nothing.</strong> Its 8-bit exponent matches fp32, so the underflow problem that motivates the scaler disappears. This is why bf16 became the default: you delete the entire loss-scaler apparatus. You still keep the reduction-heavy ops in fp32.</p>
+
+<p><strong>fp8 → the careful one.</strong> Smallest range, so it is the most likely to overflow and the hardest to keep stable. You keep per-tensor or per-block scale factors (lesson 17), and you deliberately leave the most numerically sensitive components — the normalization layers, the MoE router, the embedding and LM-head — in bf16 or fp32. fp8 is for the bulk matmuls, not for the parts where a small error becomes a spike.</p>
+
+<p>And underneath all three, the <strong>fp32 gradient accumulation</strong> rule from lesson 11: when you accumulate gradients over many micro-batches, accumulate in fp32. The accumulator is summed over potentially hundreds of micro-batches; doing that sum in bf16 loses the small contributions exactly as a bf16 vocabulary sum does. The unifying principle across this whole section is one sentence:</p>
+
+<div class="callout">
+  <div class="label">The mixed-precision stability principle</div>
+  Keep the <strong>reduction-heavy and large-dynamic-range</strong> operations in higher precision — gradient norm, softmax/cross-entropy, layer norms, gradient accumulation, the LM head — and let the low precision live in the bulk matmuls. Spikes are born in the reductions; defend the reductions.
+</div>
+
+<h2>Defense 5 · Detection and recovery</h2>
+
+<p>Even with every static defense in place, the heavy tail eventually produces a spike. So the final layer is operational, and it ties directly to lesson 26 (fault tolerance): <strong>watch every step, and react automatically.</strong></p>
+
+<p>Monitor two scalars on <em>every</em> optimizer step — they cost nothing because you already computed them:</p>
+
+<ul>
+  <li>the <strong>training loss</strong>, and</li>
+  <li>the <strong>global gradient norm</strong> (you computed it for the clip in Defense 1; log it).</li>
+</ul>
+
+<p>The grad-norm is the better early-warning signal because it spikes <em>before</em> the loss does — a bad batch shows up as an anomalous norm one step before that step's update corrupts the loss. The standard trigger compares the current norm to a running statistic:</p>
+
+<div class="math block">
+  spike &nbsp;⟺&nbsp; ‖g‖ &nbsp;&gt;&nbsp; k · median<sub>recent</sub>(‖g‖)
+</div>
+
+<p>with <span class="math">k</span> ≈ 3–10. A median (or other robust statistic) is used rather than a mean precisely because the mean is contaminated by the spikes you are trying to detect. On a trigger, two responses, in increasing order of severity:</p>
+
+<ol>
+  <li><strong>Skip the step.</strong> Throw away this batch's gradient entirely — do not call <code>optimizer.step()</code> — and continue from the same weights with the next batch. The offending data is gone, the weights are untouched, and you have lost one batch of compute. This handles the common case (a single outlier batch) almost for free.</li>
+  <li><strong>Roll back.</strong> If the loss has already gone NaN (a step slipped through, or several bad steps compounded), the in-memory weights are poisoned and skipping won't help. Reload the last good checkpoint, and — crucially — <em>skip past the data shard that caused it</em> so you don't immediately re-trigger on the same poison batch. This is exactly lesson 26's checkpoint-and-resume machinery, repurposed from "a GPU died" to "the math died."</li>
+</ol>
+
+<div class="callout">
+  <div class="label">The economics</div>
+  Logging two scalars and a skip-on-spike rule is a few lines of code and zero measurable runtime. The downside it insures against is <em>days</em> of wasted compute on a 1000-GPU cluster — a run that quietly NaN'd at 3am and was discovered at 9am has burned six hours × 1000 GPUs for nothing. Detection-and-skip is the highest return-on-effort defense in this entire lesson. Build it before you scale up, not after your first all-nighter.
+</div>
+
+<h2>Widget · the loss-spike sandbox</h2>
+
+<p>A simulated 70B training run. The blue curve is a smooth loss decay; every so often an outlier batch injects a spike. Toggle the three defenses and move the sliders to feel how they interact. With all defenses <em>off</em> and a healthy LR, a single big spike sends the run to NaN and it flatlines — that flat red line is days of compute gone. Turn on clipping (caps the step), warmup (survives the fragile early phase), and z-loss (tames the spike magnitude), and watch the same spikes become survivable wobbles. Try raising the LR with defenses off, then turning them on.</p>
+
+<div class="widget" id="ls-widget">
+  <div class="title">Loss-spike sandbox · defenses on vs off</div>
+  <div class="hint">Smooth decay + stochastic spikes. Clipping bounds each step; warmup protects the early steps; z-loss shrinks spike magnitude. With everything off and a high LR the run diverges (flat-high / NaN). The same seed is used so you compare like-for-like.</div>
+
+  <div class="controls">
+    <button id="ls-clip" class="primary">grad clip: ON</button>
+    <button id="ls-warm" class="primary">LR warmup: ON</button>
+    <button id="ls-zl" class="primary">z-loss: ON</button>
+  </div>
+  <div class="controls">
+    <label class="inline">peak LR: <input type="range" id="ls-lr" min="1" max="30" step="1" value="10"> <span class="val" id="ls-lr-v">3.0e-4</span></label>
+    <label class="inline">spike rate: <input type="range" id="ls-sr" min="0" max="40" step="1" value="14"> <span class="val" id="ls-sr-v">14%</span></label>
+    <label class="inline">spike size: <input type="range" id="ls-sm" min="1" max="50" step="1" value="22"> <span class="val" id="ls-sm-v">22×</span></label>
+    <button id="ls-reseed">↻ new run</button>
+  </div>
+
+  <canvas id="ls-canvas" width="760" height="260" style="width:100%; height:260px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">final loss</div><div class="v" id="ls-final" style="font-size:16px;">—</div></div>
+    <div class="kpi"><div class="k">spikes survived</div><div class="v" id="ls-surv" style="font-size:16px;">—</div></div>
+    <div class="kpi"><div class="k">fatal spike</div><div class="v" id="ls-fatal" style="font-size:16px;">—</div></div>
+    <div class="kpi"><div class="k">verdict</div><div class="v" id="ls-verdict" style="font-size:14px;">—</div></div>
+  </div>
+</div>
+
+<h2>Widget · global-norm clipping as a collective</h2>
+
+<p>Per-step gradient norms drawn as bars over a stretch of training. Most steps are well-behaved; a few are outliers (sampled deterministically from the step index, so the picture is stable as you drag). The dashed line is the clip threshold <span class="math">c</span>. Bars above it are <span style="color:#dc2626;">clipped</span> down to <span class="math">c</span> (the darker cap shows how much was shaved); bars below pass through untouched. The annotation is the load-bearing systems fact: that single threshold comparison requires every rank to first agree on <span class="math">‖g‖</span> via an AllReduce.</p>
+
+<div class="widget" id="gc-widget">
+  <div class="title">Global gradient-norm clipping · ‖g‖ = sqrt(AllReduce(Σ local‖g‖²))</div>
+  <div class="hint">Bars = per-step global gradient norm. Dashed line = clip threshold c. Above-threshold steps are scaled down to c (you keep the direction, lose the magnitude). Drag c and watch how many steps get clipped. The norm itself is a collective — a single AllReduced scalar per step.</div>
+
+  <div class="controls">
+    <label class="inline">clip threshold c: <input type="range" id="gc-c" min="2" max="60" step="1" value="10"> <span class="val" id="gc-c-v">1.0</span></label>
+    <label class="inline">window: <input type="range" id="gc-n" min="24" max="80" step="2" value="48"> <span class="val" id="gc-n-v">48</span></label>
+    <button id="gc-shift">▷ advance steps</button>
+  </div>
+
+  <canvas id="gc-canvas" width="760" height="260" style="width:100%; height:260px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">steps clipped</div><div class="v" id="gc-clipped">—</div></div>
+    <div class="kpi"><div class="k">max norm (before)</div><div class="v" id="gc-before">—</div></div>
+    <div class="kpi"><div class="k">max norm (after)</div><div class="v" id="gc-after">—</div></div>
+    <div class="kpi"><div class="k">collective / step</div><div class="v" id="gc-coll" style="font-size:13px;">1 AllReduce</div></div>
+  </div>
+</div>
+
+<h2>Initialization &amp; residual scaling — divergence you can prevent before step 1</h2>
+
+<p>Every defense so far reacts to a spike <em>during</em> the run. Initialization is the one lever that decides whether the run is stable <em>before step 0</em>. Init sets the variance of activations and gradients at the very first forward/backward pass; get it wrong and the model diverges before warmup (Defense 2) ever has a chance to save it. The baseline rule is variance-preserving: draw weights with std <span class="math">∝ 1/√(fan_in)</span> (Xavier/Kaiming). That keeps the activation variance ≈ 1 as a signal passes through a layer, so neither activations nor gradients shrink toward zero or blow up toward overflow as they propagate.</p>
+
+<h3>The depth problem: a growing residual stream</h3>
+
+<p>One layer being well-conditioned is not enough. In a residual network the residual stream variance <em>grows with depth</em> <span class="math">L</span>, because every block <em>adds</em> its output back into the stream — <span class="math">x ← x + f(x)</span>, repeated <span class="math">L</span> times. Variances of independent contributions add, so after <span class="math">L</span> blocks the stream variance scales like <span class="math">L</span>. The fix is to scale each residual-branch output down by <span class="math">1/√(2L)</span> (the GPT-2 trick) or use DeepNorm, so the accumulated stream variance stays bounded as <span class="math">L</span> grows.</p>
+
+<div class="callout bad">
+  <div class="label">Failure mode</div>
+  Skip the residual scaling and a <em>deep</em> model (80+ layers) sees its activations grow geometrically up the stack. The activations at the top layers overflow the format's range, the loss spikes, and the run typically dies in the first hundred steps — before warmup has even reached peak LR. This is a pure depth effect: the same recipe is perfectly stable at 12 layers and divergent at 96.
+</div>
+
+<h3>μP: hyperparameters that transfer across width</h3>
+
+<p>μP (maximal update parametrization) goes one step further. It parametrizes the init <em>and</em> the per-layer learning rates so that the optimal hyperparameters are <strong>invariant to width</strong>. You tune LR and init on a small, narrow proxy model, then transfer those exact values to the full-width model without re-tuning. This is how large runs avoid an LR sweep at full scale — sweeping a 70B model is the expense you cannot afford, so you sweep a cheap proxy and let μP carry the result across.</p>
+
+<table>
+  <thead><tr><th>Lever</th><th>Divergence it prevents</th></tr></thead>
+  <tbody>
+    <tr><td>Init std <span class="math">∝ 1/√(fan_in)</span></td><td>Per-layer activation/gradient blowup (or vanish) at step 0</td></tr>
+    <tr><td>Residual scale <span class="math">1/√(2L)</span> / DeepNorm</td><td>Depth-driven residual-stream blowup in deep (80+ layer) models</td></tr>
+    <tr><td>μP</td><td>LR-transfer mistuning — wrong LR/init when scaling width up</td></tr>
+  </tbody>
+</table>
+
+<p>These are the cheapest defenses of all: they cost zero runtime and are decided once, in the config, before the GPUs (lesson 01) ever spin up. A run that is initialized right rarely needs the reactive defenses to fire at all.</p>
+
+<h2>Putting the defenses in order</h2>
+
+<p>If you are bringing up a new large-model run, this is the order to add the defenses and the failure each one removes:</p>
+
+<table>
+  <thead><tr><th>Defense</th><th>Removes</th><th>Systems cost</th></tr></thead>
+  <tbody>
+    <tr><td>Global grad-norm clip (c≈1)</td><td>Single-step blowups from outlier batches/grads</td><td>1 scalar AllReduce/step</td></tr>
+    <tr><td>LR warmup</td><td>Early-training divergence (cold Adam state)</td><td>Free</td></tr>
+    <tr><td>LR decay (cosine / WSD)</td><td>Late-training bouncing around the minimum</td><td>Free</td></tr>
+    <tr><td>z-loss</td><td>Softmax-normalizer drift / overflow (vocab, router)</td><td>One extra scalar in the loss</td></tr>
+    <tr><td>Logit soft-cap / QK-norm</td><td>Attention-logit blowup</td><td>A few elementwise ops</td></tr>
+    <tr><td>fp32 reductions + (fp16) loss scaler</td><td>Precision overflow/underflow in reductions</td><td>Format-dependent</td></tr>
+    <tr><td>Grad-norm monitor + skip/rollback</td><td>Whatever the static defenses miss</td><td>Two logged scalars</td></tr>
+  </tbody>
+</table>
+
+<p>Notice how cheap the column on the right is. Almost none of this shows up in your MFU. Convergence engineering is not a throughput tax — it is insurance with a near-zero premium and a payout measured in saved GPU-days.</p>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Convergence at 70B scale is defensive engineering, not luck. Clip the <strong>global</strong> gradient norm — and remember that the norm is a collective (an AllReduce of each rank's local sum-of-squares, lesson 02), so clip on the global value or every rank diverges silently. <strong>Warm up</strong> the LR through the fragile early phase, then <strong>decay</strong> it (cosine or WSD). <strong>Bound the logits</strong> with z-loss and soft-cap/QK-norm so nothing that gets exponentiated runs away. Keep the spike-prone <strong>reductions in higher precision</strong> (lesson 17). And <strong>monitor</strong> loss + grad-norm every step so you can skip a bad batch or roll back a poisoned checkpoint. The next lesson keeps the GPUs <em>fed</em> (25 · the data pipeline); lesson 26 lets you <em>recover</em> when the hardware itself dies.
+</div>
+
+<footer class="lesson-nav">
+  <a href="23_profiling_mfu.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">23 · Profiling, MFU &amp; the bottleneck</span>
+  </a>
+  <a class="next" href="25_data_pipeline.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">25 · The data pipeline</span>
+  </a>
+</footer>
+</main>
+
+<script>
+/* ─── Widget: loss-spike sandbox ───
+ * Simulate a training loss curve: smooth decay + occasional stochastic spikes.
+ * Defenses: gradient clipping, LR warmup, z-loss. Sliders: peak LR, spike rate, spike size.
+ * With defenses off + high LR the run diverges (NaN / flat-high). With them on it recovers.
+ * Uses a seeded PRNG so the same run is reproducible across redraws; "new run" reseeds.
+ */
+(function(){
+  const C = document.getElementById('ls-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+
+  const state = { clip:true, warm:true, zl:true, seed:1234 };
+
+  // small seeded PRNG (mulberry32)
+  function mulberry32(a){
+    return function(){
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function readControls(){
+    const lr   = parseInt($('ls-lr').value) * 3e-5;     // 1..30 -> 3e-5 .. 9e-4
+    const rate = parseInt($('ls-sr').value) / 100;       // spike probability per step
+    const size = parseInt($('ls-sm').value);             // spike magnitude multiplier
+    $('ls-lr-v').textContent = lr.toExponential(1);
+    $('ls-sr-v').textContent = parseInt($('ls-sr').value) + '%';
+    $('ls-sm-v').textContent = size + '×';
+    return { lr, rate, size };
+  }
+
+  // Simulate the loss trajectory.
+  function simulate(){
+    const { lr, rate, size } = readControls();
+    const STEPS = 220;
+    const warmupSteps = 25;
+    const rng = mulberry32(state.seed);
+
+    // Baseline decay toward an asymptote; faster decay at higher (healthy) LR.
+    const L0 = 9.0, Linf = 2.0;
+    const loss = new Array(STEPS);
+    let cur = L0;
+    let dead = false;       // hit NaN / divergence
+    let deadAt = -1;
+    let survived = 0, fatal = false;
+
+    // An "effective" LR factor: healthy LR helps; too-high LR (no warmup safeguard) hurts.
+    for (let t = 0; t < STEPS; t++){
+      if (dead){ loss[t] = NaN; continue; }
+
+      // warmup ramp on the LR actually applied
+      let lrEff = lr;
+      if (state.warm && t < warmupSteps) lrEff = lr * (t + 1) / warmupSteps;
+
+      // baseline exponential-ish decay rate scales mildly with LR
+      const k = 0.012 + lrEff * 12.0;     // per-step decay fraction toward Linf
+      cur = Linf + (cur - Linf) * (1 - Math.min(0.06, k));
+
+      // tiny stochastic measurement noise
+      cur += (rng() - 0.5) * 0.015;
+
+      // High LR without warmup is itself destabilising early on.
+      const earlyFragile = (t < warmupSteps) && !state.warm;
+      const lrHot = lr > 4.5e-4;          // "too hot" regime
+
+      // spike?
+      if (rng() < rate){
+        // base shock proportional to slider, amplified by hot LR
+        let shock = size * (0.45 + 0.9 * rng());
+        if (lrHot) shock *= 1.7;
+        if (earlyFragile) shock *= 1.8;
+
+        // z-loss tames the magnitude of logit-driven spikes
+        if (state.zl) shock *= 0.45;
+
+        // gradient clipping bounds how far one step can move the loss up
+        if (state.clip) shock = Math.min(shock, 6.0);
+
+        // convert shock into a loss jump
+        const jump = shock * (0.06 + lrEff * 60.0);
+        cur += jump;
+
+        // Fatal if the post-spike loss is large AND no clip to rein it back,
+        // or if we're in the fragile early phase with a hot LR and no warmup.
+        const runaway = (cur > 9.5 && !state.clip) ||
+                        (earlyFragile && lrHot && cur > 7.5) ||
+                        (cur > 14);
+        if (runaway){
+          dead = true; deadAt = t; fatal = true;
+        } else {
+          survived++;
+        }
+      }
+
+      // Clamp sane region; recovery pulls back down next steps via the decay term.
+      if (!dead){
+        if (cur < Linf - 0.3) cur = Linf - 0.3 + rng()*0.05;
+        loss[t] = cur;
+      } else {
+        loss[t] = NaN;
+      }
+    }
+
+    // final loss = last finite value
+    let finalLoss = NaN;
+    for (let t = STEPS - 1; t >= 0; t--){ if (isFinite(loss[t])){ finalLoss = loss[t]; break; } }
+
+    return { loss, STEPS, deadAt, survived, fatal, finalLoss, warmupSteps };
+  }
+
+  function render(){
+    const sim = simulate();
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width = Math.round(W*dpr); C.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 46, padR = 16, padT = 18, padB = 26;
+    const innerW = W - padL - padR, innerH = H - padT - padB;
+    const ymin = 1.5, ymax = 12;
+    const xOf = t => padL + (t / (sim.STEPS - 1)) * innerW;
+    const yOf = v => padT + (1 - (Math.min(ymax, Math.max(ymin, v)) - ymin) / (ymax - ymin)) * innerH;
+
+    // grid + y labels
+    ctx.strokeStyle = '#eef1f5'; ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace'; ctx.lineWidth = 1;
+    for (let v = 2; v <= 12; v += 2){
+      const y = yOf(v);
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+      ctx.fillText(v.toFixed(0), 8, y + 3);
+    }
+    ctx.fillText('loss', 8, padT - 4);
+    ctx.fillText('step →', W - padR - 40, H - 8);
+
+    // warmup region shading
+    if (state.warm){
+      ctx.fillStyle = 'rgba(37,99,235,0.06)';
+      ctx.fillRect(padL, padT, xOf(sim.warmupSteps) - padL, innerH);
+      ctx.fillStyle = '#2563eb'; ctx.font = '9px monospace';
+      ctx.fillText('warmup', padL + 4, padT + 11);
+    }
+
+    // loss curve
+    ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    let started = false;
+    for (let t = 0; t < sim.STEPS; t++){
+      const v = sim.loss[t];
+      if (!isFinite(v)){ started = false; continue; }
+      const x = xOf(t), y = yOf(v);
+      if (!started){ ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // death marker: flat-high red line + NaN flag
+    if (sim.fatal && sim.deadAt >= 0){
+      const x = xOf(sim.deadAt);
+      ctx.strokeStyle = '#dc2626'; ctx.lineWidth = 2; ctx.setLineDash([4,3]);
+      ctx.beginPath(); ctx.moveTo(x, yOf(ymax)); ctx.lineTo(W - padR, yOf(ymax)); ctx.stroke();
+      ctx.setLineDash([]);
+      // vertical drop at death
+      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, H - padB); ctx.stroke();
+      ctx.fillStyle = '#dc2626'; ctx.font = 'bold 12px monospace';
+      ctx.fillText('NaN — run dead', Math.min(x + 6, W - 130), padT + 14);
+    }
+
+    // KPIs
+    $('ls-final').textContent   = sim.fatal ? 'NaN' : sim.finalLoss.toFixed(2);
+    $('ls-final').style.color   = sim.fatal ? '#dc2626' : '#16a34a';
+    $('ls-surv').textContent    = sim.survived;
+    $('ls-fatal').textContent   = sim.fatal ? 'yes (step ' + sim.deadAt + ')' : 'none';
+    $('ls-fatal').style.color   = sim.fatal ? '#dc2626' : '#16a34a';
+    const allOn = state.clip && state.warm && state.zl;
+    let verdict;
+    if (sim.fatal) verdict = 'diverged';
+    else if (allOn) verdict = 'converged · defended';
+    else verdict = 'survived (this seed)';
+    $('ls-verdict').textContent = verdict;
+    $('ls-verdict').style.color = sim.fatal ? '#dc2626' : (allOn ? '#16a34a' : '#d97706');
+  }
+
+  function bindToggle(id, key, label){
+    const b = $(id);
+    b.addEventListener('click', () => {
+      state[key] = !state[key];
+      b.textContent = label + (state[key] ? ': ON' : ': OFF');
+      b.classList.toggle('primary', state[key]);
+      render();
+    });
+  }
+  bindToggle('ls-clip', 'clip', 'grad clip');
+  bindToggle('ls-warm', 'warm', 'LR warmup');
+  bindToggle('ls-zl',   'zl',   'z-loss');
+
+  ['ls-lr','ls-sr','ls-sm'].forEach(id => $(id).addEventListener('input', render));
+  $('ls-reseed').addEventListener('click', () => { state.seed = (Math.random()*1e9)|0; render(); });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: global-norm clipping ───
+ * Per-step gradient norms as bars, with deterministic outliers (function of step index,
+ * NOT Math.random at load). Slider for clip threshold c. Draw clipped vs unclipped norms.
+ * Annotate: global norm = sqrt(AllReduce(Σ local‖g‖²)) — a collective (lesson 02).
+ */
+(function(){
+  const C = document.getElementById('gc-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+
+  let offset = 0;  // "advance steps" shifts the deterministic window
+
+  // Deterministic pseudo-norm as a function of absolute step index.
+  // Baseline ~0.6–1.2 with occasional sharp outliers; fully reproducible per index.
+  function normAt(i){
+    // smooth baseline from a couple of sines
+    const base = 0.85 + 0.22*Math.sin(i*0.45) + 0.12*Math.sin(i*0.17 + 1.3);
+    // deterministic "hash" in [0,1)
+    const h = ((Math.sin(i * 12.9898) * 43758.5453) % 1 + 1) % 1;
+    let v = base + h*0.5;                     // mild step-to-step jitter
+    // sparse outliers at indices where a second hash is small
+    const h2 = ((Math.sin(i * 78.233 + 0.7) * 12543.123) % 1 + 1) % 1;
+    if (h2 > 0.90){
+      const mag = 3 + 9 * (((Math.sin(i*3.71)+1)/2));   // 3×..12× outliers
+      v *= mag;
+    }
+    return Math.max(0.05, v);
+  }
+
+  function readControls(){
+    const c = parseInt($('gc-c').value) / 10;        // 2..60 -> 0.2 .. 6.0
+    const N = parseInt($('gc-n').value);
+    $('gc-c-v').textContent = c.toFixed(1);
+    $('gc-n-v').textContent = N;
+    return { c, N };
+  }
+
+  function render(){
+    const { c, N } = readControls();
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width = Math.round(W*dpr); C.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 44, padR = 16, padT = 20, padB = 26;
+    const innerW = W - padL - padR, innerH = H - padT - padB;
+
+    // gather norms for the visible window, find scale
+    const raw = [];
+    for (let k = 0; k < N; k++) raw.push(normAt(offset + k));
+    const maxNorm = Math.max(c * 1.3, ...raw);
+    const ymax = maxNorm * 1.08;
+    const yOf = v => padT + (1 - v / ymax) * innerH;
+
+    // y grid
+    ctx.strokeStyle = '#eef1f5'; ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace'; ctx.lineWidth = 1;
+    const ticks = 4;
+    for (let t = 0; t <= ticks; t++){
+      const v = ymax * t / ticks;
+      const y = yOf(v);
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+      ctx.fillText(v.toFixed(1), 6, y + 3);
+    }
+    ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+    ctx.fillText('‖g‖', 8, padT - 5);
+
+    // bars
+    const slot = innerW / N;
+    const bw = Math.max(2, slot * 0.66);
+    let clipped = 0, maxBefore = 0, maxAfter = 0;
+    for (let k = 0; k < N; k++){
+      const v = raw[k];
+      maxBefore = Math.max(maxBefore, v);
+      const x = padL + k * slot + (slot - bw) / 2;
+      const over = v > c;
+      const shown = over ? c : v;            // clipped value
+      maxAfter = Math.max(maxAfter, shown);
+      if (over) clipped++;
+
+      // the part that survives the clip
+      ctx.fillStyle = over ? '#16a34a' : '#2563eb';
+      const yb = yOf(shown);
+      ctx.fillRect(x, yb, bw, (H - padB) - yb);
+
+      // the shaved-off part (what clipping removed), drawn faint red on top
+      if (over){
+        const yTop = yOf(v);
+        ctx.fillStyle = 'rgba(220,38,38,0.30)';
+        ctx.fillRect(x, yTop, bw, yb - yTop);
+        // a solid cap line at c
+        ctx.strokeStyle = '#dc2626'; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(x, yb); ctx.lineTo(x + bw, yb); ctx.stroke();
+      }
+    }
+
+    // threshold line c
+    const yc = yOf(c);
+    ctx.strokeStyle = '#dc2626'; ctx.lineWidth = 1.6; ctx.setLineDash([5,3]);
+    ctx.beginPath(); ctx.moveTo(padL, yc); ctx.lineTo(W - padR, yc); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#dc2626'; ctx.font = 'bold 11px monospace';
+    ctx.fillText('c = ' + c.toFixed(1), W - padR - 66, yc - 5);
+
+    // the collective annotation
+    ctx.fillStyle = '#1f2430'; ctx.font = '11px monospace';
+    ctx.fillText('‖g‖ = sqrt( AllReduce( Σ local‖g‖² ) )  — a collective (lesson 02)', padL + 2, H - 6);
+
+    // KPIs
+    $('gc-clipped').textContent = clipped + ' / ' + N;
+    $('gc-before').textContent  = maxBefore.toFixed(2);
+    $('gc-after').textContent   = maxAfter.toFixed(2);
+  }
+
+  $('gc-c').addEventListener('input', render);
+  $('gc-n').addEventListener('input', render);
+  $('gc-shift').addEventListener('click', () => { offset += 12; render(); });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

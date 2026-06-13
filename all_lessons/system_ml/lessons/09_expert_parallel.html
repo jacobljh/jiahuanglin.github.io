@@ -13,7 +13,7 @@
     <a class="crumb-link" href="index.html">system_ml</a>
     <span class="crumb">/</span>
     <span class="crumb">09 · expert parallel</span>
-    <span class="step-pill">lesson 9 / 23</span>
+    <span class="step-pill">lesson 9 / 26</span>
   </div>
 </header>
 
@@ -175,7 +175,7 @@
 
 <p>Worse: the chunk sizes are unequal because the router is unpredictable. If 80% of tokens this batch chose expert 3, rank 3 receives 4× the workload of average. The slowest rank determines the AllToAll completion time. This is the <strong>load imbalance</strong> problem and it has its own machinery (below).</p>
 
-<p>Bandwidth math: each token of size <span class="math">d</span> bytes × 2 (bf16) gets sent <em>twice</em> per layer (dispatch + combine, ignoring backward). For <span class="math">B · T = 16384</span> tokens, <span class="math">d = 4096</span>, that's <span class="math">~134 MB</span> per AllToAll. Twice per layer × 32 layers = ~8.5 GB of AllToAll traffic per forward, on top of the inter-rank routing latency. On NVLink: ~10 ms. On IB: ~170 ms. <strong>EP is intra-node, with rare exceptions.</strong></p>
+<p>Bandwidth math: each token of size <span class="math">d</span> bytes × 2 (bf16) gets sent <em>twice</em> per layer (dispatch + combine, ignoring backward). For <span class="math">B · T = 16384</span> tokens, <span class="math">d = 4096</span>, that's <span class="math">~134 MB</span> per AllToAll. Twice per layer × 32 layers = ~8.5 GB of AllToAll traffic per forward, on top of the inter-rank routing latency. On NVLink: ~10 ms. On IB: ~170 ms. The ~17× gap is why <strong>the default instinct is to keep EP intra-node</strong> — but it is a preference, not a hard rule (see below).</p>
 
 <h2>Load balancing — a loss term, not a flag</h2>
 
@@ -188,6 +188,11 @@
 
 <p>Tradeoff: capacity factor 1.0 → tight pipelines, max drop rate (some loss in quality). 1.25–1.5 typical. Mixtral and most earlier MoEs use the standard aux-loss recipe; DeepSeek-V3 introduced an <em>auxiliary-loss-free</em> approach (per-expert bias terms that adjust during training) — a modern variant that avoids the aux-loss term's mild quality drag.</p>
 
+<div class="callout">
+  <div class="label">Modern caveat — "wasted FLOPs from capacity" is worst-case, not inherent</div>
+  The capacity-factor picture above assumes each expert runs a fixed-size matmul and you pad to it, so the padding above the true token count is wasted compute. That is the pre-Megablocks framing. Modern MoE kernels are <strong>dropless</strong>: a grouped-GEMM (Megablocks-style block-sparse matmul) batches the variable per-expert token counts into a <em>single</em> kernel without padding every expert to a fixed capacity. So you neither drop tokens nor pad — the "wasted FLOPs" are mostly an artifact of the older fixed-capacity execution, not a law of MoE. Capacity factor is still the right mental model for the imbalance/quality tradeoff, but on a grouped-GEMM path it no longer directly buys you idle compute.
+</div>
+
 <h2>Composing EP with the rest</h2>
 
 <p>EP shards the experts' parameters; nothing forces it to also shard the per-token compute. In a typical layout EP is the dimension <em>around</em> the experts, like TP. Common compositions:</p>
@@ -198,7 +203,7 @@
   <li><strong>EP × TP</strong>. Inside an expert, also shard along feature dim. Useful when each expert is itself huge. Adds an AllReduce <em>inside</em> the expert MLP, on top of the AllToAlls.</li>
 </ul>
 
-<p>EP is bandwidth-hungry like TP — pin it to NVLink. If you have 8 experts and an 8-GPU node, EP fits naturally on one node.</p>
+<p>EP is bandwidth-hungry like TP, so the cheap default is to pin it to NVLink: if you have 8 experts and an 8-GPU node, EP fits naturally on one node. <strong>But this is no longer a hard ceiling.</strong> DeepSeek-V3 has 256 routed experts and deliberately runs EP <em>across</em> nodes (EP of 64+) over InfiniBand, hiding the cross-node AllToAll behind compute with a custom dispatch/combine kernel library (DeepEP) and a communication–computation overlap schedule. The intra-node intuition still tells you where the cheap bandwidth is; it does <em>not</em> mean cross-node EP is off the table once the expert count makes it necessary.</p>
 
 <h2>The serving cost (because this is also an inference question)</h2>
 
@@ -238,9 +243,35 @@
   </div>
 </div>
 
+<h2>Expert-choice routing</h2>
+
+<p>Everything above assumes <strong>token-choice</strong> routing: each token picks its top-<span class="math">k</span> experts. That is the source of every headache in this lesson — because tokens choose independently, nothing stops them piling onto one expert, so you need a capacity factor, a load-balance aux loss, and a drop policy for overflow.</p>
+
+<p>Expert-choice routing (Zhou et al. 2022) inverts the selection. Instead of tokens picking experts, <strong>each expert picks its top-<span class="math">C</span> tokens</strong> from the batch by router score, where <span class="math">C = B · T · k / E</span> is the per-expert budget. The consequences flip every problem:</p>
+
+<ul>
+  <li><strong>Perfect load balance by construction</strong> — every expert takes exactly <span class="math">C</span> tokens, so no rank is ever the straggler in the AllToAll. The imbalance factor is 1.0 by definition.</li>
+  <li><strong>Zero drops</strong> — there is no overflow, because capacity is the selection mechanism, not a cap bolted on after.</li>
+  <li><strong>No aux loss</strong> — balance isn't something the router has to be coaxed toward; it's structural.</li>
+</ul>
+
+<p>The cost is on the token side. Because experts choose, a given token may be picked by zero experts (no expert wanted it — it passes through on the residual only) or by many (variable compute per token). And critically, an expert's choice depends on <em>the whole batch</em> at once — the selection is <strong>non-causal</strong>. That's fine in training, where the full sequence is present, but it breaks autoregressive decode, where token <span class="math">t+1</span> doesn't exist yet when you route token <span class="math">t</span>. So expert-choice is a training-time technique; serving still runs token-choice.</p>
+
+<table>
+  <thead><tr><th></th><th>Token-choice</th><th>Expert-choice</th></tr></thead>
+  <tbody>
+    <tr><td>Who selects</td><td>each token picks top-<span class="math">k</span> experts</td><td>each expert picks top-<span class="math">C</span> tokens</td></tr>
+    <tr><td>Load balance</td><td>needs aux loss + capacity</td><td>perfect by construction</td></tr>
+    <tr><td>Token drops</td><td>overflow tokens dropped</td><td>none</td></tr>
+    <tr><td>Aux loss</td><td>required (or aux-free bias)</td><td>not needed</td></tr>
+    <tr><td>Compute per token</td><td>fixed (<span class="math">k</span> experts)</td><td>variable (0..many experts)</td></tr>
+    <tr><td>Causal?</td><td>yes — usable at decode</td><td>no — training only</td></tr>
+  </tbody>
+</table>
+
 <div class="callout warn">
   <div class="label">Practical caveat — MoE is bandwidth-hungry but not always feasible</div>
-  AllToAll cost scales with <span class="math">N - 1</span> messages per call, so doubling EP doubles the latency floor. Past EP = 16 or so, the latency tax is large enough that the gains from spreading experts are eaten by communication. Frontier MoE training uses EP = 8 or 16, never EP = thousands.
+  AllToAll cost scales with <span class="math">N - 1</span> messages per call, so doubling EP doubles the latency floor. For modest expert counts the latency tax means there is little reason to push EP past one node. But "frontier MoE never goes wide" is no longer true: DeepSeek-V3's 256 experts run at EP of 64+ <em>spanning nodes</em>, and only stay efficient because a custom kernel library (DeepEP) overlaps the cross-node AllToAll with compute. The lesson is that very high EP is a kernel-engineering problem, not a hard wall — but you still don't get it for free with stock NCCL collectives.
 </div>
 
 <div class="callout ok">
@@ -251,11 +282,11 @@
 <footer class="lesson-nav">
   <a href="08_sequence_context_parallel.html">
     <span class="dir">← Previous</span>
-    <span class="ttl">08 · Sequence / context parallel</span>
+    <span class="ttl">08 · Sequence & context parallel</span>
   </a>
-  <a class="next" href="10_3d_parallelism.html">
+  <a class="next" href="10_activation_checkpointing.html">
     <span class="dir">Next →</span>
-    <span class="ttl">10 · 3D parallelism</span>
+    <span class="ttl">10 · Activation checkpointing</span>
   </a>
 </footer>
 

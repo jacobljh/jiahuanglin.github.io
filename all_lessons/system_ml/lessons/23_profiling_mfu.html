@@ -1,0 +1,687 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>23 · Profiling, MFU &amp; finding the bottleneck</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">23 · profiling &amp; MFU</span>
+    <span class="step-pill">lesson 23 / 26</span>
+  </div>
+</header>
+<main>
+
+<h1>Profiling, MFU &amp; finding the bottleneck</h1>
+<p class="subtitle">The whole series taught you to <em>predict</em> where the bottleneck lives. This lesson is how you <em>measure</em> it on a real run and score the prediction. MFU is the single number; the trace is how you find which named cause — each from an earlier lesson — is eating the gap.</p>
+
+<h2>The one number, and what it really asks</h2>
+
+<p>Every previous lesson ended with a hammer: FSDP for the memory wall, overlap for the comm wall, fusion for memory-bound kernels, CUDA graphs for launch overhead. You now have a toolbox and a habit of <em>guessing</em> which tool a given run needs. This lesson closes the loop. There is exactly one scalar that scores the whole run, and it has a name: <strong>Model FLOPs Utilization</strong> — MFU.</p>
+
+<p>The definition starts from the same accounting we did in lesson 01. A transformer step does, for the useful forward+backward math, about <span class="math">6 · N</span> FLOPs per token, where <span class="math">N</span> is the parameter count (2 for forward, 4 for backward — the 6ND rule). So the <em>useful</em> work per training step is:</p>
+
+<div class="math block">
+  model_FLOPs_per_step &nbsp;≈&nbsp; 6 · N · (B · T)
+</div>
+
+<p>where <span class="math">B · T</span> is the number of tokens processed in one optimizer step (global batch × sequence length, summed across all data-parallel replicas). Divide that useful work by what the hardware <em>could</em> have done in the wall-clock time the step actually took, across every GPU you paid for:</p>
+
+<div class="math block">
+  MFU &nbsp;=&nbsp; (6 · N · tokens_per_step) / (step_time · peak_FLOPS · num_gpus)
+</div>
+
+<p>That denominator is the honest one. <span class="math">peak_FLOPS</span> is the chip's datasheet number — for an H100 SXM, <strong>989 TFLOP/s</strong> dense bf16 (the marketing "1979 TFLOP/s" is the 2:4-sparse figure; never use it for MFU). Multiply by <span class="math">num_gpus</span> and by the measured <span class="math">step_time</span> and you have the total FLOP-budget the cluster had available during that step. MFU is the fraction of that budget that went to math your model actually needed.</p>
+
+<div class="callout warn">
+  <div class="label">Worked example · 70B, the number to memorize</div>
+  Llama-70B, global batch 1024 sequences of 4096 tokens, on 512 H100s, measured step time 8.0 s. Tokens/step = 1024 × 4096 = 4.19M. Useful FLOPs = 6 × 70e9 × 4.19M = <strong>1.76 × 10¹⁸</strong>. Available budget = 8.0 s × 989e12 × 512 = 4.05 × 10¹⁸. MFU = 1.76 / 4.05 = <strong>43.5%</strong>. That is a perfectly healthy large-scale training run. If someone tells you their 70B run is at 12% MFU, something on the list below is broken, and the trace will say which.
+</div>
+
+<p>Three rules of thumb worth burning in: <strong>35–45% MFU is typical</strong> for well-tuned large-model training, <strong>&gt;50% is very good</strong> (frontier labs publish numbers in the 40–55% range), and <strong>100% is physically impossible</strong>. Why impossible? Because the 6ND count ignores everything that isn't a big matmul — attention softmax, LayerNorm, the optimizer step, embeddings, the LM head — and those run at well below peak because they are memory-bound (next section). Even a perfect, zero-overhead, zero-communication run spends real time in kernels the tensor cores can't keep busy. MFU is asymptotic to something like 60–70%, not 100%, on a transformer.</p>
+
+<p>It helps to see where the FLOPs actually go. In the 6ND accounting, the dominant terms are the four big GEMMs per layer — the QKV projection, the attention output projection, and the two MLP matmuls — and these are exactly the kernels that sit comfortably above the roofline ridge and run near peak. But a real step also pays for things the 6ND count politely ignores: the softmax inside attention, two LayerNorms per layer, the residual adds, the SwiGLU/GELU nonlinearity, dropout, the embedding lookup, the final LM-head projection over a 100k+ vocabulary, and the optimizer update over every parameter. Individually each is cheap in FLOPs; collectively they are a meaningful slice of <em>wall-clock</em> precisely because they run at single-digit-percent of peak. That is the structural reason MFU tops out well below 1.0: the denominator counts time the numerator's 6ND formula refuses to credit.</p>
+
+<p>One more subtlety on the numerator. The strict 6ND count is the <em>matmul-only</em> approximation; some teams add the attention score-and-context FLOPs (the <span class="math">QKᵀ</span> and <span class="math">·V</span> products, which scale with <span class="math">T²</span> rather than <span class="math">T</span>) into "useful" work, which nudges the reported MFU up at long sequence lengths. Both conventions are defensible — what is <em>not</em> defensible is comparing your MFU against someone else's without knowing which convention each of you used. When you read "we hit 52% MFU" in a paper, the first question is always "6ND, or 6ND plus attention?" The widget below uses the clean 6ND convention so the numbers are comparable across model sizes.</p>
+
+<h2>MFU vs HFU — the recompute distinction</h2>
+
+<p>There is a second utilization number, and confusing the two is the most common profiling mistake. <strong>HFU</strong> — Hardware FLOPs Utilization — counts <em>every</em> FLOP the hardware executed, including the ones you did twice on purpose.</p>
+
+<p>Recall lesson 10: activation checkpointing throws away activations in the forward pass and recomputes them during backward to save memory. That recompute is real forward work the GPU does a second time — roughly <strong>+33%</strong> more FLOPs (one extra forward on top of the fwd+bwd, so 6ND becomes ~8ND of executed work). Those extra FLOPs are <em>hardware</em> work but not <em>useful model</em> work — the gradient would be identical without them; you only pay them to fit in memory.</p>
+
+<div class="math block">
+  HFU &nbsp;=&nbsp; (6 · N · tokens + recompute_FLOPs) / (step_time · peak_FLOPS · num_gpus) &nbsp;≥&nbsp; MFU
+</div>
+
+<p>So with full activation recompute, HFU ≈ 1.33 × MFU. The practical reading:</p>
+
+<ul>
+  <li><strong>MFU</strong> answers "how efficiently is my run turning GPU-seconds into <em>model progress</em>?" — the number you report and budget against. Tokens/dollar lives here.</li>
+  <li><strong>HFU</strong> answers "how busy are the tensor cores?" — the number that tells you whether the chip is saturated. If HFU is ~70% but MFU is ~50%, the gap is recompute, and that's a memory-vs-compute trade you chose (lesson 10), not a bug to chase.</li>
+</ul>
+
+<div class="callout">
+  <div class="label">Why this trips people</div>
+  A team turns on full activation checkpointing to fit a longer sequence, MFU drops from 45% to 38%, and someone files a "regression." It isn't one. HFU went <em>up</em> (more tensor-core work), MFU went down (more of that work is recompute, not new model progress), and the run fits where it didn't before. The right lever — selective recompute (lesson 10) — recomputes only the cheap-to-store, expensive-to-recompute tensors and recovers most of the MFU.
+</div>
+
+<h2>The roofline — the per-kernel lens</h2>
+
+<p>MFU scores the whole run. To understand <em>why</em> a kernel is slow you drop to the roofline from lesson 01. Every kernel is bound by one of two ceilings: how fast you stream bytes from HBM, or how fast the tensor cores chew FLOPs already in SRAM. The crossover is the <strong>ridge point</strong> — the arithmetic intensity (FLOPs per byte) at which the two ceilings meet:</p>
+
+<div class="math block">
+  ridge_point &nbsp;=&nbsp; peak_FLOPS / HBM_BW &nbsp;=&nbsp; 989 × 10¹² / 3.35 × 10¹² &nbsp;≈&nbsp; <strong>295 FLOP/byte</strong>
+</div>
+
+<p>That number — ~295 FLOP/byte for an H100 (989 TFLOP/s over 3.35 TB/s of HBM3) — is the line that decides everything. A kernel whose arithmetic intensity sits <em>above</em> 295 is compute-bound: it can in principle reach peak FLOP/s. A kernel <em>below</em> 295 is memory-bound: it will finish reading its bytes before the tensor cores are busy, and no amount of faster math helps.</p>
+
+<p>Work one kernel explicitly to make the ridge concrete. Take an MLP matmul <span class="math">[M, K] × [K, n]</span> with <span class="math">M = B·T</span> rows, <span class="math">K = d</span> contraction, <span class="math">n = 4d</span> output. The FLOPs are <span class="math">2·M·K·n</span>. The bytes moved (bf16, 2 B/elem) are roughly the two inputs plus the output: <span class="math">2·(M·K + K·n + M·n)</span>. The arithmetic intensity is the ratio, and for a square-ish problem it grows with <span class="math">M</span> — i.e. with how many tokens you push through at once. At <span class="math">M = 1</span> (single-token decode), the matmul is a matrix-vector product: it reads the entire <span class="math">K × n</span> weight (megabytes) to do <span class="math">2·K·n</span> FLOPs, intensity ≈ 1–2, far down the orange slope. At <span class="math">M = 4096</span> (a healthy training tile), the same weight is read once but reused across 4096 rows, intensity climbs into the hundreds, and the kernel crosses the ridge into compute-bound territory. <strong>This single ratio — reuse of the weight across the batch dimension — is why training prefers big tiles and why decode is doomed to be memory-bound</strong> (the entire content of lesson 14 and the motivation for continuous batching).</p>
+
+<div class="callout">
+  <div class="label">The number to keep in your head</div>
+  Ridge ≈ 295 FLOP/byte on an H100. If a kernel's arithmetic intensity is below that, faster tensor cores do <em>nothing</em> for it — you are gated on HBM, and your only levers are (a) move fewer bytes (fusion, lesson 19; quantization, lesson 17) or (b) raise reuse (bigger batch/tile). If it's above 295, you're gated on FLOPs, and the lever is better tiling so the SMs stay full. Profilers like Nsight Compute will tell you a kernel's achieved intensity directly; this number tells you which side of the ridge it lives on.
+</div>
+
+<svg viewBox="0 0 720 320" class="diagram">
+  <line x1="60" y1="280" x2="700" y2="280" stroke="var(--text-dim)" stroke-width="1"/>
+  <line x1="60" y1="40"  x2="60"  y2="280" stroke="var(--text-dim)" stroke-width="1"/>
+  <text x="380" y="306" text-anchor="middle" font-size="11" fill="var(--text-mute)" font-family="monospace">arithmetic intensity (FLOPs / byte)</text>
+  <text x="20"  y="160" text-anchor="middle" font-size="11" fill="var(--text-mute)" font-family="monospace" transform="rotate(-90 20 160)">achievable FLOPs/s</text>
+
+  <line x1="60" y1="280" x2="320" y2="70" stroke="var(--accent-2)" stroke-width="2"/>
+  <line x1="320" y1="70" x2="700" y2="70" stroke="#16a34a" stroke-width="2"/>
+
+  <circle cx="320" cy="70" r="4" fill="var(--accent)"/>
+  <text x="300" y="60" font-size="11" font-family="monospace" fill="var(--accent)">ridge ≈ 295 FLOP/byte</text>
+
+  <text x="110" y="210" font-size="11" font-family="monospace" fill="var(--accent-2)">memory-bound</text>
+  <text x="114" y="226" font-size="10" font-family="monospace" fill="var(--text-mute)">FLOP/s = HBM_BW × intensity</text>
+  <text x="470" y="60" font-size="11" font-family="monospace" fill="#16a34a">compute-bound</text>
+  <text x="470" y="46" font-size="10" font-family="monospace" fill="var(--text-mute)">FLOP/s = peak</text>
+
+  <circle cx="120" cy="252" r="5" fill="#dc2626"/>
+  <text x="128" y="248" font-size="11" font-family="monospace" fill="var(--text)">decode matmul (batch 1)</text>
+  <text x="128" y="260" font-size="10" fill="var(--text-mute)" font-family="monospace">~2 FLOP/byte</text>
+
+  <circle cx="150" cy="232" r="5" fill="var(--accent-2)"/>
+  <text x="158" y="222" font-size="11" font-family="monospace" fill="var(--text)">LayerNorm / softmax / GELU</text>
+
+  <circle cx="470" cy="70" r="5" fill="#16a34a"/>
+  <text x="478" y="86" font-size="11" font-family="monospace" fill="var(--text)">training GEMM / prefill</text>
+  <text x="478" y="98" font-size="10" fill="var(--text-mute)" font-family="monospace">~300+ FLOP/byte</text>
+</svg>
+
+<p>Two consequences you will see in every trace:</p>
+
+<ul>
+  <li><strong>Big training GEMMs sit above the ridge.</strong> A <span class="math">[B·T, d] × [d, 4d]</span> MLP matmul at training batch sizes has intensity in the hundreds — comfortably compute-bound, running near peak. This is the work MFU rewards, and it's why big batches help.</li>
+  <li><strong>Decode and elementwise ops sit far below it.</strong> A single-token decode matmul reads the whole weight matrix to do one matrix-vector product: intensity ≈ 2 FLOP/byte (lesson 14's punchline). LayerNorm reads a tensor, does a handful of FLOPs per element, writes it back — a few FLOP/byte. These run at a tiny fraction of peak <em>no matter what</em>, which is exactly why kernel fusion (lesson 19) pays: fusing LayerNorm+GELU+bias into one kernel doesn't add FLOPs, it removes round-trips to HBM, moving the kernel up its memory-bound slope.</li>
+</ul>
+
+<h2>Why MFU &lt; 100% — the subtraction list</h2>
+
+<p>MFU is a budget, and the gap from 100% (really, from the ~60–70% ceiling) is a sum of named subtractions. Each one is a lesson you already read; the trace tells you which subtraction is large <em>right now</em>:</p>
+
+<table>
+  <thead><tr><th>Subtraction</th><th>What it is</th><th>Fix &amp; lesson</th></tr></thead>
+  <tbody>
+    <tr><td>Pipeline bubble</td><td>Stages idle at fill/drain of each pipeline schedule</td><td>Interleaved/zero-bubble schedules — lesson 07</td></tr>
+    <tr><td>Exposed communication</td><td>TP AllReduce or DP/FSDP collective on the critical path, not hidden behind compute</td><td>Overlap, bigger buckets, fewer cross-node collectives — lesson 13</td></tr>
+    <tr><td>Data starvation</td><td>GPU waits because the input pipeline didn't deliver the next batch</td><td>More workers, prefetch — lesson 25</td></tr>
+    <tr><td>Launch / Python overhead</td><td>CPU can't dispatch kernels fast enough; GPU idles between tiny ops</td><td>torch.compile (21), CUDA graphs (22); root cause is the dispatcher (16)</td></tr>
+    <tr><td>Memory-bound small kernels</td><td>Elementwise / norm kernels running far below the ridge</td><td>Fusion — lesson 19</td></tr>
+    <tr><td>Suboptimal matmul tiling</td><td>GEMM shapes that don't tile cleanly onto the SMs (bad M/N/K, wave quantization)</td><td>Better shapes, autotuned kernels — lessons 19/20</td></tr>
+    <tr><td>Recompute (HFU&gt;MFU)</td><td>Activation recomputation — real FLOPs, no model progress</td><td>Selective recompute — lesson 10</td></tr>
+  </tbody>
+</table>
+
+<p>The mental model: <strong>MFU is the scoreboard that tells you how much total headroom remains. The trace tells you which row above is currently the big one.</strong> You don't optimize the list top-to-bottom; you profile, find the dominant gap, fix that, re-measure, and repeat. Optimizing a subtraction that's already small is wasted work.</p>
+
+<h2>The profiler — what a trace actually is</h2>
+
+<p>Two tools cover almost everything. <code>torch.profiler</code> emits a Chrome trace (open it in <code>chrome://tracing</code> or Perfetto) and gives you per-operator CPU and CUDA timings with autograd attribution. <strong>Nsight Systems</strong> (<code>nsys</code>) gives a lower-level system timeline — NVTX ranges, NCCL kernels, CUDA API calls, even the PCIe/NVLink traffic — and is the tool of choice when you suspect communication or driver-level stalls.</p>
+
+<p>The minimal <code>torch.profiler</code> incantation, which you should keep in muscle memory:</p>
+
+<pre><code>import torch
+from torch.profiler import profile, ProfilerActivity, schedule
+
+sched = schedule(wait=1, warmup=1, active=3, repeat=1)  # skip warmup steps
+
+with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=sched,
+        on_trace_ready=torch.profiler.tensorboard_trace_handler("./tb"),
+        record_shapes=True, with_stack=True) as prof:
+    for step, batch in enumerate(loader):
+        train_step(batch)
+        prof.step()                      # advances the schedule
+
+# prints the kernels eating the most GPU time:
+print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+</code></pre>
+
+<p>Three details in that snippet are load-bearing and routinely gotten wrong. First, the <code>schedule</code> with a <code>warmup</code> phase: the first few steps of any run pay one-time costs — CUDA context creation, the caching allocator growing its pools (lesson 18), cuDNN/cuBLAS algorithm autotuning, and (if you use it) torch.compile's first-call compilation (lesson 21). Profiling those steps gives you a trace dominated by costs you'll never pay again; always skip them. Second, <code>record_shapes</code> and <code>with_stack</code> are not free — stack capture in particular adds real overhead and can distort the very timings you're measuring, so turn them on only when you specifically need to attribute a kernel back to a Python line. Third, <strong>CUDA is asynchronous</strong>: the CPU launches a kernel and moves on, so a naive CPU-side timer measures launch time, not execution time. The profiler's CUDA activity lane records the real on-device duration; if you ever hand-roll timing, you must <code>torch.cuda.synchronize()</code> or use CUDA events, or your numbers are fiction.</p>
+
+<p>The <code>key_averages().table()</code> print is the fast first read before you even open the visual trace. Sorted by <code>cuda_time_total</code>, the top rows tell you where the GPU spends its seconds: if the top entries are <code>ampere_sgemm</code>/<code>cutlass</code> GEMM kernels, your time is going to matmuls (healthy — you're compute-bound on the right thing). If the top entries are <code>elementwise</code>, <code>vectorized_</code>, <code>reduce</code>, or a long tail of tiny named ops, you're memory-bound and fusion is the lever. If a <code>nccl</code> kernel (e.g. <code>ncclAllReduce</code>) is near the top <em>and</em> the run isn't overlapping it, communication is exposed. The table answers "what" in five seconds; the visual trace answers "why is the GPU idle," which the table cannot show because idle time has no kernel to attribute.</p>
+
+<p>Whatever the tool, a trace is the same picture: time on the x-axis, and a set of horizontal <em>lanes</em> stacked vertically. The four lanes that matter:</p>
+
+<ul>
+  <li><strong>CPU / Python lane</strong> — the training loop, autograd, and the op-dispatch + kernel-launch calls (lesson 16's dispatcher lives here). When this lane is the only busy one, the CPU is the bottleneck.</li>
+  <li><strong>GPU compute stream</strong> — the actual kernels (GEMMs, attention, elementwise). The blocks here are what you <em>want</em> packed wall-to-wall.</li>
+  <li><strong>NCCL / comm stream</strong> — collective kernels (AllReduce, AllGather, ReduceScatter, AllToAll), usually on their own CUDA stream so they <em>can</em> overlap with compute.</li>
+  <li><strong>The gaps</strong> — the white space on the GPU compute stream. Every gap is the bottleneck for the duration of that gap, and its <em>signature</em> — what's busy on the other lanes while compute is idle — is the diagnosis.</li>
+</ul>
+
+<h2>The MFU calculator</h2>
+
+<p>This is the scoreboard. Set your run's parameters and read the MFU live. The lower stacked bar lets you <em>attribute</em> the gap from peak to named causes (bubble, exposed comm, data stall) — drag them until the bar's leftover "unexplained" slice shrinks to zero, which is the same accounting you do when you read a trace. The KPIs report achieved TFLOP/s per GPU, MFU %, and how much headroom remains to the 50% "very good" mark.</p>
+
+<div class="widget" id="mfu-widget">
+  <div class="title">MFU calculator · score the run, attribute the gap</div>
+  <div class="hint">MFU = 6·N·tokens_per_step / (step_time · peak · num_gpus). tokens_per_step = micro-batch × seq × data-parallel. The attribution sliders carve the measured gap (peak − MFU) into named causes; "unexplained" is whatever you haven't accounted for yet.</div>
+
+  <div class="controls">
+    <label class="inline">params N (B): <input type="range" id="mc-N" min="1" max="405" step="1" value="70"> <span class="val" id="mc-N-v">70</span></label>
+    <label class="inline">micro-batch: <input type="range" id="mc-mb" min="1" max="64" step="1" value="2"> <span class="val" id="mc-mb-v">2</span></label>
+    <label class="inline">seq len: <input type="range" id="mc-seq" min="512" max="32768" step="512" value="4096"> <span class="val" id="mc-seq-v">4096</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline">data-parallel: <input type="range" id="mc-dp" min="1" max="512" step="1" value="512"> <span class="val" id="mc-dp-v">512</span></label>
+    <label class="inline">step time (s): <input type="range" id="mc-st" min="0.2" max="20" step="0.1" value="8"> <span class="val" id="mc-st-v">8.0</span></label>
+    <label class="inline">#GPUs: <input type="range" id="mc-g" min="1" max="1024" step="1" value="512"> <span class="val" id="mc-g-v">512</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline">GPU:
+      <select id="mc-gpu" style="background:var(--code-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px;font-family:var(--mono);font-size:12px;">
+        <option value="989" selected>H100 (989 TFLOP/s bf16)</option>
+        <option value="312">A100 (312 TFLOP/s bf16)</option>
+        <option value="2250">B200 (2250 TFLOP/s bf16)</option>
+      </select>
+    </label>
+    <label class="inline">bubble %: <input type="range" id="mc-b" min="0" max="60" step="1" value="0"> <span class="val" id="mc-b-v">0</span></label>
+    <label class="inline">exposed comm %: <input type="range" id="mc-c" min="0" max="60" step="1" value="0"> <span class="val" id="mc-c-v">0</span></label>
+    <label class="inline">data stall %: <input type="range" id="mc-d" min="0" max="60" step="1" value="0"> <span class="val" id="mc-d-v">0</span></label>
+  </div>
+
+  <canvas id="mfu-canvas" width="760" height="240" style="width:100%; height:240px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">tokens / step</div><div class="v" id="mc-tok" style="font-size:15px;">—</div></div>
+    <div class="kpi"><div class="k">achieved TFLOP/s/GPU</div><div class="v" id="mc-ach" style="font-size:15px;">—</div></div>
+    <div class="kpi"><div class="k">MFU</div><div class="v" id="mc-mfu">—</div></div>
+    <div class="kpi"><div class="k">headroom to 50%</div><div class="v" id="mc-head" style="font-size:15px;">—</div></div>
+  </div>
+</div>
+
+<p>Play with it: bump the micro-batch from 1 and watch MFU climb (you're walking up the roofline slope). Push the step time up by 2× and watch it halve — that's what an unhidden AllReduce or a starving dataloader does to the same useful work. The headroom KPI is the prize: it's the number a quarter of optimization work is chasing.</p>
+
+<h2>Reading a trace — the diagnostic decision tree</h2>
+
+<p>This is the heart of the lesson. You have the scoreboard (MFU is low); now you open the trace and ask one question repeatedly: <em>while the GPU compute stream is idle, what is busy?</em> The answer is the signature, and each signature has exactly one first response:</p>
+
+<table>
+  <thead><tr><th>Trace signature</th><th>Diagnosis</th><th>Go fix it in…</th></tr></thead>
+  <tbody>
+    <tr><td>GPU compute idle <em>while the CPU lane is busy launching</em> kernels (lots of tiny kernels, fat gaps between them)</td><td>Launch / CPU-bound — framework overhead exceeds kernel time</td><td>CUDA graphs (22), torch.compile (21); cause is the dispatcher (16)</td></tr>
+    <tr><td>GPU compute idle <em>while a NCCL kernel runs on the comm stream</em></td><td>Exposed communication — the collective is on the critical path</td><td>Overlap, bigger buckets, fewer cross-node collectives (13)</td></tr>
+    <tr><td>GPU idle <em>and the CPU is blocked</em> (waiting on a <code>next(loader)</code> / H2D copy), comm idle too</td><td>Data starvation — the input pipeline is too slow</td><td>More workers, prefetch, faster decode (25)</td></tr>
+    <tr><td>GPU compute lane <em>fully packed</em>, no gaps — but MFU still low</td><td>Memory-bound or tiny matmuls — kernels run below the ridge</td><td>Fusion (19), larger batch, better tiling</td></tr>
+    <tr><td><em>Regular, periodic</em> gaps with the same shape each iteration's edges</td><td>Pipeline bubble — fill/drain of the schedule</td><td>Interleaved / zero-bubble schedule (07)</td></tr>
+  </tbody>
+</table>
+
+<p>Walk the five rows, because the distinctions are exactly what's hard the first time you stare at a real trace:</p>
+
+<ul>
+  <li><strong>Launch-bound.</strong> The tell is the <em>ratio of lane activity</em>: the CPU lane is a dense wall of small dispatch calls while the GPU compute lane is mostly red gaps punctuated by tiny kernels. The CPU literally cannot issue launches fast enough to keep the GPU fed — each kernel runs for, say, 8 μs but takes 12 μs of Python+dispatch to launch (lesson 16's overhead). This is the dominant failure mode of <em>decode</em> (tiny per-token kernels) and of any model with thousands of small ops. The fix is to stop launching per-op: capture the whole step as a CUDA graph and replay it (lesson 22), or let torch.compile fuse and cut the launch count (lesson 21).</li>
+  <li><strong>Comm-bound.</strong> The tell is <em>vertical alignment</em>: a fat orange NCCL kernel on the comm lane with a red gap on the compute lane directly above it, for the same time window. The collective is on the critical path — compute is waiting for it. The usual culprits are the TP AllReduce that sits in the forward critical path (hard to hide — lesson 13 explains why), an FSDP AllGather that wasn't prefetched early enough, or a gradient AllReduce that's too small to overlap. Levers: prefetch earlier, grow the bucket so the collective is bandwidth-bound rather than latency-bound, and keep collectives intra-node where NVLink is ~18× faster than IB (lesson 03).</li>
+  <li><strong>Data-starved.</strong> The tell is the <em>absence</em> of activity: compute idle, comm idle, and the CPU lane showing one long blocking call instead of its usual dispatch ticks. Nothing on the GPU is waiting on the GPU — it's waiting on the host to produce the next batch. Often the H2D copy isn't pinned, or there are too few dataloader workers, or the dataset decode (image resize, tokenization) is CPU-bound. Lesson 25 is the whole toolbox; the first move is almost always "add workers and prefetch."</li>
+  <li><strong>Memory-bound but packed.</strong> A <em>fully packed</em> compute lane feels like success — the GPU is never idle! — but if those packed kernels are memory-bound elementwise ops or skinny matmuls, you're busy doing low-FLOP work and MFU stays low. The trace alone won't catch this (no gaps to see); you catch it by cross-referencing with MFU and with the op table, where the top entries are elementwise/reduce kernels rather than GEMMs. That's the case the roofline diagnoses and fusion fixes: the lane is full, just full of the wrong thing.</li>
+  <li><strong>Pipeline bubble.</strong> The giveaway the others lack is <strong>periodicity</strong>: the gaps repeat with the cadence of the pipeline fill/drain, identical every iteration — unlike a one-off allocator hiccup (lesson 18) or a stochastic data stall. Once you see the same-shaped gap at every iteration boundary, you know it's structural, and the fix is a better schedule — interleaved 1F1B or zero-bubble (lesson 07) — not anything you can tune away with workers or buckets.</li>
+</ul>
+
+<h2>The trace reader</h2>
+
+<p>This is the payoff. Pick a scenario; the canvas draws a synthetic three-lane trace (CPU/launch, GPU-compute, GPU-comm) with that scenario's characteristic block-and-gap signature. It computes an illustrative utilization and prints the diagnosis plus the lesson number to go fix it. Compare "healthy" against the four failure modes — the goal is to make the signatures recognizable on sight, so that when you open a real Perfetto trace your eye already knows what it's looking for.</p>
+
+<div class="widget" id="trace-widget">
+  <div class="title">Trace reader · pick a scenario, read the signature</div>
+  <div class="hint">Three lanes: CPU launch (top), GPU compute (middle), GPU comm (bottom). Blue = compute kernel, orange = comm/NCCL, gray = CPU dispatch, red hatching = GPU idle. The diagnosis below names the cause and the lesson that fixes it.</div>
+
+  <div class="controls">
+    <button id="tr-healthy" class="primary">healthy</button>
+    <button id="tr-launch">launch-bound</button>
+    <button id="tr-comm">comm-bound</button>
+    <button id="tr-data">data-starved</button>
+    <button id="tr-bubble">bubble</button>
+  </div>
+
+  <canvas id="trace-canvas" width="760" height="240" style="width:100%; height:240px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">scenario</div><div class="v" id="tr-name" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">GPU compute busy</div><div class="v" id="tr-util">—</div></div>
+    <div class="kpi"><div class="k">illustrative MFU</div><div class="v" id="tr-mfu">—</div></div>
+    <div class="kpi"><div class="k">go fix in</div><div class="v" id="tr-fix" style="font-size:14px;">—</div></div>
+  </div>
+  <div class="callout" id="tr-diag" style="margin-top:12px;">
+    <div class="label">diagnosis</div>
+    <span id="tr-diag-text">—</span>
+  </div>
+</div>
+
+<p>Notice how different the five pictures are. Healthy: compute packed, comm tucked underneath it, CPU launching ahead. Launch-bound: tiny compute blocks marooned in a sea of red idle while the CPU lane churns. Comm-bound: a fat orange NCCL block on the comm lane with the compute lane idle right above it. Data-starved: everything idle, including comm, while the CPU blocks on the loader. Bubble: the regular, periodic gaps. Once these shapes are in your head, diagnosing a real trace is pattern-matching.</p>
+
+<h2>Five ways to compute MFU wrong</h2>
+
+<p>Because MFU is the number you report, budget against, and compare to other teams, it is worth knowing how it gets miscalculated — every one of these produces a number that looks plausible and is wrong:</p>
+
+<ul>
+  <li><strong>Using the sparse peak.</strong> The H100 datasheet headlines ~1979 TFLOP/s — that is the 2:4 <em>structured-sparse</em> figure. Dense bf16 is 989. Using the sparse number halves your apparent MFU and makes a healthy 44% run look like a broken 22%. Always use the dense peak for the precision you're actually training in.</li>
+  <li><strong>Forgetting that the precision changes the peak.</strong> fp8 on an H100 doubles the dense peak again (~1979 dense fp8). If you train in fp8 (lesson 17) you must put the fp8 peak in the denominator, or your MFU is inflated 2×.</li>
+  <li><strong>Counting recompute as useful (MFU vs HFU).</strong> If you compute the numerator with the recompute FLOPs included, you've computed HFU and labeled it MFU. The two differ by ~1.33× under full checkpointing, which is a huge gap to misattribute.</li>
+  <li><strong>Timing only one step, including a stall.</strong> Step times are noisy — a checkpoint write, an allocator defrag, or a slow batch can double a single step. Measure the median over many steady-state steps, after warmup, not a single sample.</li>
+  <li><strong>Getting tokens-per-step wrong with gradient accumulation.</strong> With accumulation (lesson 11), the optimizer step covers <span class="math">accum_steps × micro_batch × seq × dp</span> tokens, and the <em>step_time</em> in the denominator must be the time for the whole accumulated step, not one micro-batch. Mixing the micro-batch token count with the full-step time (or vice versa) is the most common off-by-a-factor in the whole calculation.</li>
+</ul>
+
+<h2>The workflow, in one breath</h2>
+
+<ol>
+  <li><strong>Measure MFU.</strong> One number. If it's 40%+, you're probably fine — go do something else. If it's low, continue.</li>
+  <li><strong>Open a trace</strong> (torch.profiler for op-level, nsys for system-level). Find the largest gap on the GPU compute stream.</li>
+  <li><strong>Read the signature</strong> — what's busy while compute is idle — and match it to the decision tree. That names the cause and the lesson.</li>
+  <li><strong>Apply that lesson's fix.</strong> Just the one for the dominant gap.</li>
+  <li><strong>Re-measure MFU.</strong> Did it move? If the dominant gap shifted to a new signature, repeat from step 2.</li>
+</ol>
+
+<p>The discipline that matters: <strong>never optimize before profiling.</strong> Half of "obvious" optimizations target a subtraction that was already small, and you can't know which subtraction is large without the trace. The series gave you the hammers; this lesson is the X-ray that tells you which nail to hit.</p>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  MFU is the single scalar that scores a whole run: useful 6ND FLOPs over the FLOP-budget the cluster had. 35–45% is healthy, &gt;50% is excellent, 100% is impossible. HFU additionally counts recompute, so HFU &gt; MFU whenever you checkpoint activations. When MFU is low, the profiler trace tells you which named gap is eating it — and every signature points at a specific earlier lesson's fix: launch-bound → CUDA graphs/compile (21/22), exposed comm → overlap (13), data starvation → the pipeline (25), memory-bound kernels → fusion (19), periodic gaps → the pipeline bubble (07). The next lesson (24, numerical stability) is about a different kind of failure entirely — not a slow run, but a <em>divergent</em> one: the loss spikes and the whole training melts down, and no amount of MFU saves you.
+</div>
+
+<footer class="lesson-nav">
+  <a href="22_cuda_graphs_tensorrt.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">22 · CUDA Graphs &amp; TensorRT</span>
+  </a>
+  <a class="next" href="24_numerical_stability.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">24 · Numerical stability</span>
+  </a>
+</footer>
+</main>
+
+<script>
+/* ─── Widget: MFU calculator ───
+ * MFU = 6*N*tokens_per_step / (step_time * peak_FLOPS * num_gpus)
+ * tokens_per_step = micro_batch * seq * data_parallel
+ * Lower stacked bar attributes the gap (peak..MFU) to named causes.
+ */
+(function(){
+  const C  = document.getElementById('mfu-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    N:$('mc-N'), Nv:$('mc-N-v'),
+    mb:$('mc-mb'), mbv:$('mc-mb-v'),
+    seq:$('mc-seq'), seqv:$('mc-seq-v'),
+    dp:$('mc-dp'), dpv:$('mc-dp-v'),
+    st:$('mc-st'), stv:$('mc-st-v'),
+    g:$('mc-g'), gv:$('mc-g-v'),
+    gpu:$('mc-gpu'),
+    b:$('mc-b'), bv:$('mc-b-v'),
+    c:$('mc-c'), cv:$('mc-c-v'),
+    d:$('mc-d'), dv:$('mc-d-v'),
+    tok:$('mc-tok'), ach:$('mc-ach'), mfu:$('mc-mfu'), head:$('mc-head'),
+  };
+
+  function fmtE(x){
+    if (x < 1e3)  return x.toFixed(0);
+    if (x < 1e6)  return (x/1e3).toFixed(1)+'K';
+    if (x < 1e9)  return (x/1e6).toFixed(1)+'M';
+    if (x < 1e12) return (x/1e9).toFixed(1)+'G';
+    if (x < 1e15) return (x/1e12).toFixed(2)+'T';
+    if (x < 1e18) return (x/1e15).toFixed(2)+'P';
+    return (x/1e18).toFixed(2)+'E';
+  }
+
+  function compute(){
+    const N   = parseInt(els.N.value) * 1e9;
+    const mb  = parseInt(els.mb.value);
+    const seq = parseInt(els.seq.value);
+    const dp  = parseInt(els.dp.value);
+    const st  = parseFloat(els.st.value);
+    const g   = parseInt(els.g.value);
+    const peak = parseInt(els.gpu.value) * 1e12;   // FLOP/s per GPU
+
+    els.Nv.textContent  = parseInt(els.N.value) + 'B';
+    els.mbv.textContent = mb;
+    els.seqv.textContent = seq;
+    els.dpv.textContent = dp;
+    els.stv.textContent = st.toFixed(1);
+    els.gv.textContent  = g;
+    els.bv.textContent  = els.b.value;
+    els.cv.textContent  = els.c.value;
+    els.dv.textContent  = els.d.value;
+
+    const tokens = mb * seq * dp;
+    const usefulFLOPs = 6 * N * tokens;
+    const budget = st * peak * g;            // total FLOP budget across cluster
+    const mfu = usefulFLOPs / budget;        // fraction (can exceed 1 if inputs silly)
+    const achievedPerGPU = usefulFLOPs / (st * g); // FLOP/s/GPU achieved (useful)
+
+    return { tokens, usefulFLOPs, budget, mfu, achievedPerGPU, peak };
+  }
+
+  function render(){
+    const r = compute();
+    const mfuPct = r.mfu * 100;
+
+    els.tok.textContent = fmtE(r.tokens);
+    els.ach.textContent = (r.achievedPerGPU/1e12).toFixed(0) + ' TF/s';
+    els.mfu.textContent = mfuPct.toFixed(1) + '%';
+    els.mfu.style.color = mfuPct >= 50 ? '#16a34a' : mfuPct >= 35 ? '#d97706' : '#dc2626';
+    const head = 50 - mfuPct;
+    els.head.textContent = head <= 0 ? 'at/above 50%' : '+' + head.toFixed(1) + ' pts';
+    els.head.style.color = head <= 0 ? '#16a34a' : '#1f2430';
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 130, padR = 24, padT = 22, padB = 26;
+    const innerW = W - padL - padR;
+
+    // ── Top bar: MFU as a fraction of the full peak budget (capped display at 100%) ──
+    const barY = padT, barH = 46;
+    const mfuFrac = Math.min(1, Math.max(0, r.mfu));
+    // full budget frame
+    ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+    ctx.strokeRect(padL, barY, innerW, barH);
+    // achieved (useful) portion
+    ctx.fillStyle = mfuPct >= 50 ? '#16a34a' : '#2563eb';
+    ctx.fillRect(padL, barY, mfuFrac*innerW, barH);
+    // 50% target marker
+    const x50 = padL + 0.5*innerW;
+    ctx.strokeStyle = '#16a34a'; ctx.setLineDash([4,3]); ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(x50, barY-4); ctx.lineTo(x50, barY+barH+4); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#16a34a'; ctx.font = '10px monospace';
+    ctx.fillText('50% (very good)', x50+4, barY-6);
+    // labels
+    ctx.fillStyle = '#1f2430'; ctx.font = '12px monospace'; ctx.textAlign='right';
+    ctx.fillText('useful (MFU)', padL-8, barY+barH/2+4);
+    ctx.textAlign='left';
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 14px monospace';
+    if (mfuFrac > 0.12) ctx.fillText(mfuPct.toFixed(0)+'%', padL+6, barY+barH/2+5);
+    ctx.fillStyle = '#94a3b8'; ctx.font='10px monospace';
+    ctx.fillText('full cluster FLOP budget = step_time × peak × #GPUs', padL+innerW*0.50, barY+barH+0);
+
+    // ── Bottom stacked bar: attribute the gap (1 - mfu) to named causes ──
+    const bar2Y = barY + barH + 46, bar2H = 46;
+    const gap = Math.max(0, 1 - mfuFrac);     // fraction of budget lost
+    const bPct = parseInt(els.b.value)/100;
+    const cPct = parseInt(els.c.value)/100;
+    const dPct = parseInt(els.d.value)/100;
+    // attributed fractions are slider% OF THE GAP
+    let attrib = [
+      { name:'pipeline bubble (07)', frac: gap*bPct, c:'#7c3aed' },
+      { name:'exposed comm (13)',    frac: gap*cPct, c:'#d97706' },
+      { name:'data stall (25)',      frac: gap*dPct, c:'#dc2626' },
+    ];
+    const used = attrib.reduce((s,a)=>s+a.frac,0);
+    const unexplained = Math.max(0, gap - used);
+    attrib.push({ name:'unexplained gap', frac: unexplained, c:'#94a3b8' });
+
+    ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+    ctx.strokeRect(padL, bar2Y, innerW, bar2H);
+    // the recovered (MFU) part shown faint on the left for context
+    ctx.fillStyle = '#eef1f5';
+    ctx.fillRect(padL, bar2Y, mfuFrac*innerW, bar2H);
+    ctx.fillStyle = '#94a3b8'; ctx.font='10px monospace'; ctx.textAlign='center';
+    if (mfuFrac>0.1) ctx.fillText('achieved', padL+mfuFrac*innerW/2, bar2Y+bar2H/2+3);
+    ctx.textAlign='left';
+    // stack the gap causes starting at mfuFrac
+    let cum = mfuFrac;
+    attrib.forEach(a => {
+      const x0 = padL + cum*innerW;
+      const w = a.frac*innerW;
+      ctx.fillStyle = a.c;
+      ctx.fillRect(x0, bar2Y, Math.max(0,w), bar2H);
+      cum += a.frac;
+    });
+    ctx.fillStyle = '#1f2430'; ctx.font = '12px monospace'; ctx.textAlign='right';
+    ctx.fillText('gap attribution', padL-8, bar2Y+bar2H/2+4);
+    ctx.textAlign='left';
+
+    // legend under bottom bar
+    let lx = padL, ly = bar2Y + bar2H + 16;
+    ctx.font = '10px monospace';
+    attrib.forEach(a => {
+      ctx.fillStyle = a.c; ctx.fillRect(lx, ly-8, 9, 9);
+      ctx.fillStyle = '#5b6573';
+      const lbl = a.name + ' ' + (a.frac*100).toFixed(0) + '%';
+      ctx.fillText(lbl, lx+13, ly);
+      lx += ctx.measureText(lbl).width + 34;
+      if (lx > W - 140){ lx = padL; ly += 15; }
+    });
+  }
+
+  ['input','change'].forEach(ev=>{
+    [els.N,els.mb,els.seq,els.dp,els.st,els.g,els.gpu,els.b,els.c,els.d]
+      .forEach(el=>el.addEventListener(ev, render));
+  });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: trace reader ───
+ * Synthetic 3-lane trace (CPU launch / GPU compute / GPU comm).
+ * Five scenarios, each with a distinct block/gap signature, a util number,
+ * an illustrative MFU, a diagnosis string, and the lesson to fix it.
+ */
+(function(){
+  const C  = document.getElementById('trace-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+
+  const COL = { compute:'#2563eb', comm:'#d97706', cpu:'#94a3b8', idle:'#dc2626',
+                ok:'#16a34a', text:'#1f2430', mute:'#5b6573' };
+
+  // Each scenario returns three arrays of segments [{t0,t1,kind}] over a 0..1 timeline.
+  // kind: 'compute' | 'comm' | 'cpu' | 'idle' (idle drawn as red hatch on the GPU lane)
+  const SCEN = {
+    healthy: {
+      name:'healthy', util:0.93, mfu:44, fix:'nothing — ship it',
+      diag:'GPU compute lane is packed wall-to-wall; the NCCL collective on the comm lane runs underneath compute (overlapped); the CPU launches kernels ahead of time. This is what 40–45% MFU looks like. Nothing to fix here.',
+      build(){
+        const comp=[], comm=[], cpu=[];
+        let t=0.02;
+        while(t<0.98){ const w=0.10+(Math.sin(t*97.13)*0.5+0.5)*0.05; comp.push({t0:t,t1:Math.min(0.98,t+w),kind:'compute'}); t+=w+0.004; }
+        // comm overlaps compute, on its own lane
+        comm.push({t0:0.20,t1:0.42,kind:'comm'});
+        comm.push({t0:0.62,t1:0.84,kind:'comm'});
+        // cpu launches ahead, busy small ticks
+        for(let x=0.01;x<0.95;x+=0.06) cpu.push({t0:x,t1:x+0.02,kind:'cpu'});
+        return {comp,comm,cpu};
+      }
+    },
+    launch: {
+      name:'launch-bound', util:0.34, mfu:13, fix:'lesson 22 (CUDA graphs) / 21',
+      diag:'GPU compute sits idle (red) between many tiny kernels while the CPU lane is continuously busy launching them — kernel launch + dispatch overhead exceeds the kernel runtime. Classic small-op / decode pattern. Capture the graph (CUDA graphs, lesson 22) or compile it (lesson 21); the root cause is the dispatcher, lesson 16.',
+      build(){
+        const comp=[], comm=[], cpu=[];
+        // many tiny compute blocks with big idle gaps
+        for(let x=0.03;x<0.96;x+=0.085){ comp.push({t0:x,t1:x+0.022,kind:'compute'}); comp.push({t0:x+0.022,t1:x+0.085,kind:'idle'}); }
+        // CPU lane is saturated launching
+        for(let x=0.01;x<0.97;x+=0.028) cpu.push({t0:x,t1:x+0.02,kind:'cpu'});
+        return {comp,comm,cpu};
+      }
+    },
+    comm: {
+      name:'comm-bound', util:0.55, mfu:24, fix:'lesson 13 (overlap)',
+      diag:'A fat NCCL kernel runs on the comm lane and the GPU compute lane is idle directly above it — the collective is on the critical path, not hidden behind compute. This is an exposed AllReduce/AllGather. Overlap it behind backward, grow the buckets, or cut cross-node collectives — lesson 13.',
+      build(){
+        const comp=[], comm=[], cpu=[];
+        comp.push({t0:0.02,t1:0.30,kind:'compute'});
+        comp.push({t0:0.30,t1:0.62,kind:'idle'});       // idle while comm runs
+        comp.push({t0:0.62,t1:0.90,kind:'compute'});
+        comp.push({t0:0.90,t1:0.98,kind:'idle'});
+        comm.push({t0:0.31,t1:0.61,kind:'comm'});        // exposed, not under compute
+        comm.push({t0:0.90,t1:0.985,kind:'comm'});
+        for(let x=0.01;x<0.30;x+=0.05) cpu.push({t0:x,t1:x+0.02,kind:'cpu'});
+        for(let x=0.62;x<0.90;x+=0.05) cpu.push({t0:x,t1:x+0.02,kind:'cpu'});
+        return {comp,comm,cpu};
+      }
+    },
+    data: {
+      name:'data-starved', util:0.56, mfu:20, fix:'lesson 25 (data pipeline)',
+      diag:'GPU compute is idle AND the comm lane is idle — nothing is running — while the CPU lane shows one long blocking call (waiting on next(loader) / the H2D copy). The input pipeline did not deliver the next batch in time. Add dataloader workers, prefetch, or speed up decode — lesson 25.',
+      build(){
+        const comp=[], comm=[], cpu=[];
+        comp.push({t0:0.02,t1:0.40,kind:'compute'});
+        comp.push({t0:0.40,t1:0.80,kind:'idle'});       // long stall, nothing else busy
+        comp.push({t0:0.80,t1:0.98,kind:'compute'});
+        // CPU: one long blocking wait during the stall
+        for(let x=0.01;x<0.38;x+=0.05) cpu.push({t0:x,t1:x+0.02,kind:'cpu'});
+        cpu.push({t0:0.40,t1:0.79,kind:'cpu'});          // blocked on loader
+        for(let x=0.80;x<0.96;x+=0.05) cpu.push({t0:x,t1:x+0.02,kind:'cpu'});
+        return {comp,comm,cpu};
+      }
+    },
+    bubble: {
+      name:'pipeline bubble', util:0.68, mfu:30, fix:'lesson 07 (schedule)',
+      diag:'Regular, PERIODIC idle gaps with the same shape at each iteration boundary — the pipeline fill/drain bubble. The giveaway is the periodicity: identical gaps repeating with the pipeline cadence, not random hiccups. Use an interleaved or zero-bubble schedule — lesson 07.',
+      build(){
+        const comp=[], comm=[], cpu=[];
+        // 3 "iterations", each: compute - small periodic bubble
+        const iters=3, span=0.95/iters;
+        for(let k=0;k<iters;k++){
+          const base=0.025+k*span;
+          comp.push({t0:base, t1:base+span*0.66, kind:'compute'});
+          comp.push({t0:base+span*0.66, t1:base+span*0.95, kind:'idle'}); // the bubble
+        }
+        for(let x=0.01;x<0.96;x+=0.05) cpu.push({t0:x,t1:x+0.02,kind:'cpu'});
+        // p2p sends on comm lane at stage boundaries
+        for(let k=0;k<iters;k++){ const base=0.025+k*span; comm.push({t0:base+span*0.6,t1:base+span*0.7,kind:'comm'}); }
+        return {comp,comm,cpu};
+      }
+    },
+  };
+
+  let current = 'healthy';
+  const btns = {
+    healthy:$('tr-healthy'), launch:$('tr-launch'), comm:$('tr-comm'),
+    data:$('tr-data'), bubble:$('tr-bubble'),
+  };
+  Object.entries(btns).forEach(([k,b])=>{
+    b.addEventListener('click', ()=>{
+      current = k;
+      Object.values(btns).forEach(x=>x.classList.remove('primary'));
+      b.classList.add('primary');
+      render();
+    });
+  });
+
+  function laneRect(i, W, H){
+    const padL=86, padR=20, padT=30, padB=24;
+    const innerW = W - padL - padR;
+    const laneGap = 10;
+    const laneH = (H - padT - padB - 2*laneGap) / 3;
+    return { x0:padL, y0:padT + i*(laneH+laneGap), w:innerW, h:laneH };
+  }
+
+  function drawSeg(lane, s){
+    const x = lane.x0 + s.t0*lane.w;
+    const w = Math.max(1, (s.t1 - s.t0)*lane.w);
+    const y = lane.y0, h = lane.h;
+    if (s.kind === 'idle'){
+      // red hatched idle block
+      ctx.fillStyle = 'rgba(220,38,38,0.10)';
+      ctx.fillRect(x, y, w, h);
+      ctx.strokeStyle = COL.idle; ctx.lineWidth = 1; ctx.globalAlpha = 0.7;
+      for(let xx = x - h; xx < x + w; xx += 7){
+        ctx.beginPath(); ctx.moveTo(xx, y+h); ctx.lineTo(xx + h, y); ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = COL.idle; ctx.strokeRect(x, y, w, h);
+      return;
+    }
+    const c = s.kind==='compute'?COL.compute : s.kind==='comm'?COL.comm : COL.cpu;
+    ctx.fillStyle = c;
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1;
+    ctx.strokeRect(x, y, w, h);
+  }
+
+  function render(){
+    Object.entries(btns).forEach(([k,b])=>{ if(k===current) b.classList.add('primary'); else b.classList.remove('primary'); });
+
+    const s = SCEN[current];
+    const data = s.build();
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const lanes = [ laneRect(0,W,H), laneRect(1,W,H), laneRect(2,W,H) ];
+    const labels = ['CPU launch','GPU compute','GPU comm'];
+
+    // lane backgrounds + labels
+    lanes.forEach((L,i)=>{
+      ctx.fillStyle = '#f7f8fa';
+      ctx.fillRect(L.x0, L.y0, L.w, L.h);
+      ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+      ctx.strokeRect(L.x0, L.y0, L.w, L.h);
+      ctx.fillStyle = COL.mute; ctx.font = '10px monospace'; ctx.textAlign='right';
+      ctx.fillText(labels[i], L.x0-8, L.y0 + L.h/2 + 3);
+      ctx.textAlign='left';
+    });
+
+    // time axis hint
+    ctx.fillStyle = COL.mute; ctx.font='10px monospace';
+    ctx.fillText('time →', lanes[2].x0, lanes[2].y0 + lanes[2].h + 16);
+
+    // draw segments: cpu->lane0, compute->lane1, comm->lane2
+    data.cpu.forEach(seg => drawSeg(lanes[0], seg));
+    data.comp.forEach(seg => drawSeg(lanes[1], seg));
+    data.comm.forEach(seg => drawSeg(lanes[2], seg));
+
+    // KPIs + diagnosis
+    $('tr-name').textContent = s.name;
+    $('tr-util').textContent = (s.util*100).toFixed(0) + '%';
+    $('tr-util').style.color = s.util >= 0.9 ? COL.ok : s.util >= 0.6 ? COL.comm : COL.idle;
+    $('tr-mfu').textContent = s.mfu + '%';
+    $('tr-mfu').style.color = s.mfu >= 40 ? COL.ok : s.mfu >= 25 ? COL.comm : COL.idle;
+    $('tr-fix').textContent = s.fix;
+
+    const diagBox = $('tr-diag');
+    diagBox.classList.remove('ok','warn','bad');
+    if (current === 'healthy') diagBox.classList.add('ok');
+    else if (current === 'launch' || current === 'data') diagBox.classList.add('bad');
+    else diagBox.classList.add('warn');
+    $('tr-diag-text').textContent = s.diag;
+  }
+
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+</body>
+</html>

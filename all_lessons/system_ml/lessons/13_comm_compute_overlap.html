@@ -1,0 +1,594 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>13 · Communication–computation overlap</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">system_ml</a>
+    <span class="crumb">/</span>
+    <span class="crumb">13 · comm–compute overlap</span>
+    <span class="step-pill">lesson 13 / 26</span>
+  </div>
+</header>
+<main>
+
+<h1>Communication–computation overlap</h1>
+<p class="subtitle">Every collective in this series is dead time — unless it hides behind compute. This is the one principle behind DDP bucketing, FSDP prefetch, async-TP, and zero-bubble pipelines. We've used it piecemeal; here we name it, derive it, and find its limit.</p>
+
+<h2>The one equation</h2>
+
+<p>A distributed training step does two kinds of work. It runs compute kernels (matmuls, attention, the optimizer), and it runs communication (NCCL collectives moving gradients, parameters, or activations between GPUs). The naive assumption is that these are serial — you compute, then you communicate, then you compute again — so wall-clock is their sum:</p>
+
+<div class="math block">
+  T_step<sup>naive</sup> &nbsp;=&nbsp; T_compute &nbsp;+&nbsp; T_comm
+</div>
+
+<p>But compute and communication use <em>different hardware paths</em>. The SMs (streaming multiprocessors) run matmuls; the copy engines and the NVLink/IB fabric move bytes. There is no fundamental reason a GPU can't grind a matmul on its SMs <em>while</em> NCCL pushes a previous layer's gradient out over NVLink. When they run at the same time, the communication is <strong>hidden</strong> — it costs zero wall-clock. One caveat the "different paths" framing hides: NCCL collective <em>kernels</em> also occupy SMs to drive the transfer, so even off the critical path, overlap contends with compute for SM resources — which is why achieved overlap never quite reaches the theoretical maximum. The real equation is:</p>
+
+<div class="math block">
+  T_step &nbsp;=&nbsp; T_compute &nbsp;+&nbsp; max(0, &nbsp;T_comm − T_overlap)
+</div>
+
+<p>where <span class="math">T_overlap</span> is how much of the communication actually ran concurrently with compute. The quantity we care about — the thing that shows up as a stall on your profiler — is the leftover:</p>
+
+<div class="math block">
+  T_exposed &nbsp;=&nbsp; max(0, &nbsp;T_comm − T_overlap)
+</div>
+
+<p>This is <strong>exposed communication</strong>: the part of a collective that no compute was available to hide behind, so it sits on the wall-clock as pure overhead. Two limiting cases make the stakes concrete:</p>
+
+<ul>
+  <li><strong>Zero overlap</strong> (<span class="math">T_overlap = 0</span>): we're back to the naive sum. Every byte of communication is exposed. This is what a careless implementation gets.</li>
+  <li><strong>Perfect overlap</strong> (<span class="math">T_overlap = min(T_compute, T_comm)</span>): the two streams run fully in parallel and the step takes as long as the slower of the two: <span class="math">T_step = max(T_compute, T_comm)</span>. If you're compute-bound (<span class="math">T_comm ≤ T_compute</span>), communication is <em>completely free</em>.</li>
+</ul>
+
+<p>The entire engineering game of distributed training is driving <span class="math">T_exposed</span> toward zero. Recall lesson 04's number: a 7B model's gradient AllReduce moves ~28 GB per rank on the wire (≈2× the 14 GB bf16 gradient buffer, for a ring) and takes ~190 ms on a 150 GB/s flat ring, against a ~100 ms backward. Serial, that's a step time of ~290 ms — the AllReduce nearly triples it. Hidden, the step is <span class="math">max(100, 190) = 190</span> ms; and if you can shrink the comm under 100 ms (hierarchical AllReduce, lesson 02), it vanishes entirely. Same bytes on the wire. The difference is whether they overlap.</p>
+
+<div class="callout">
+  <div class="label">Volume is not wall-clock</div>
+  This is the mental shift the whole lesson is built on. We spent lessons 02–12 counting <em>bytes</em> — how much each parallelism scheme puts on the wire. Bytes set an upper bound on cost, but the cost you actually pay is <span class="math">T_exposed</span>, which can be far smaller. FSDP moves <span class="math">1.5×</span> the communication volume of DDP (lesson 05), yet a well-tuned FSDP run is barely slower per step. The extra volume hides. <strong>Count bytes to find the ceiling; count exposed time to find the bill.</strong>
+</div>
+
+<h2>The mechanism: CUDA streams</h2>
+
+<div class="callout">
+  <div class="label">CUDA streams in 60 seconds</div>
+  A <strong>stream</strong> is an ordered FIFO queue of GPU work: kernels enqueued on the same stream run one after another, in submission order. The GPU runs <em>independent</em> streams concurrently when it has the resources to. The whole overlap trick is to enqueue collectives on a <strong>separate</strong> stream from compute, so the two can run at the same time. Ordering <em>across</em> streams (e.g. "don't AllReduce a gradient until its kernel has finished") is enforced with <strong>events</strong>. Streams already showed up in <a href="04_ddp.html">lesson 04</a> with no definition — this primer back-fills it; the full per-stream-memory-pool story is <a href="18_caching_allocator.html">lesson 18</a>.
+</div>
+
+<p>Overlap is not automatic. It is a property of how kernels are scheduled on the GPU, and the unit of scheduling is the <strong>CUDA stream</strong>. A stream is an ordered queue of work for the GPU: kernels enqueued on the same stream run one after another, in order. Kernels on <em>different</em> streams have no ordering constraint between them — the GPU's scheduler is free to run them concurrently if it has spare resources.</p>
+
+<p>In PyTorch, your forward and backward kernels land on the <strong>default (current) stream</strong>. NCCL collectives, by default, run on their own separate <strong>communication stream</strong> created by the process group. So the two are already on different streams — the hardware <em>can</em> overlap them. Whether it <em>does</em> depends entirely on the dependency structure:</p>
+
+<ol>
+  <li><strong>Input-ready.</strong> A collective on the comm stream can only start once its input tensor has been produced by the compute stream. NCCL inserts a cross-stream wait (a CUDA event) so the AllReduce of layer <span class="math">k</span>'s gradient does not begin until that gradient kernel has finished. You cannot communicate a value before it exists.</li>
+  <li><strong>Consumer-later.</strong> For the overlap to be useful, the <em>result</em> of the collective must be consumed <em>later</em> than the compute it overlaps with. If the very next kernel on the compute stream needs the collective's output, the compute stream blocks on it and there is nothing to hide behind.</li>
+</ol>
+
+<p>That second condition is the whole story. The hardware bandwidth is rarely the limiter on whether overlap happens — the <em>dependency graph</em> is. If a collective sits between two compute steps that both depend on it, no amount of fast NVLink will hide it; it is on the critical path by construction. If the collective's output is needed only much later, even a slow collective hides perfectly. Restructuring computation to create that slack is the art.</p>
+
+<pre><code>compute stream:  [grad L=k] [grad L=k-1] [grad L=k-2] ...
+                     |  event signals "grad k ready"
+                     v
+comm stream:         [AllReduce grad k ............]   &lt;- runs concurrently
+                                                       with grad k-1, k-2 compute
+</code></pre>
+
+<p>The mechanics of <em>which</em> stream a kernel lands on, how events synchronize them, and how the caching allocator keeps per-stream memory from colliding are a lesson of their own — see lesson 18 (caching allocator &amp; streams). For now the model is enough: <em>compute on one stream, comm on another, overlap is gated by the dependency between them.</em></p>
+
+<h2>Case study — DDP: bucketed AllReduce (recall lesson 04)</h2>
+
+<p>DDP is the cleanest place overlap pays off, because backward hands you a natural source of slack. Backward propagates from the loss toward the input, so gradients materialize in <em>reverse</em> layer order: layer <span class="math">L</span>'s gradient first, then <span class="math">L-1</span>, …, then layer 0. The moment a layer's gradient exists, its AllReduce can fire on the comm stream while the compute stream keeps grinding earlier layers' gradients. Each AllReduce hides behind all the backward compute that comes after it.</p>
+
+<p>Two details matter. First, you don't fire one AllReduce per layer — NCCL has a per-launch latency floor (tens of microseconds), and on a 100-layer model that's milliseconds of pure latency tax before any bytes flow. So DDP <strong>buckets</strong>: consecutive layers' gradients are packed into a flat buffer, and the bucket is AllReduced as one message when it fills. This is exactly lesson 02's <span class="math">α/β</span> cost model in action:</p>
+
+<div class="math block">
+  T_bucket &nbsp;=&nbsp; α &nbsp;+&nbsp; S_bucket / BW
+</div>
+
+<p>The bucket size is a genuine tradeoff with a U-shaped cost:</p>
+
+<ul>
+  <li><strong>Too small</strong> → many buckets, each paying the <span class="math">α</span> launch latency; you live in the latency-bound regime where ring AllReduce is inefficient. Total comm time balloons.</li>
+  <li><strong>Too big</strong> → a bucket only fires after enough layers have filled it, so the first AllReduce starts late in backward and there's less compute left to hide it behind. In the limit of one giant bucket, you AllReduce only after <em>all</em> of backward — zero overlap, back to the naive sum.</li>
+</ul>
+
+<p>PyTorch's default is <code>bucket_cap_mb = 25</code> MB, a reasonable middle for typical layer sizes and NVLink/IB bandwidths. Widget 2 below makes the U-shape visible.</p>
+
+<p>Second — and this is the part people miss — <strong>there is an irreducible exposed tail</strong>. The bucket containing the <em>first</em> layers' gradients (layers near the input) is the <em>last</em> to fill, because those gradients are produced last in backward. It fires when backward is already done. There is no compute left after it. So that final bucket's AllReduce is fully exposed:</p>
+
+<div class="math block">
+  T_exposed<sup>DDP</sup> &nbsp;≈&nbsp; T_AllReduce(last bucket)
+</div>
+
+<p>You can shrink it (smaller final bucket → less to expose) but you cannot eliminate it: backward must finish before the last gradient exists, and that gradient still has to be reduced. This tail is precisely what keeps DDP scaling efficiency below 100% — 95% is excellent, and the missing 5% is mostly this tail plus the launch tax.</p>
+
+<h2>Case study — FSDP: prefetched AllGather (recall lesson 05)</h2>
+
+<p>FSDP (ZeRO-3) shards every layer's parameters across ranks, so before you can compute layer <span class="math">k</span> in the forward pass you must AllGather its full parameter shard back together. Naively that's a serial stall in front of <em>every</em> layer: gather params, compute, discard, gather next. The collective sits directly in front of the compute that needs it — the worst possible dependency.</p>
+
+<p>The fix is <strong>prefetch</strong>, and it's the mirror image of DDP. While the compute stream is busy on layer <span class="math">k</span>, the comm stream runs the AllGather for layer <span class="math">k+1</span> ahead of time. By the time compute finishes layer <span class="math">k</span>, layer <span class="math">k+1</span>'s parameters are already assembled and waiting. The gather hides behind the previous layer's matmul. Backward does the same in reverse, and adds a ReduceScatter of gradients (the FSDP analogue of DDP's AllReduce) that overlaps the same way.</p>
+
+<p>Prefetching costs memory: to gather layer <span class="math">k+1</span> while computing layer <span class="math">k</span>, you must hold <em>both</em> layers' full (unsharded) parameters at once. Prefetch two layers ahead and you hold three. PyTorch's <code>limit_all_gathers</code> caps the number of in-flight AllGathers — it is the dial trading peak memory against overlap depth. Set it too low and the gather can't get far enough ahead to hide; too high and you OOM. This is the same memory-vs-overlap tension as DDP's bucket size, wearing a different hat.</p>
+
+<div class="callout ok">
+  <div class="label">Why FSDP's 1.5× volume isn't 1.5× wall-clock</div>
+  FSDP communicates an AllGather in the forward, plus an AllGather and a ReduceScatter in the backward — roughly <span class="math">1.5×</span> the byte volume of DDP's single AllReduce (lesson 05). If volume equalled wall-clock, FSDP would be 50% slower per step. It isn't, because <em>all three collectives prefetch into the compute they overlap</em>. As long as each layer's compute is long enough to hide the next layer's gather, the extra volume is absorbed by <span class="math">T_overlap</span> and never reaches <span class="math">T_exposed</span>. FSDP buys a huge memory saving for a small, often negligible, wall-clock cost — entirely because of overlap.
+</div>
+
+<h2>Case study — TP: the AllReduce you cannot hide (recall lesson 06)</h2>
+
+<p>Tensor parallelism is the hard case, and understanding <em>why</em> is the payoff of the streams model. TP splits a single layer's matmul across ranks: each rank computes a partial output, and an AllReduce sums the partials into the complete layer output before the <em>next</em> layer can run. Look at the dependency:</p>
+
+<div class="math block">
+  Y = AllReduce( X · W_shard ) &nbsp;→&nbsp; Z = Y · W_next
+</div>
+
+<p>The next layer's matmul (<span class="math">Z</span>) depends on <span class="math">Y</span>, which depends on the AllReduce, which depends on this layer's matmul. The collective sits <strong>on the critical path</strong> — it is sandwiched between two compute steps that both need its result, and there is no <em>other</em> work on the compute stream to overlap it with. This violates the consumer-later condition by construction: the consumer is the very next kernel. TP comm is the most exposed communication in the whole series.</p>
+
+<p>That single fact explains a rule you've already met: <strong>TP stays inside one node.</strong> Since the AllReduce can't hide, its full cost is exposed on every layer, twice per layer in the forward (attention + MLP) and again in backward — a very high frequency. The only lever left is to make each exposed AllReduce as cheap as possible, which means running it over the fastest fabric you have: intra-node NVLink (~900 GB/s peak, ~150 GB/s effective ring) rather than inter-node IB (~50 GB/s per NIC). You minimize the unhideable cost because you can't hide it.</p>
+
+<p>The modern fix doesn't make the AllReduce hide behind a <em>different</em> layer — it can't — but behind <em>itself</em>. With <strong>sequence parallelism</strong>, the TP AllReduce is decomposed into its two halves (recall lesson 02's identity, <span class="math">AllReduce = AllGather ∘ ReduceScatter</span>) spread across the layer boundary. <strong>Async tensor parallelism</strong> (Megatron's async-TP) goes further: it tiles the matmul and the collective together, so as each tile of the output matrix is computed, its partial result is communicated <em>while the next tile is still being computed</em>. The collective is now overlapped with the same matmul that feeds it, by interleaving at the tile granularity. It is fiddly, requires the matmul and the communication to be co-scheduled, and only pays off when the matmul is large enough to have tiles worth overlapping — but it is how frontier TP claws back some of the exposed time. The honest summary: TP comm is exposed by default, and the fixes are partial.</p>
+
+<h2>Case study — PP: tiny sends, the bubble is the cost (recall lesson 07)</h2>
+
+<p>Pipeline parallelism is the opposite extreme. Its communication is point-to-point Send/Recv of a single activation tensor across a stage boundary — small, infrequent, and trivially overlapped with the abundant compute of a pipeline stage. The Send of microbatch <span class="math">m</span>'s activations overlaps the compute of microbatch <span class="math">m+1</span> without any special effort. PP's <em>communication</em> is essentially never the exposed cost.</p>
+
+<p>PP's exposed time is the <strong>bubble</strong>: the idle gaps at pipeline fill and drain where some stages have no microbatch to work on. And here's the connection that ties the lesson together — the famous PP schedules are <em>overlap strategies in disguise</em>. <strong>1F1B</strong> (one-forward-one-backward) interleaves forward and backward microbatches so a stage always has work, shrinking the bubble. <strong>Zero-bubble</strong> schedules go further, splitting the backward into its input-gradient and weight-gradient halves and reordering them to fill the gaps almost completely. They don't reduce communication — they eliminate <em>exposed idle</em>, which is the pipeline's version of exposed time. Same principle, different resource: instead of hiding comm behind compute, you're hiding one stage's idle behind another stage's compute.</p>
+
+<h2>Interactive · the overlap timeline</h2>
+
+<p>Two stream lanes — compute (blue) and comm (orange) — for a single step. Slide the compute time, the comm time, and the overlap fraction (how much of the comm runs concurrently with compute). The hidden portion of the comm is drawn under the compute lane; the exposed remainder spills past it in red. Watch the effective step time collapse toward <span class="math">max(T_compute, T_comm)</span> as overlap → 100%, and note that once you're compute-bound, dragging comm down does nothing — it's already free.</p>
+
+<div class="widget" id="ov-widget">
+  <div class="title">Overlap timeline · how much comm hides behind compute</div>
+  <div class="hint">Top lane: compute (one solid block). Bottom lane: comm, split into a hidden part (overlapping compute, drawn translucent under the compute block) and an exposed part (red, past the end of compute). The step ends when the last lane finishes.</div>
+
+  <div class="controls">
+    <label class="inline">compute T<sub>c</sub> (ms): <input type="range" id="ov-tc" min="10" max="300" step="5" value="100"> <span class="val" id="ov-tc-v">100</span></label>
+    <label class="inline">comm T<sub>k</sub> (ms): <input type="range" id="ov-tk" min="10" max="300" step="5" value="150"> <span class="val" id="ov-tk-v">150</span></label>
+    <label class="inline">overlap: <input type="range" id="ov-fr" min="0" max="100" step="1" value="80"> <span class="val" id="ov-fr-v">80%</span></label>
+  </div>
+
+  <canvas id="ov-canvas" width="760" height="280" style="width:100%; height:280px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">exposed comm</div><div class="v" id="ov-ex">—</div></div>
+    <div class="kpi"><div class="k">effective step time</div><div class="v" id="ov-st">—</div></div>
+    <div class="kpi"><div class="k">vs fully-serial</div><div class="v" id="ov-sp" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">regime</div><div class="v" id="ov-rg" style="font-size:13px;">—</div></div>
+  </div>
+</div>
+
+<p>The takeaway the slider teaches: speedup from overlap is bounded by <span class="math">(T_compute + T_comm) / max(T_compute, T_comm)</span>. When the two are balanced, perfect overlap nearly halves the step. When one dominates, overlap can only erase the smaller one — there's nothing more to win. This is why people tune batch size and parallelism degrees to keep compute and comm in the same ballpark: that's where overlap has the most to give.</p>
+
+<h2>Interactive · the DDP bucket U-curve</h2>
+
+<p>This animates the DDP case study and sweeps the tradeoff. Backward runs left-to-right over <span class="math">L</span> layers on the compute lane; as gradients fill each bucket, an AllReduce fires on the comm lane. Watch the <em>last</em> bucket — it fires after backward ends, and its red exposed tail is the irreducible DDP cost. The inset curve sweeps bucket size against total exposed comm: too-small buckets pay <span class="math">α</span> latency on every one; too-big buckets leave a long exposed tail. The valley is the sweet spot.</p>
+
+<div class="widget" id="bk-widget">
+  <div class="title">DDP bucket overlap · the exposed-tail U-curve</div>
+  <div class="hint">Top lane: backward compute, layer L−1 down to 0. Bottom lane: per-bucket AllReduce on the comm stream. Red = exposed comm (the tail past backward). Inset: total exposed comm vs bucket size — drag the bucket slider and watch the dot ride the curve.</div>
+
+  <div class="controls">
+    <button id="bk-play" class="primary">▶ play</button>
+    <button id="bk-reset">⟲ reset</button>
+    <label class="inline">bucket (MB): <input type="range" id="bk-mb" min="5" max="1200" step="5" value="100"> <span class="val" id="bk-mb-v">100</span></label>
+    <label class="inline">layers L: <input type="range" id="bk-L" min="8" max="80" step="2" value="32"> <span class="val" id="bk-L-v">32</span></label>
+    <label class="inline">per-bucket α (μs): <input type="range" id="bk-al" min="5" max="400" step="5" value="40"> <span class="val" id="bk-al-v">40</span></label>
+  </div>
+
+  <canvas id="bk-canvas" width="760" height="300" style="width:100%; height:300px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k"># buckets</div><div class="v" id="bk-nb">—</div></div>
+    <div class="kpi"><div class="k">exposed tail</div><div class="v" id="bk-tail">—</div></div>
+    <div class="kpi"><div class="k">total step time</div><div class="v" id="bk-tt">—</div></div>
+    <div class="kpi"><div class="k">scaling efficiency</div><div class="v" id="bk-eff">—</div></div>
+  </div>
+</div>
+
+<p>Drag the bucket slider slowly from left to right while watching the inset dot. At the far left (tiny buckets) total exposed comm is high — dozens of AllReduces, each paying <span class="math">α</span>, and the comm stream can't keep up with the gradients pouring in, so it backs up past the end of backward. At the far right (one giant bucket) it's high again — the single AllReduce only fires after backward finishes, so almost all of it is exposed. Somewhere in the middle the curve bottoms out: buckets small enough to start early and overlap, large enough to amortize <span class="math">α</span>. That valley moves with bandwidth, <span class="math">α</span>, and layer count — which is exactly why bucket size is a knob and not a constant.</p>
+
+<h2>Where the exposed time concentrates</h2>
+
+<p>Step back and the four case studies fall into a clean hierarchy of <em>how hideable</em> each scheme's communication is:</p>
+
+<table>
+  <thead><tr><th>Scheme</th><th>Collective</th><th>Hidden behind</th><th>Irreducible exposed cost</th></tr></thead>
+  <tbody>
+    <tr><td>DDP (04)</td><td>AllReduce (bucketed)</td><td>Backward compute, in reverse</td><td>Last bucket's AllReduce</td></tr>
+    <tr><td>FSDP (05)</td><td>AllGather + ReduceScatter</td><td>Adjacent layer compute (prefetch)</td><td>First gather / last scatter</td></tr>
+    <tr><td>TP (06)</td><td>AllReduce (per layer)</td><td>Nothing — on critical path</td><td>Most of it (async-TP claws back some)</td></tr>
+    <tr><td>PP (07)</td><td>P2P Send/Recv (tiny)</td><td>Next microbatch's compute</td><td>The bubble (not the comm)</td></tr>
+  </tbody>
+</table>
+
+<p>Reading down the "hidden behind" column is the design lesson: schemes whose communication has a <em>later</em> consumer (DDP, FSDP, PP) hide almost everything; the scheme whose consumer is the <em>next kernel</em> (TP) hides almost nothing. When you compose them in 3D parallelism (lesson 12), you place each scheme where its exposed cost is cheapest: TP intra-node on NVLink (smallest unhideable cost), DDP/FSDP across the wider, slower fabric (where the AllReduce hides behind backward anyway), PP across the slowest links (only tiny sends cross them).</p>
+
+<div class="callout warn">
+  <div class="label">How to spot lost overlap on a profiler</div>
+  Three failure signatures, all visible in an <code>nsys</code> trace: (1) NCCL kernels on the <em>same</em> stream as compute — they'll never overlap, usually a fix in how the collective was launched. (2) Compute-stream gaps lining up exactly with NCCL kernels — a true critical-path dependency (TP), or a prefetch that didn't fire early enough (FSDP <code>limit_all_gathers</code> too low). (3) A long NCCL kernel hanging past the end of backward with nothing above it — the DDP exposed tail, or a bucket sized too large. Each maps to one knob from the case studies above.
+</div>
+
+<h2>The connection to MFU</h2>
+
+<p>Exposed communication is not an abstraction — it is the gap between the FLOPs your GPUs <em>could</em> have done and the FLOPs they actually did. An H100 delivers ~1 PFLOP/s of bf16; while a GPU stalls on exposed comm, it does zero useful FLOPs. <strong>Model FLOPs Utilization</strong> (MFU, lesson 23) measures exactly this — achieved throughput divided by peak — and every millisecond of <span class="math">T_exposed</span> is a millisecond of stall that drags MFU down. The DDP tail, the TP critical-path AllReduce, and the PP bubble are not separate problems; they are the three places exposed time hides, and they are what your MFU number is really reporting.</p>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  A step costs <span class="math">T_compute + max(0, T_comm − T_overlap)</span>. Overlap converts communication <em>volume</em> into near-zero wall-clock by running collectives on a separate CUDA stream concurrently with compute — gated not by bandwidth but by the dependency graph. What survives is the <strong>exposed</strong> comm: the last DDP bucket (fired after backward), TP's critical-path AllReduce (no later consumer to hide behind), and the PP bubble (idle, not comm). Drive those three toward zero and you've done everything the bytes will let you do — and that residual is precisely what MFU (lesson 23) measures.
+</div>
+
+<footer class="lesson-nav">
+  <a href="12_3d_parallelism.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">12 · 3D / nD parallelism</span>
+  </a>
+  <a class="next" href="14_inference_tp_vs_replication.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">14 · Inference — TP vs replication</span>
+  </a>
+</footer>
+</main>
+
+<script>
+/* ─── Widget 1: overlap timeline ───
+ * Two lanes: compute (one block of T_c) and comm (T_k, split into hidden + exposed).
+ * Hidden comm = overlap_fraction * min(T_c, T_k). Exposed = T_k - hidden.
+ * Step time = T_c + exposed  (compute runs first, then the exposed tail of comm).
+ * Equivalently approaches max(T_c, T_k) as overlap -> 100%.
+ */
+(function(){
+  const C = document.getElementById('ov-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    tc:$('ov-tc'), tcv:$('ov-tc-v'),
+    tk:$('ov-tk'), tkv:$('ov-tk-v'),
+    fr:$('ov-fr'), frv:$('ov-fr-v'),
+    ex:$('ov-ex'), st:$('ov-st'), sp:$('ov-sp'), rg:$('ov-rg'),
+  };
+
+  function compute(){
+    const Tc = +els.tc.value;
+    const Tk = +els.tk.value;
+    const fr = +els.fr.value / 100;
+    els.tcv.textContent = Tc;
+    els.tkv.textContent = Tk;
+    els.frv.textContent = Math.round(fr*100) + '%';
+
+    const hideable = Math.min(Tc, Tk);   // most you could ever hide
+    const hidden   = fr * hideable;       // what this overlap fraction actually hides
+    const exposed  = Tk - hidden;         // leftover comm on the wall-clock
+    const stepT    = Tc + exposed;        // compute, then the exposed tail
+    const serial   = Tc + Tk;             // no overlap at all
+    const speedup  = serial / stepT;
+    const computeBound = Tk <= Tc;
+    return { Tc, Tk, fr, hidden, exposed, stepT, serial, speedup, computeBound };
+  }
+
+  function render(){
+    const s = compute();
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width = Math.round(W*dpr); C.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 110, padR = 24, padT = 28, padB = 40;
+    const innerW = W - padL - padR;
+    const tMax = Math.max(s.serial, s.stepT, 1);
+    const xPerMs = innerW / tMax;
+
+    const rowY1 = padT + 14;   // compute lane
+    const rowY2 = padT + 96;   // comm lane
+    const rowH  = 40;
+
+    // lane labels
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('compute stream', 4, rowY1 + 24);
+    ctx.fillText('comm stream', 4, rowY2 + 24);
+
+    // baseline rules
+    ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+    [rowY1 + rowH + 3, rowY2 + rowH + 3].forEach(y=>{
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + innerW, y); ctx.stroke();
+    });
+
+    // ── compute block ──
+    const cW = s.Tc * xPerMs;
+    ctx.fillStyle = '#2563eb';
+    ctx.fillRect(padL, rowY1, Math.max(1, cW), rowH);
+    ctx.fillStyle = '#ffffff'; ctx.font = 'bold 11px monospace';
+    if (cW > 70) ctx.fillText('compute ' + s.Tc + ' ms', padL + 6, rowY1 + 24);
+
+    // ── comm: hidden part sits UNDER the compute block (drawn translucent on comm lane,
+    //    aligned to start of compute), exposed part starts where compute ends ──
+    // Hidden portion: drawn from x=padL spanning `hidden` ms (it overlaps compute time)
+    const hW = s.hidden * xPerMs;
+    ctx.fillStyle = '#d97706';
+    ctx.globalAlpha = 0.45;
+    ctx.fillRect(padL, rowY2, Math.max(0, hW), rowH);
+    ctx.globalAlpha = 1;
+    if (hW > 60){
+      ctx.fillStyle = '#7c4a02'; ctx.font = '10px monospace';
+      ctx.fillText('hidden ' + s.hidden.toFixed(0) + ' ms', padL + 6, rowY2 + 24);
+    }
+
+    // Exposed portion: solid orange-into-red, starting at end of compute lane time (Tc)
+    const exX = padL + s.Tc * xPerMs;
+    const exW = s.exposed * xPerMs;
+    if (s.exposed > 0.01){
+      ctx.fillStyle = '#d97706';
+      ctx.fillRect(exX, rowY2, Math.max(1, exW), rowH);
+      // red exposed overlay band spanning both lanes
+      ctx.fillStyle = 'rgba(220,38,38,0.16)';
+      ctx.fillRect(exX, rowY1, Math.max(1, exW), rowY2 + rowH - rowY1);
+      ctx.fillStyle = '#dc2626'; ctx.font = 'bold 11px monospace';
+      ctx.fillText('exposed ' + s.exposed.toFixed(0) + ' ms', exX + 4, rowY1 - 6);
+    }
+
+    // ── step-time marker ──
+    const stepX = padL + s.stepT * xPerMs;
+    ctx.strokeStyle = '#16a34a'; ctx.lineWidth = 2; ctx.setLineDash([5,3]);
+    ctx.beginPath(); ctx.moveTo(stepX, padT - 4); ctx.lineTo(stepX, rowY2 + rowH + 8); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#16a34a'; ctx.font = 'bold 11px monospace';
+    ctx.fillText('step = ' + s.stepT.toFixed(0) + ' ms', Math.min(stepX + 6, W - 96), rowY2 + rowH + 8);
+
+    // ── faint serial marker (where it would end with zero overlap) ──
+    const serX = padL + s.serial * xPerMs;
+    ctx.strokeStyle = '#94a3b8'; ctx.lineWidth = 1; ctx.setLineDash([2,3]);
+    ctx.beginPath(); ctx.moveTo(serX, padT - 4); ctx.lineTo(serX, rowY1 - 2); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+    if (serX < W - 70) ctx.fillText('serial ' + s.serial.toFixed(0), serX - 18, padT + 4);
+
+    // axis ticks
+    ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+    ctx.strokeStyle = '#dde2ea';
+    const ticks = 5;
+    for (let i=0; i<=ticks; i++){
+      const ms = i * tMax / ticks;
+      const x = padL + ms * xPerMs;
+      ctx.fillText(ms.toFixed(0), x - 8, H - 12);
+      ctx.beginPath(); ctx.moveTo(x, H - padB + 2); ctx.lineTo(x, H - padB - 2); ctx.stroke();
+    }
+    ctx.fillText('ms', padL + innerW + 2, H - 12);
+
+    // KPIs
+    els.ex.textContent = s.exposed.toFixed(1) + ' ms';
+    els.st.textContent = s.stepT.toFixed(1) + ' ms';
+    els.sp.textContent = s.speedup.toFixed(2) + '× faster';
+    els.rg.textContent = s.computeBound ? 'compute-bound' : 'comm-bound';
+    els.rg.style.color = s.computeBound ? '#16a34a' : '#d97706';
+  }
+
+  [els.tc, els.tk, els.fr].forEach(el => el.addEventListener('input', render));
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget 2: DDP bucket overlap + exposed-tail U-curve ───
+ * Backward over L layers (per-layer bwd time TL, params/layer SL fixed). Gradients fill
+ * buckets of size `bucket_mb`; each bucket AllReduces (alpha + bytes/BW) on the comm stream.
+ * The LAST bucket fires after backward ends -> exposed tail. We animate a playhead and draw
+ * an inset curve of total-exposed-comm vs bucket size, with a dot at the current bucket size.
+ */
+(function(){
+  const C = document.getElementById('bk-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+
+  let bucket_mb = 100, L = 32, alpha_us = 40;
+  const TL = 6;       // ms per layer backward (fixed)
+  const SL = 40;      // params/layer in MB (fixed) -> bf16 grad ~ SL MB on the wire
+  const BW = 150;     // GB/s effective ring bandwidth (fixed, lesson 02/03 number)
+
+  let playhead = 0, playing = false, lastTs = 0;
+
+  $('bk-mb').addEventListener('input', e=>{ bucket_mb = +e.target.value; $('bk-mb-v').textContent = bucket_mb; render(); });
+  $('bk-L').addEventListener('input',  e=>{ L = +e.target.value; $('bk-L-v').textContent = L; render(); });
+  $('bk-al').addEventListener('input', e=>{ alpha_us = +e.target.value; $('bk-al-v').textContent = alpha_us; render(); });
+
+  $('bk-play').addEventListener('click', ()=>{
+    playing = !playing;
+    $('bk-play').textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ if (playhead >= simulate(bucket_mb).t_total) playhead = 0; lastTs = performance.now(); requestAnimationFrame(tick); }
+  });
+  $('bk-reset').addEventListener('click', ()=>{
+    playhead = 0; playing = false; $('bk-play').textContent = '▶ play'; render();
+  });
+
+  function tick(ts){
+    if (!playing) return;
+    const dt = ts - lastTs; lastTs = ts;
+    playhead += dt * 0.10;
+    const sim = simulate(bucket_mb);
+    if (playhead >= sim.t_total){ playhead = sim.t_total; playing = false; $('bk-play').textContent = '▶ play'; }
+    render();
+    if (playing) requestAnimationFrame(tick);
+  }
+
+  // Core simulation: returns layer bars, AR bars, backward end, total end, exposed comm.
+  function simulate(bk){
+    let bucket_acc = 0, bucket_ready_at = 0, comm_ready_at = 0, cur_t = 0;
+    const layers = [], ars = [];
+    for (let i = L - 1; i >= 0; i--){
+      const start = cur_t, end = cur_t + TL;
+      layers.push({ start, end, idx: i });
+      cur_t = end;
+      bucket_acc += SL;
+      bucket_ready_at = end;
+      if (bucket_acc >= bk || i === 0){
+        const ar_dur = alpha_us/1000 + bucket_acc / BW;   // alpha (ms) + bytes/BW (MB / GBps = ms)
+        const ar_start = Math.max(bucket_ready_at, comm_ready_at);
+        const ar_end = ar_start + ar_dur;
+        ars.push({ start: ar_start, end: ar_end, mb: bucket_acc });
+        comm_ready_at = ar_end;
+        bucket_acc = 0;
+      }
+    }
+    const t_bwd = cur_t;
+    const t_total = Math.max(t_bwd, comm_ready_at);
+    const exposed = Math.max(0, comm_ready_at - t_bwd);
+    return { layers, ars, t_bwd, t_total, exposed, nb: ars.length };
+  }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width = Math.round(W*dpr); C.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const sim = simulate(bucket_mb);
+
+    // ── main timeline (left ~64% of width) ──
+    const padL = 96, padT = 22;
+    const tlW = W * 0.62 - padL;
+    const xPerMs = tlW / Math.max(1, sim.t_total);
+    const rowY1 = padT + 8;
+    const rowY2 = padT + 74;
+    const rowH = 32;
+
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('compute (backward)', 4, rowY1 + 20);
+    ctx.fillText('comm (AllReduce)', 4, rowY2 + 20);
+
+    // layer bars
+    sim.layers.forEach(b=>{
+      const x = padL + b.start * xPerMs;
+      const w = Math.max(1, (b.end - b.start) * xPerMs);
+      const shown = playhead >= b.end;
+      const partial = !shown && playhead > b.start;
+      ctx.fillStyle = '#2563eb';
+      ctx.globalAlpha = shown ? 1 : partial ? 0.7 : 0.16;
+      const ww = partial ? Math.max(1, (playhead - b.start) * xPerMs) : w;
+      ctx.fillRect(x, rowY1, ww, rowH);
+      ctx.globalAlpha = 1;
+    });
+
+    // AR bars
+    sim.ars.forEach(b=>{
+      const x = padL + b.start * xPerMs;
+      const w = Math.max(1, (b.end - b.start) * xPerMs);
+      const shown = playhead >= b.end;
+      const partial = !shown && playhead > b.start;
+      const exposedBar = b.start >= sim.t_bwd - 1e-6;   // fired at/after backward end
+      ctx.fillStyle = exposedBar ? '#dc2626' : '#d97706';
+      ctx.globalAlpha = shown ? 1 : partial ? 0.7 : 0.16;
+      const ww = partial ? Math.max(1, (playhead - b.start) * xPerMs) : w;
+      ctx.fillRect(x, rowY2, ww, rowH);
+      ctx.globalAlpha = 1;
+    });
+
+    // exposed region shading (past backward end)
+    if (sim.exposed > 0){
+      const x0 = padL + sim.t_bwd * xPerMs;
+      const w = sim.exposed * xPerMs;
+      ctx.fillStyle = 'rgba(220,38,38,0.14)';
+      ctx.fillRect(x0, rowY1, w, rowY2 + rowH - rowY1);
+      ctx.fillStyle = '#dc2626'; ctx.font = '10px monospace';
+      ctx.fillText('exposed tail', x0 + 3, rowY1 - 6);
+    }
+
+    // backward-end divider
+    const bx = padL + sim.t_bwd * xPerMs;
+    ctx.strokeStyle = '#94a3b8'; ctx.lineWidth = 1; ctx.setLineDash([3,3]);
+    ctx.beginPath(); ctx.moveTo(bx, padT - 2); ctx.lineTo(bx, rowY2 + rowH + 4); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // playhead
+    const xPh = padL + Math.min(playhead, sim.t_total) * xPerMs;
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(xPh, padT - 2); ctx.lineTo(xPh, rowY2 + rowH + 4); ctx.stroke();
+
+    // timeline axis
+    ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace';
+    for (let i=0; i<=4; i++){
+      const ms = i * sim.t_total / 4;
+      const x = padL + ms * xPerMs;
+      ctx.fillText(ms.toFixed(0), x - 8, rowY2 + rowH + 22);
+    }
+    ctx.fillText('ms', padL + tlW + 2, rowY2 + rowH + 22);
+
+    // ── inset U-curve (right ~33% of width) ──
+    const ixL = W * 0.68, ixR = W - 18;
+    const iyT = padT + 6, iyB = H - 34;
+    const iW = ixR - ixL, iH = iyB - iyT;
+
+    // sweep bucket sizes log-spaced 5..1200 MB, y = total exposed comm
+    const xs = [], ys = [];
+    for (let lg = Math.log10(5); lg <= Math.log10(1200); lg += 0.04){
+      const mb = Math.pow(10, lg);
+      xs.push(mb);
+      ys.push(simulate(mb).exposed);
+    }
+    const yMax = Math.max(...ys, 0.001);
+    const lgMin = Math.log10(5), lgMax = Math.log10(1200);
+    const xToPx = mb => ixL + (Math.log10(mb) - lgMin)/(lgMax - lgMin) * iW;
+    const yToPx = ms => iyB - (ms / (yMax * 1.08)) * iH;
+
+    // inset frame + title
+    ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(ixL, iyT); ctx.lineTo(ixL, iyB); ctx.lineTo(ixR, iyB); ctx.stroke();
+    ctx.fillStyle = '#5b6573'; ctx.font = '10px monospace';
+    ctx.fillText('exposed comm vs bucket size', ixL, iyT - 6);
+
+    // x ticks
+    ctx.fillStyle = '#94a3b8'; ctx.font = '9px monospace';
+    [10, 100, 1000].forEach(v=>{
+      const x = xToPx(v);
+      ctx.fillText(v, x - 7, iyB + 12);
+    });
+
+    // curve
+    ctx.strokeStyle = '#d97706'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i=0; i<xs.length; i++){
+      const x = xToPx(xs[i]), y = yToPx(ys[i]);
+      if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+
+    // mark the minimum of the curve
+    let minI = 0; for (let i=1;i<ys.length;i++) if (ys[i] < ys[minI]) minI = i;
+    ctx.fillStyle = '#16a34a';
+    ctx.beginPath(); ctx.arc(xToPx(xs[minI]), yToPx(ys[minI]), 4, 0, 2*Math.PI); ctx.fill();
+
+    // current bucket-size dot riding the curve
+    const cExposed = simulate(bucket_mb).exposed;
+    const cx = xToPx(bucket_mb), cy = yToPx(cExposed);
+    ctx.fillStyle = '#dc2626';
+    ctx.beginPath(); ctx.arc(cx, cy, 5, 0, 2*Math.PI); ctx.fill();
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1.5; ctx.stroke();
+    // vertical guide
+    ctx.strokeStyle = 'rgba(220,38,38,0.4)'; ctx.lineWidth = 1; ctx.setLineDash([2,2]);
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx, iyB); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // KPIs
+    $('bk-nb').textContent = sim.nb;
+    $('bk-tail').textContent = sim.exposed.toFixed(2) + ' ms';
+    $('bk-tt').textContent = sim.t_total.toFixed(1) + ' ms';
+    const eff = sim.t_bwd / sim.t_total;
+    $('bk-eff').textContent = (eff * 100).toFixed(1) + '%';
+    $('bk-eff').style.color = eff > 0.92 ? '#16a34a' : eff > 0.8 ? '#d97706' : '#dc2626';
+  }
+
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>
