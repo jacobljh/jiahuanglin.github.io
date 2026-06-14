@@ -125,7 +125,11 @@
   cost_per_request &nbsp;≈&nbsp; t_token_single / B &nbsp;+&nbsp; small_per_request_overhead
 </div>
 
-<p>Decode batching, plus continuous batching (lesson 04 in the vLLM series), is what makes shared GPU serving economical. The TP-vs-replicas question becomes: with batching, is one TP=8 replica running batch 32 cheaper than 8 TP=1 replicas each running batch 32? In wall-clock per request: the TP=8 replica is still ~8× faster (memory-bound dynamics survive batching for a while). In total cluster throughput: roughly equal again — the GPU work is the same, just spread.</p>
+<p>Decode batching, plus continuous batching, is what makes shared GPU serving economical. The TP-vs-replicas question becomes: with batching, is one TP=8 replica running batch 32 cheaper than 8 TP=1 replicas each running batch 32? In wall-clock per request: the TP=8 replica is still ~8× faster (memory-bound dynamics survive batching for a while). In total cluster throughput: roughly equal again — the GPU work is the same, just spread.</p>
+
+<p><strong>Continuous batching</strong> is the mechanism that makes <span class="math">cost_per_request ≈ t_token / B</span> hold in practice. Requests arrive and finish at different times, so a <em>static</em> batch — one fixed set of sequences run to completion together — would stall on the slowest member and leave the batch dimension half-empty for most of the run. Instead the server admits and evicts sequences <em>every decode step</em>: a finished sequence frees its slot immediately and a waiting request is spliced in, so <span class="math">B</span> stays full and the single expensive weight read is amortized across as many live requests as the KV budget allows. That continuously-full batch is what keeps memory-bound decode cheap per token. The implementation — the scheduler, the paged KV slots it admits into — is the <a href="../../vllm/lessons/index.html">vLLM track</a>; the core idea is just "never run a half-empty batch."</p>
+
+<p>How long does the memory-bound regime last as <span class="math">B</span> grows? Decode does <span class="math">≈ 2·B·P</span> FLOPs while reading <span class="math">≈ 2·P</span> weight-bytes, so its arithmetic intensity is <span class="math">≈ B</span> FLOP/byte. The H100 bf16 roofline ridge sits at <span class="math">≈ 295</span> FLOP/byte (989 TFLOP/s ÷ 3.35 TB/s), so decode crosses from memory-bound to compute-bound at roughly <span class="math">B ≈ 200–300</span>; below that batch the weight read dominates and TP's HBM split is the lever, above it the matmul dominates and only more FLOPs (or fp8) help.</p>
 
 <p>So the right framing: at any batch size, TP and replication trade <em>latency for parallelism</em>, not for total throughput. The exception is when batching itself becomes a constraint:</p>
 
@@ -176,7 +180,7 @@
 
 <h3>fp8 weights + activations</h3>
 
-<p>On Hopper, fp8 (the E4M3 / E5M2 formats from <a href="17_mixed_precision.html">lesson 17</a>) quantizes both weights and activations, so the matmul itself runs on fp8 tensor cores. This wins on bandwidth <em>and</em> compute, which matters once batching pushes decode toward the compute-bound regime.</p>
+<p>On Hopper, fp8 quantizes both weights and activations, so the matmul itself runs on fp8 tensor cores. fp8 comes in two layouts — <strong>E4M3</strong> (4 exponent / 3 mantissa bits: more precision, narrower range, used for weights and activations) and <strong>E5M2</strong> (5 exponent / 2 mantissa bits: more range, less precision, used for gradients) — so inference forward passes pick E4M3. This wins on bandwidth <em>and</em> compute, which matters once batching pushes decode toward the compute-bound regime. (The fp8 formats are fully treated in <a href="17_mixed_precision.html">lesson 17</a>.)</p>
 
 <h3>KV-cache quantization</h3>
 
@@ -696,14 +700,17 @@
     const P_B = ipEl ? +ipEl.value : 70;
     return P_B * 2e9;
   }
-  // KV bytes per token (Llama-70B): 671 MB / 2048 tok = ~328 kB/tok
-  const KV_PER_TOK = 671e6 / 2048;
+  // KV bytes per token. Reference: Llama-70B = 671 MB / 2048 tok ≈ 328 kB/tok.
+  // KV ∝ n_layers·n_kv_heads·d_head, all of which grow with model size, so we
+  // scale the reference linearly with param count (P / 70e9) as a first-order proxy.
+  const KV_PER_TOK_REF = 671e6 / 2048;
+  function getKVPerTok(){ return KV_PER_TOK_REF * (getPBytes() / 2 / 70e9); }
 
   function configForPoint(tp, rep, seq, batch){
     const P_BYTES = getPBytes();
     // memory per rank: weights/tp + KV (sharded across heads ≈ tp)
     const weight_per_rank = P_BYTES / tp;
-    const kv_per_rank = (KV_PER_TOK / tp) * seq * batch;
+    const kv_per_rank = (getKVPerTok() / tp) * seq * batch;
     const fits = (weight_per_rank + kv_per_rank) < HBM * 0.95;
     // latency: HBM bytes / (tp * BW) + small AR
     const memT = weight_per_rank / HBM_BW * 1000;
