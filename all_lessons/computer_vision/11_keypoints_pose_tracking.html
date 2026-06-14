@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>11 · Keypoints, pose, tracking</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../index.html">all lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">computer_vision</a>
+    <span class="crumb">/</span>
+    <span class="crumb">11 · pose &amp; tracking</span>
+    <span class="step-pill">lesson 11 / 18</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Keypoints, pose, and tracking primitives</h1>
+<p class="subtitle">Lesson 10 gave us a label at every pixel — but a mask is an amorphous region. It cannot say "this pixel is the left elbow" or "this is the same person who was here last frame." Two new output shapes are needed: <strong>sparse structured points</strong> (joints, landmarks) and <strong>persistent identity over time</strong>. This lesson builds both, and ends by noticing that identity-by-appearance is secretly a distance problem — the subject of lesson 12.</p>
+
+<div class="callout">
+  <div class="label">The plan</div>
+  Four moves. (1) Predict keypoints as <em>heatmaps</em> rather than raw coordinates, and see exactly why — including how a Gaussian target is built and how soft-argmax decodes a sub-pixel coordinate differentiably. (2) Define the pose metrics PCK and OKS, and derive why OKS must scale by object size. (3) Build tracking-by-detection from parts: a Kalman motion model (predict/update), Hungarian data association, and Re-ID embeddings for appearance. (4) Define the tracking metrics MOTA and IDF1, then hand off to lesson 12 — because appearance association <em>is</em> embedding distance.
+</div>
+
+<h2>1 · Keypoints: heatmaps vs coordinate regression</h2>
+
+<p>A keypoint model predicts specific landmark locations — the 17 body joints of a person, 68 facial landmarks, the corners of a license plate. The naive approach is <strong>coordinate regression</strong>: have the network output 2K numbers (x,y for each of K keypoints) and train with L2 loss. It works, but it has three problems. It is <em>spatially destructive</em> — squashing a feature map to a single (x,y) via fully-connected layers discards the spatial structure the convolutions worked to build. It cannot represent <em>uncertainty</em> — one point, no notion of "I'm confident it's here, unsure between there and there." And it cannot represent <em>multiple modes</em> — if two joints are plausible, the L2-optimal answer is the average, which may be a location that is wrong for both.</p>
+
+<p>The dominant alternative is <strong>heatmap prediction</strong>. For each keypoint the network outputs a full-resolution map (one channel per keypoint) whose value at each pixel is "how likely the keypoint is here." This keeps the prediction spatial, naturally represents confidence (peak height) and uncertainty (peak width), and can even show multiple candidate peaks. It is the reason heatmap methods (from the Stacked Hourglass network onward) beat direct regression on pose benchmarks.</p>
+
+<h3>1a · Building the Gaussian target (the actual mechanic)</h3>
+
+<p>To train with a heatmap you need a <em>target</em> heatmap, and a single bright pixel at the true location is a bad target — almost all pixels are zero, so the loss is dominated by "predict zero everywhere" and gradients near the keypoint are tiny. Instead we paint a <strong>2D Gaussian bump</strong> centered on the ground-truth keypoint <span class="math">(x<sub>0</sub>, y<sub>0</sub>)</span>:</p>
+
+<div class="math block">
+  H(x, y) = exp( − [ (x − x<sub>0</sub>)² + (y − y<sub>0</sub>)² ] / (2σ²) )
+</div>
+
+<p>The Gaussian gives a smooth gradient that grows as you approach the true location, so the network gets useful signal in a neighborhood, not just at one pixel. The spread <span class="math">σ</span> (often 1–3 px at the heatmap resolution) is a deliberate knob: small <span class="math">σ</span> demands precise localization (sharp, hard to train); large <span class="math">σ</span> is forgiving but blurs nearby joints together. Training loss is then a per-pixel L2 (MSE) between predicted and target heatmaps.</p>
+
+<svg class="diagram" viewBox="0 0 760 200" role="img" aria-label="Gaussian heatmap target and soft-argmax decoding">
+  <text x="120" y="20" text-anchor="middle" font-size="12" fill="#5b6573">target heatmap = Gaussian at (x₀,y₀)</text>
+  <!-- grid -->
+  <g>
+    <rect class="node-bg" x="40" y="35" width="160" height="120" rx="4"/>
+    <!-- gaussian rings -->
+    <circle cx="120" cy="95" r="36" fill="#2563eb" opacity="0.10"/>
+    <circle cx="120" cy="95" r="24" fill="#2563eb" opacity="0.18"/>
+    <circle cx="120" cy="95" r="13" fill="#2563eb" opacity="0.32"/>
+    <circle cx="120" cy="95" r="5" fill="#2563eb" opacity="0.85"/>
+    <text x="120" y="170" text-anchor="middle" font-size="10">σ controls spread</text>
+  </g>
+  <!-- arrow -->
+  <path class="edge active" d="M 215 95 L 285 95"/>
+  <text x="250" y="86" text-anchor="middle" class="edge-label">soft-argmax</text>
+  <!-- formula -->
+  <rect class="node-bg" x="300" y="55" width="440" height="80" rx="6"/>
+  <text x="520" y="85" text-anchor="middle" font-size="13" font-family="serif" font-style="italic">x̂ = Σ x·softmax(H)  ,  ŷ = Σ y·softmax(H)</text>
+  <text x="520" y="112" text-anchor="middle" font-size="11" fill="#5b6573">expected coordinate under the normalized heatmap → sub-pixel &amp; differentiable</text>
+</svg>
+
+<h3>1b · Soft-argmax: decoding a coordinate, differentiably</h3>
+
+<p>At inference you must turn the heatmap back into a coordinate. The obvious choice is <strong>argmax</strong> — take the brightest pixel — but it has two flaws: it is limited to integer pixel resolution (the heatmap is often downsampled, so one pixel = several image pixels), and it is <em>not differentiable</em>, so you cannot back-propagate a coordinate loss through it. <strong>Soft-argmax</strong> fixes both. Normalize the heatmap with a softmax so it becomes a probability distribution over locations, then take the <em>expected</em> coordinate:</p>
+
+<div class="math block">
+  x̂ = ∑<sub>x,y</sub> x · p(x,y) , &nbsp;&nbsp; ŷ = ∑<sub>x,y</sub> y · p(x,y) , &nbsp;&nbsp; p = softmax(H)
+</div>
+
+<p><strong>Worked example.</strong> A tiny 1-D heatmap over pixels {0,1,2,3} with softmax probabilities [0.05, 0.15, 0.60, 0.20]. Argmax says pixel 2. Soft-argmax says 0·0.05 + 1·0.15 + 2·0.60 + 3·0.20 = 0 + 0.15 + 1.20 + 0.60 = <strong>1.95</strong> — a sub-pixel estimate pulled slightly below 2 by the mass at pixel 1, and a smooth function of the heatmap values, so gradients flow. That sub-pixel precision and differentiability is why soft-argmax is the standard decoder.</p>
+
+<p>For <strong>multi-person</strong> pose there are two regimes. <em>Top-down</em>: detect each person (lesson 09), crop, run single-person pose on each crop — accurate, but cost scales with the number of people. <em>Bottom-up</em> (e.g. OpenPose): detect all keypoints of all people at once, then group them into skeletons (using learned part-affinity fields) — constant cost regardless of crowd size, but grouping is the hard part.</p>
+
+<h2>2 · Pose metrics: PCK and OKS</h2>
+
+<p><strong>PCK</strong> = <strong>Percentage of Correct Keypoints</strong>. A predicted keypoint counts as correct if it falls within a threshold distance of the ground truth, and PCK is the fraction that do. The threshold is made scale-relative — typically a fraction of a reference length like head size or torso diameter (PCKh@0.5 = within 50% of head segment length) — so a 10-pixel error is "correct" on a large nearby person and "wrong" on a small distant one. PCK is simple and interpretable but has a hard pass/fail boundary.</p>
+
+<p><strong>OKS</strong> = <strong>Object Keypoint Similarity</strong>, the COCO standard, is a smooth analogue that plays the role IoU plays for boxes (so you can compute a keypoint "AP" by thresholding OKS). For one person it is a Gaussian on the per-keypoint error, averaged over visible keypoints:</p>
+
+<div class="math block">
+  OKS = ∑<sub>i</sub> exp( − d<sub>i</sub>² / (2 s² k<sub>i</sub>²) ) · 𝟙[v<sub>i</sub>&gt;0] &nbsp;/&nbsp; ∑<sub>i</sub> 𝟙[v<sub>i</sub>&gt;0]
+</div>
+
+<p>Read the symbols: <span class="math">d<sub>i</sub></span> is the pixel distance between predicted and true keypoint <span class="math">i</span>; <span class="math">v<sub>i</sub></span> is its visibility flag (unlabeled/occluded keypoints are skipped); <span class="math">k<sub>i</sub></span> is a per-joint constant (eyes are pinpointed precisely, hips are fuzzy, so each joint has its own tolerance); and <span class="math">s</span> is the <strong>object scale</strong> — the square root of the person's segment area.</p>
+
+<div class="callout">
+  <div class="label">Why OKS scales by object size</div>
+  The <span class="math">s²</span> in the denominator is the whole point. A 5-pixel wrist error on a person who fills the frame is excellent; the <em>same</em> 5-pixel error on a person 30 pixels tall is a gross mistake. Dividing the squared error by <span class="math">s²</span> makes the metric measure error <em>relative to the person's size</em>, so OKS is comparable across near and far subjects — exactly the scale-invariance that raw pixel distance lacks. When <span class="math">d<sub>i</sub></span> = 0, the term is exp(0) = 1 (perfect); as error grows past the joint's tolerance <span class="math">k<sub>i</sub></span>·<span class="math">s</span>, it decays smoothly toward 0.
+</div>
+
+<h2>3 · Tracking-by-detection</h2>
+
+<p>Now the second new output: identity over time. The dominant paradigm is <strong>tracking-by-detection</strong>. Run a detector (lesson 09) independently on every frame, then <em>link</em> detections across frames into persistent <em>tracks</em>. The detector is a black box; tracking is the linking problem. Three components do the work.</p>
+
+<h3>3a · Kalman filter — a motion model that predicts then corrects</h3>
+
+<p>Between frames, an object moves. A <strong>Kalman filter</strong> maintains a belief about each track's state — typically position and velocity, e.g. (x, y, scale, aspect, plus their rates) — as a Gaussian (a mean estimate plus a covariance encoding uncertainty), and runs a two-step cycle every frame:</p>
+
+<ul>
+  <li><strong>Predict.</strong> Advance the state with a constant-velocity assumption: new position ≈ old position + velocity·Δt. Because prediction extrapolates, <em>uncertainty grows</em> — the covariance inflates. This gives a prior on where the object <em>should</em> appear next, before looking at the new frame.</li>
+  <li><strong>Update.</strong> When a detection is matched to this track, blend the prediction with the measurement, weighted by their relative uncertainties (the Kalman gain). A confident measurement pulls the estimate toward itself and <em>shrinks</em> the uncertainty; a noisy one barely moves it.</li>
+</ul>
+
+<p>The intuition that matters for interviews: the filter is a running compromise between "where physics says it should be" and "where the detector says it is," and it weights them by how much it trusts each. This is what lets a track <em>coast</em> through a missed detection (predict-only for a few frames) and snap back when the object reappears. It fails under abrupt, non-linear motion (the constant-velocity prior is wrong) or a bad Δt.</p>
+
+<h3>3b · Data association via Hungarian matching</h3>
+
+<p>Each frame you have M existing tracks (each with a Kalman prediction) and N new detections. Which detection belongs to which track? Build an M×N <strong>cost matrix</strong> where entry (i,j) is the cost of assigning detection j to track i — low cost = good match. Then solve for the assignment that <em>minimizes total cost</em> with each track getting at most one detection and vice versa. That is the classic <strong>assignment problem</strong>, solved optimally in polynomial time by the <strong>Hungarian algorithm</strong> (Kuhn–Munkres). Greedily picking the best pair one at a time can be globally suboptimal; the Hungarian method finds the best <em>overall</em> matching.</p>
+
+<svg class="diagram" viewBox="0 0 760 210" role="img" aria-label="Data association cost matrix between tracks and detections">
+  <text x="380" y="18" text-anchor="middle" font-size="12" fill="#5b6573">cost(track i, detection j) = motion gate (Kalman) + appearance distance (Re-ID embedding)</text>
+  <!-- tracks -->
+  <rect class="node-bg active" x="40" y="55" width="90" height="34" rx="4"/><text x="85" y="77" text-anchor="middle" font-size="12">track A</text>
+  <rect class="node-bg active" x="40" y="105" width="90" height="34" rx="4"/><text x="85" y="127" text-anchor="middle" font-size="12">track B</text>
+  <!-- detections -->
+  <rect class="node-bg" x="320" y="45" width="100" height="30" rx="4"/><text x="370" y="65" text-anchor="middle" font-size="12">det 1</text>
+  <rect class="node-bg" x="320" y="90" width="100" height="30" rx="4"/><text x="370" y="110" text-anchor="middle" font-size="12">det 2</text>
+  <rect class="node-bg" x="320" y="135" width="100" height="30" rx="4"/><text x="370" y="155" text-anchor="middle" font-size="12">det 3</text>
+  <!-- edges with costs -->
+  <path class="edge active" d="M 130 72 L 320 60"/><text x="225" y="56" class="edge-label">0.1</text>
+  <path class="edge" d="M 130 122 L 320 60"/><text x="225" y="98" class="edge-label">0.8</text>
+  <path class="edge active" d="M 130 122 L 320 150"/><text x="225" y="150" class="edge-label">0.2</text>
+  <path class="edge" d="M 130 72 L 320 105"/><text x="200" y="84" class="edge-label">0.9</text>
+  <text x="585" y="80" font-size="12" fill="#16a34a">Hungarian picks A→1, B→3</text>
+  <text x="585" y="100" font-size="11" fill="#5b6573">(min total cost, 1-to-1)</text>
+  <text x="585" y="125" font-size="11" fill="#5b6573">det 2 → new track or noise</text>
+</svg>
+
+<h3>3c · Re-ID embeddings — appearance when motion isn't enough</h3>
+
+<p>What goes <em>into</em> the cost? Simple trackers (SORT) use only motion: cost = 1 − IoU between the Kalman prediction and the detection box. That breaks under occlusion — when two people cross, their boxes overlap and the predictions get swapped, causing an <strong>identity switch</strong>. The fix (DeepSORT and successors) adds an <strong>appearance</strong> term: a small network embeds each detection's crop into a <strong>Re-Identification (Re-ID)</strong> feature vector, and the association cost includes the distance between a detection's embedding and the track's stored appearance. Now even if motion is ambiguous, "this crop <em>looks like</em> the person we lost behind the pillar" recovers the identity. <strong>Track management</strong> wraps it all: birth (a detection unmatched for a few frames becomes a new track), death (a track unmatched too long is retired), and a grace period so a track survives brief occlusion.</p>
+
+<table>
+  <thead><tr><th>Piece</th><th>Role</th><th>Failure mode</th></tr></thead>
+  <tbody>
+    <tr><td>Kalman filter</td><td>Predict next state, correct with measurement.</td><td>Abrupt/non-linear motion; wrong Δt.</td></tr>
+    <tr><td>Hungarian matching</td><td>Optimal 1-to-1 track↔detection assignment.</td><td>Bad cost matrix → identity switches.</td></tr>
+    <tr><td>Re-ID embedding</td><td>Appearance distance to survive occlusion.</td><td>Look-alikes; domain shift; cheap embedder.</td></tr>
+    <tr><td>Track management</td><td>Birth, death, occlusion grace period.</td><td>Fragmentation, ghost tracks, late starts.</td></tr>
+  </tbody>
+</table>
+
+<h2>4 · Tracking metrics: MOTA and IDF1</h2>
+
+<p>Per-frame detection accuracy is not enough — a tracker must keep identities <em>consistent over time</em>, and two metrics capture different aspects of that.</p>
+
+<p><strong>MOTA</strong> = <strong>Multiple Object Tracking Accuracy</strong>. It sums the three error types over all frames and normalizes by the number of ground-truth objects:</p>
+
+<div class="math block">
+  MOTA = 1 − ( ∑<sub>t</sub> FN<sub>t</sub> + FP<sub>t</sub> + IDSW<sub>t</sub> ) / ∑<sub>t</sub> GT<sub>t</sub>
+</div>
+
+<p>where FN = misses, FP = false positives, and <strong>IDSW</strong> = identity switches. MOTA is detection-dominated — because misses and false positives usually vastly outnumber switches, MOTA mostly grades <em>did you find the objects?</em> and barely penalizes losing track of who's who. It can even go negative when errors exceed ground-truth count.</p>
+
+<p><strong>IDF1</strong> = the <strong>ID F1 score</strong>: the F1 (harmonic mean of precision and recall) computed over <em>identity-consistent</em> matches across the whole sequence, after a global optimal matching of predicted trajectories to ground-truth trajectories. IDF1 directly grades <em>how long you kept the right identity</em>, so it is the metric to watch when identity preservation is the product requirement — e.g. counting unique shoppers in a crowded retail camera, where one ID switch corrupts the count more than a one-frame localization wobble.</p>
+
+<h2>Where this points next</h2>
+
+<p>Look again at the Re-ID term in section 3c. Appearance association works by embedding each crop into a vector and measuring the <em>distance</em> between embeddings — "same person ⟺ small distance, different person ⟺ large distance." We bolted that on as a heuristic, but it is in fact a deep, general capability: learning a representation where <em>distance encodes similarity</em>. The same machinery powers face verification, product search, duplicate detection, and the contrastive pre-training that underpins modern vision. Lesson 12 builds it properly — the contrastive, triplet, and InfoNCE losses that shape an embedding space, why L2-normalizing turns dot products into cosine similarity, hard-negative mining, and the approximate-nearest-neighbor indexes that make distance search scale to a billion items.</p>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Predict keypoints as <strong>heatmaps</strong>, not coordinates: train against a <strong>Gaussian target</strong> (smooth gradient, encodes uncertainty) and decode with <strong>soft-argmax</strong> (the expected coordinate under the normalized map — sub-pixel and differentiable). Evaluate with <strong>PCK</strong> (scale-relative pass/fail) or <strong>OKS</strong> (a smooth Gaussian on error that divides by object scale <span class="math">s²</span>, so the metric is comparable across near and far subjects). Track by <strong>detection</strong>: a <strong>Kalman filter</strong> predicts each track's motion and corrects on measurement, the <strong>Hungarian algorithm</strong> solves optimal track↔detection assignment, and <strong>Re-ID</strong> embeddings add appearance to survive occlusion. Grade with <strong>MOTA</strong> (detection-heavy) and <strong>IDF1</strong> (identity-consistency). Appearance association is embedding distance — which is lesson 12.
+</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why predict keypoint heatmaps instead of regressing coordinates? Give three concrete advantages.</li>
+  <li>How is a Gaussian heatmap target constructed, and what does σ trade off?</li>
+  <li>What is soft-argmax, why is it preferred over argmax, and work a small numeric example.</li>
+  <li>Define PCK and OKS. Why must OKS scale by object size — what is the role of s² in the formula?</li>
+  <li>Walk through one frame of tracking-by-detection: predict, associate, update, manage.</li>
+  <li>Explain the Kalman predict/update cycle. How does it let a track survive a missed detection?</li>
+  <li>Why use the Hungarian algorithm rather than greedy matching for data association?</li>
+  <li>What causes identity switches, and how do Re-ID embeddings reduce them?</li>
+  <li>MOTA vs IDF1 — which would you optimize for a retail people-counter and why?</li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="10_segmentation.html">
+    <span class="dir">&larr; Previous</span>
+    <span class="ttl">10 · Segmentation</span>
+  </a>
+  <a class="next" href="12_metric_learning_retrieval.html">
+    <span class="dir">Next &rarr;</span>
+    <span class="ttl">12 · Metric learning &amp; retrieval</span>
+  </a>
+</footer>
+
+</main>
+
+</body>
+</html>

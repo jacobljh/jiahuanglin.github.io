@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>16 · Video and temporal models</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../index.html">all lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">computer_vision</a>
+    <span class="crumb">/</span>
+    <span class="crumb">16 · video</span>
+    <span class="step-pill">lesson 16 / 18</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Video and temporal models</h1>
+<p class="subtitle">Lesson 15 closed our tour of <em>single still images</em>: CLIP aligned one frozen frame to text, and the VLM stack (vision encoder → projector → LLM) could caption or answer questions about a photograph. But the photograph never moved. The real world is a stream — an action is not a pixel pattern, it is a pixel pattern <em>changing over time</em>. This lesson adds the time axis, and with it a new free variable that quietly decides everything: <strong>which frames the model even gets to see.</strong></p>
+
+<div class="callout">
+  <div class="label">The plan</div>
+  Four moves. (1) Treat frame sampling — rate, stride, clip length — as a modeling decision, not a loader detail, and count the data it throws away. (2) Pin down what optical flow <em>is</em> numerically: the brightness-constancy assumption and the one scalar equation it yields. (3) Compare the three ways to fuse time — 3D conv, two-stream, temporal attention — and do the FLOP arithmetic that explains why 3D conv is expensive. (4) Put it in production: streaming latency budgets, causal vs offline models, and the temporal metrics (clip vs video accuracy, mAP for temporal localization) the index promised.
+</div>
+
+<h2>1 · Frame sampling is a modeling choice</h2>
+
+<p>A one-minute clip at 30 frames per second (fps) and 224×224×3 is <span class="math">60 · 30 · 224 · 224 · 3 ≈ 2.7 × 10<sup>8</sup></span> values — about 270 MB as float32 before a single layer runs. You cannot feed it whole. So every video model begins with a <strong>sampling policy</strong>: how many frames, at what spacing, covering how much wall-clock time. That policy is not plumbing; it sets the ceiling on what the model can possibly learn, because <em>information you do not sample, you cannot recover.</em></p>
+
+<p>Three knobs, with concrete consequences:</p>
+
+<ul>
+  <li><strong>Frame rate / stride.</strong> If you keep every <span class="math">s</span>-th frame from a 30 fps source, your effective rate is <span class="math">30/s</span> fps and the time between sampled frames is <span class="math">Δt = s/30</span> seconds. A hand-clap that lasts 0.1 s spans only 3 frames at 30 fps; sample every 8th frame (<span class="math">Δt ≈ 0.27</span> s) and you may capture <em>zero</em> frames of the closed hand — the action becomes invisible.</li>
+  <li><strong>Clip length.</strong> How many sampled frames the model ingests at once (e.g. 8, 16, 32). This is the temporal receptive field: a 16-frame clip at stride 4 covers <span class="math">16 · 4 / 30 ≈ 2.1</span> s of real time. Actions longer than the clip (opening a door, a tennis rally) are seen only in pieces.</li>
+  <li><strong>Sampling pattern.</strong> <em>Dense</em> (contiguous frames — good for fine motion), <em>uniform/sparse</em> (spread evenly across the whole video — TSN-style, good for slow context), or <em>random</em> per training step (an augmentation that forces invariance to exact timing). Two-rate designs like SlowFast run a slow high-resolution pathway for appearance and a fast low-resolution pathway for motion.</li>
+</ul>
+
+<p>The frequency view from lesson 02 applies directly: sampling in time is subject to the same Nyquist limit as sampling in space. To resolve an event that repeats at <span class="math">f</span> Hz you must sample faster than <span class="math">2f</span>; below that, fast motion <em>aliases</em> into a slower phantom (the wagon-wheel effect — spokes appearing to spin backward). Choosing the frame rate is choosing your temporal anti-aliasing budget.</p>
+
+<div class="ascii">
+source 30 fps   |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■|  30 frames / sec
+                 ↓ stride 8 (Δt ≈ 0.27 s)
+sampled          |■.......■.......■.......■....|   ~4 frames / sec
+                       ↑ a 0.1 s clap (3 source frames) can fall entirely
+                         in a gap — sampled too coarsely to ever be learned
+</div>
+
+<div class="callout warn">
+  <div class="label">Trap — the split leak comes back, worse</div>
+  Adjacent frames are near-duplicates: frame <span class="math">t</span> and <span class="math">t+1</span> differ by milliseconds of motion. Split a dataset at the <em>frame</em> level and almost every validation frame has an near-twin in training — the model memorizes, validation accuracy looks superb, production collapses. Split by <strong>source video, scene, or uploader</strong>, exactly the entity/time-level discipline lesson 07 demanded for images, now mandatory because the duplication is structural.
+</div>
+
+<h2>2 · What optical flow actually is</h2>
+
+<p>"Motion signal" is vague. Optical flow makes it a number: for each pixel, the 2D displacement vector <span class="math">(u, v)</span> that says where that bit of brightness moved between frame <span class="math">t</span> and frame <span class="math">t+1</span>. The whole construction rests on one assumption, the <strong>brightness-constancy assumption</strong>: a surface point keeps the same intensity as it moves a small amount over a small time. Writing the image intensity as <span class="math">I(x, y, t)</span>:</p>
+
+<div class="math block">
+  I(x, y, t) = I(x + u, y + v, t + 1) .
+</div>
+
+<p>"A pixel's brightness doesn't change as it slides to its new location." Now expand the right side with a first-order Taylor approximation (valid when the motion is small — the assumption's fine print):</p>
+
+<div class="math block">
+  I(x + u, y + v, t+1) ≈ I(x, y, t) + I<sub>x</sub> u + I<sub>y</sub> v + I<sub>t</sub> ,
+</div>
+
+<p>where <span class="math">I<sub>x</sub>, I<sub>y</sub></span> are the spatial gradients (how brightness changes left-right and up-down — the Sobel responses from lesson 02) and <span class="math">I<sub>t</sub></span> is the temporal gradient (frame difference at that pixel). Substitute into brightness-constancy: the <span class="math">I(x,y,t)</span> terms cancel, leaving the <strong>optical-flow constraint equation</strong>:</p>
+
+<div class="math block">
+  I<sub>x</sub> u + I<sub>y</sub> v + I<sub>t</sub> = 0 &nbsp;&nbsp;⟺&nbsp;&nbsp; ∇I · (u, v) + I<sub>t</sub> = 0 .
+</div>
+
+<p><strong>Worked numerically.</strong> Suppose at one pixel the horizontal gradient is <span class="math">I<sub>x</sub> = 10</span> intensity units/pixel, the vertical gradient <span class="math">I<sub>y</sub> = 0</span> (a vertical edge — no vertical structure), and between frames the pixel got darker: <span class="math">I<sub>t</sub> = −20</span> units. The constraint becomes <span class="math">10u + 0·v − 20 = 0 ⟹ u = 2</span> pixels. We recovered the horizontal motion: the edge slid 2 pixels right. But <span class="math">v</span> is completely undetermined — the equation says nothing about vertical motion along a vertical edge. This is the <strong>aperture problem</strong>: one equation, two unknowns per pixel. You only ever recover the motion component <em>perpendicular to the local edge</em>. Classical solvers break the tie with extra assumptions — Lucas–Kanade assumes neighboring pixels share one <span class="math">(u,v)</span> and solves a small least-squares system; Horn–Schunck adds a global smoothness penalty. Modern systems learn it: RAFT regresses flow with iterative refinement and beats the classical methods on benchmarks.</p>
+
+<p>So flow is an <em>explicit</em> motion representation you can hand a model. The two-stream design (next section) does exactly that. The alternative is to let the model discover motion <em>implicitly</em> from raw frames — cheaper at inference (no flow to compute), but it must learn the equivalent of <span class="math">I<sub>t</sub></span> internally and needs enough temporal data to do so.</p>
+
+<h2>3 · Three ways to fuse time — and why 3D conv is expensive</h2>
+
+<p>An image backbone (lesson 06) maps one frame to features. To use time we must combine information <em>across</em> frames. There are three dominant strategies.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 760 200" xmlns="http://www.w3.org/2000/svg" font-family="monospace" font-size="12">
+  <!-- late fusion -->
+  <text x="10" y="18" font-size="13" fill="#1f2430">A · per-frame + pool</text>
+  <rect class="node-bg" x="10" y="30" width="40" height="28"/><text x="22" y="48">f₁</text>
+  <rect class="node-bg" x="60" y="30" width="40" height="28"/><text x="72" y="48">f₂</text>
+  <rect class="node-bg" x="110" y="30" width="40" height="28"/><text x="122" y="48">f₃</text>
+  <rect class="node-bg active" x="60" y="75" width="40" height="24"/><text x="66" y="91" font-size="10">pool</text>
+  <line class="edge" x1="30" y1="58" x2="78" y2="75"/><line class="edge" x1="80" y1="58" x2="80" y2="75"/><line class="edge" x1="130" y1="58" x2="82" y2="75"/>
+  <text x="10" y="120" font-size="10" fill="#5b6573">cheap; loses ordering &amp; fine motion</text>
+
+  <!-- 3D conv -->
+  <text x="270" y="18" font-size="13" fill="#1f2430">B · 3D conv (space × time)</text>
+  <rect class="node-bg" x="270" y="30" width="40" height="28"/>
+  <rect class="node-bg" x="282" y="38" width="40" height="28"/>
+  <rect class="node-bg" x="294" y="46" width="40" height="28"/>
+  <rect class="node-bg active" x="350" y="40" width="46" height="28"/><text x="356" y="58" font-size="10">k×k×t</text>
+  <line class="edge" x1="334" y1="60" x2="350" y2="54"/>
+  <text x="270" y="120" font-size="10" fill="#5b6573">local motion; FLOPs × kernel-depth t</text>
+
+  <!-- two stream / attention -->
+  <text x="540" y="18" font-size="13" fill="#1f2430">C · two-stream / attention</text>
+  <rect class="node-bg" x="540" y="30" width="58" height="24"/><text x="548" y="46" font-size="10">RGB</text>
+  <rect class="node-bg" x="540" y="62" width="58" height="24"/><text x="546" y="78" font-size="10">flow</text>
+  <rect class="node-bg active" x="640" y="46" width="58" height="24"/><text x="648" y="62" font-size="10">fuse</text>
+  <line class="edge" x1="598" y1="42" x2="640" y2="56"/><line class="edge" x1="598" y1="74" x2="640" y2="62"/>
+  <text x="540" y="120" font-size="10" fill="#5b6573">motion explicit (flow) or all-pairs (attn, O(n²))</text>
+</svg>
+</div>
+
+<p><strong>3D convolution</strong> extends the 2D kernel of lesson 06 with a temporal depth: instead of a <span class="math">k×k</span> window over one frame, a <span class="math">k×k×t</span> window slides over a stack of <span class="math">t</span> frames, learning spatio-temporal patterns (a flick, a bounce) directly. It is the most natural extension — and the most expensive. Here is the arithmetic, because the FLOP argument is the whole point.</p>
+
+<p>A 2D conv layer with <span class="math">C<sub>in</sub></span> input channels, <span class="math">C<sub>out</sub></span> output channels, kernel <span class="math">k×k</span>, over a feature map of <span class="math">H×W</span> spatial positions costs roughly</p>
+
+<div class="math block">
+  FLOPs<sub>2D</sub> ≈ H · W · C<sub>in</sub> · C<sub>out</sub> · k · k .
+</div>
+
+<p>The 3D version adds a temporal kernel dimension <span class="math">k<sub>t</sub></span> <em>and</em> processes <span class="math">D</span> temporal positions (frames in the stack):</p>
+
+<div class="math block">
+  FLOPs<sub>3D</sub> ≈ D · H · W · C<sub>in</sub> · C<sub>out</sub> · k · k · k<sub>t</sub> .
+</div>
+
+<p><strong>Plug in numbers.</strong> Take <span class="math">H=W=56</span>, <span class="math">C<sub>in</sub>=C<sub>out</sub>=256</span>, <span class="math">k=3</span>. The 2D layer: <span class="math">56·56·256·256·9 ≈ 1.85 × 10<sup>9</sup></span> FLOPs per frame. Now a 3D layer over a <span class="math">D=16</span>-frame clip with <span class="math">k<sub>t</sub>=3</span>: <span class="math">16·56·56·256·256·9·3 ≈ 8.9 × 10<sup>10</sup></span> FLOPs — roughly <span class="math">D · k<sub>t</sub> = 48×</span> the per-frame 2D cost. The temporal kernel multiplies cost by <span class="math">k<sub>t</sub></span>, and you pay it at every one of <span class="math">D</span> frames. That blow-up is exactly why the field invented cheaper factorizations: <strong>(2+1)D</strong> convolutions split the <span class="math">k×k×k<sub>t</sub></span> kernel into a spatial <span class="math">k×k×1</span> followed by a temporal <span class="math">1×1×k<sub>t</sub></span> (the separability trick from lesson 02, applied to time — fewer parameters and a non-linearity between them), and SlowFast spends the expensive high-resolution path only on a low-frame-rate stream.</p>
+
+<p><strong>Two-stream</strong> networks sidestep learning motion from scratch: one CNN branch sees RGB (appearance — <em>what</em> is there), a second sees precomputed optical flow (motion — <em>how</em> it moves), and their predictions fuse. This was the early winner on action recognition precisely because flow hands the network the <span class="math">I<sub>t</sub></span> signal it would otherwise struggle to extract. The cost is the flow computation itself — a second, often non-trivial, pipeline and failure surface.</p>
+
+<p><strong>Temporal attention</strong> tokenizes frames or patches and lets the transformer of lesson 13 attend across time. A video tokenizes into <span class="math">n</span> spatio-temporal tokens, and self-attention is <span class="math">O(n²)</span> — for video, <span class="math">n</span> is huge (patches × frames), so the quadratic cost bites hard. Video transformers (TimeSformer, ViViT) make it tractable by <em>factorizing</em> attention: attend within a frame (spatial) and across the same patch over time (temporal) separately, turning <span class="math">O((P·F)²)</span> into <span class="math">O(P² + F²)</span> — the same divide-and-conquer instinct as (2+1)D conv and windowed attention.</p>
+
+<table>
+  <thead><tr><th>Family</th><th>How it fuses time</th><th>Cost driver</th><th>Best when</th></tr></thead>
+  <tbody>
+    <tr><td>Per-frame + pool</td><td>Image backbone per frame, average logits</td><td>cheapest; linear in frames</td><td>action ≈ appearance (a scene, an object)</td></tr>
+    <tr><td>3D CNN / (2+1)D</td><td>conv over space <em>and</em> time</td><td><span class="math">× D·k<sub>t</sub></span> over 2D</td><td>fine local motion matters</td></tr>
+    <tr><td>Two-stream</td><td>RGB branch + explicit optical-flow branch</td><td>flow precompute pipeline</td><td>motion-defined actions, smaller data</td></tr>
+    <tr><td>Temporal transformer</td><td>attention over frame/patch tokens</td><td><span class="math">O(n²)</span>, memory-heavy</td><td>long-range temporal context, large data</td></tr>
+    <tr><td>Track-then-classify</td><td>detect/track (lesson 11), classify trajectory</td><td>tracker quality</td><td>object-centric events, few actors</td></tr>
+  </tbody>
+</table>
+
+<h2>4 · Streaming, latency budgets, and temporal metrics</h2>
+
+<p>The headline task is <strong>action recognition</strong>: assign a clip a label from a fixed set ("clapping", "pouring"). Its cousins are <em>temporal action localization</em> (find the start/end of each action in a long untrimmed video) and <em>spatio-temporal detection</em> (box + action per actor per frame). Each needs a metric that respects time.</p>
+
+<ul>
+  <li><strong>Clip accuracy vs video accuracy.</strong> A model scores individual clips, but a video has many clips. <em>Clip accuracy</em> evaluates each sampled clip; <em>video accuracy</em> aggregates (average the softmax over clips, then argmax). Video accuracy is what users see and is almost always higher — averaging cancels per-clip noise. Reporting clip accuracy as if it were video accuracy understates the system; the reverse oversells it. State which one you mean.</li>
+  <li><strong>Temporal IoU and localization mAP.</strong> For localization, borrow IoU from lesson 09 but in 1D: <span class="math">tIoU = (overlap of predicted and true time intervals) / (their union)</span>. A prediction counts as correct if <span class="math">tIoU ≥ τ</span> (e.g. 0.5), and you summarize with <strong>mean Average Precision (mAP)</strong> — exactly the precision-recall area of lesson 09, now over temporal segments, averaged across classes and often across several <span class="math">τ</span> thresholds.</li>
+  <li><strong>Streaming-specific quality.</strong> For online models also track <em>per-frame latency</em>, <em>detection delay</em> (how long after an action begins until you flag it), and <em>temporal flicker</em> (label thrashing between adjacent frames).</li>
+</ul>
+
+<p><strong>The streaming latency budget.</strong> An offline model may use future frames — it can look at frame <span class="math">t+10</span> to label frame <span class="math">t</span>. A real-time model cannot; it is <em>causal</em>, seeing only the past. Concretely, suppose a product has a 100 ms end-to-end budget per frame at 30 fps (a frame arrives every <span class="math">1000/30 ≈ 33</span> ms). If inference takes 70 ms, you have 30 ms for decode + preprocess + post-process, and you <em>cannot</em> buffer 10 future frames for smoothing without adding 10·33 = 330 ms of delay — blowing the budget more than 3×. So streaming forces choices the offline benchmark never penalizes: smaller clips, causal (no-lookahead) temporal modeling, frame-skipping under load, and lightweight temporal smoothing (an exponential moving average over recent logits) that trades a little lag for stability. The trap: heavy smoothing hides exactly the quick events you may most need to catch.</p>
+
+<div class="callout">
+  <div class="label">Handoff to 17</div>
+  Everything in lessons 01–16 has <em>analyzed</em> pixels — classified them, localized them, tracked them through time, aligned them to text. We have been a very sophisticated reader of images. The obvious next question: can a model run the arrow the other way and <strong>synthesize</strong> pixels — turn a label, a caption, or pure noise <em>into</em> an image or a video? That is a fundamentally different objective, and lesson 17 builds it from <span class="math">p(x)</span> up.
+</div>
+
+<h2>Where this points next</h2>
+
+<p>We added time and found that the loader is part of the model: sampling rate sets the information ceiling, flow gives an explicit motion signal grounded in one brightness-constancy equation, and the choice of 3D conv / two-stream / attention is a FLOP-and-data trade. But all of this still <em>consumes</em> video. <strong>Lesson 17 (Generative vision)</strong> attacks the inverse problem — generation — and it is not classification run backward. Estimating <span class="math">p(x)</span> over the space of all images (and the per-pixel multimodality that makes VAEs blur) demands new machinery: autoencoders, the adversarial game of GANs, and the denoising chain of diffusion that now powers text-to-image and text-to-video. The temporal lessons here resurface there: video generation is diffusion with the time axis we just learned to sample.</p>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Video is images plus a time axis, and the first modeling decision is <strong>frame sampling</strong> — rate, stride, clip length, pattern — because unsampled events are unlearnable and frame-level splits leak catastrophically. Motion can be made explicit via <strong>optical flow</strong>, which rests on brightness-constancy <span class="math">I(x,y,t)=I(x+u,y+v,t+1)</span> and yields the one-equation, two-unknown constraint <span class="math">I<sub>x</sub>u + I<sub>y</sub>v + I<sub>t</sub> = 0</span> (hence the aperture problem). Time is fused by <strong>3D conv</strong> (costs <span class="math">D·k<sub>t</sub>×</span> a 2D layer — the reason for (2+1)D factorization), <strong>two-stream</strong> (RGB + flow), or <strong>temporal attention</strong> (<span class="math">O(n²)</span>, factorized in practice). Production splits the world into offline (uses the future) and streaming (causal, on a hard per-frame latency budget), and is judged by clip-vs-video accuracy and temporal-IoU mAP.
+</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why is video harder to split correctly than images, and what split granularity fixes it? <em>(§1: adjacent frames are near-duplicates; split by source/scene/uploader, not frame.)</em></li>
+  <li>Write the optical-flow constraint equation and explain the aperture problem. <em>(§2: <span class="math">I<sub>x</sub>u+I<sub>y</sub>v+I<sub>t</sub>=0</span>; one equation, two unknowns — only motion perpendicular to the edge is recoverable.)</em></li>
+  <li>Why is a 3D conv so much more expensive than a 2D conv, and how does (2+1)D help? <em>(§3: extra factor <span class="math">D·k<sub>t</sub></span>; factorize into spatial then temporal conv.)</em></li>
+  <li>How do frame rate and clip length change which actions are learnable? <em>(§1: stride sets temporal Nyquist; clip length sets the temporal receptive field.)</em></li>
+  <li>How do offline and streaming video models differ, and what does a 100 ms budget at 30 fps imply? <em>(§4: causal vs lookahead; can't buffer future frames without blowing the budget.)</em></li>
+  <li>How would you evaluate an action-recognition model — and report results honestly? <em>(§4: distinguish clip vs video accuracy; use temporal-IoU mAP for localization.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="15_multimodal_vision_language.html">
+    <span class="dir">&larr; Previous</span>
+    <span class="ttl">15 · Multimodal vision-language</span>
+  </a>
+  <a class="next" href="17_generative_vision.html">
+    <span class="dir">Next &rarr;</span>
+    <span class="ttl">17 · Generative vision</span>
+  </a>
+</footer>
+
+</main>
+
+</body>
+</html>
