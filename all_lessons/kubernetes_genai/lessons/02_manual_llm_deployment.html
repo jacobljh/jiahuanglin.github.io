@@ -44,14 +44,36 @@ Five moves. (1) Name the contract a serving pod must satisfy, and the one idea t
 <div class="step"><span class="n">→</span><strong>readiness</strong> → green only once the target model is loaded and can answer</div>
 </div>
 
-<p>The single idea this whole lesson turns on is the last one, and it is where engineers coming from ordinary web services get burned. <strong>A normal web server is ready the moment its process binds a port</strong> — the handler is in memory, there is nothing to warm. An LLM server is different: it binds its port in a second or two, then spends <em>minutes</em> doing real work before it can answer anything — reading tens of gigabytes of weights off disk, copying them into GPU memory (HBM, the high-bandwidth memory on the accelerator), compiling or autotuning CUDA kernels for the specific GPU, building the KV-cache allocator (the buffer that holds attention keys and values during decoding), and loading any LoRA adapters (small fine-tuned weight deltas merged onto the base model). "Process up" and "model ready" are separated by a multi-minute gap, and confusing the two is the defining failure of manual LLM deployment.</p>
+<p>The single idea this whole lesson turns on is the last one, and it is where engineers coming from ordinary web services get burned. <strong>A normal web server is ready the moment its process binds a port</strong> — the handler is in memory, there is nothing to warm. An LLM server is different: it binds its port in a second or two, then spends <em>minutes</em> doing real work before it can answer anything — reading tens of gigabytes of weights off disk, copying them into GPU memory (HBM, the high-bandwidth memory soldered onto the accelerator, distinct from the host's system RAM), compiling or autotuning CUDA kernels (CUDA is NVIDIA's GPU programming stack; the server JIT-compiles or selects the optimal kernel variants for the specific GPU model on the node), building the KV-cache allocator (the KV cache is the buffer that stores the attention keys and values for tokens already processed, so the model does not recompute them on every decode step; the allocator carves up leftover HBM into pages for it), and loading any LoRA adapters (LoRA — Low-Rank Adaptation — produces small fine-tuned weight deltas that are merged onto or served alongside the base model). "Process up" and "model ready" are separated by a multi-minute gap, and confusing the two is the defining failure of manual LLM deployment.</p>
+
+<p>It is worth making "model ready" physically concrete, because it is not one event but a sequence, and each stage can be the thing that hangs. A useful mental model is a four-stage warm-up, each with its own dominant cost:</p>
+
+<div class="lesson-flow">
+  <div><strong>1 · Read weights</strong><span>Pull tens of GB off the PVC, image layer, or network into host memory. Dominated by storage/network read bandwidth — this is the cold-start term you compute in §4.</span></div>
+  <div><strong>2 · Load to HBM</strong><span>Copy the weights across the PCIe/NVLink bus into GPU memory and lay out the tensors. Bounded by host-to-device bandwidth; a few seconds for a single GPU.</span></div>
+  <div><strong>3 · Compile kernels</strong><span>JIT-compile or autotune CUDA/attention kernels and, on engines that do it, capture CUDA graphs for the decode loop. Tens of seconds, paid once per process.</span></div>
+  <div><strong>4 · Allocate KV cache</strong><span>Reserve the HBM left after weights as paged KV-cache blocks and run a dummy forward pass to warm them. Fast, but it is what makes the <em>first real request</em> not also pay a warm-up.</span></div>
+</div>
+
+<p>Only after stage 4 can the server honestly answer a request inside its normal latency. Stages 1–4 are exactly the work that a TCP-port check is blind to.</p>
 
 <div class="callout warn"><div class="label">Process started ≠ model ready</div>
 If readiness means "the TCP port is open," Kubernetes marks the pod <code>Ready</code> within seconds, adds it to the Service endpoints, and routes live traffic to a server whose model is still loading. Every request in that window fails or hangs. The readiness signal must represent the <em>serving contract</em>: the target model is loaded and can produce a response within the expected latency envelope — not merely that a socket accepts connections.</div>
 
+<div class="callout"><div class="label">Why the weights even fit — an HBM budget</div>
+Stage 2 above only succeeds if the weights fit in HBM, and that is arithmetic, not hope. An 8-billion-parameter model at <span class="math">fp16</span> (2 bytes per parameter) needs <span class="math">8 × 10⁹ × 2 = 16</span> GB just for weights. On an 80 GB GPU (e.g. an H100/H200-class card) that leaves <span class="math">80 − 16 = 64</span> GB for everything else, most of which becomes KV cache. If you instead loaded a 70B model at fp16 — <span class="math">70 × 2 = 140</span> GB — it does <em>not</em> fit on one 80 GB GPU at all; you would either quantize it (e.g. to 8-bit, ~70 GB) or split it across GPUs (lesson 07). The point for this lesson: a server that starts, loads weights, and then OOMs while sizing the KV cache is failing stage 2 or 4, and §5 has a bucket for exactly that.</div>
+
 <h2>2 · Making readiness honest with probes</h2>
 
-<p>Kubernetes gives you three probes, and an LLM pod needs all three doing distinct jobs. The <strong>startupProbe</strong> guards the long load: while it is still failing, Kubernetes suppresses the other two probes and will not kill the container for being slow. The <strong>readinessProbe</strong> gates traffic — a pod only receives requests once it passes, and is pulled from the Service the moment it fails again. The <strong>livenessProbe</strong> decides whether to restart a wedged process. The mistake is using a liveness-style probe (or a short readiness probe) to cover the cold start: the model has not finished loading inside the deadline, Kubernetes concludes the container is dead, kills it, and the replica enters a restart loop that never completes a load.</p>
+<p>Kubernetes gives you three probes, and an LLM pod needs all three doing distinct jobs. A <strong>probe</strong> is a periodic health check Kubernetes runs against the container — here, an HTTP GET against a path, where any <span class="math">2xx</span>/<span class="math">3xx</span> status counts as a pass. The three differ only in what a pass or fail <em>does</em>:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">startupProbe</div><div class="v">Guards the long load. While it is still failing, Kubernetes <em>suppresses the other two probes entirely</em> and will not kill the container for being slow. Once it passes once, it never runs again and hands off to the other two.</div></div>
+  <div class="topic-card"><div class="k">readinessProbe</div><div class="v">Gates traffic. A pod is added to the Service endpoints only while this passes, and is pulled the moment it fails — without restarting the container. This is the one that must mean "model loaded and can answer."</div></div>
+  <div class="topic-card"><div class="k">livenessProbe</div><div class="v">Decides whether to <em>restart</em> a wedged process. A failure here kills and recreates the container, so its deadline must never be shorter than a legitimate load, or it will kill healthy slow starts.</div></div>
+</div>
+
+<p>The mistake is using a liveness-style probe (or a short readiness probe) to cover the cold start: the model has not finished loading inside the deadline, Kubernetes concludes the container is dead, kills it, and the replica enters a restart loop that never completes a load. The startupProbe exists precisely to break that loop — it is the only probe whose job is to say "still loading, leave it alone." Because it suppresses the liveness probe, you are then free to make the liveness deadline tight (catch a truly hung server fast) without it ever firing during the legitimate multi-minute warm-up.</p>
 
 <pre><code>readinessProbe:
   httpGet:
@@ -72,7 +94,7 @@ startupProbe:
 
 <h2>3 · A minimal, production-minded manifest</h2>
 
-<p>Here is the whole serving path as plain objects. It is deliberately not abstracted: model path declared explicitly, GPU requested explicitly, runtime version pinned, both ports exposed, probes matched to load time. Read it as the assembly diagram every later controller hides.</p>
+<p>Here is the whole serving path as plain objects. It is deliberately not abstracted: model path declared explicitly, GPU requested explicitly, runtime version pinned, the inference/metrics port exposed, probes matched to load time. (vLLM, like most OpenAI-compatible servers, serves both the <code>/v1/*</code> inference API and the Prometheus <code>/metrics</code> scrape endpoint on the same port, so one <code>containerPort</code> covers both — a separate metrics port is only needed for servers that split them.) Read it as the assembly diagram every later controller hides.</p>
 
 <pre><code>apiVersion: apps/v1
 kind: Deployment
@@ -86,14 +108,13 @@ spec:
     spec:
       containers:
       - name: vllm
-        image: vllm/vllm-openai:v0.8.5          # PIN the runtime + CUDA stack; never :latest
+        image: vllm/vllm-openai:v0.11.0         # PIN an exact runtime + CUDA stack; never :latest
         args: ["--model", "/models/llama-3-8b"]  # serve from the mounted path, not a hub id
         ports:
-        - { name: http,    containerPort: 8000 }
-        - { name: metrics, containerPort: 8000 } # vLLM exposes /metrics on the same port
+        - { name: http, containerPort: 8000 }    # vLLM serves /v1/* AND /metrics on this one port
         resources:
           limits:
-            nvidia.com/gpu: 1                     # explicit accelerator request
+            nvidia.com/gpu: 1                     # GPUs go under limits; K8s mirrors it into requests
         volumeMounts:
         - { name: model-store, mountPath: /models, readOnly: true }
         readinessProbe:
@@ -104,6 +125,10 @@ spec:
           httpGet: { path: /health, port: 8000 }
           periodSeconds: 10
           failureThreshold: 60                    # ~600s load budget (see §4)
+        livenessProbe:
+          httpGet: { path: /health, port: 8000 }  # suppressed until startupProbe passes
+          periodSeconds: 10
+          failureThreshold: 3                      # tight: restart a TRULY wedged process fast
       volumes:
       - name: model-store
         persistentVolumeClaim: { claimName: llm-weights }  # PVC holds the weights
@@ -158,7 +183,15 @@ The lesson: the right path is the one whose bottleneck (network egress, registry
   <div class="topic-card"><div class="k">Readiness failure</div><div class="v">Probe flips green before the model loads, or never flips at all. Signal: traffic hits cold runtimes (errors right after a scale-up), or the pod restart-loops mid-load.</div></div>
 </div>
 
-<p>Six labels, one decision tree: <code>kubectl get pods</code> tells you scheduling vs. image vs. accelerator (Pending/BackOff/Running); pod logs tell you model-data vs. runtime-config; <code>kubectl get endpoints</code> and a probe check separate network-exposure from readiness. Internalize this and the rest of the track — controllers, operators, autoscalers — becomes "which of these six did the automation get wrong?"</p>
+<p>Six labels, one decision tree, and three commands resolve it in order — never guess, read the signal:</p>
+
+<div class="mini-flow">
+<div class="step"><span class="n">→</span><strong>kubectl get pods</strong> → <code>Pending</code> ⇒ accelerator (no GPU to schedule onto); <code>ImagePullBackOff</code>/<code>CrashLoopBackOff</code> before logs ⇒ image; <code>Running</code> but not <code>Ready</code> ⇒ keep going</div>
+<div class="step"><span class="n">→</span><strong>kubectl logs</strong> → path-not-found ⇒ model-data; CUDA/driver mismatch or OOM-during-load ⇒ runtime-config (or accelerator if the device never initialized); log stops mid-load and the pod restarted ⇒ a liveness/startup deadline killed the load</div>
+<div class="step"><span class="n">→</span><strong>kubectl get endpoints llm-server</strong> → empty while the pod is <code>Ready</code> ⇒ network-exposure (selector/port mismatch); populated but requests still fail right after scale-up ⇒ readiness flipped green too early</div>
+</div>
+
+<p>Internalize this and the rest of the track — controllers, operators, autoscalers — becomes "which of these six did the automation get wrong?" A KServe <code>InferenceService</code> stuck not-ready is the same readiness-vs-network question, just one layer up; an autoscaler that adds replicas which never serve is the cold-start arithmetic of §4 colliding with a too-short probe budget.</p>
 
 <div class="lesson-grid">
   <div class="lesson-card"><h3>Failure modes</h3><ul>
@@ -205,5 +238,6 @@ A manual LLM deployment is the assembly diagram for everything that follows: a D
 <footer class="lesson-nav"><a href="01_why_genai_kubernetes.html"><span class="dir">Previous</span><span class="ttl">01 - Why GenAI Is Different on Kubernetes</span></a><a class="next" href="03_model_servers_controllers.html"><span class="dir">Next</span><span class="ttl">03 - Model Servers and Controllers</span></a></footer>
 
 </main>
+<!-- reviewed:v1 -->
 </body>
 </html>
