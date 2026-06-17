@@ -37,117 +37,183 @@
 <main>
 
 <h1>Design a URL shortener</h1>
-<p class="subtitle">A shortener is a clean interview case because the write path is simple, the read path is huge, and every extra feature is a trade against redirect latency.</p>
+<p class="subtitle">One byte in, a redirect out — but the redirect happens a hundred times for every byte you write. The whole design falls out of that asymmetry: this is a read system pretending to be a write system.</p>
 <div class="case-meta">
   <span class="chip">Source: Vol. 1 Ch. 8</span>
   <span class="chip">Case drill</span>
-  <span class="chip">Trade-off first</span>
+  <span class="chip">Read-heavy</span>
 </div>
 
 <div class="callout">
-  <div class="label">How to read this case</div>
-  This page is an original educational walkthrough based on the case topic, not a transcription. Read it linearly: contract, estimates, data, flows, bottlenecks, trade-offs, then failure modes.
-</div>
+  <div class="label">First principle — the read/write asymmetry is the whole problem</div>
+  A URL shortener writes a row once and reads it forever. Every other decision — what kind of index, where the cache sits, whether you emit 301 or 302, how you log clicks — is downstream of one ratio: <strong>reads dominate writes by ~100:1</strong>. Once you accept that, you stop designing a database and start designing a <em>cache hierarchy with a database of record behind it</em>. The interview reward is for noticing that the "hard part" (allocating unique codes) is the easy, low-QPS part, and the "easy part" (looking one up) is where all your traffic and money go.</div>
 
 <h2>0. Interview hinge</h2>
-<p>The hinge is the moment where the prompt stops being generic and the architecture becomes forced. For this case, that hinge is: <strong>Read-heavy routing, ID allocation, redirects, analytics, abuse, cache hit rate.</strong></p>
-<div class="callout ok">
-  <div class="label">Invariant to protect</div>
-  The design is only correct if the user-visible contract survives retries, partial failures, stale caches, and reordering. A concrete invariant to defend here: <strong>Cache stampede on viral link</strong> must be handled by <strong>Use request coalescing and pre-warm known campaigns.</strong>.
-</div>
-<div class="callout warn">
-  <div class="label">Tempting but wrong</div>
-  A common shortcut is to choose <strong>Sequential vs random code</strong> just because it buys short codes and easy uniqueness. That shortcut fails when its cost matters: enumeration and volume leakage. Use it only when the workload matches the condition: internal or low-abuse systems.
-</div>
+<p>The hinge is the moment the prompt stops being generic and the architecture becomes forced. Here it is the read/write ratio. A naive candidate spends the interview on code generation — base62, Snowflake IDs, collision handling. A strong candidate spends thirty seconds on that, then says: <em>"writes are 3 req/s; reads are 10,000 req/s; so the design lives or dies on cache hit rate, and I'm going to spend my time there."</em> Everything that follows derives the cache, then derives the keyspace, then protects the hot path.</p>
 
 <h2>1. Clarify the contract</h2>
-<p>The prompt is best treated as a product contract before it is treated as a component diagram. The system needs to do the following:</p>
+<p>Treat the prompt as a product contract before a box diagram. The system must:</p>
 <ul>
-  <li>Create a short code for a long URL.</li>
-  <li>Redirect code lookups with low latency.</li>
-  <li>Optionally support custom aliases and expiration.</li>
-  <li>Collect analytics without slowing redirects.</li>
-  <li>Detect malware, spam, and abusive destinations.</li>
+  <li><strong>Shorten</strong> — accept a long URL, return a short code (optionally a custom alias, optionally a TTL).</li>
+  <li><strong>Redirect</strong> — resolve a code to its long URL with the lowest possible latency, returning an HTTP redirect.</li>
+  <li><strong>Count</strong> — record click analytics <em>without</em> ever slowing the redirect.</li>
+  <li><strong>Defend</strong> — refuse to send users to malware/phishing destinations, and support takedown of a bad link.</li>
 </ul>
+<p>And — just as important for scoping — what it need <strong>not</strong> do: it is not a general key-value store, it does not need transactions across multiple links, it does not need strong read-after-write consistency on analytics (a click counter that is eventually correct is fine), and it does not need to be writable at scale. Naming the non-goals is what frees you to cache aggressively.</p>
 
 <h2>2. Put numbers on the shape</h2>
-<p>The exact numbers depend on the interviewer, but these are the estimates that should steer the architecture:</p>
-<ul>
-  <li>Reads often exceed writes by 100:1 or more.</li>
-  <li>A 7-character base62 code gives roughly 3.5 trillion combinations.</li>
-  <li>100M new URLs/year with 200 bytes metadata is tens of GB before analytics.</li>
-  <li>Redirect latency budget is dominated by cache or database lookup plus network round trip.</li>
-</ul>
+<p>Back-of-envelope, with explicit arithmetic — these numbers <em>drive the design</em>, they aren't decoration.</p>
+
+<p><strong>Write rate &amp; storage.</strong> 100M new URLs/year. That is <span class="math">100\,000\,000 / (365 \cdot 86400) \approx 3.2</span> writes/s — trivially small. At ~500 bytes/row (long URL + metadata), one year is <span class="math">100\text{M} \cdot 500\text{B} = 50</span> GB; a decade is ~0.5 TB. The database of record is small enough to fit on one beefy node and easily on a modest shard set. <em>Writes are not the problem.</em></p>
+
+<p><strong>Read rate.</strong> At 100:1, the redirect path runs at ~320 req/s steady-state — but shorteners are bursty (a link in a TV ad, a viral tweet), so size for a peak of <strong>10,000 redirect QPS</strong>. This is the load that costs money.</p>
+
+<p><strong>The keyspace — why 7 characters is derived, not chosen.</strong> Base62 (a–z, A–Z, 0–9) gives 62 symbols per position. A 7-character code yields <span class="math">62^7 \approx 3.5 \times 10^{12}</span> — 3.5 <em>trillion</em> codes. At 100M URLs/year you exhaust it in <span class="math">3.5\times10^{12} / 10^{8} = 35{,}000</span> years. Six chars (<span class="math">62^6 \approx 56.8\text{B}</span>) lasts ~568 years — also fine, but a random-code scheme needs sparsity to keep collision probability low, and the extra character buys three orders of magnitude of headroom for one byte on the wire. So <strong>7 is the smallest length that is comfortably future-proof under random allocation</strong> — a derived choice, not a round number.</p>
+
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">Write rate (100M/yr)</div><div class="v">~3.2 req/s</div></div>
+  <div class="kpi"><div class="k">Peak read rate</div><div class="v">~10,000 req/s</div></div>
+  <div class="kpi"><div class="k">Keyspace 62^7</div><div class="v">~3.5T codes</div></div>
+  <div class="kpi"><div class="k">Years to exhaust</div><div class="v">~35,000 yr</div></div>
+</div>
+
+<h3>Cache hit rate is the only knob that matters</h3>
+<p>Here is the load-bearing calculation. At 10,000 redirect QPS, the QPS that reaches the database of record is <span class="math">\text{origin QPS} = \text{read QPS} \cdot (1 - h)</span> where <span class="math">h</span> is the cache hit rate. The hit rate is not a detail — it is a <em>multiplier on your entire backend bill</em>:</p>
+
+<table>
+  <thead><tr><th>Cache hit rate <span class="math">h</span></th><th>Origin QPS = 10k·(1−h)</th><th>What that means for the DB</th></tr></thead>
+  <tbody>
+    <tr><td>0% (no cache)</td><td>10,000</td><td>Needs a sharded, replicated KV fleet just to serve reads.</td></tr>
+    <tr><td>90%</td><td>1,000</td><td>One primary + a couple of read replicas handles it.</td></tr>
+    <tr><td>95%</td><td>500</td><td>Comfortable on a single replicated KV store.</td></tr>
+    <tr><td>99%</td><td>100</td><td>The DB is nearly idle; it exists mostly for durability and cold misses.</td></tr>
+    <tr><td>99.9%</td><td>10</td><td>Origin is a rounding error; spend your money on cache, not DB.</td></tr>
+  </tbody>
+</table>
+
+<p>Read that table as a design directive: going from 90% to 99% cuts origin load <strong>10×</strong>. Because click traffic is heavily Zipfian — a tiny fraction of links carry most clicks — a modest LRU cache of the hottest codes gets you well past 95% almost for free. <em>This is why the shortener is a cache problem.</em> We defer the mechanics of cache eviction, write-through vs. write-around, and TTL choice to <a href="06_caching.html">lesson 06</a>; here the point is only that hit rate is the dominant cost variable, and the cache hierarchy (browser → CDN/edge → app-tier cache → DB) is the architecture.</p>
+
+<div class="callout warn">
+  <div class="label">The trade-off you must name out loud</div>
+  A high cache hit rate is also what makes <strong>takedowns and edits slow</strong>. The same caching that saves your DB means a malicious link can keep redirecting from caches (and browser history, for a 301) long after you've flipped its blocklist bit in the database. Caching buys read latency and cost; it costs you <em>control latency</em>. Hold that thought — it's the crux of the 301-vs-302 dive below.</p></div>
 
 <h2>3. Define the surface area</h2>
-<p>Keep the API small. The API should express the product operation, not leak the internal queue, cache, or shard layout.</p>
+<p>Keep the API small and expressive of the product, not the internals. The redirect endpoint is the entire product to 99% of traffic; the rest is administrative.</p>
 <table>
   <thead><tr><th>API / operation</th><th>Why it exists</th></tr></thead>
   <tbody>
-    <tr><td><code>POST /links {long_url, alias?, ttl?}</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>GET /{code} -&gt; 301/302</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>GET /links/{code}/stats</code></td><td>Part of the minimal contract for this case.</td></tr>
+    <tr><td><code>POST /links {long_url, alias?, ttl?}</code></td><td>Create a code. Low QPS, can afford a synchronous abuse pre-check and a DB write. Returns the short code.</td></tr>
+    <tr><td><code>GET /{code} → 301/302</code></td><td>The hot path. Resolve code → long_url and redirect. Must be cache-served and must never block on analytics. (See <a href="03_api_design.html">lesson 03</a> for why the redirect verb itself is part of the contract.)</td></tr>
+    <tr><td><code>GET /links/{code}/stats</code></td><td>Read aggregated click analytics. Served from the analytics store, never the hot redirect store.</td></tr>
+    <tr><td><code>DELETE /links/{code}</code> / takedown</td><td>Flip the link to disabled/blocked. The hard part is cache + browser invalidation, not the DB write.</td></tr>
   </tbody>
 </table>
 
 <h2>4. Model the data</h2>
-<p>The data model is the first architecture. If the data ownership is vague, every later box-and-arrow decision will be vague too.</p>
+<p>The data model is the first architecture. The redirect store is a textbook <strong>point-lookup index</strong>: one key (the code), one value (the long URL + a few flags), accessed by exact-match only — never a range scan, never a join. That is <a href="07_partitioning.html">DDIA Ch. 3</a>'s canonical case for a hash-keyed store: you don't need a B-tree's ordered structure, you need O(1) get-by-key, which is exactly what a KV store (or a hash index) gives you. The flags travel <em>with</em> the row so the hot path needs a single lookup, not a fan-out:</p>
 <div class="case-meta">
-<span class="chip">code</span><span class="chip">long_url</span><span class="chip">owner</span><span class="chip">created_at</span><span class="chip">expires_at</span><span class="chip">abuse_state</span><span class="chip">analytics events</span>
+<span class="chip">code (PK)</span><span class="chip">long_url</span><span class="chip">owner</span><span class="chip">created_at</span><span class="chip">expires_at</span><span class="chip">status (active/blocked)</span>
 </div>
+<p>Analytics is a <em>separate</em> store with a different shape: an append-only event stream (code, ts, ip-hash, referrer, ua) feeding an aggregation, never co-located with the redirect KV. Mixing them is the classic mistake — it couples a 10k-QPS latency-critical read path to a high-volume write path. We'll see why that boundary is sacred in the analytics dive.</p>
 
 <h2>5. Linearized design</h2>
-<p>Walk the design in the order a request or event actually moves. This keeps the interview grounded and exposes the first bottleneck naturally.</p>
+<p>Walk a request and an event through the system in the order they actually move. The hot read path and the async analytics tee are two different stories sharing one entry point.</p>
 <ol class="linear-list">
-<li><strong>1.</strong> Validate and canonicalize long URLs before generating a code.</li>
-<li><strong>2.</strong> Generate a unique code through an ID allocator plus base62 encoding or collision-checked random codes.</li>
-<li><strong>3.</strong> Store code metadata in a primary database and populate a cache on first redirect.</li>
-<li><strong>4.</strong> On redirect, keep the hot path to cache lookup, abuse check, and 301/302 response.</li>
-<li><strong>5.</strong> Emit click analytics asynchronously to a queue or log.</li>
-<li><strong>6.</strong> Run abuse scanning out of band and let the redirect path read a compact blocklist state.</li>
+<li><strong>1.</strong> <em>Create:</em> validate &amp; canonicalize the long URL, run a synchronous abuse pre-check (cheap blocklist + reputation), allocate a code, write the row to the KV store of record. Low QPS, so this can be careful and slow.</li>
+<li><strong>2.</strong> <em>Redirect (the hot path):</em> request hits the edge. If the code is in the edge/app cache → emit the redirect immediately, no origin touch.</li>
+<li><strong>3.</strong> On a cache miss, read the row from the KV store, check <code>status</code>, populate the cache, then redirect. This is the only step that costs origin resources, and only <span class="math">(1-h)</span> of traffic reaches it.</li>
+<li><strong>4.</strong> <em>Tee the analytics:</em> as the redirect is sent, fire a click event to a queue/log — fire-and-forget, off the critical path. The redirect does not wait for it.</li>
+<li><strong>5.</strong> An offline consumer aggregates events into per-code counts for <code>/stats</code>. Lag of seconds-to-minutes is fine.</li>
+<li><strong>6.</strong> Abuse scanning runs out of band, writing only a compact <code>status</code> flag the hot path reads inline — no extra lookup.</li>
 </ol>
 
+<div class="ascii">
+  THE HOT READ PATH                                THE ASYNC ANALYTICS TEE
+  ═════════════════                                ═══════════════════════
+
+   client                                          (fired as the redirect leaves)
+     │  GET /aZ3kP9                                        │
+     ▼                                                     ▼
+  ┌─────────────┐  hit (~99%)   ┌──────────────┐    ┌──────────────┐
+  │ EDGE / CDN  │──────────────▶│ 301/302 +    │    │  event queue │  (Kafka / log)
+  │  + app LRU  │               │ Location:    │    │  code,ts,ref │
+  └─────┬───────┘               │ long_url     │    └──────┬───────┘
+        │ miss (~1%)            └──────────────┘           │ offline, lagging
+        ▼                          ▲                       ▼
+  ┌─────────────┐  read row        │                ┌──────────────┐
+  │  KV STORE   │──────────────────┘                │  aggregator  │──▶ GET /{code}/stats
+  │ (of record) │  check status, fill cache         │  counts/day  │
+  └─────────────┘                                    └──────────────┘
+
+  origin QPS = read QPS · (1 − h)          analytics NEVER blocks the redirect
+</div>
+<p>The first bottleneck this exposes is not the database — it's the cache miss path under correlated load. A single cold code that suddenly goes viral sends its entire miss traffic to the origin at once. That's the senior question, handled in the next section.</p>
+
 <h2>6. Deep dives</h2>
-<h3>301 vs 302</h3>
-<p>Permanent redirects let browsers cache aggressively, which lowers load but makes changes and abuse takedowns harder. Temporary redirects keep control at the service but cost more requests.</p>
-<h3>Code generation</h3>
-<p>Sequential IDs are compact and cache-friendly, but reveal volume. Random codes are harder to enumerate but require collision handling and may use longer strings.</p>
-<h3>Analytics boundary</h3>
-<p>Analytics cannot sit synchronously in the redirect path. The correct shape is fire-and-forget event logging with later aggregation.</p>
+
+<h3>Deep dive 1 — 301 vs 302: you are trading control for cost</h3>
+<p>This looks like an HTTP trivia question; it is actually the central trade-off of the whole system, and it ties straight back to the caching warning above.</p>
+<p>A <strong>301 Moved Permanently</strong> tells the browser (and every cache in between) "this mapping never changes — remember it." The browser caches it, often indefinitely, and on the next click <em>does not contact your service at all</em>. That is wonderful for cost: a viral link that's been clicked once per device is served entirely from browser cache, dropping your origin QPS toward zero. It is the cheapest possible redirect.</p>
+<p>The catastrophe arrives at takedown. Suppose a link turns out to point at malware and you flip its <code>status</code> to blocked. With a 301, <strong>every browser that already cached it keeps redirecting to the malware</strong> — you have no way to reach those caches; the redirect lives in the user's machine, not yours. You also see almost no clicks for that link, so your analytics under-count by exactly the most-cached (most popular) links — the ones you most want to measure. You have optimized yourself out of both control and visibility.</p>
+<p>A <strong>302 Found</strong> says "temporary — ask me again next time." The browser does not durably cache it, so <em>every</em> click returns to your service. Now a takedown is instant (the next click reads the flipped <code>status</code>), and analytics are complete. The cost is real origin traffic: 302 trades the 301's free browser-cache hits for the ability to change your mind and to count every click. Most production shorteners choose <strong>302</strong> precisely because takedown and analytics are core product requirements, and they recover the lost cost at the <em>edge/CDN</em> cache (which they <em>can</em> invalidate) rather than the browser (which they can't). The decision rule: 301 when destinations are immutable and you don't need per-click data; 302 whenever you need takedown control or accurate analytics.</p>
+
+<h3>Deep dive 2 — sequential vs random codes: compactness vs. enumeration</h3>
+<p><strong>Sequential</strong> codes come from a monotonic counter (or an ID-allocator block; see <a href="case_04_unique_id_generator.html">C04</a>) base62-encoded. They are maximally compact (you use the keyspace densely, so codes stay short longest), uniqueness is free (the counter never repeats), and they are cache-friendly because consecutive codes cluster. The fatal cost is that they <strong>leak your volume and let anyone enumerate every link</strong>: if <code>POST</code> returns <code>aZ3kP8</code> and a minute later <code>aZ3kP9</code>, a competitor reads your growth rate off the codes, and a scraper walks <code>...P0, P1, P2...</code> to harvest every destination — a privacy and abuse disaster for a public service.</p>
+<p><strong>Random</strong> codes draw 7 base62 characters at random. They are enumeration-resistant (the space is 3.5T-wide and sparse, so guessing is hopeless) and leak nothing about volume. The cost is <strong>collision handling</strong>: two random draws can collide, so the write path must "generate, attempt insert-if-absent, retry on conflict." With <span class="math">62^7 = 3.5\text{T}</span> slots and 100M used, occupancy is <span class="math">10^8 / (3.5\times10^{12}) \approx 3\times10^{-5}</span>, so a collision is a <span class="math">0.003\%</span> event — one cheap retry on the low-QPS write path, never on the hot read path. That tiny insert-if-absent cost is the entire price of enumeration resistance, which is why a public shortener almost always picks <strong>random</strong>. Sequential is right only for internal/low-abuse systems where compactness and cache locality matter more than secrecy.</p>
+
+<h3>Deep dive 3 — the analytics boundary is an async event stream</h3>
+<p>Analytics must never sit synchronously in the redirect path: a redirect that blocks on an analytics write inherits the analytics store's latency and failure modes, and a 10k-QPS read path cannot afford either. The correct shape is <a href="11_async_messaging.html">DDIA Ch. 11</a>'s stream processing: the redirect <em>tees</em> a click event to a durable log (Kafka/Kinesis) and returns immediately; a separate consumer aggregates the stream into per-code, per-day counts at its own pace. This decouples the two completely — the analytics pipeline can lag, batch, sample, or even fall over, and redirects keep flowing at full speed. It also matches the read-pattern: <code>/stats</code> is a low-QPS dashboard read that tolerates seconds of lag, so there's no reason to pay for synchronous counting. The boundary is sacred: <strong>the redirect's only job is to redirect; counting is somebody else's problem, downstream, asynchronously.</strong></p>
 
 <h2>7. Trade-offs</h2>
 <table>
   <thead><tr><th>Choice</th><th>Buys</th><th>Costs</th><th>Choose when</th></tr></thead>
   <tbody>
-<tr><td><strong>Sequential vs random code</strong></td><td>short codes and easy uniqueness</td><td>enumeration and volume leakage</td><td>internal or low-abuse systems</td></tr>
-<tr><td><strong>301 vs 302</strong></td><td>client/browser caching</td><td>less control after destination changes</td><td>stable safe destinations</td></tr>
-<tr><td><strong>Cache everything vs cache hot links</strong></td><td>lowest read latency</td><td>memory spent on cold codes</td><td>viral or skewed traffic</td></tr>
-<tr><td><strong>Synchronous abuse scan vs async scan</strong></td><td>blocks bad links immediately</td><td>slow creation path</td><td>high-risk public submissions</td></tr>
+<tr><td><strong>Random vs sequential code</strong></td><td>enumeration resistance, no volume leak</td><td>collision handling (cheap insert-if-absent)</td><td>public-facing service (the default)</td></tr>
+<tr><td><strong>302 vs 301</strong></td><td>instant takedown, complete analytics</td><td>real origin/edge traffic per click</td><td>you need control or per-click data (usually)</td></tr>
+<tr><td><strong>Cache hot links vs cache everything</strong></td><td>95%+ hit rate for tiny memory</td><td>cold codes still miss to origin</td><td>Zipfian click traffic (always)</td></tr>
+<tr><td><strong>Async vs synchronous abuse scan</strong></td><td>fast creation path</td><td>brief window before a bad link is flagged</td><td>most cases; sync only for high-risk public submissions</td></tr>
   </tbody>
 </table>
+<p>The sharpest of these is <strong>302-over-301</strong>. It looks like you're choosing the "worse" redirect — you're deliberately giving up free browser caching and accepting real traffic on every click. But the read/write asymmetry already told you the system is a cache problem, and you'd rather solve that at a cache layer you <em>control</em> (the edge/CDN, which you can invalidate on takedown) than one you don't (the user's browser). 302 keeps the control and the data; you buy back the cost at the edge. Choosing 301 to "save load" is the trap — it saves load by surrendering the two things the product actually needs.</p>
 
 <h2>8. Failure modes</h2>
 <table>
   <thead><tr><th>Failure</th><th>Mitigation</th></tr></thead>
   <tbody>
-<tr><td><strong>Cache stampede on viral link</strong></td><td>Use request coalescing and pre-warm known campaigns.</td></tr>
-<tr><td><strong>Database outage</strong></td><td>Serve cached redirects with stale policy and fail closed for uncached unsafe states.</td></tr>
-<tr><td><strong>Custom alias squatting</strong></td><td>Reserve namespaces and enforce ownership.</td></tr>
-<tr><td><strong>Analytics overload</strong></td><td>Sample or shed analytics before impacting redirects.</td></tr>
+<tr><td><strong>Viral link not in cache (thundering herd)</strong></td><td>Request coalescing / single-flight at the edge: one origin fetch serves the whole herd (see the senior Q below). Pre-warm known campaigns.</td></tr>
+<tr><td><strong>Database of record outage</strong></td><td>Serve cached redirects with a stale-while-revalidate policy; fail closed for uncached codes (better a 503 than redirecting to an un-vetted destination).</td></tr>
+<tr><td><strong>Custom alias squatting / collision</strong></td><td>Reserve system namespaces, enforce ownership, insert-if-absent so two creators can't claim the same alias.</td></tr>
+<tr><td><strong>Analytics pipeline overload</strong></td><td>Sample or shed click events <em>before</em> they touch the redirect path — the tee is fire-and-forget by design, so dropping events degrades stats, never redirects.</td></tr>
+<tr><td><strong>Stale 301 after takedown</strong></td><td>You can't recall browser caches — this is why public shorteners default to 302. Mitigate existing 301s by short cache TTLs and edge invalidation.</td></tr>
   </tbody>
 </table>
 
-<h2>9. What to say in the interview</h2>
-<div class="callout ok">
-  <div class="label">Strong signal</div>
-  Lead with the dominant constraint: Read-heavy routing, ID allocation, redirects, analytics, abuse, cache hit rate. Then defend the design by naming what you made faster, what you made more reliable, and what complexity you accepted.
+<h2>9. Interview Q&amp;A</h2>
+<div class="callout">
+  <ol>
+    <li><strong>A link goes viral at 200k rps and it's NOT in cache — describe the millisecond.</strong> <em>(senior answer)</em> Without protection, all 200k requests miss simultaneously and stampede the origin — the DB gets 200k concurrent identical reads and falls over, taking every other link with it. The fix is <strong>request coalescing / single-flight at the edge</strong>: the first miss for a code acquires a per-code lock and issues <em>one</em> origin fetch; the other 199,999 concurrent requests for that same code <em>wait on that in-flight fetch</em> rather than each issuing their own. When the single fetch returns, it fills the cache and unblocks the whole herd, which is now served from cache. The origin saw exactly one read. This collapses an O(herd) stampede into O(1) origin load — it's the single most important mechanism on the read path, and it's why "what happens on a cold viral link" separates senior from junior answers.</li>
+    <li><strong>Why is this a cache problem and not a database problem?</strong> <em>(senior answer)</em> Writes are ~3 req/s and the dataset is sub-TB — the DB is trivial. Reads peak at 10k QPS, and origin QPS = read QPS·(1−h), so cache hit rate is a 10× cost multiplier from 90% to 99%. Click traffic is Zipfian, so a small hot-set cache buys 95%+ almost free. The architecture <em>is</em> the cache hierarchy; the DB is just durability behind it. (Mechanics of eviction/TTL: lesson 06.)</li>
+    <li><strong>Why 7 characters?</strong> <em>(senior answer)</em> It's derived, not chosen. 62^7 ≈ 3.5T codes; at 100M/yr that's ~35,000 years to exhaust. Six chars (~57B) also lasts centuries but leaves a random-allocation scheme with less sparsity (higher collision rate). 7 is the smallest length with comfortable headroom for random codes, at the cost of one byte.</li>
+    <li><strong>301 or 302?</strong> <em>(senior answer)</em> 302 by default. 301 is cheaper (browsers cache it and never come back) but you lose takedown control — a blocked malware link keeps redirecting from browser caches you can't reach — and your analytics under-count exactly the most popular links. 302 keeps every click coming to you, so takedown is instant and counts are complete; recover the cost at the edge/CDN cache, which you <em>can</em> invalidate. 301 only when destinations are immutable and you don't need per-click data.</li>
+    <li><strong>Sequential or random codes?</strong> <em>(senior answer)</em> Random for any public service. Sequential is compact and cache-friendly but lets anyone enumerate every link and read your volume off consecutive codes. Random at 3×10⁻⁵ occupancy collides ~0.003% of the time — one cheap insert-if-absent retry on the low-QPS write path — to buy full enumeration resistance.</li>
+    <li><strong>How do you count clicks without slowing redirects?</strong> <em>(senior answer)</em> You don't count on the redirect path at all. The redirect tees a fire-and-forget event to a durable log and returns; an offline consumer aggregates the stream (DDIA Ch. 11). The pipeline can lag, batch, sample, or fail and redirects never notice. Synchronous counting would couple a 10k-QPS latency-critical path to a high-volume write store — the canonical mistake.</li>
+    <li><strong>The database is down — what does a redirect do?</strong> <em>(senior answer)</em> Cached codes keep redirecting (stale-while-revalidate). Uncached codes fail closed — return 503 rather than guess — because a shortener that redirects to an un-vetted destination during an outage is an abuse vector. The high cache hit rate means most traffic survives the outage untouched, which is the upside of having made this a cache problem.</li>
+    <li><strong>How do you stop your shortener from being a malware launderer?</strong> <em>(senior answer)</em> Synchronous reputation/blocklist check at creation for high-risk submissions, continuous async re-scanning, and a compact <code>status</code> flag the redirect reads inline (no extra lookup). The 302 default is what makes takedown actually effective — flip the flag and the next click is blocked.</li>
+  </ol>
 </div>
 
 <h2>Related foundation lessons</h2>
+<p>This case leans on four foundations, each for a specific reason. <strong>Caching (<a href="06_caching.html">lesson 06</a>)</strong> owns the hit-rate → origin-load mechanics, eviction, and TTL — we used the result here and deferred the how. <strong>API design (<a href="03_api_design.html">lesson 03</a>)</strong> covers why the redirect verb and idempotent create belong in the contract. <strong>Rate limiting &amp; the edge (<a href="15_rate_limiting_edge.html">lesson 15</a>)</strong> is where request coalescing and edge admission control live in full — the single-flight answer above is its application to the viral-link herd. <strong>Async messaging (<a href="11_async_messaging.html">lesson 11</a>)</strong> is the click-event stream: the queue/log that lets analytics lag without ever touching the redirect.</p>
 <div class="case-meta">
 <a class="chip" href="03_api_design.html">API design</a>
 <a class="chip" href="06_caching.html">Caching</a>
 <a class="chip" href="15_rate_limiting_edge.html">Rate limiting and edge</a>
 <a class="chip" href="11_async_messaging.html">Async messaging</a>
 </div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  A URL shortener is a read system wearing a write system's clothes. Writes are ~3 req/s and the data is tiny; reads peak at 10k QPS and origin load = read QPS·(1−h), so cache hit rate — not the database — is the dominant cost. The keyspace (62^7 ≈ 3.5T, ~35,000 years of headroom) makes 7 characters a derived choice, and random codes buy enumeration resistance for a 0.003% retry. Default to 302 so you keep takedown control and complete analytics, tee click events to an async log so counting never touches the hot path, and protect the one dangerous moment — a cold link going viral — with single-flight request coalescing at the edge. Everything else is downstream of the read/write asymmetry.</div>
 
 <footer class="lesson-nav">
   <a href="case_04_unique_id_generator.html"><span class="dir">Previous</span><span class="ttl">Previous case</span></a>

@@ -37,116 +37,200 @@
 <main>
 
 <h1>Microsecond-latency exchange architecture</h1>
-<p class="subtitle">When latency is measured in microseconds, architecture becomes subtraction: remove hops, locks, allocations, syscalls, and ambiguity.</p>
+<p class="subtitle">When the budget is single-digit microseconds, you do not "add" a fast path — you <em>subtract</em> until nothing slow is left. Architecture becomes the disciplined removal of every hop, copy, allocation, lock, and syscall between the wire and the match.</p>
 <div class="case-meta">
-  <span class="chip">Source: Archive</span>
-  <span class="chip">Case drill</span>
+  <span class="chip">Satellite of C37</span>
+  <span class="chip">Latency deep-dive</span>
   <span class="chip">Trade-off first</span>
 </div>
 
 <div class="callout">
-  <div class="label">How to read this case</div>
-  This page is an original educational walkthrough based on the case topic, not a transcription. Read it linearly: contract, estimates, data, flows, bottlenecks, trade-offs, then failure modes.
+  <div class="label">Where this sits in the exchange arc</div>
+  This case is one of three. <a href="case_37_stock_exchange.html">C37</a> is the anchor — the whole-exchange overview, order book, sessions, gateways. <a href="case_39_matching_orders.html">C39</a> owns the matching <em>kernel</em> (price-time priority, deterministic replay). <strong>C38 — this page — owns the latency budget</strong>: where the microseconds actually go and how you reclaim them. We will not re-derive the order book (see C37) or the matching algorithm (see C39); we derive only the time budget and the engineering that fits inside it.
 </div>
 
-<h2>0. Interview hinge</h2>
-<p>The hinge is the moment where the prompt stops being generic and the architecture becomes forced. For this case, that hinge is: <strong>Latency budget, colocated components, single-writer design, recovery logs.</strong></p>
-<div class="callout ok">
-  <div class="label">Invariant to protect</div>
-  The design is only correct if the user-visible contract survives retries, partial failures, stale caches, and reordering. A concrete invariant to defend here: <strong>Latency outlier</strong> must be handled by <strong>Profile p99.99 and remove allocation, locks, and cross-core contention.</strong>.
-</div>
+<h2>1. The hinge — latency is a budget you spend by subtraction</h2>
 <div class="callout warn">
-  <div class="label">Tempting but wrong</div>
-  A common shortcut is to choose <strong>Kernel bypass vs normal sockets</strong> just because it buys lower latency. That shortcut fails when its cost matters: operational complexity. Use it only when the workload matches the condition: ultra-low-latency environments.
+  <div class="label">What makes this problem forcing</div>
+  In an ordinary web service a 10&nbsp;ms request is fine; you reach for more replicas when you need more throughput. Here the forcing function is different: the customer's edge is measured in <strong>microseconds of wire-to-wire latency</strong> and — far more importantly — in the <strong>variance</strong> of that latency. A median of 5&nbsp;µs is worthless if one order in 10,000 takes 2&nbsp;ms, because that one order is the one that loses money. So the dominant constraint is not "be fast on average," it is "have <em>no slow path at all</em>." Every microsecond is a line item in a fixed budget, and you can only meet the budget by <em>removing</em> things, never by adding.
 </div>
+<p>The discipline this enforces is the one foundation <a href="14_optimization.html">lesson 14</a> calls optimisation-by-removal: you do not speed up a hop, you <em>delete</em> the hop. The cost of an operation in this regime is dominated by things that are invisible in normal service design — a kernel crossing, a cache line that lives on another core, a heap allocation that might trip the garbage collector. The architecture is whatever survives after you have subtracted all of those. That is why the right mental model for this page is a <strong>waterfall</strong>: start with the wall-clock you are allowed, subtract each unavoidable cost, and what remains is the slack you must protect.</p>
 
-<h2>1. Clarify the contract</h2>
-<p>The prompt is best treated as a product contract before it is treated as a component diagram. The system needs to do the following:</p>
+<h2>2. Clarify the contract</h2>
+<p>Treat the prompt as a product contract before drawing boxes. The matching engine must:</p>
 <ul>
-  <li>Minimize order-entry latency.</li>
-  <li>Keep matching deterministic and auditable.</li>
-  <li>Avoid unpredictable pauses.</li>
-  <li>Publish market data quickly.</li>
-  <li>Recover without losing accepted orders.</li>
+  <li><strong>Minimise wire-to-wire order-entry latency</strong> — the time from the order's last bit arriving on the NIC to the acknowledgement's first bit leaving it.</li>
+  <li><strong>Match deterministically</strong> — identical input sequence ⇒ identical output, so the book can be replayed and audited (the C39 / DDIA Ch. 11 property).</li>
+  <li><strong>Have no unpredictable pauses</strong> — no GC, no page fault, no lock convoy on the hot path. This is the real spec; "fast" is downstream of it.</li>
+  <li><strong>Be durable for accepted orders</strong> — an acknowledged order must survive a process crash, without the journal sitting synchronously in the budget.</li>
+  <li><strong>Publish market data fast and in order.</strong></li>
 </ul>
+<p>What it explicitly need <em>not</em> do: be a general-purpose service, scale horizontally per book (one book = one writer — see §6), tolerate dynamic allocation in steady state, or use a rich RPC stack. Those are the very things we will subtract.</p>
 
-<h2>2. Put numbers on the shape</h2>
-<p>The exact numbers depend on the interviewer, but these are the estimates that should steer the architecture:</p>
-<ul>
-  <li>A single network hop can dominate a microsecond budget.</li>
-  <li>Garbage collection pauses are unacceptable in the hottest path.</li>
-  <li>Batching improves throughput but can add waiting latency.</li>
-  <li>Durable logging can be on the critical path unless carefully engineered.</li>
-</ul>
+<h2>3. Put numbers on it — the latency budget table</h2>
+<p>This is the load-bearing calculation of the whole case. Take a target of <strong>&lt;10&nbsp;µs wire-to-wire</strong> for order entry (a credible "fast but not exotic" target; the lowest tier of houses push under 1&nbsp;µs with FPGAs, which we treat as the extreme below). Now write down what each unavoidable mechanism <em>costs</em>, and subtract.</p>
 
-<h2>3. Define the surface area</h2>
-<p>Keep the API small. The API should express the product operation, not leak the internal queue, cache, or shard layout.</p>
 <table>
-  <thead><tr><th>API / operation</th><th>Why it exists</th></tr></thead>
+  <thead><tr><th>Mechanism on the path</th><th>Typical cost</th><th>Verdict / what you do about it</th></tr></thead>
   <tbody>
-    <tr><td><code>binary order entry</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>cancel</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>market data feed</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>admin halt</code></td><td>Part of the minimal contract for this case.</td></tr>
+    <tr><td><strong>NIC → kernel network stack → userspace</strong> (normal sockets)</td><td><strong>~10&nbsp;µs</strong> each way</td><td>Catastrophic — it <em>alone</em> blows the whole budget. Subtract it: kernel bypass.</td></tr>
+    <tr><td><strong>Kernel bypass</strong> (DPDK / Solarflare / Onload, NIC DMA straight to userspace)</td><td><strong>~1&nbsp;µs</strong> each way</td><td>The replacement for the row above. This is the single largest saving you make.</td></tr>
+    <tr><td><strong>Cross-core / cross-NUMA cache miss</strong> (data owned by another core's cache)</td><td><strong>~100&nbsp;ns</strong> (≈0.1&nbsp;µs)</td><td>Per hop. Pin the book to one core; keep its hot state in that core's L1/L2 (single-writer, §6).</td></tr>
+    <tr><td><strong>Lock contention</strong> (uncontended CAS is ~tens of ns; a contended lock that parks)</td><td><strong>hundreds of ns</strong> → µs+ if it sleeps</td><td>Subtract entirely: no locks on the hot path. One writer per book means nothing to contend.</td></tr>
+    <tr><td><strong>Main-memory access</strong> (last-level cache miss to DRAM)</td><td><strong>~100&nbsp;ns</strong></td><td>Preallocate and keep the working set resident; never fault in pages on the hot path.</td></tr>
+    <tr><td><strong>GC pause</strong> (managed runtime stop-the-world)</td><td><strong>~milliseconds</strong></td><td>1000× over budget. Not a tax — a <em>cliff</em>. Either no allocation on the path, or no managed runtime (§6).</td></tr>
   </tbody>
 </table>
 
-<h2>4. Model the data</h2>
-<p>The data model is the first architecture. If the data ownership is vague, every later box-and-arrow decision will be vague too.</p>
-<div class="case-meta">
-<span class="chip">preallocated order object</span><span class="chip">sequenced event</span><span class="chip">memory order book</span><span class="chip">append log</span>
+<p>Now sum the budget by <em>subtraction</em> from the 10&nbsp;µs target, one direction (inbound):</p>
+<p class="math block">10&nbsp;µs target − 1&nbsp;µs (NIC bypass in) − ~0.5&nbsp;µs (parse binary msg, risk check) − ~0.2&nbsp;µs (sequencer) − ~0.3&nbsp;µs (match: a few cache-resident lookups + book update) − ~0.5&nbsp;µs (encode + journal handoff) − 1&nbsp;µs (NIC bypass out) ≈ 6.5&nbsp;µs spent, ≈ 3.5&nbsp;µs of slack.</p>
+<p>Two things fall out of that arithmetic immediately. First, the <strong>NIC crossings dominate</strong>: 2&nbsp;µs of the ~6.5&nbsp;µs spent is just getting bits on and off the wire — which is why kernel bypass is non-negotiable, not an optimisation. Second, the budget has <em>no room for a single millisecond-scale event</em>. A lone GC pause (≈1&nbsp;ms) is ~150× the entire spent budget; one page fault or one contended lock that sleeps is the same story. The table does not say "GC is slow," it says <strong>one GC pause = ~150 orders' worth of budget vaporised in one go.</strong> That is the number that forces every later decision.</p>
+
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">Wire-to-wire target</div><div class="v">&lt; 10 µs</div></div>
+  <div class="kpi"><div class="k">NIC crossings (bypass, both ways)</div><div class="v">~2 µs</div></div>
+  <div class="kpi"><div class="k">Match + book update (cache-resident)</div><div class="v">~0.3 µs</div></div>
+  <div class="kpi"><div class="k">One GC pause</div><div class="v">~1 ms = 1000 µs</div></div>
 </div>
 
-<h2>5. Linearized design</h2>
-<p>Walk the design in the order a request or event actually moves. This keeps the interview grounded and exposes the first bottleneck naturally.</p>
+<h2>4. Data model &amp; API</h2>
+<p>The data model <em>is</em> the latency design. Every hot-path object is preallocated at startup so steady-state allocation is zero, and laid out for cache locality. (The book structure itself — price levels, FIFO queues per level — belongs to <a href="case_39_matching_orders.html">C39</a>; here we care only that it lives entirely in one core's cache.)</p>
+<div class="case-meta">
+<span class="chip">preallocated order pool (no steady-state malloc)</span><span class="chip">sequenced event (monotonic seq# = truth)</span><span class="chip">in-memory order book (cache-resident)</span><span class="chip">sequential append journal</span>
+</div>
+<table>
+  <thead><tr><th>API / operation</th><th>Why it exists / latency note</th></tr></thead>
+  <tbody>
+    <tr><td><code>NewOrder</code> (binary, fixed-layout)</td><td>Compact binary over a persistent session — no JSON, no per-message connection setup, parseable without allocation.</td></tr>
+    <tr><td><code>Cancel</code> / <code>Replace</code></td><td>Same fast path; cancels are often the latency-sensitive ones in market-making.</td></tr>
+    <tr><td><code>MarketData</code> feed</td><td>Published from the <em>same</em> ordered event stream that drove matching — one source of truth, sequence-numbered.</td></tr>
+    <tr><td><code>Halt</code> (admin)</td><td>Control plane; deliberately off the hot path.</td></tr>
+  </tbody>
+</table>
+
+<h2>5. Linearized design — follow one order, and the colocated layout</h2>
+<p>Walk the order in the order it actually moves. The whole pipeline lives in a single colocated rack (clients colocate too — physical distance is light-speed latency you cannot subtract), and the matching stage is pinned to one core per book.</p>
 <ol class="linear-list">
-<li><strong>1.</strong> Place gateways, risk, matching, and market data in the same low-latency environment where possible.</li>
-<li><strong>2.</strong> Use compact binary protocols and persistent sessions.</li>
-<li><strong>3.</strong> Preallocate hot-path memory and avoid dynamic allocation.</li>
-<li><strong>4.</strong> Run a single-writer event loop per book partition.</li>
-<li><strong>5.</strong> Append sequenced events to a low-latency journal.</li>
-<li><strong>6.</strong> Publish market data from the same ordered event stream.</li>
+<li><strong>1. NIC, kernel-bypassed.</strong> The NIC DMAs the order frame straight into a userspace ring buffer (DPDK/Solarflare). No kernel, no copy, no context switch. ~1&nbsp;µs.</li>
+<li><strong>2. Gateway parse + risk.</strong> A busy-spinning thread reads the ring, parses the fixed-layout binary message in place (no allocation), and runs pre-trade risk (credit, size limits) against preallocated state. ~0.5&nbsp;µs.</li>
+<li><strong>3. Sequencer.</strong> The order is stamped with a monotonic sequence number — the total order that makes deterministic replay possible (DDIA Ch. 11). This, not the wall clock, is "truth."</li>
+<li><strong>4. Matching core (single writer).</strong> One thread, pinned to one core, owns this book's entire state in its L1/L2. It matches against the resident book, mutating preallocated objects. No lock (nobody else writes), no allocation, no cache miss to another core. ~0.3&nbsp;µs.</li>
+<li><strong>5. Journal handoff.</strong> The sequenced event is handed (lock-free, via a ring/queue) to a journal writer that appends it sequentially. The ack does not wait on fsync (see §6.3); durability runs <em>alongside</em>, not <em>inside</em>, the budget.</li>
+<li><strong>6. Encode + NIC out.</strong> The ack is encoded into a preallocated buffer and DMA'd back out through the bypassed NIC. Market data is published off the same ordered stream. ~1.5&nbsp;µs.</li>
 </ol>
 
+<div class="ascii">
+  LATENCY BUDGET WATERFALL  (target &lt; 10 µs wire-to-wire, inbound shown)
+
+  budget per stage, subtracted from 10 µs
+  10 µs ┤████████████████████████  start: the whole budget
+        │
+   9 µs ┤███████████████████       − NIC→userspace (kernel bypass)   ~1.0 µs
+        │
+ ~8.5µs ┤██████████████████        − parse binary + pre-trade risk   ~0.5 µs
+        │
+ ~8.3µs ┤██████████████████        − sequencer (stamp seq#)          ~0.2 µs
+        │
+ ~8.0µs ┤█████████████████         − MATCH + book update (in cache)  ~0.3 µs
+        │
+ ~7.5µs ┤████████████████          − encode + journal handoff        ~0.5 µs
+        │
+ ~6.5µs ┤██████████████            − NIC userspace→wire (bypass)     ~1.0 µs
+        └──────────────────────────▶  ~3.5 µs slack left to protect the TAIL
+
+  ┌──────────────── the thing you must NEVER let onto this path ───────────────┐
+  │  one GC pause  ≈ 1 ms = 1000 µs  ≈ 150× the entire spent budget            │
+  └────────────────────────────────────────────────────────────────────────────┘
+
+
+  COLOCATED, SINGLE-WRITER-PER-CORE LAYOUT  (one rack, NUMA-pinned)
+
+            kernel-bypass NIC (DMA → userspace ring)
+                          │
+        ┌─────────────────┼──────────────────────────────┐  NUMA node 0
+        │  core 0          │   core 1          core 2      │
+        │  ┌──────────┐  ring  ┌──────────┐  ┌──────────┐  │
+        │  │ gateway  │──────▶ │ MATCH    │  │ MATCH    │  │
+        │  │ + risk   │ seq#   │ book AAPL│  │ book MSFT│  │   one writer
+        │  │ (spin)   │        │ (spin,   │  │ (spin)   │  │   per book,
+        │  └──────────┘        │  no lock,│  └──────────┘  │   state in L1/L2
+        │       ▲              │  no GC)  │       │        │
+        │       │ ring         └────┬─────┘       │ ring   │
+        │  ┌────┴─────┐    seq event│        ┌────┴─────┐  │
+        │  │ NIC out  │◀────────────┴───────▶│ journal  │  │  append-only,
+        │  │ (encode) │   market-data feed   │ (async)  │  │  sequential
+        │  └──────────┘   off same stream    └──────────┘  │
+        └───────────────────────────────────────────────────┘
+   cross-core hop = ~100 ns cache miss · cross-NUMA = worse → keep a book on ONE core
+</div>
+
 <h2>6. Deep dives</h2>
-<h3>Latency budget</h3>
-<p>Write the budget per hop. If gateway parsing, risk, sequencing, matching, journaling, and market data each get a few microseconds, ordinary service boundaries are too expensive.</p>
-<h3>Mechanical sympathy</h3>
-<p>CPU cache locality, kernel bypass, pinned threads, and preallocated memory matter because variance is the enemy.</p>
-<h3>Recovery</h3>
-<p>Low latency does not remove durability. It forces a design where the recovery log is compact, sequential, and replayable.</p>
+
+<h3>6.1 Architecture as subtraction</h3>
+<p>Re-read the waterfall as a list of things that <em>used to be there</em>. A normal service would have, on this path: a kernel socket (subtracted → DPDK), a load balancer hop (subtracted → clients connect directly to the colocated gateway), JSON/Protobuf parsing with allocation (subtracted → fixed-layout binary parsed in place), an RPC call to a separate matching service (subtracted → matching is in-process, one core away via a ring), a lock around the shared book (subtracted → single writer, nothing to lock), a heap allocation per order (subtracted → preallocated object pool), and a synchronous database write (subtracted → async sequential journal, §6.3). Each subtraction removes both a chunk of mean latency <em>and</em>, more importantly, a <em>source of variance</em>. The finished design is not "a service with optimisations bolted on"; it is the residue left after you delete everything that can stall. This is exactly the removal-not-addition discipline of <a href="14_optimization.html">lesson 14</a> taken to its limit.</p>
+
+<h3>6.2 Managed runtime vs manual memory; spin vs interrupt</h3>
+<p>The trade-off table lists "managed runtime vs manual memory" with <em>pause risk</em> as the cost and <em>matching core</em> as the place it bites — and §3 tells you why: one stop-the-world GC pause (~1&nbsp;ms) is ~150× the spent budget. You have two honest ways out. (a) Use a <strong>non-managed language</strong> (C++/Rust) on the matching core so there is no collector at all. (b) Keep a managed runtime (Java is common — LMAX Disruptor is the canonical example) but engineer <strong>zero steady-state allocation</strong>: preallocate every hot object at startup, reuse from pools, and the GC has nothing to collect, so it never runs on the hot path. Both reach the same place — <em>no allocation in steady state</em> — which is the real invariant; the language is secondary.</p>
+<p>The second mechanical-sympathy choice is <strong>busy-spin vs interrupt</strong>. A normal thread blocks on a socket and is woken by an interrupt — but the wakeup itself costs microseconds and is jittery (it depends on the scheduler). So the hot threads <em>busy-spin</em>: a pinned thread polls its ring buffer in a tight loop, burning a whole CPU core to stay warm and never pay a wakeup. You trade power and a dedicated core for the elimination of scheduler-induced variance. That is the same trade everywhere on this path: spend a fixed, predictable resource (a core, RAM for preallocation) to delete an unpredictable cost (a wakeup, an allocation, a fault).</p>
+
+<h3>6.3 The p99.99 tail is the real enemy</h3>
+<p>This is the point foundation <a href="02_latency_throughput.html">lesson 02</a> and <strong>DDIA Ch. 1</strong> hammer, and it is the heart of this case. DDIA's own framing: users do not experience your mean or even your p99 — they experience your <em>tail</em>, and in a system that fires millions of orders, p99.99 (the worst one in 10,000) happens constantly. A p50 of 5&nbsp;µs alongside a p99.99 of 2&nbsp;ms is not "fast with a rare blip"; it is a <strong>slow system that is occasionally fast</strong>, because the 2&nbsp;ms outliers are the trades that get picked off. So the engineering target is not "lower the mean" — the mean is easy — it is "<strong>collapse the distance between p50 and p99.99</strong>." Every subtraction in §6.1 is really a tail-killer: allocation, GC, page faults, lock contention, cross-NUMA misses, and syscalls each produce a small <em>fraction</em> of slow events that never show in the mean but <em>are</em> the tail. You attack the tail by removing its causes one by one, then proving it with histograms (HdrHistogram-style, full distribution — never averages), per <a href="16_observability.html">lesson 16</a>.</p>
+
+<h3>6.4 Determinism, sequence numbers, and recovery</h3>
+<p>Low latency does not excuse you from durability — it just dictates <em>how</em>. The single-writer matching core processing one ordered input stream is precisely <strong>DDIA Ch. 11's deterministic stream processing</strong>: because there is exactly one writer and a total order, the same event sequence always yields the same book, so the journal is a replayable source of truth. On crash you replay the journal to reconstruct the book — no distributed consensus needed on the hot path. The sequence number, not the clock, is truth: <strong>DDIA Ch. 8</strong> warns that physical clocks across machines are unreliable and non-monotonic, so you never order trades by timestamp; the sequencer's monotonic counter is the canonical order, and timestamps are advisory metadata only. The journal write is kept off the budget by handing the event to an async writer over a lock-free ring — but you can choose to make the <em>ack</em> wait for the journal (sync) when the regulatory/risk requirement outweighs the latency (the §7 sync-vs-async row).</p>
 
 <h2>7. Trade-offs</h2>
 <table>
   <thead><tr><th>Choice</th><th>Buys</th><th>Costs</th><th>Choose when</th></tr></thead>
   <tbody>
-<tr><td><strong>Kernel bypass vs normal sockets</strong></td><td>lower latency</td><td>operational complexity</td><td>ultra-low-latency environments</td></tr>
-<tr><td><strong>Batching vs immediate process</strong></td><td>throughput</td><td>added wait</td><td>market data distribution</td></tr>
-<tr><td><strong>Managed runtime vs manual memory</strong></td><td>developer speed</td><td>pause risk</td><td>matching core</td></tr>
-<tr><td><strong>Sync journal vs async journal</strong></td><td>recovery guarantee</td><td>latency</td><td>accepted order log</td></tr>
+<tr><td><strong>Kernel bypass vs normal sockets</strong></td><td>~9 µs saved per crossing; removes scheduler jitter</td><td>operational complexity, special NICs, busy-spin burns cores</td><td>always, in this regime — it is the single biggest line item</td></tr>
+<tr><td><strong>Busy-spin vs interrupt-driven</strong></td><td>no wakeup cost, predictable latency</td><td>a dedicated core at 100% + power</td><td>hot threads (gateway, matching) — not the control plane</td></tr>
+<tr><td><strong>Managed runtime vs manual memory</strong></td><td>developer speed, safety</td><td>GC pause risk (~1 ms cliff)</td><td>managed is fine <em>only</em> with zero-allocation discipline; else C++/Rust on the matching core</td></tr>
+<tr><td><strong>Sync journal vs async journal</strong></td><td>sync: order is durable before ack</td><td>sync: fsync (ms-scale) lands inside the budget</td><td>async by default; sync only when regulation/risk demands ack-after-durable</td></tr>
   </tbody>
 </table>
+<p>The sharpest of these is the journal one, because it is where the latency story and the durability story collide. An fsync to even an NVMe device is tens to hundreds of microseconds — orders of magnitude over the whole order-entry budget — so putting it <em>inside</em> the ack path destroys the latency you spent the rest of the design earning. The standard resolution is to make durability concurrent: hand the sequenced event to a journal writer over a lock-free ring and let the ack return immediately, accepting a tiny window where an acked order could be lost on a hard crash before it lands. When that window is unacceptable (and for an exchange it often is), you do not synchronously fsync per order — you <strong>batch</strong> the journal (the §6.3 batching/throughput row) or replicate the sequenced stream to a hot standby in the same rack, so "durable" means "received by the replica," which is far cheaper than a disk fsync. The latency is preserved by making durability a parallel concern, never a serial one.</p>
 
 <h2>8. Failure modes</h2>
 <table>
   <thead><tr><th>Failure</th><th>Mitigation</th></tr></thead>
   <tbody>
-<tr><td><strong>Latency outlier</strong></td><td>Profile p99.99 and remove allocation, locks, and cross-core contention.</td></tr>
-<tr><td><strong>Clock sync issue</strong></td><td>Use disciplined time sources and sequence numbers for truth.</td></tr>
-<tr><td><strong>Dropped market data packet</strong></td><td>Provide sequence numbers and recovery channel.</td></tr>
-<tr><td><strong>Hot symbol overload</strong></td><td>Partition by symbol but keep one writer per book.</td></tr>
+<tr><td><strong>Latency outlier (the tail)</strong></td><td>Profile the full distribution at p99.99 (histograms, not means); hunt and remove the cause — allocation, GC, page fault, lock contention, cross-NUMA miss, or syscall (§6.3).</td></tr>
+<tr><td><strong>GC pause on the matching core</strong></td><td>Zero steady-state allocation (preallocated pools) or a non-managed runtime; pre-touch and lock pages so nothing faults in.</td></tr>
+<tr><td><strong>Clock skew between machines</strong></td><td>Never order by wall clock (DDIA Ch. 8). The sequencer's monotonic seq# is truth; timestamps are advisory only.</td></tr>
+<tr><td><strong>Dropped market-data packet</strong></td><td>Sequence-number every message so gaps are detectable; provide a separate recovery/snapshot channel to refill.</td></tr>
+<tr><td><strong>Hot symbol overload</strong></td><td>Partition books across cores, but keep <em>exactly one writer per book</em> — never split a single book across cores (that reintroduces locks and cross-core misses).</td></tr>
+<tr><td><strong>Matching process crash</strong></td><td>Replay the sequential journal to rebuild the in-memory book deterministically (DDIA Ch. 11), or fail over to a hot standby replaying the same ordered stream.</td></tr>
   </tbody>
 </table>
 
-<h2>9. What to say in the interview</h2>
-<div class="callout ok">
-  <div class="label">Strong signal</div>
-  Lead with the dominant constraint: Latency budget, colocated components, single-writer design, recovery logs. Then defend the design by naming what you made faster, what you made more reliable, and what complexity you accepted.
+<h2>9. Interview Q&amp;A</h2>
+<div class="callout">
+  <ol>
+    <li><strong>Your p50 is 5&nbsp;µs but your p99.99 is 2&nbsp;ms — where does that tail come from and how do you kill it?</strong> <em>(senior answer)</em> A 2&nbsp;ms tail next to a 5&nbsp;µs median is a millisecond-scale <em>event</em>, not gradual slowness — so look for the handful of causes that produce ms-scale stalls: a GC pause, a major page fault (memory not resident), a lock that parked a thread, a cross-NUMA access, or a syscall/scheduler wakeup. I'd capture the full histogram and correlate the slow samples with GC logs, page-fault counters, and core/NUMA placement. The kills, in order: eliminate steady-state allocation (or drop the managed runtime) to remove GC; pre-touch and mlock pages so nothing faults; busy-spin pinned threads so there's no scheduler wakeup; single-writer-per-core so there's no lock and no cross-core miss. The tail isn't "the system being slow" — it's a specific event class, and you remove the classes one at a time.</li>
+    <li><strong>Why is kernel bypass non-negotiable here?</strong> <em>(senior answer)</em> Normal NIC→kernel→userspace is ~10&nbsp;µs each way, which alone exceeds a sub-10&nbsp;µs wire-to-wire budget — and it's jittery because of context switches and scheduling. DPDK/Solarflare DMAs frames straight into a userspace ring (~1&nbsp;µs), removing both the mean cost and a major variance source. It's the single biggest line item on the waterfall, so it's a starting assumption, not an optimisation.</li>
+    <li><strong>Why single-writer per book instead of a thread pool with a lock?</strong> <em>(senior answer)</em> A lock on the book reintroduces exactly what we're subtracting: contention (hundreds of ns, µs+ if it sleeps) and, worse, unpredictable tail latency under contention. One thread pinned to one core owns the whole book in its L1/L2 — no lock to take, no cross-core cache miss, and as a bonus the processing is deterministic, which is what makes journal replay correct (DDIA Ch. 11). You scale by partitioning <em>different</em> books to different cores, never by sharing one book.</li>
+    <li><strong>Can you use Java/managed languages at all?</strong> <em>(senior answer)</em> Yes — LMAX runs the Disruptor pattern in Java in production. The trick is zero steady-state allocation: preallocate every hot object at startup and reuse from pools, so the GC never has work to do on the hot path. If you can't guarantee that discipline, use C++/Rust on the matching core. The invariant is "no allocation in steady state," not "no managed runtime."</li>
+    <li><strong>How do you stay durable without putting an fsync in the budget?</strong> <em>(senior answer)</em> Hand the sequenced event to an async journal writer over a lock-free ring so the ack doesn't wait on disk; or, when an order must be durable before ack, replicate the sequenced stream to a hot standby in the same rack and define "durable = received by replica," which is far cheaper than a disk fsync, and batch the disk journal behind that. Durability runs parallel to the hot path, never serial to it.</li>
+    <li><strong>Why busy-spin and burn a whole core?</strong> <em>(senior answer)</em> Blocking-and-interrupt wakeups cost microseconds and are jittery — they depend on the scheduler, which is a tail-latency source. Spinning on the ring keeps the thread hot and removes the wakeup entirely. You're trading a fixed, predictable resource (a dedicated core + power) for the removal of an unpredictable cost. In this regime predictability is worth more than the core.</li>
+    <li><strong>Why sequence numbers and not timestamps for ordering?</strong> <em>(senior answer)</em> Physical clocks across machines drift and aren't monotonic (DDIA Ch. 8), so ordering trades by timestamp is incorrect and unauditable. The sequencer assigns a single monotonic position to every event — that total order is the truth, it's what makes deterministic replay and fair price-time priority possible, and timestamps become advisory metadata only.</li>
+    <li><strong>Where does this case stop and C37/C39 begin?</strong> <em>(senior answer)</em> C37 is the exchange overview (sessions, gateways, the book as a concept); C39 is the matching kernel's algorithm (price-time priority, deterministic replay mechanics). This case (C38) is specifically the latency budget and the mechanical engineering — bypass, pinning, no-alloc, spin, async journal — that lets the C39 kernel run inside the C37 system at microsecond scale. They're one arc, not three overlapping designs.</li>
+  </ol>
 </div>
 
-<h2>Related foundation lessons</h2>
+<h2>Related lessons</h2>
+<p>This page is the <strong>latency satellite</strong> of the exchange arc: <a href="case_37_stock_exchange.html">C37</a> is the system overview/anchor (read it first for the order book and session model), and <a href="case_39_matching_orders.html">C39</a> owns the matching kernel and deterministic replay (the algorithm that runs inside this budget). It leans hardest on foundation <a href="02_latency_throughput.html">lesson 02</a> for the percentile/tail framing and <a href="14_optimization.html">lesson 14</a> for the optimisation-by-removal discipline, with <a href="16_observability.html">lesson 16</a> for measuring the tail honestly with histograms.</p>
 <div class="case-meta">
-<a class="chip" href="02_latency_throughput.html">Latency and throughput</a>
-<a class="chip" href="14_optimization.html">Optimization</a>
-<a class="chip" href="09_consistency_cap.html">Consistency</a>
-<a class="chip" href="13_fault_tolerance.html">Fault tolerance</a>
+<a class="chip" href="case_37_stock_exchange.html">C37 · Exchange overview (anchor)</a>
+<a class="chip" href="case_39_matching_orders.html">C39 · Matching kernel</a>
+<a class="chip" href="02_latency_throughput.html">02 · Latency &amp; percentiles</a>
+<a class="chip" href="14_optimization.html">14 · Optimisation</a>
+<a class="chip" href="16_observability.html">16 · Observability</a>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  At microsecond scale, architecture is subtraction: you start with a fixed wire-to-wire budget (~10&nbsp;µs), and the waterfall shows the NIC crossings (~2&nbsp;µs of it, hence kernel bypass) and a ~0.3&nbsp;µs cache-resident match leave room only if <em>nothing</em> slow ever lands on the path. The real enemy is not the mean but the p99.99 tail (DDIA Ch. 1), and every slow event is a removable cause — allocation, GC (a ~1&nbsp;ms cliff = ~150× the budget), page faults, lock contention, cross-NUMA misses, syscalls. So you delete them: single-writer-per-core (DDIA Ch. 11) kills locks and cross-core misses, preallocation/no-managed-runtime kills GC, busy-spin kills wakeup jitter, and an async sequential journal keyed on sequence numbers (DDIA Ch. 8/11) keeps durability and determinism off the budget. Fast on average is free; <strong>no slow path at all</strong> is the whole job.
 </div>
 
 <footer class="lesson-nav">

@@ -37,117 +37,170 @@
 <main>
 
 <h1>Design a rate limiter</h1>
-<p class="subtitle">A rate limiter is the first serious edge system because the product wants bursts, the infrastructure wants smooth traffic, and attackers exploit any ambiguity between the two.</p>
+<p class="subtitle">You already know the token bucket. This drill is about the part the whiteboard glosses over: the moment one bucket becomes <em>N</em> buckets behind a load balancer, and "100 requests per minute" stops meaning a single, knowable number.</p>
 <div class="case-meta">
   <span class="chip">Source: Vol. 1 Ch. 4</span>
   <span class="chip">Case drill</span>
-  <span class="chip">Trade-off first</span>
+  <span class="chip">Applies lesson 15</span>
 </div>
 
 <div class="callout">
   <div class="label">How to read this case</div>
-  This page is an original educational walkthrough based on the case topic, not a transcription. Read it linearly: contract, estimates, data, flows, bottlenecks, trade-offs, then failure modes.
+  This is a <strong>drill</strong>, not a lesson. The mechanism — token bucket, sliding window, the 429 contract — is derived from first principles in <a href="15_rate_limiting_edge.html">foundation lesson 15</a>. Do not re-derive it on the whiteboard; reference it and move on. What an interviewer is actually probing in C01 is the part lesson 15 names but doesn't drill: <strong>where the counter lives when there are many nodes, what happens when that store dies, and what one abusive tenant does to all of it.</strong> Read linearly, but spend your time in §6.
 </div>
 
-<h2>0. Interview hinge</h2>
-<p>The hinge is the moment where the prompt stops being generic and the architecture becomes forced. For this case, that hinge is: <strong>Token bucket, sliding windows, shared counters, edge placement, abuse protection.</strong></p>
-<div class="callout ok">
-  <div class="label">Invariant to protect</div>
-  The design is only correct if the user-visible contract survives retries, partial failures, stale caches, and reordering. A concrete invariant to defend here: <strong>Clock skew between nodes</strong> must be handled by <strong>Use server-side time from the counter backend or monotonic bucket refill.</strong>.
-</div>
+<h2>0. Interview hinge — what 15 already settled, and what it didn't</h2>
+<p>Lesson 15 gives you everything for a single front door: reject early because a request that never touches business logic costs almost nothing (15's economic first principle); token bucket = "burst up to <span class="math">B</span>, cap the average at <span class="math">r</span>"; emit 429 with <code>Retry-After</code> so clients back off. If the interviewer wanted that, they'd have asked a junior. Walk it in thirty seconds and bank the time.</p>
 <div class="callout warn">
-  <div class="label">Tempting but wrong</div>
-  A common shortcut is to choose <strong>Token bucket vs sliding window</strong> just because it buys bursts and constant memory. That shortcut fails when its cost matters: less intuitive fairness at exact window boundaries. Use it only when the workload matches the condition: public APIs with legitimate bursty clients.
-</div>
+  <div class="label">The hinge</div>
+  The single-bucket math assumes one counter. The instant you say "we run a fleet of gateway nodes" — and you must, because a single limiter is itself the SPOF lesson 15 warns about — the question becomes <strong>where does the counter live, and how wrong is each answer?</strong> Every accuracy gain costs a network hop or a coordination round; every cheap option drifts. The senior signal is naming that spectrum and sizing the choice to how wrong you can afford to be. Everything below §3 is that one question.</div>
+
+<div class="callout ok">
+  <div class="label">Invariant to defend</div>
+  A limit is only meaningful if it maps to a knowable global rate. The invariant: <strong>the effective global limit must not silently drift as the fleet autoscales.</strong> Per-node local buckets violate this — they make the global limit a function of <span class="math">N</span> and of how evenly the load balancer spreads a tenant's traffic, neither of which is stable. Naming that drift before the interviewer does is the whole drill.</div>
 
 <h2>1. Clarify the contract</h2>
-<p>The prompt is best treated as a product contract before it is treated as a component diagram. The system needs to do the following:</p>
+<p>Treat the prompt as a product contract before a box diagram. What it must do:</p>
 <ul>
-  <li>Limit per API key, user, IP, route, or tenant.</li>
-  <li>Allow short bursts while enforcing a longer-term budget.</li>
-  <li>Return a deterministic allow/deny decision within a few milliseconds.</li>
-  <li>Work across many stateless API servers.</li>
-  <li>Expose remaining quota and retry-after metadata when useful.</li>
+  <li>Decide allow/deny per <strong>API key / user / IP / route</strong>, in single-digit milliseconds.</li>
+  <li>Allow short bursts while bounding sustained rate — this is exactly lesson 15's token bucket; don't re-derive it.</li>
+  <li>Work across <strong>many stateless gateway nodes</strong> that autoscale, with a tenant's requests landing on arbitrary nodes.</li>
+  <li>Return <code>Retry-After</code> and <code>RateLimit-*</code> headers so well-behaved clients self-throttle.</li>
 </ul>
+<p>What it explicitly need <em>not</em> do: it is not a billing meter (that's an offline aggregation, see §6); it need not be exact to the single request for a <em>soft</em> guard; and it is not a place to ration demand below capacity — lesson 15's rule holds, every 429 should map to real abuse or real backend pressure.</p>
 
 <h2>2. Put numbers on the shape</h2>
-<p>The exact numbers depend on the interviewer, but these are the estimates that should steer the architecture:</p>
-<ul>
-  <li>Decision QPS is at least request QPS; a 100k req/s API needs 100k limiter checks/s.</li>
-  <li>A 16-byte counter key plus metadata for 10M active keys is hundreds of MB before replication.</li>
-  <li>One remote Redis round trip can cost more latency than the application handler for cheap endpoints.</li>
-  <li>Per-request writes create hot keys for large tenants, so batching or local admission can matter.</li>
-</ul>
+<p>The mechanism is cheap. The cost is in the coordination, so the numbers that steer the architecture are about hops and key cardinality, not bytes.</p>
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">Limiter checks/s for a 100k req/s API</div><div class="v">100k</div></div>
+  <div class="kpi"><div class="k">State for 10M active keys (≈16 B + meta)</div><div class="v">~hundreds of MB</div></div>
+  <div class="kpi"><div class="k">Central-store cost per request</div><div class="v">+1 round trip</div></div>
+  <div class="kpi"><div class="k">Whale tenant peak (the §6 stress)</div><div class="v">50k rps · 1 key</div></div>
+</div>
+<p>Two of these are load-bearing. The <strong>+1 round trip per request</strong> means a sub-millisecond Redis hop can exceed the handler time for a cheap endpoint — accuracy is not free. And <strong>50k rps onto one key</strong> is a single-partition hot spot: no amount of replication helps a write hot key (07), so the central design that looks exact on the whiteboard melts in production. Hold both numbers; they decide §6.</p>
 
-<h2>3. Define the surface area</h2>
-<p>Keep the API small. The API should express the product operation, not leak the internal queue, cache, or shard layout.</p>
+<h2>3. Surface area</h2>
+<p>Keep it small. The API expresses the decision, never the shard layout.</p>
 <table>
   <thead><tr><th>API / operation</th><th>Why it exists</th></tr></thead>
   <tbody>
-    <tr><td><code>check(key, route, cost) -&gt; allow/deny</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>consume(key, cost, window)</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>admin override for tenant policy</code></td><td>Part of the minimal contract for this case.</td></tr>
+    <tr><td><code>check(key, route, cost) -&gt; {allow|deny, remaining, reset}</code></td><td>The hot-path decision; <code>cost</code> enables weighted limiting (15's GitHub-points model).</td></tr>
+    <tr><td><code>consume(key, cost)</code></td><td>Atomic check-and-decrement where the data lives (see §6, atomicity).</td></tr>
+    <tr><td><code>setPolicy(scope, limit, window, tier)</code></td><td>Admin plane; read from a local cache on the hot path so the data path only touches counters.</td></tr>
   </tbody>
 </table>
 
-<h2>4. Model the data</h2>
-<p>The data model is the first architecture. If the data ownership is vague, every later box-and-arrow decision will be vague too.</p>
+<h2>4. Data model</h2>
+<p>The data model is the first architecture; vague ownership makes every later arrow vague.</p>
 <div class="case-meta">
-<span class="chip">policy table</span><span class="chip">counter buckets</span><span class="chip">token state</span><span class="chip">audit sample stream</span>
+<span class="chip">policy table (cold, cached)</span><span class="chip">counter / token state (hot)</span><span class="chip">usage event stream (offline)</span>
 </div>
+<p>The split that matters: <strong>policy</strong> is read-mostly and cacheable per node; <strong>counter state</strong> is the contended write — its placement <em>is</em> the design question; and a <strong>usage stream</strong> (an append log of admit/deny events) feeds offline metering and abuse analytics off the hot path. That last one is DDIA Ch. 11 stream aggregation — billing-grade usage is computed by a stream processor over the event log, never read from the live limiter counter, which is approximate and resets every window.</p>
 
 <h2>5. Linearized design</h2>
-<p>Walk the design in the order a request or event actually moves. This keeps the interview grounded and exposes the first bottleneck naturally.</p>
+<p>Walk a request through the front door. This is lesson 15's flow; the only new step is step 4, where the counter's location forces a decision.</p>
 <ol class="linear-list">
-<li><strong>1.</strong> Normalize identity at the gateway: authenticated user beats IP, route policy beats global default.</li>
-<li><strong>2.</strong> Read the policy from a local cache so the hot path only mutates counters.</li>
-<li><strong>3.</strong> Use token bucket for burst-friendly APIs; use sliding window when fairness at boundaries matters.</li>
-<li><strong>4.</strong> Keep the decision service stateless and store shared counters in Redis or a purpose-built in-memory cluster.</li>
-<li><strong>5.</strong> Return headers that tell clients how to back off, but never reveal enough to help attackers tune around the limit.</li>
-<li><strong>6.</strong> Export allow, deny, near-limit, and backend-error metrics by policy, not by raw user ID.</li>
+<li><strong>1.</strong> Normalize identity at the gateway: authenticated key beats user beats IP; route policy beats global default.</li>
+<li><strong>2.</strong> Read policy from a local cache (preloaded; conservative default on miss to avoid a stampede).</li>
+<li><strong>3.</strong> Run the token-bucket check — mechanism per lesson 15, not re-derived here.</li>
+<li><strong>4.</strong> <strong>The hinge:</strong> the bucket state for this key lives <em>somewhere</em> — local to this node, in a central store, or leased from a budget. This choice sets your accuracy and your per-request cost (§6).</li>
+<li><strong>5.</strong> On deny, return 429 + <code>Retry-After</code> + <code>RateLimit-*</code> (15's contract). On allow, route inward — the first step that costs real backend resources.</li>
+<li><strong>6.</strong> Emit an admit/deny event to the usage stream (Ch. 11) for metering and abuse detection, off the hot path.</li>
 </ol>
 
-<h2>6. Deep dives</h2>
-<h3>Algorithm choice</h3>
-<p>Fixed windows are cheap but unfair at boundaries. Sliding logs are fair but store too much. Sliding-window counters are a useful middle. Token buckets are usually the interview default because they separate average rate from burst capacity.</p>
-<h3>Distributed counters</h3>
-<p>A shared counter is simple until one tenant becomes a hot key. Local warm buckets reduce latency but permit overshoot. Centralized Redis keeps decisions tighter but adds a dependency to every request.</p>
-<h3>Fail-open or fail-closed</h3>
-<p>For login, payment, and abuse-sensitive endpoints, fail closed or degrade to a tiny local budget. For low-risk read endpoints, fail open with alerting may protect availability better than perfect enforcement.</p>
+<h2>6. Deep dives — the part the drill is actually testing</h2>
+
+<h3>Where the counter lives, and how far each option drifts</h3>
+<p>Here is the calculation that separates a senior answer from a recited one. Take a hard limit of <strong>100 req/min</strong> for one tenant, and a fleet of <span class="math">N</span> gateway nodes. The naive distributed answer is "give each node a local bucket of <span class="math">L = \text{limit}/N</span>." Work it:</p>
+<ul>
+  <li>At <span class="math">N = 10</span>: <span class="math">L = 100/10 = 10</span> per node. If the load balancer spread this tenant perfectly evenly across all 10 nodes, the global accepted rate is <span class="math">10 \times 10 = 100</span> — exactly right. The trick works <em>only</em> under perfect spread.</li>
+  <li><strong>Now skew the spread.</strong> Real load balancers and keyed/sticky routing don't spread one tenant evenly. Say this tenant's requests skew onto just <strong>4 hot nodes</strong>. Each of those 4 still holds a full <span class="math">L = 10</span> bucket, so the tenant gets <span class="math">4 \times 10 = 40</span>… but that's the <em>under</em>-shoot case. Flip it: a client that deliberately fans out to <em>maximize</em> coverage, hitting all 10 nodes, drains <span class="math">10 \times L = 100</span> — and if you'd sized <span class="math">L</span> for a smaller expected spread, the abuser simply spreads wider. The effective limit is <span class="math">(\text{nodes the client touches}) \times L</span>, which the client, not you, controls.</li>
+  <li><strong>Now autoscale mid-flight.</strong> Traffic spikes, the fleet grows <span class="math">N: 10 \to 25</span>. You re-derive <span class="math">L = 100/25 = 4</span>. But buckets are per-node and stateful — the 10 old nodes are still running with <span class="math">L = 10</span> until they're recycled, while 15 new nodes come up with <span class="math">L = 4</span>. For the transient, a client touching all nodes can pass up to <span class="math">10\times10 + 15\times4 = 160</span> against a limit of 100 — a <strong>60% over-admit</strong> that exists purely because the divisor <span class="math">N</span> moved and the state didn't move with it.</li>
+</ul>
+<p>That is the whole problem with "divide by <span class="math">N</span>": the global limit is <span class="math">N\cdot L</span>, and both <span class="math">N</span> (autoscaling) and the per-tenant spread (the load balancer and the attacker) are out of your control. The drift isn't a rounding error; it's structural.</p>
+
+<div class="ascii">
+  THREE PLACEMENTS for the bucket of one tenant  (limit = 100/min, N=10 nodes)
+
+  (a) LOCAL per-node            (b) CENTRAL Redis            (c) HYBRID lease
+  ─────────────────────         ──────────────────────       ──────────────────────
+  node1 [L=10] ─┐                node1 ─┐                      node1 [lease 12]─┐
+  node2 [L=10] ─┤  no            node2 ─┤  atomic              node2 [lease  8]─┤ borrow
+  node3 [L=10] ─┼─ coordination  node3 ─┼─▶ [ Redis ]          node3 [lease 10]─┼─▶[budget]
+   ...          │                 ...   │  INCR+Lua            ...               │  every
+  node10[L=10] ─┘                node10─┘  (1 source)         node10[lease 7] ─┘  ~200ms
+  ─────────────────────         ──────────────────────       ──────────────────────
+  hops/req : 0                  hops/req : +1 (per req)       hops/req : ~0 (amortized)
+  accuracy : ±N·L drift,        accuracy : EXACT global       accuracy : eventually exact,
+             client controls               limit                        small transient over/
+             effective limit                                            under-shoot
+  fails by : over-admit on      fails by : hot key melts      fails by : drift between syncs
+             skew / autoscale              one tenant (07),              ≈ (sum of leases not
+             (160 vs 100)                  SPOF (13)                     yet returned)
+</div>
+
+<p>The map is the answer to "how do you rate limit across N autoscaling nodes." <strong>(a) Local</strong> is free and fine for a <em>soft</em> saturation guard where being 1.6× off costs nothing. <strong>(b) Central Redis</strong> gives an exact global limit — the single source of truth — at the price of a round trip per request and a dependency on the store. <strong>(c) Hybrid lease</strong> sits between: each node borrows a slice of a global budget every ~200ms and returns the residual, so the hot path stays local (≈0 hops) and the drift is bounded by the un-returned leases — DDIA Ch. 9's eventual consistency applied to a counter. Choose by how wrong you can afford to be, not by reflex.</p>
+
+<h3>Why the central path must be atomic where the data lives</h3>
+<p>The naive central implementation — read counter, compare to limit, write counter+1 — has the textbook race lesson 15 names: two nodes read 99 under a limit of 100, both decide they're under, both write 100, and you've admitted 101. This is <strong>DDIA Ch. 7's atomic single-object operation</strong>: the check-and-increment must be atomic <em>at the store</em>, not split across a read and a later write from the client. Redis <code>INCR</code> is atomic; to also apply the limit and TTL in one round trip you ship a <strong>Lua script</strong> (executed atomically server-side) or use <code>CL.THROTTLE</code> (redis-cell's GCRA token bucket in one call). The general law: a distributed counter is correct only if its read-modify-write is atomic where the data physically lives. Move the decision to the client and you've reintroduced the race.</p>
+
+<h3>Fail-open vs fail-closed when the store dies</h3>
+<p>Option (b) makes Redis a dependency on every request, so you must decide its failure mode <em>before</em> it fails. <strong>Fail-open</strong> (allow on store error) keeps the API serving but removes all protection — fine for low-risk reads, catastrophic for login or payment endpoints where the limiter is an abuse control. <strong>Fail-closed</strong> (reject) protects the backend but converts a Redis blip into a full outage. The senior move is neither: <strong>degrade to per-node local buckets</strong> on store failure (option a as a fallback) — you lose global accuracy but stay bounded, and you alert. That degradation path is exactly why the hybrid design earns its complexity: it already has local buckets to fall back to.</p>
+
+<h3>The whale tenant: a hot key, not a capacity problem</h3>
+<p>One tenant at <strong>50k rps</strong> against a single counter key is a write hot key (lesson 07). Replication does not help — every request is a write to the same key, so it lands on the same primary partition regardless of replica count, and that one shard melts while the rest of Redis idles. This is the sharpest question in the drill; it's handled below.</p>
 
 <h2>7. Trade-offs</h2>
 <table>
   <thead><tr><th>Choice</th><th>Buys</th><th>Costs</th><th>Choose when</th></tr></thead>
   <tbody>
-<tr><td><strong>Token bucket vs sliding window</strong></td><td>bursts and constant memory</td><td>less intuitive fairness at exact window boundaries</td><td>public APIs with legitimate bursty clients</td></tr>
-<tr><td><strong>Central counter vs local leases</strong></td><td>global accuracy</td><td>latency and backend dependency</td><td>small number of regions or high-abuse endpoints</td></tr>
-<tr><td><strong>Edge limiter vs service limiter</strong></td><td>blocks bad traffic early</td><td>less product context</td><td>route-level quotas and unauthenticated abuse</td></tr>
-<tr><td><strong>Fail open vs fail closed</strong></td><td>availability</td><td>possible abuse leakage</td><td>low-risk traffic during limiter outage</td></tr>
+<tr><td><strong>Local per-node vs central counter</strong></td><td>zero hops, no shared state</td><td>effective limit drifts as N·L; client controls it; over-admits on skew/autoscale</td><td>soft saturation guard where being ~2× off is harmless</td></tr>
+<tr><td><strong>Central Redis vs hybrid lease</strong></td><td>exact global limit, single source of truth</td><td>+1 round trip/req, store is SPOF (13) and hot key (07)</td><td>hard contractual quota where exactness is the product</td></tr>
+<tr><td><strong>Hybrid lease vs central</strong></td><td>local hot path + bounded drift</td><td>more code; transient over/under-shoot between syncs</td><td>very high RPS where the hop or hot key hurts</td></tr>
+<tr><td><strong>Fail open vs fail closed</strong></td><td>availability vs protection</td><td>abuse leakage vs self-inflicted outage</td><td>read endpoints fail open; auth/payment degrade to local buckets</td></tr>
   </tbody>
 </table>
+<p>The sharpest trade-off is the first one, and it's a trap if you state it as "local is approximate." The senior framing is that local doesn't have <em>an</em> error bar — it has an error the <strong>client controls</strong>, because the effective limit is (nodes the client touches) × L, and a motivated client spreads to touch more nodes. So "approximate" is fine for a saturation guard but disqualifying for a billing quota, where someone is paid to find that drift.</p>
 
 <h2>8. Failure modes</h2>
 <table>
   <thead><tr><th>Failure</th><th>Mitigation</th></tr></thead>
   <tbody>
-<tr><td><strong>Clock skew between nodes</strong></td><td>Use server-side time from the counter backend or monotonic bucket refill.</td></tr>
-<tr><td><strong>Cache stampede on policy fetch</strong></td><td>Preload common policies and keep a conservative default.</td></tr>
-<tr><td><strong>Hot tenant counter</strong></td><td>Shard counters by key plus time slice, or issue local leases from a central allocator.</td></tr>
-<tr><td><strong>Retry storm after 429</strong></td><td>Return retry-after and jitter client guidance; alert on synchronized retries.</td></tr>
+<tr><td><strong>Effective limit drifts as N autoscales</strong></td><td>Use central or hybrid for hard limits; for local, treat N·L as soft and alert on the transient over-admit.</td></tr>
+<tr><td><strong>Redis (central counter) dies</strong></td><td>Degrade to per-node local buckets (bounded, degraded accuracy) + alert. Decide fail-open vs fail-closed per endpoint class up front.</td></tr>
+<tr><td><strong>Whale tenant hot key (50k rps on one key)</strong></td><td>Shard the counter by key + time-slice, or allocate local leases from a central budget — see §9.</td></tr>
+<tr><td><strong>Retry storm after 429</strong></td><td>Return <code>Retry-After</code>; require exponential backoff + jitter (lesson 13); alert on synchronized retries.</td></tr>
+<tr><td><strong>Clock skew across nodes</strong></td><td>Refill from monotonic local time or server-side time at the store; never trust client timestamps for the window.</td></tr>
   </tbody>
 </table>
 
-<h2>9. What to say in the interview</h2>
-<div class="callout ok">
-  <div class="label">Strong signal</div>
-  Lead with the dominant constraint: Token bucket, sliding windows, shared counters, edge placement, abuse protection. Then defend the design by naming what you made faster, what you made more reliable, and what complexity you accepted.
+<h2>9. Interview prompts you should be ready for</h2>
+<div class="callout">
+  <ol>
+    <li><strong>How do you rate limit across N autoscaling gateway nodes?</strong> <em>(senior answer)</em> Name the spectrum: local per-node (free, but effective limit is N·L and drifts — at limit 100 it over-admits to 160 when N goes 10→25 mid-flight), central Redis (exact global limit, +1 hop/req, hot-key + SPOF risk), or hybrid leases that borrow from a global budget every ~200ms (eventually exact, local hot path). Pick by how wrong you can afford to be.</li>
+    <li><strong>Why isn't "divide the limit by N" good enough?</strong> <em>(senior answer)</em> Because the effective global limit is N·L, and both N (autoscaling) and per-tenant spread are outside your control — a client that fans out to touch all N nodes gets the full N·L, and during a scale-up the old high-L buckets coexist with new low-L ones, so it over-admits. The error is structural and client-controlled, not a rounding error.</li>
+    <li><strong>Your Redis limiter is the hot key for one whale tenant at 50k rps — keep global accuracy without melting it.</strong> <em>(senior answer)</em> A single key is one partition; replication won't help a write hot key (07). Two real fixes: (1) <strong>shard the counter by key + time-slice</strong> — split the whale's bucket into K sub-counters (key:shard0..K) and limit/K on each, summing for the global view, spreading 50k rps across K partitions; or (2) <strong>local lease allocation</strong> — the central store hands each gateway node a lease (say 1/N of the budget) every ~200ms, so the node decides 50k rps locally and only touches the budget at the sync interval. Lease is usually better at this scale: it converts 50k round-trips/s into ~5/s while keeping global accuracy eventually exact.</li>
+    <li><strong>Your limiter's Redis goes down — what happens?</strong> <em>(senior answer)</em> Decide the mode before it dies. Don't fail-open globally (removes abuse protection on login/payment) or fail-closed globally (turns a blip into an outage). Degrade to per-node local buckets — still bounded, degraded accuracy — and alert. The hybrid design already has those local buckets, which is half of why it earns its complexity.</li>
+    <li><strong>Why must the central check-and-increment be atomic, and where?</strong> <em>(senior answer)</em> DDIA Ch. 7 atomic single-object op: a split read-then-write races (two nodes read 99, both admit, you get 101). It must be atomic <em>at the store</em> — a Redis Lua script or CL.THROTTLE does check + decrement + TTL in one server-side call. Moving the decision client-side reintroduces the race.</li>
+    <li><strong>How is billing-grade usage different from the limiter counter?</strong> <em>(senior answer)</em> The live counter is approximate and resets every window — never bill from it. Emit an admit/deny event to a usage log and aggregate it with a stream processor (DDIA Ch. 11). The limiter protects the backend in real time; metering is an offline, exactly-once aggregation over the event stream.</li>
+    <li><strong>Token bucket vs sliding window here?</strong> <em>(senior answer)</em> Mechanism is lesson 15 — I wouldn't re-derive it. Token bucket for burst-friendly public APIs (allow B, cap average r); sliding-window counter when boundary fairness matters at O(1) memory. The interesting choice in C01 isn't the algorithm, it's where its state lives.</li>
+    <li><strong>How does this relate to load shedding (lesson 13)?</strong> <em>(senior answer)</em> Same goal — keep the backend below the saturation cliff — different timing. Rate limiting is planned, per-key admission control; shedding is the emergency reaction once already overloaded. The 429-vs-503 split encodes it: 429 = "you exceeded your quota," 503 = "the whole service is hurting." Both want backoff + jitter from clients.</li>
+  </ol>
 </div>
 
 <h2>Related foundation lessons</h2>
+<p>The mechanism — token bucket, the 429 contract, why the edge is the cheapest place to reject — lives in <a href="15_rate_limiting_edge.html">lesson 15</a>; this drill deliberately does not re-derive it. The distributed failure side leans on <a href="13_fault_tolerance.html">lesson 13</a> for the fail-open/closed decision and backoff+jitter (load shedding is C01's sibling — same goal, different timing), and on <a href="07_partitioning.html">lesson 07</a> for why a whale tenant's single counter key is a write hot key that replication can't fix. The eventual-consistency reasoning behind hybrid leases is <a href="09_consistency_cap.html">lesson 09</a>, and the per-hop latency cost of a central store is <a href="02_latency_throughput.html">lesson 02</a>.</p>
 <div class="case-meta">
 <a class="chip" href="15_rate_limiting_edge.html">Rate limiting and edge</a>
-<a class="chip" href="06_caching.html">Caching</a>
-<a class="chip" href="02_latency_throughput.html">Latency and throughput</a>
 <a class="chip" href="13_fault_tolerance.html">Fault tolerance</a>
+<a class="chip" href="07_partitioning.html">Partitioning</a>
+<a class="chip" href="09_consistency_cap.html">Consistency &amp; CAP</a>
+<a class="chip" href="02_latency_throughput.html">Latency and throughput</a>
 </div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  The token bucket is lesson 15's; don't re-derive it in the room. C01 is won on the next sentence: a limit is only meaningful if it maps to a knowable global rate, and the moment you have N autoscaling nodes, "divide by N" makes that rate drift to whatever the client and the autoscaler choose (100 → 160 on a 10→25 scale-up). Central Redis buys exactness for a hop per request and a hot key; hybrid leases buy a local hot path for bounded drift. Make the atomicity, the fail-mode, and the whale-tenant decisions out loud — that's the senior signal.</div>
 
 <footer class="lesson-nav">
   <a href="syllabus.html"><span class="dir">Back</span><span class="ttl">Case syllabus</span></a>

@@ -37,117 +37,186 @@
 <main>
 
 <h1>Design a chat system</h1>
-<p class="subtitle">Chat teaches the difference between sending, storing, delivering, and reading. Users call it one message; the system sees multiple contracts.</p>
+<p class="subtitle">Users call it "one message." The system sees four separate contracts — send, store, deliver, read — and the box that quietly dominates the bill is not the database or the CPU. It's the open socket.</p>
 <div class="case-meta">
   <span class="chip">Source: Vol. 1 Ch. 12</span>
   <span class="chip">Case drill</span>
-  <span class="chip">Trade-off first</span>
+  <span class="chip">Connection-bound</span>
 </div>
 
 <div class="callout">
-  <div class="label">How to read this case</div>
-  This page is an original educational walkthrough based on the case topic, not a transcription. Read it linearly: contract, estimates, data, flows, bottlenecks, trade-offs, then failure modes.
-</div>
+  <div class="label">First principle — this is a memory/connection problem, not a QPS problem</div>
+  Most systems in this track are bounded by request rate. Chat is bounded by <strong>how many simultaneous conversations you can hold open</strong>. A chat connection is "live" for hours while sending almost nothing. The cost is not the messages flowing through it — it's the millions of idle TCP/WebSocket sockets you must keep alive <em>between</em> messages. Get that one fact wrong and you size the database tier and starve the connection tier. The whole design follows from one number: bytes of RAM per idle socket.</div>
 
-<h2>0. Interview hinge</h2>
-<p>The hinge is the moment where the prompt stops being generic and the architecture becomes forced. For this case, that hinge is: <strong>WebSockets, message ordering, online presence, offline sync, multi-device state.</strong></p>
-<div class="callout ok">
-  <div class="label">Invariant to protect</div>
-  The design is only correct if the user-visible contract survives retries, partial failures, stale caches, and reordering. A concrete invariant to defend here: <strong>Duplicate send from retry</strong> must be handled by <strong>Use client message IDs for idempotency.</strong>.
-</div>
+<h2>0. The hinge</h2>
+<p>The hinge — the moment the architecture becomes forced — is this: <strong>delivery, storage, ordering, presence, and offline sync are four different problems wearing one UI.</strong> The forcing observation is that a persistent connection is cheap in CPU and expensive in <em>memory and statefulness</em>. That single asymmetry decides the whole topology: a fat stateful connection tier you scale by RAM, a thin stateless message tier you scale by QPS, and a durable log that is the actual source of truth because the connections are not.</p>
+
 <div class="callout warn">
   <div class="label">Tempting but wrong</div>
-  A common shortcut is to choose <strong>WebSocket vs polling</strong> just because it buys low latency. That shortcut fails when its cost matters: connection state and load balancing complexity. Use it only when the workload matches the condition: active chat.
-</div>
+  "Push the message over the WebSocket — if the client got the frame, it's delivered." A WebSocket write succeeding means the bytes left <em>your</em> kernel, not that they reached the phone. Mobile networks switch towers and Wi-Fi-to-LTE constantly, silently dropping the TCP connection without a FIN. Treat push as a <em>latency optimization</em>, never as the storage or delivery guarantee. The source of truth is the durable log plus the client's cursor — see the deep dive below.</div>
 
 <h2>1. Clarify the contract</h2>
-<p>The prompt is best treated as a product contract before it is treated as a component diagram. The system needs to do the following:</p>
+<p>Before drawing boxes, pin the product contract — and, just as important, what you explicitly do <em>not</em> owe.</p>
 <ul>
-  <li>Support one-to-one and group conversations.</li>
-  <li>Deliver messages in near real time when users are online.</li>
-  <li>Store history for offline and multi-device sync.</li>
-  <li>Show delivery/read state when required.</li>
-  <li>Preserve order within a conversation.</li>
+  <li><strong>1:1 and group conversations</strong> (say groups up to 500 members — that bound is load-bearing for fan-out math).</li>
+  <li><strong>Near-real-time delivery</strong> when the recipient is online; <strong>reliable catch-up</strong> when they reconnect.</li>
+  <li><strong>Durable history</strong> for offline and multi-device sync — a message survives any single device.</li>
+  <li><strong>Per-conversation order</strong> — every member of a conversation sees messages in the same sequence.</li>
+  <li><strong>Optional delivery/read receipts</strong> — flagged optional on purpose, because receipts are the volume multiplier (Section 2).</li>
 </ul>
+<p>What we deliberately do <em>not</em> promise: a <strong>global</strong> order across unrelated conversations (nobody can observe it, so don't pay for it), sub-50ms delivery guarantees (best-effort latency, guaranteed eventual delivery), or end-to-end encryption (orthogonal; it changes the server from "reads bodies" to "routes opaque blobs" but not the topology).</p>
 
-<h2>2. Put numbers on the shape</h2>
-<p>The exact numbers depend on the interviewer, but these are the estimates that should steer the architecture:</p>
-<ul>
-  <li>Concurrent connections can be much larger than message QPS.</li>
-  <li>A million idle WebSockets is mostly memory and kernel tuning, not CPU.</li>
-  <li>Group messages multiply delivery events but should store the message body once.</li>
-  <li>Read receipts can exceed message volume in active groups.</li>
-</ul>
+<h2>2. Put numbers on it</h2>
+<p>The estimate that steers everything is the connection tier, so derive it first. Say <strong>50M daily users</strong>, and at peak <strong>10M concurrent</strong> live connections. The CPU to hold an idle socket is negligible; the memory is not. Budget the kernel socket buffers (send + receive) plus per-connection application state (auth identity, subscription set, write buffer) at a conservative <strong>~10 KB per idle connection</strong>.</p>
 
-<h2>3. Define the surface area</h2>
-<p>Keep the API small. The API should express the product operation, not leak the internal queue, cache, or shard layout.</p>
+<p class="math block">10,000,000 conns × 10 KB = 100 GB of RAM just to hold connections open</p>
+
+<p>That is RAM doing <em>nothing</em> but waiting. Now size the tier. If one gateway box comfortably holds <strong>250K</strong> connections (a realistic figure once you've tuned file-descriptor limits and epoll), then:</p>
+
+<p class="math block">#gateways = concurrent_conns / conns_per_gateway = 10,000,000 / 250,000 = 40 gateways</span></p>
+
+<p>Forty boxes whose job is <em>almost entirely</em> to sit there holding sockets and forwarding frames. Contrast that with message <em>rate</em>: even at 10M concurrent users, a person sends maybe one message per 10 seconds when active, and most are idle. Call it 1M messages/s at a generous peak — fan-out, not ingest, is the cost. A 1:1 message is one stored body and one delivery event; a 500-person group message is <strong>one stored body and 499 delivery events</strong>. And read receipts invert the ratio entirely:</p>
+
+<div class="callout warn">
+  <div class="label">The receipt amplification trap</div>
+  In a 500-person group, one message body triggers up to <strong>500 read events</strong> (one per member who opens it), each of which may itself fan out a "seen by X" update to the other 499 viewers. Naively, a single message can generate <span class="math">500 × 500 = 250,000</span> receipt-delivery events. Receipts can <strong>500× your message volume</strong>. This is why read receipts are aggregated (batched, debounced, sent as counts not per-user pings) in large groups, and often disabled past a threshold.</div>
+
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">Concurrent connections (peak)</div><div class="v">10 M</div></div>
+  <div class="kpi"><div class="k">RAM to hold them (≈10 KB ea)</div><div class="v">100 GB</div></div>
+  <div class="kpi"><div class="k">Gateways @ 250K conns each</div><div class="v">40</div></div>
+  <div class="kpi"><div class="k">Group msg → delivery events</div><div class="v">1 store : 499 deliver</div></div>
+</div>
+
+<h2>3. Data model &amp; API</h2>
+<p>Keep the surface small; it should express the product operation, not leak the queue, shard, or cursor mechanics underneath. Note the <strong>client-generated <code>client_msg_id</code></strong> in <code>send</code> — that field is the idempotency key the whole retry story hangs on (deep dive 4).</p>
 <table>
   <thead><tr><th>API / operation</th><th>Why it exists</th></tr></thead>
   <tbody>
-    <tr><td><code>send_message(conversation, client_msg_id, body)</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>sync(conversation, cursor)</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>connect websocket for events</code></td><td>Part of the minimal contract for this case.</td></tr>
+    <tr><td><code>send(conversation_id, client_msg_id, body)</code></td><td>Submit a message; <code>client_msg_id</code> dedupes retries.</td></tr>
+    <tr><td><code>sync(conversation_id, since_seq)</code></td><td>Pull everything after the client's last-seen sequence — the catch-up path.</td></tr>
+    <tr><td><code>connect() → WebSocket</code></td><td>Open the persistent channel for live push events.</td></tr>
+    <tr><td><code>ack(conversation_id, up_to_seq)</code></td><td>Advance this device's delivery/read cursor.</td></tr>
   </tbody>
 </table>
-
-<h2>4. Model the data</h2>
-<p>The data model is the first architecture. If the data ownership is vague, every later box-and-arrow decision will be vague too.</p>
+<p>The core entities and who owns them:</p>
 <div class="case-meta">
-<span class="chip">conversation</span><span class="chip">message</span><span class="chip">membership</span><span class="chip">delivery cursor</span><span class="chip">presence session</span>
+<span class="chip">conversation (members, settings)</span><span class="chip">message (conv_id, seq, sender, body)</span><span class="chip">membership</span><span class="chip">cursor (per device: last_delivered, last_read)</span><span class="chip">presence session (soft, TTL'd)</span>
 </div>
+<p>The shape that matters: <code>message</code> is keyed by <code>(conversation_id, seq)</code> — a per-conversation monotonic sequence number, <em>not</em> a wall-clock timestamp and <em>not</em> a global ID. That choice is Section 6's first deep dive, and partitioning the message store by <code>conversation_id</code> falls straight out of it (see lesson 07's sharding).</p>
 
-<h2>5. Linearized design</h2>
-<p>Walk the design in the order a request or event actually moves. This keeps the interview grounded and exposes the first bottleneck naturally.</p>
+<h2>4. Linearized design</h2>
+<p>Follow one message from the sender's thumb to every recipient's screen. The tiers split cleanly along the cost asymmetry: stateful connections out front, stateless logic in the middle, durable log behind.</p>
 <ol class="linear-list">
-<li><strong>1.</strong> Terminate persistent connections at gateway nodes.</li>
-<li><strong>2.</strong> Route send requests to a conversation owner or partition.</li>
-<li><strong>3.</strong> Assign a monotonically increasing sequence number per conversation.</li>
-<li><strong>4.</strong> Persist the message before fanout so offline devices can sync later.</li>
-<li><strong>5.</strong> Publish delivery events to online recipient connection gateways.</li>
-<li><strong>6.</strong> Let clients reconcile through sync cursors rather than trusting push delivery.</li>
+<li><strong>1.</strong> Sender's app writes over its open <strong>WebSocket</strong> to whichever <strong>gateway</strong> it's pinned to. The gateway is dumb on purpose: it holds the socket and forwards.</li>
+<li><strong>2.</strong> Gateway forwards the frame to the stateless <strong>message service</strong>, which routes by <code>conversation_id</code> to that conversation's <strong>sequencer</strong> (the owner of its <code>seq</code> counter).</li>
+<li><strong>3.</strong> The sequencer assigns the next <strong>monotonic <code>seq</code></strong> and <strong>persists the message to the durable log first</strong> (store-before-fanout — so it survives even if every push below fails).</li>
+<li><strong>4.</strong> Look up the conversation's members and their <strong>presence</strong>: for each online recipient, find which gateway holds their connection and push the delivery event there; for each offline recipient, enqueue an <strong>offline push</strong> (APNs/FCM).</li>
+<li><strong>5.</strong> Each recipient gateway writes the frame down the recipient's socket. The client renders it and later <code>ack</code>s, advancing its cursor.</li>
+<li><strong>6.</strong> On reconnect, a client does <strong>not</strong> trust that it received every push — it calls <code>sync(conv, since_seq)</code> and pulls any gap from the log. Push is the fast path; the log + cursor is the correct path.</li>
 </ol>
 
-<h2>6. Deep dives</h2>
-<h3>Ordering</h3>
-<p>Global order is unnecessary and expensive. Per-conversation order is the right contract. A single sequencer per conversation partition is simpler than distributed total ordering.</p>
-<h3>Push is not storage</h3>
-<p>WebSocket delivery can fail silently when mobile networks switch. The source of truth is the message log plus client cursors.</p>
-<h3>Presence</h3>
-<p>Presence is soft state. Heartbeats and TTLs are enough; do not use consensus to decide whether someone is online.</p>
+<div class="ascii">
+  sender                CONNECTION TIER (stateful, RAM-bound)         LOGIC + STORAGE
+ ────────       ┌──────────────────────────────────────────┐
+  app ──WS────▶ │ gateway G1  (≈250K sockets, ~2.5GB RAM)    │
+               └───────────────────┬──────────────────────────┘
+                                   │ forward frame
+                                   ▼
+                    ┌──────────────────────────────┐
+                    │   message service (stateless) │
+                    └───────────────┬───────────────┘
+                                    ▼   route by conversation_id
+                    ┌──────────────────────────────┐      ┌──────────────────────┐
+                    │ per-conversation SEQUENCER     │────▶│ durable message LOG   │
+                    │  assign monotonic seq          │store│ (conv_id, seq, body)  │  ◀── source of truth
+                    └───────────────┬───────────────┘first └──────────────────────┘
+                          fanout to members' gateways
+              ┌──────────────────────┼──────────────────────┐
+              ▼ online                ▼ online                ▼ OFFLINE
+        gateway G7 ──WS▶ Bob    gateway G7 ──WS▶ Cara   push service ─▶ APNs/FCM ─▶ Dia's phone
+        (best-effort, may drop silently)              (wakes app → it calls sync(cursor))
+</div>
 
-<h2>7. Trade-offs</h2>
+<p>The first bottleneck this exposes is <strong>not</strong> ingest QPS — it's the <em>fan-out × presence-lookup</em> step (4). A message to a 500-person group fires up to 499 gateway lookups + writes. That's why presence and the "which gateway holds whom" routing table must be a fast in-memory store (Redis-class), and why group fan-out is the thing you batch and cap. The sequencer in (3) is the second pressure point — a single per-conversation writer is a hot shard for a viral group (lesson 07's hot-partition problem); you mitigate by keeping the sequencer's critical section to "assign seq + append," nothing more.</p>
+
+<h2>5. Deep dives</h2>
+
+<h3>5.1 Ordering — per-conversation monotonic seq beats global order, and beats timestamps</h3>
+<p>Users need to agree on the order of messages <em>within a conversation</em>. They have no way to observe the relative order of messages in two different conversations, so a <strong>global total order is something nobody can see and everybody pays for</strong> — it forces all writes through one coordinator. The right contract is a <strong>per-conversation monotonic sequence number</strong>: cheap (one counter per conversation, owned by that conversation's partition), sufficient (every member sorts by <code>seq</code> and sees the identical order), and naturally sharded (independent conversations never contend).</p>
+<p>Why not wall-clock timestamps? Because <strong>clocks lie</strong>. This is DDIA Ch. 8's unreliable-clocks problem made concrete: two messages sent 5 ms apart from two servers whose clocks differ by 50 ms will sort in the wrong order, and worse, <em>different readers can disagree</em> depending on whose timestamp they trust. A monotonic <code>seq</code> assigned by a single owner is DDIA Ch. 9's lighter-weight cousin of total-order broadcast — total order, but scoped to one conversation so it costs one counter instead of consensus. The client uses the gaps in <code>seq</code> to detect loss: if it holds seq 1,2,3,7 it <em>knows</em> 4–6 are missing and calls <code>sync</code> for the range.</p>
+
+<h3>5.2 Push is not storage — delivery fails silently, so the log is the truth</h3>
+<p>The single most common chat-design mistake is conflating "I wrote the frame to the socket" with "the user has the message." On mobile, the OS hands you a TCP connection that looks alive but is dead — the phone moved from Wi-Fi to LTE, the NAT mapping expired, the radio slept. Your write succeeds into a buffer that never drains, and no error comes back for tens of seconds. If push were your delivery guarantee, that message is silently lost.</p>
+<p>So the architecture inverts: <strong>persist to the durable log before fanout</strong> (step 3), and make the client responsible for closing the gap. Every device tracks a <strong>cursor</strong> (last <code>seq</code> it has). Push is a hint that says "there's something new, come pull." On every reconnect — and they reconnect constantly — the client calls <code>sync(conv, since_seq)</code> and the log replays anything it missed. This is exactly DDIA Ch. 11's log-as-source-of-truth with a consumer cursor: the broker (here, the per-conversation log) is durable and replayable; delivery is an at-least-once push over an unreliable channel, made <em>effectively</em> reliable by the pull-on-reconnect reconciliation. Lose every push and you lose nothing — the next sync recovers it.</p>
+
+<div class="ascii">
+  device cursor reconciliation (why push loss is harmless)
+  ───────────────────────────────────────────────────────
+   log:   [ seq1 ][ seq2 ][ seq3 ][ seq4 ][ seq5 ]   ◀ durable, source of truth
+   pushed: ✓1     ✓2      ✗3      ✗4      ✓5          ◀ 3,4 dropped on tower switch
+   client holds: 1,2, __ , __ ,5   →  sees gap after seq2
+                    │
+                    ▼  on reconnect: sync(conv, since_seq=2)
+   log replays: seq3, seq4, seq5  →  client cursor advances to 5, nothing lost
+</div>
+
+<h3>5.3 Presence is soft state — heartbeats and TTL, never consensus</h3>
+<p>"Is Bob online?" is allowed to be slightly wrong. Showing a green dot for someone who disconnected 8 seconds ago harms nothing, and the cost of being <em>exactly</em> right is enormous. The wrong instinct is to treat presence as a consistency problem — to coordinate so every node agrees on the exact online set. That's spending consensus (lesson 10) on data with no integrity requirement.</p>
+<p>The right model: each connection emits a <strong>heartbeat</strong> every ~30 s into a fast key-value store with a <strong>TTL</strong> (say 45 s). Online = "key exists." If the connection dies, the heartbeats stop, the key expires, and presence flips to offline automatically — no cleanup logic, no distributed agreement, no leader. Flapping (a brief drop showing offline-then-online) is damped by the TTL margin and a small client-side grace period. Presence is the textbook case for choosing <strong>availability over consistency</strong> (lesson 09): it must be cheap and always answerable, and it's allowed to be a few seconds stale.</p>
+
+<h2>6. Trade-offs</h2>
 <table>
   <thead><tr><th>Choice</th><th>Buys</th><th>Costs</th><th>Choose when</th></tr></thead>
   <tbody>
-<tr><td><strong>WebSocket vs polling</strong></td><td>low latency</td><td>connection state and load balancing complexity</td><td>active chat</td></tr>
-<tr><td><strong>Per-conversation sequencer vs timestamp order</strong></td><td>deterministic ordering</td><td>partition ownership</td><td>group and one-to-one messages</td></tr>
-<tr><td><strong>Store-before-send vs send-before-store</strong></td><td>reliable offline sync</td><td>slightly higher send latency</td><td>normal messaging</td></tr>
-<tr><td><strong>Rich receipts vs minimal receipts</strong></td><td>better UX</td><td>extra writes and fanout</td><td>small groups or premium messaging</td></tr>
+<tr><td><strong>WebSocket vs polling</strong></td><td>Low-latency push, no poll overhead</td><td>Stateful connections; sticky routing; RAM-bound tier</td><td>Active conversations with live delivery</td></tr>
+<tr><td><strong>Per-conversation seq vs timestamp order</strong></td><td>Deterministic, shardable order; clock-immune</td><td>A per-conversation owner (hot shard for viral groups)</td><td>Always — both 1:1 and group</td></tr>
+<tr><td><strong>Store-before-fanout vs fanout-first</strong></td><td>Survives total push failure; clean sync</td><td>One log write on the send latency path</td><td>Always for durable messaging</td></tr>
+<tr><td><strong>Rich per-user receipts vs aggregated counts</strong></td><td>"Seen by Bob" precision</td><td>Up to 500× fan-out in large groups</td><td>Per-user only in small groups; aggregate/cap in large</td></tr>
   </tbody>
 </table>
+<p>The sharpest trade-off is the last one, because it's where naive designs quietly explode. Per-user read receipts are delightful in a 4-person chat and catastrophic in a 500-person one — the <span class="math">N × N</span> receipt fan-out derived in Section 2 dwarfs the actual message traffic. The senior move is to make the receipt model a <em>function of group size</em>: precise per-user receipts below a threshold, debounced aggregate counts ("Seen by 312") above it, and an option to disable entirely. The body fan-out (1 store : 499 deliver) is unavoidable; the receipt fan-out is a product choice, so make it one.</p>
 
-<h2>8. Failure modes</h2>
+<h2>7. Failure modes</h2>
 <table>
   <thead><tr><th>Failure</th><th>Mitigation</th></tr></thead>
   <tbody>
-<tr><td><strong>Duplicate send from retry</strong></td><td>Use client message IDs for idempotency.</td></tr>
-<tr><td><strong>Gateway dies with connections</strong></td><td>Clients reconnect and resume from last cursor.</td></tr>
-<tr><td><strong>Out-of-order delivery</strong></td><td>Client applies sequence numbers and requests missing ranges.</td></tr>
-<tr><td><strong>Presence flapping</strong></td><td>Use TTL and damped state changes.</td></tr>
+<tr><td><strong>Client retries a send after a timeout</strong></td><td>Client-generated <code>client_msg_id</code> as idempotency key; sequencer dedupes on it (DDIA Ch. 12).</td></tr>
+<tr><td><strong>Gateway dies holding 250K connections</strong></td><td>Clients detect the drop, reconnect to another gateway, and resume via <code>sync</code> from their cursor. Connections are disposable; the log isn't.</td></tr>
+<tr><td><strong>Push silently lost (network switch)</strong></td><td>Reconcile from the log on reconnect — gaps in <code>seq</code> trigger a range sync (deep dive 5.2).</td></tr>
+<tr><td><strong>Out-of-order delivery</strong></td><td>Client buffers and orders by <code>seq</code>, requests missing ranges before rendering.</td></tr>
+<tr><td><strong>Presence flapping</strong></td><td>TTL margin + client grace period damp transient drops (deep dive 5.3).</td></tr>
+<tr><td><strong>Viral group sequencer hot shard</strong></td><td>Keep the critical section to assign-seq-and-append only; batch fan-out downstream of it (lesson 07).</td></tr>
   </tbody>
 </table>
 
-<h2>9. What to say in the interview</h2>
-<div class="callout ok">
-  <div class="label">Strong signal</div>
-  Lead with the dominant constraint: WebSockets, message ordering, online presence, offline sync, multi-device state. Then defend the design by naming what you made faster, what you made more reliable, and what complexity you accepted.
+<h2>8. Interview Q&amp;A</h2>
+<div class="callout">
+  <ol>
+    <li><strong>A client sends a message, times out waiting for the ack, and retries. How do you avoid storing it twice?</strong> <em>(senior answer)</em> The client generates a <code>client_msg_id</code> (a UUID) <em>before</em> the first attempt and reuses it on every retry. The sequencer treats it as an idempotency key: insert-if-absent on <code>(conversation_id, client_msg_id)</code>. The first write assigns a <code>seq</code>; the retry finds the existing row and returns its <code>seq</code> instead of creating a new one. This is DDIA Ch. 12's idempotency-key pattern — the client owns the key so the dedupe survives a server that crashed mid-write.</li>
+    <li><strong>Why not a global total order on all messages?</strong> <em>(senior answer)</em> Nobody can observe it — users only ever compare messages within a conversation. A global order forces every send through one coordinator (DDIA Ch. 9 total-order broadcast), which is expensive and a bottleneck. A per-conversation monotonic <code>seq</code> gives the only order anyone can see, costs one counter, and shards perfectly because conversations are independent.</li>
+    <li><strong>Why store before you push, instead of pushing first for lower latency?</strong> <em>(senior answer)</em> Because push is best-effort over an unreliable channel and can fail silently (mobile network switches). If the store is downstream of fanout and the process dies after pushing, the message exists nowhere durable. Store-first costs one log write on the send path and guarantees the message survives total delivery failure — clients reconcile from the log on reconnect (DDIA Ch. 11, log + consumer cursor).</li>
+    <li><strong>How do you know a delivered message actually reached the phone?</strong> <em>(senior answer)</em> You don't, from the socket write — it only confirms bytes left your kernel. You rely on the client's <code>ack</code> advancing its cursor, and on the client pulling via <code>sync</code> on every reconnect. Delivery is at-least-once push made effectively-reliable by pull-on-reconnect reconciliation against the durable log.</li>
+    <li><strong>What dominates the cost of this system — and what does that imply for sizing?</strong> <em>(senior answer)</em> Memory for idle connections, not message QPS. 10M concurrent sockets at ~10 KB each is ~100 GB of RAM doing nothing but waiting, which sets the gateway count (≈40 boxes at 250K each). You scale the connection tier by RAM and the message tier by QPS — they're separate problems, and conflating them is the classic mistake.</li>
+    <li><strong>Read receipts in a 500-person group — what's the catch?</strong> <em>(senior answer)</em> Amplification. One message can trigger up to 500 read events, each fanning out a "seen by" update to ~499 others — order <span class="math">N²</span>, up to 250K receipt events from one message. Make the receipt model a function of group size: precise below a threshold, debounced aggregate counts above it, disable-able. The body fan-out is unavoidable; the receipt fan-out is a product knob.</li>
+    <li><strong>How do you represent presence without it becoming a consistency nightmare?</strong> <em>(senior answer)</em> As soft state. Heartbeats every ~30 s into a TTL'd key-value store; online = key exists, offline = key expired. No consensus, no cleanup job, no leader. Presence may be a few seconds stale and that's fine — it's an availability-over-consistency choice (lesson 09).</li>
+    <li><strong>A gateway holding 250K connections crashes. What happens?</strong> <em>(senior answer)</em> Nothing is lost. Connections are disposable; the durable log is the source of truth. Affected clients detect the dropped socket, reconnect to another gateway, and resume from their cursor via <code>sync</code>. This is why the connection tier is deliberately dumb and stateless beyond the socket itself — recovery is just "reconnect and pull."</li>
+  </ol>
 </div>
 
 <h2>Related foundation lessons</h2>
+<p>This case is a tour through the messaging foundations. <a href="11_async_messaging.html">Lesson 11 (async messaging)</a> is the spine: the durable per-conversation log with consumer cursors is exactly its broker-and-offset model, and it's what makes "push is just a hint" work. The retry-dedup story leans on <a href="12_distributed_transactions.html">lesson 12 (idempotency)</a> — the <code>client_msg_id</code> is its idempotency key applied to sends. The ordering and presence decisions both invoke <a href="09_consistency_cap.html">lesson 09 (consistency / CAP)</a>: per-conversation order is the minimum total order anyone can observe, while presence is the textbook availability-over-consistency choice. And the 40-gateway connection tier is <a href="05_scaling_load_balancing.html">lesson 05 (scaling &amp; load balancing)</a> in stateful form — you can't scale sticky WebSocket connections the way you scale a stateless HTTP fleet, which is precisely why the connection tier and message tier are separated.</p>
 <div class="case-meta">
 <a class="chip" href="11_async_messaging.html">Async messaging</a>
 <a class="chip" href="12_distributed_transactions.html">Transactions and idempotency</a>
 <a class="chip" href="09_consistency_cap.html">Consistency</a>
 <a class="chip" href="05_scaling_load_balancing.html">Scaling and load balancing</a>
+<a class="chip" href="07_partitioning.html">Partitioning</a>
 </div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Chat is a memory problem disguised as a messaging problem. Size the connection tier from one number — bytes per idle socket — and 10M concurrent users becomes 100 GB of RAM and 40 gateways before you've sent a single byte. Then keep the four contracts separate: order by a per-conversation monotonic <code>seq</code> (cheap, shardable, clock-immune), treat push as a best-effort hint over a durable log that clients reconcile against on reconnect, make presence soft state with heartbeats and TTL, and dedupe retried sends with a client-generated message ID. Every one of those is a deliberate refusal to over-pay: no global order, no delivery-equals-push, no consensus for green dots.</div>
 
 <footer class="lesson-nav">
   <a href="case_08_news_feed.html"><span class="dir">Previous</span><span class="ttl">Previous case</span></a>

@@ -37,7 +37,7 @@
 <main>
 
 <h1>Design a notification system</h1>
-<p class="subtitle">Notifications are product policy plus distributed delivery. The system must decide not only how to send, but whether sending is still valuable.</p>
+<p class="subtitle">A notification system is two systems wearing one coat: a <em>policy engine</em> that decides whether a message is still worth sending, wrapped around a <em>delivery engine</em> that fans one event out to millions. Get the order wrong and you build a very efficient spam cannon.</p>
 <div class="case-meta">
   <span class="chip">Source: Vol. 1 Ch. 10, archive</span>
   <span class="chip">Case drill</span>
@@ -45,109 +45,171 @@
 </div>
 
 <div class="callout">
-  <div class="label">How to read this case</div>
-  This page is an original educational walkthrough based on the case topic, not a transcription. Read it linearly: contract, estimates, data, flows, bottlenecks, trade-offs, then failure modes.
-</div>
+  <div class="label">First principle — sending is not free, and not always wanted</div>
+  Every other CRUD system gets <em>more</em> correct the more requests it serves. A notification system is the opposite: a correctly-fired send and an incorrectly-fired send look identical to the delivery code, but one delights a user and the other gets your domain blocklisted, burns real money, and trains the user to disable notifications forever. So the dominant question is not "how do I send fast?" — that part is a queue. The dominant question is <strong>"should this still be sent at all?"</strong>, and that question must be answered <em>before</em> any token is spent. The architecture is forced by two facts: (1) one event can fan out to millions of recipients, so delivery must be asynchronous and rate-limited; (2) policy (preferences, quiet hours, consent, priority) gates value and cost, so policy must run <em>upstream</em> of delivery, not as an afterthought.</div>
 
-<h2>0. Interview hinge</h2>
-<p>The hinge is the moment where the prompt stops being generic and the architecture becomes forced. For this case, that hinge is: <strong>Fanout, device tokens, templates, preferences, retry, dedupe, channel priority.</strong></p>
-<div class="callout ok">
-  <div class="label">Invariant to protect</div>
-  The design is only correct if the user-visible contract survives retries, partial failures, stale caches, and reordering. A concrete invariant to defend here: <strong>Provider outage</strong> must be handled by <strong>Circuit-break that provider and retry with backoff or fallback channel.</strong>.
-</div>
-<div class="callout warn">
-  <div class="label">Tempting but wrong</div>
-  A common shortcut is to choose <strong>Synchronous send vs queued send</strong> just because it buys immediate feedback. That shortcut fails when its cost matters: slow producer and provider coupling. Use it only when the workload matches the condition: tiny internal notifications.
+<h2>The hinge: fanout × cost makes synchronous sending impossible</h2>
+<p>Put the two forcing numbers on the table immediately, because both kill the naive design.</p>
+
+<p><strong>Fanout.</strong> A celebrity posts once and 10M followers should be notified. That is <em>one</em> API call from the product, expanding into 10M sends. Suppose your fleet of provider adapters can push <strong>50,000 sends/s</strong> in aggregate (a generous number — APNs/FCM throughput plus connection limits). Draining the fanout takes:</p>
+<p class="math block">10{,}000{,}000 / 50{,}000 = 200 \text{ s} \approx 3.3 \text{ minutes}</p>
+<p>Three minutes of continuous work for one event. If the producer (the post service) tried to do this <em>synchronously</em> inside its request, it would block for 3.3 minutes, hold a connection the whole time, and fall over the instant a second celebrity posts. The fanout <strong>must</strong> land in a queue and drain in the background. This is not an optimization — it is the only shape that survives.</p>
+
+<p><strong>Cost.</strong> Now layer in money. Push and in-app are effectively free per message; email is fractions of a cent; <strong>SMS is real money</strong> — roughly $0.005 per segment. Mis-fire one campaign to those 10M users over SMS:</p>
+<p class="math block">10{,}000{,}000 \times \$0.005 = \$50{,}000</p>
+<p>Fifty thousand dollars for <em>one</em> policy bug — a missing quiet-hours check, a consent flag ignored, a dedupe key that didn't dedupe. In a feed system a bug shows you a stale post. Here a bug is a line item on the finance review. This is why policy is not a "feature" bolted on the side; it is the part of the system most worth getting right, and it must run where it can still <em>prevent</em> the spend.</p>
+
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">Celebrity fanout</div><div class="v">10M sends / event</div></div>
+  <div class="kpi"><div class="k">Drain @ 50k/s</div><div class="v">~200 s (3.3 min)</div></div>
+  <div class="kpi"><div class="k">SMS mis-fire cost</div><div class="v">$50,000</div></div>
+  <div class="kpi"><div class="k">Forced shape</div><div class="v">queue + policy-first</div></div>
 </div>
 
 <h2>1. Clarify the contract</h2>
-<p>The prompt is best treated as a product contract before it is treated as a component diagram. The system needs to do the following:</p>
+<p>Treat the prompt as a product contract before it is a box diagram. The system must:</p>
 <ul>
-  <li>Send push, email, SMS, or in-app notifications.</li>
-  <li>Respect user preferences, quiet hours, and legal consent.</li>
-  <li>Deduplicate repeated events.</li>
-  <li>Retry transient provider failures without spamming users.</li>
-  <li>Track delivery, open, and failure events.</li>
+  <li>Accept a <strong>notification intent</strong> from a product service ("user X liked your photo", "your code finished building") — not a raw provider call.</li>
+  <li>Deliver over <strong>multiple channels</strong> — push, email, SMS, in-app — each with its own provider, quota, latency, and cost.</li>
+  <li>Respect <strong>user preferences, quiet hours, and legal consent</strong> (CAN-SPAM, GDPR, TCPA) — and respect them <em>before</em> spending.</li>
+  <li><strong>Deduplicate</strong> the same logical event so a retried producer or a re-delivered queue message doesn't double-notify.</li>
+  <li><strong>Retry transient failures</strong> without spamming, and give up gracefully on permanent ones.</li>
+  <li>Emit <strong>delivery / open / failure</strong> events for analytics and future suppression.</li>
 </ul>
+<p>And explicitly what it need <em>not</em> do: it is not the system of record for the event itself (the post lives in the feed service), it does not guarantee ordering across channels, and it does not promise exactly-once delivery — only <em>effectively-once</em> (at-least-once + idempotency), which we derive below.</p>
 
-<h2>2. Put numbers on the shape</h2>
-<p>The exact numbers depend on the interviewer, but these are the estimates that should steer the architecture:</p>
-<ul>
-  <li>Fanout can turn one celebrity event into millions of notifications.</li>
-  <li>Provider APIs have quotas and variable latency; synchronous sends will not scale.</li>
-  <li>Template rendering and personalization can dominate CPU at high volume.</li>
-  <li>SMS has real cost per message, so policy bugs become money leaks.</li>
-</ul>
-
-<h2>3. Define the surface area</h2>
-<p>Keep the API small. The API should express the product operation, not leak the internal queue, cache, or shard layout.</p>
+<h2>2. Data model &amp; API</h2>
+<p>The API expresses the product operation and hides the queues, shards, and providers behind it.</p>
 <table>
   <thead><tr><th>API / operation</th><th>Why it exists</th></tr></thead>
   <tbody>
-    <tr><td><code>POST /notifications</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>register_device(user, token)</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>update_preferences(user, channel, policy)</code></td><td>Part of the minimal contract for this case.</td></tr>
+    <tr><td><code>POST /notifications {user|segment, type, payload, dedupe_key}</code></td><td>The one ingest path. Producers send <em>intent</em>; the system owns channel/policy/timing. <code>dedupe_key</code> is the producer's promise of identity.</td></tr>
+    <tr><td><code>register_device(user, channel, token)</code></td><td>Device tokens are mutable and expire; this keeps the routing table fresh.</td></tr>
+    <tr><td><code>update_preferences(user, channel, policy)</code></td><td>Opt-outs, quiet hours, frequency caps — the policy data that gates everything.</td></tr>
   </tbody>
 </table>
+<p>The core tables: <strong>notification_event</strong> (the intent + dedupe key), <strong>template</strong> (versioned), <strong>user_preference</strong> (per channel: enabled, quiet-hours window, consent flags, frequency cap), <strong>device_token</strong> (user → channel → token, with last-seen), and <strong>delivery_attempt</strong> (event × recipient × channel → state, for idempotency and analytics). The data model <em>is</em> the architecture: if preference ownership is vague, every downstream decision is vague.</p>
 
-<h2>4. Model the data</h2>
-<p>The data model is the first architecture. If the data ownership is vague, every later box-and-arrow decision will be vague too.</p>
-<div class="case-meta">
-<span class="chip">notification event</span><span class="chip">template</span><span class="chip">user preference</span><span class="chip">device token</span><span class="chip">delivery attempt</span>
-</div>
-
-<h2>5. Linearized design</h2>
-<p>Walk the design in the order a request or event actually moves. This keeps the interview grounded and exposes the first bottleneck naturally.</p>
+<h2>3. Linearized design — follow one event through</h2>
+<p>Walk the event in the order it actually moves; the bottleneck exposes itself.</p>
 <ol class="linear-list">
-<li><strong>1.</strong> Ingest notification intents from product services, not raw provider calls.</li>
-<li><strong>2.</strong> Evaluate preference, consent, dedupe, and priority before queueing channel work.</li>
-<li><strong>3.</strong> Render templates with stable snapshot data so retries do not drift semantically.</li>
-<li><strong>4.</strong> Fan out to channel-specific queues with independent rate limits.</li>
-<li><strong>5.</strong> Send through provider adapters that normalize success, retryable failure, and permanent failure.</li>
-<li><strong>6.</strong> Record attempts and feedback events for analytics and future suppression.</li>
+  <li><strong>Ingest.</strong> A product service POSTs a notification <em>intent</em> to the notification service. The service writes it durably and acks fast — it does not send anything inline. For a segment ("all followers of X"), it stores the segment reference, not 10M rows.</li>
+  <li><strong>Policy evaluation (the gate).</strong> Before any channel work, evaluate per recipient: is this channel enabled? Are we inside their quiet hours? Is there valid consent for this message class? Has their frequency cap been hit? What channel does priority dictate? <strong>Recipients that fail policy are dropped here — costing nothing.</strong> This is where the $50k bug is prevented.</li>
+  <li><strong>Dedupe.</strong> Check the dedupe store for <code>(user, dedupe_key)</code>. Seen recently? Suppress. This collapses producer retries and "liked, then unliked, then liked again" storms.</li>
+  <li><strong>Render.</strong> Render the template against a <em>stable snapshot</em> of the data, so a retry days later produces the same message it would have at send time (no semantic drift).</li>
+  <li><strong>Fan out to per-channel queues.</strong> Push, email, and SMS each have their own queue with independent rate limits and consumer pools. A slow SMS provider cannot back up the push pipeline.</li>
+  <li><strong>Provider adapter.</strong> Each channel's workers call the provider (APNs/FCM, SES/SendGrid, Twilio) behind a <strong>circuit breaker</strong>, carrying an <strong>idempotency key</strong> so a redelivered queue message doesn't re-send. The adapter normalizes the response into {success | retryable | permanent}.</li>
+  <li><strong>Feedback.</strong> Record the attempt; ingest delivery/open/bounce webhooks. Permanent failures (dead token, hard bounce) feed back into suppression.</li>
 </ol>
 
-<h2>6. Deep dives</h2>
-<h3>Policy before delivery</h3>
-<p>A notification service that only sends messages becomes a spam cannon. Preferences, quiet hours, and priority are first-class data models.</p>
-<h3>Retry semantics</h3>
-<p>At-least-once queues mean duplicates are normal. Every send needs an idempotency key at the provider adapter and a dedupe key at the user-event level.</p>
-<h3>Fanout control</h3>
-<p>For huge fanouts, create batches or segments rather than one queue message per user immediately. This lets you pause, rate limit, and cancel campaigns.</p>
+<div class="ascii">
+                          NOTIFICATION SYSTEM
+  producer                                                          providers
+ ─────────                                                         ───────────
+  feed   ──┐     ┌──────────────────────────────────────────┐
+  build  ──┼───▶ │  INGEST  (durable write, fast ack)        │
+  billing ─┘     └───────────────────┬──────────────────────┘
+                                      ▼
+                 ┌──────────────────────────────────────────┐
+                 │  POLICY GATE   prefs · quiet hours ·       │  ◀── drops cost
+                 │  consent · frequency cap · priority        │       NOTHING
+                 └───────────────────┬──────────────────────┘
+                                      ▼
+                 ┌──────────────────────────────────────────┐
+                 │  DEDUPE / IDEMPOTENCY  (user, dedupe_key)  │
+                 └───────────────────┬──────────────────────┘
+                                      ▼   render (snapshot data)
+                 ┌──────────────────────────────────────────┐
+                 │   FANOUT  ──▶ per-channel queues           │
+                 │   ┌────────┐  ┌────────┐  ┌────────┐       │
+                 │   │ push q │  │ email q│  │ SMS  q │  ◀ independent
+                 │   │ 50k/s  │  │ 10k/s  │  │ 200/s  │    rate limits
+                 │   └───┬────┘  └───┬────┘  └───┬────┘       │
+                 └───────┼───────────┼───────────┼───────────┘
+                         ▼           ▼           ▼
+                   [adapter+CB] [adapter+CB] [adapter+CB]  ──▶ APNs/FCM
+                         │           │           │          ──▶ SES
+                  idempotency key per send                  ──▶ Twilio
+                         └───────────┴───────────┘
+                                      ▼
+                          feedback / suppression store
+</div>
 
-<h2>7. Trade-offs</h2>
+<h2>4. Deep dives</h2>
+
+<h3>4.1 Policy before delivery — or you've built a spam cannon</h3>
+<p>The single most common junior mistake is to draw <em>ingest → queue → provider</em> and bolt preferences on as a filter near the end. That ordering is wrong for both reasons that define this system. <strong>Cost:</strong> if you check quiet hours <em>after</em> rendering and enqueuing 10M SMS messages, you've already done the expensive work — and if the check itself has a bug, you've already spent the $50k. Policy must run where it can still <em>prevent</em> the spend, which is upstream of the channel queues. <strong>Trust:</strong> a user who gets one notification at 3am they explicitly disabled will disable <em>all</em> notifications and never come back; that lost engagement dwarfs the cost of the single send.</p>
+<p>So preferences, quiet hours, consent, and priority are <strong>first-class data models</strong>, not config flags. Priority deserves emphasis: a security alert ("new login from an unknown device") overrides quiet hours and frequency caps; a "someone you may know joined" does not. Encoding priority as a property of the message class lets the gate make that call deterministically. The rule of thumb: <em>every byte of policy you can evaluate before enqueuing saves you a byte of cost and a unit of user trust.</em></p>
+
+<h3>4.2 At-least-once queues → duplicates are normal → idempotency is mandatory</h3>
+<p>This is the delivery-semantics heart of the case. Queues that survive crashes give you <strong>at-least-once</strong> delivery: a worker can pull a message, send it, and die before acking — so the broker redelivers it, and the user gets two pushes. You cannot wish this away; true exactly-once across a network and a third-party provider is impossible (the provider might have received your request and only the ack got lost). What you <em>can</em> build is <strong>effectively-once</strong> = at-least-once transport + idempotent consumers. This is DDIA Ch. 11's idempotent-consumer pattern, and the concept is taught in full in <a href="case_27_delivery_semantics.html">C27 (delivery semantics)</a> — here we apply its two distinct keys:</p>
+<ul>
+  <li><strong>Dedupe key — at the user-event level.</strong> The producer's <code>dedupe_key</code> identifies the logical event ("post 9981 liked by user 42"). The policy stage records it; a second arrival of the same logical event is suppressed. This protects against <em>producer</em> retries and event storms.</li>
+  <li><strong>Idempotency key — at the provider adapter.</strong> A per-send key (event_id × recipient × channel) stored insert-if-absent before the provider call. If a queue message is redelivered, the adapter sees the key already exists in a terminal state and skips the resend. This protects against <em>queue</em> redelivery. Many providers also accept their own idempotency token (Twilio, Stripe-style) — use it when available so even a lost-ack retry is dedup'd provider-side.</li>
+</ul>
+<p>Two keys, two layers, two failure sources. Conflating them — using one dedupe at ingest only — leaves the window between "message pulled from queue" and "provider acked" unprotected, which is exactly the window that produces the double-push in production.</p>
+
+<h3>4.3 Batching and segmentation — making a 10M fanout controllable</h3>
+<p>If a celebrity-post event expands into 10M individual queue messages <em>at ingest</em>, you've created 10M rows you cannot easily pause, cancel, or reprioritize, and you've put a 200-second write storm on the broker. Instead, fan out <strong>lazily in batches</strong>: store the event as a <em>segment job</em> ("notify followers of X, batch by 10k"), and let a fanout worker materialize recipient batches and feed them to the channel queues at a controlled rate. This buys three properties the flat design can't:</p>
+<ul>
+  <li><strong>Pause / cancel.</strong> A campaign found to be buggy (the $50k case) can be halted after batch 50 of 1000 — you've sent 500k, not 10M. The flat design has already committed all 10M.</li>
+  <li><strong>Rate-limit per channel.</strong> The SMS queue drains at 200/s while push drains at 50k/s; batching lets each channel pull at its own pace from one logical job.</li>
+  <li><strong>Reprioritize.</strong> A high-priority transactional notification can jump ahead of a low-priority marketing fanout that's mid-drain.</li>
+</ul>
+<p>This is the <a href="case_08_news_feed.html">C08</a> fanout-on-write tension at notification scale: you trade a little ingest latency (you don't materialize all recipients immediately) for enormous operational control over the long tail of the send.</p>
+
+<h2>5. Trade-offs</h2>
 <table>
   <thead><tr><th>Choice</th><th>Buys</th><th>Costs</th><th>Choose when</th></tr></thead>
   <tbody>
-<tr><td><strong>Synchronous send vs queued send</strong></td><td>immediate feedback</td><td>slow producer and provider coupling</td><td>tiny internal notifications</td></tr>
-<tr><td><strong>User-level dedupe vs event-level dedupe</strong></td><td>less spam</td><td>may suppress distinct useful events</td><td>likes/comments bursts</td></tr>
-<tr><td><strong>One queue vs channel queues</strong></td><td>simplicity</td><td>SMS outage can block push</td><td>small systems</td></tr>
-<tr><td><strong>Personalized rendering vs generic templates</strong></td><td>higher engagement</td><td>more CPU and data dependencies</td><td>high-value notifications</td></tr>
+    <tr><td><strong>Synchronous send vs queued send</strong></td><td>Immediate delivery confirmation to the producer.</td><td>Producer blocks on provider latency; cannot survive fanout (3.3 min for 10M).</td><td>Only tiny, low-fanout internal notifications.</td></tr>
+    <tr><td><strong>User-level dedupe vs event-level dedupe</strong></td><td>User-level cuts more spam (collapses bursts).</td><td>May suppress genuinely distinct, useful events.</td><td>Like/comment bursts → user-level; transactional → event-level.</td></tr>
+    <tr><td><strong>One queue vs per-channel queues</strong></td><td>Single queue is simpler to operate.</td><td>An SMS provider outage backs up and blocks push/email.</td><td>One queue only for small, single-channel systems.</td></tr>
+    <tr><td><strong>Eager fanout vs batched/segmented fanout</strong></td><td>Eager is simplest; every recipient is a row immediately.</td><td>No pause/cancel/reprioritize; 10M-row write storm at ingest.</td><td>Eager only when max fanout is small and bounded.</td></tr>
   </tbody>
 </table>
+<p>The sharpest one is <strong>per-channel queues</strong>. It looks like premature complexity — why not one queue with a channel field? Because the channels have wildly different failure and rate profiles: SMS at 200/s through a flaky third party versus push at 50k/s through a robust one. With a shared queue, a Twilio outage means SMS messages pile at the head and starve push consumers (head-of-line blocking), so a marketing SMS hiccup silently delays your 2FA pushes. Independent queues give each channel its own backpressure, rate limit, and circuit breaker — isolation is the whole point.</p>
 
-<h2>8. Failure modes</h2>
+<h2>6. Failure modes</h2>
 <table>
   <thead><tr><th>Failure</th><th>Mitigation</th></tr></thead>
   <tbody>
-<tr><td><strong>Provider outage</strong></td><td>Circuit-break that provider and retry with backoff or fallback channel.</td></tr>
-<tr><td><strong>Invalid device tokens</strong></td><td>Cull permanent failures and refresh tokens on app launch.</td></tr>
-<tr><td><strong>Notification storm</strong></td><td>Apply per-user and global budgets with priority shedding.</td></tr>
-<tr><td><strong>Template bug</strong></td><td>Version templates and canary high-volume campaigns.</td></tr>
+    <tr><td><strong>Provider outage (e.g. APNs down)</strong></td><td>Circuit-break the adapter, retry with exponential backoff + jitter, fall back to another channel where appropriate — and <strong>drop notifications whose value has expired</strong> (see Q&amp;A).</td></tr>
+    <tr><td><strong>Invalid / expired device tokens</strong></td><td>Treat as permanent failure; cull from the routing table and refresh on next app launch. Don't retry a dead token.</td></tr>
+    <tr><td><strong>Notification storm</strong> (runaway producer, retry loop)</td><td>Per-user and global frequency budgets with priority shedding — drop low-priority first (foundation lesson 15).</td></tr>
+    <tr><td><strong>Template bug</strong></td><td>Version templates; canary high-volume campaigns to 1% before full fanout; the batched fanout lets you abort mid-send.</td></tr>
+    <tr><td><strong>Queue redelivery → double send</strong></td><td>Idempotency key at the adapter (4.2); the duplicate is suppressed before the provider call.</td></tr>
   </tbody>
 </table>
 
-<h2>9. What to say in the interview</h2>
-<div class="callout ok">
-  <div class="label">Strong signal</div>
-  Lead with the dominant constraint: Fanout, device tokens, templates, preferences, retry, dedupe, channel priority. Then defend the design by naming what you made faster, what you made more reliable, and what complexity you accepted.
+<h2>7. Interview Q&amp;A</h2>
+<div class="callout">
+  <ol>
+    <li><strong>APNs goes down for 20 minutes — what happens to 2M queued pushes?</strong> <em>(senior answer)</em> First, the <strong>circuit breaker</strong> on the push adapter trips after a failure threshold, so workers stop hammering a dead provider and instead fast-fail, leaving messages in the queue. Retries use <strong>exponential backoff with jitter</strong> so all 2M don't stampede the instant APNs recovers (thundering herd). Crucially, I <strong>drop notifications whose value has expired</strong>: a "your build finished" or "X is live now" push is worthless 20 minutes late, so it carries a TTL and is discarded rather than delivered stale. High-value, time-insensitive ones (a security alert) survive the wait or <strong>fall back to another channel</strong> (SMS/email). The mistake is queueing all 2M forever and dumping them on the user when APNs returns — a 20-minute-old notification flood is itself an incident.</li>
+    <li><strong>Why must policy run before delivery, not as a filter at the end?</strong> <em>(senior answer)</em> Two reasons: cost and trust. Checking quiet hours after enqueuing 10M SMS means you've already risked the $50k spend before the check runs; and the whole value of the system is <em>not</em> sending unwanted messages, so the gate belongs upstream where it can prevent work. Preferences, consent, and priority are first-class data, not a trailing filter.</li>
+    <li><strong>You have at-least-once queues. How do you avoid double-notifying?</strong> <em>(senior answer)</em> You can't get true exactly-once across a third-party provider, so you build effectively-once: at-least-once transport plus idempotent consumers. Two keys — a <em>dedupe key</em> at the user-event level (collapses producer retries/storms) and an <em>idempotency key</em> at the provider adapter, insert-if-absent before the send (collapses queue redelivery). That's DDIA Ch. 11's idempotent consumer; the concept anchor is C27.</li>
+    <li><strong>A celebrity with 10M followers posts. Walk the fanout.</strong> <em>(senior answer)</em> Ingest stores a <em>segment job</em>, not 10M rows, and acks immediately. A fanout worker materializes recipient batches (say 10k) and feeds them to per-channel queues at a controlled rate; at 50k/s push drains in ~3.3 min. Batching means I can pause or cancel mid-fanout if the campaign turns out buggy — I've sent 500k, not 10M.</li>
+    <li><strong>Why per-channel queues instead of one queue with a channel field?</strong> <em>(senior answer)</em> Isolation. SMS (200/s, flaky third party) and push (50k/s, robust) have totally different rate and failure profiles. A shared queue means an SMS outage causes head-of-line blocking that starves push — so a marketing SMS problem delays your 2FA codes. Separate queues give each its own backpressure, rate limit, and circuit breaker.</li>
+    <li><strong>Should you key the limit / dedupe on IP, user, or device?</strong> <em>(senior answer)</em> On the <em>user</em> for preferences and frequency caps (the policy unit), and on the <em>device token</em> for actual push routing (a user has many devices). The dedupe key is on (user, logical-event), and the provider idempotency key is on (event, recipient, channel) so the same event to the same person on two channels isn't wrongly collapsed.</li>
+    <li><strong>How do you stop a runaway producer from spamming everyone?</strong> <em>(senior answer)</em> Per-user and global frequency budgets enforced at the policy gate, with priority shedding — low-priority marketing drops first, transactional and security survive. This is foundation lesson 15's admission control applied to notifications; the limiter protects users and the SMS budget, not just the backend.</li>
+    <li><strong>How do delivery/open feedback events close the loop?</strong> <em>(senior answer)</em> Provider webhooks (delivered, bounced, opened, unsubscribed) flow into the feedback store. Hard bounces and dead tokens become suppression rules so we stop wasting sends and money; open rates feed engagement; unsubscribes update preferences. Without this loop you keep paying to send into the void and your sender reputation rots.</li>
+  </ol>
 </div>
 
 <h2>Related foundation lessons</h2>
+<p>This case leans on several foundations, each for a specific reason. <a href="11_async_messaging.html">Lesson 11 (async messaging)</a> is the backbone — the per-channel queues and log-based brokers that make the 3.3-minute fanout survivable (DDIA Ch. 11's stream processing and log-based message brokers). <a href="13_fault_tolerance.html">Lesson 13 (fault tolerance)</a> supplies the circuit breakers and exponential-backoff-with-jitter that handle the APNs-down scenario (and DDIA Ch. 8's provider timeouts and retries). <a href="16_observability.html">Lesson 16 (observability)</a> gives the delivery/open/bounce metrics and SLOs that tell you whether the system is healthy or quietly burning money. And <a href="case_27_delivery_semantics.html">C27</a> is the anchor for delivery semantics — at-least-once vs exactly-once and idempotent consumers — which we only <em>apply</em> here.</p>
 <div class="case-meta">
-<a class="chip" href="11_async_messaging.html">Async messaging</a>
-<a class="chip" href="12_distributed_transactions.html">Transactions and idempotency</a>
-<a class="chip" href="15_rate_limiting_edge.html">Rate limiting and edge</a>
-<a class="chip" href="16_observability.html">Observability</a>
+  <a class="chip" href="11_async_messaging.html">Async messaging</a>
+  <a class="chip" href="13_fault_tolerance.html">Fault tolerance</a>
+  <a class="chip" href="15_rate_limiting_edge.html">Rate limiting and edge</a>
+  <a class="chip" href="16_observability.html">Observability</a>
+  <a class="chip" href="case_27_delivery_semantics.html">C27 · delivery semantics</a>
+  <a class="chip" href="case_08_news_feed.html">C08 · fanout</a>
 </div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  A notification system is a policy engine first and a delivery engine second. The fanout number (10M sends, ~3.3 min to drain at 50k/s) forces everything to be asynchronous and queued; the cost number ($50k for one mis-fired SMS campaign) forces policy — preferences, quiet hours, consent, priority — to run <em>upstream</em>, where it can still prevent the spend. Between them sit two non-negotiables: per-channel queues so one provider's outage can't starve another channel, and a two-layer idempotency story (dedupe key at the event level, idempotency key at the adapter) because at-least-once queues make duplicates normal. And when a provider dies, the senior move isn't to queue everything forever — it's to circuit-break, back off, fall back, and <em>drop the notifications whose value has already expired</em>.</div>
 
 <footer class="lesson-nav">
   <a href="case_06_web_crawler.html"><span class="dir">Previous</span><span class="ttl">Previous case</span></a>

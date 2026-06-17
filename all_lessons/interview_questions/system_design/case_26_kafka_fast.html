@@ -37,117 +37,154 @@
 <main>
 
 <h1>Why Kafka is fast and when to use it</h1>
-<p class="subtitle">Kafka is fast because it narrows the problem: append sequential bytes, batch them, let consumers track offsets, and avoid per-message random work.</p>
+<p class="subtitle">"Fast" is not a property of the code — it's a property of the access pattern. Kafka is fast because it refuses to do the slow things: it never seeks randomly, never serializes per message, and never copies bytes it doesn't have to.</p>
 <div class="case-meta">
-  <span class="chip">Source: Archive</span>
-  <span class="chip">Case drill</span>
-  <span class="chip">Trade-off first</span>
+  <span class="chip">Mechanism companion to C23</span>
+  <span class="chip">Sequential IO</span>
+  <span class="chip">Zero-copy</span>
 </div>
 
 <div class="callout">
-  <div class="label">How to read this case</div>
-  This page is an original educational walkthrough based on the case topic, not a transcription. Read it linearly: contract, estimates, data, flows, bottlenecks, trade-offs, then failure modes.
-</div>
+  <div class="label">This is the mechanism page, not the design page</div>
+  <a href="case_23_distributed_message_queue.html"><strong>C23</strong></a> is the design anchor: it derives the partitioned append-log queue, replication, consumer groups, and delivery semantics. This page owns the low-level <em>why is it fast</em> — the physics and the syscalls underneath that design. If you're asked to design the queue, go to C23; if you're asked why a log broker out-throughputs a "normal" message queue by 10–100&times;, you're in the right place.</div>
 
-<h2>0. Interview hinge</h2>
-<p>The hinge is the moment where the prompt stops being generic and the architecture becomes forced. For this case, that hinge is: <strong>Append logs, batching, zero-copy, page cache, partition parallelism.</strong></p>
+<h2>The hinge: throughput is a fight against the disk head</h2>
+<div class="callout">
+  <div class="label">First principle</div>
+  A spinning disk (and to a lesser but real degree an SSD) is fast at <strong>one</strong> thing: reading or writing bytes that are physically adjacent. The instant you ask it to jump to a new location, you pay a seek. So the entire performance question collapses to: <em>can I express my workload as long sequential runs, or am I forcing the device to chase pointers?</em> Kafka's design is a single-minded answer — make every write an append to the end of a file, and every read a forward scan — so the disk does the only thing it's good at.</div>
+
+<p>Put numbers on the gap, because the whole architecture is a reaction to it. A commodity disk streams sequential data at <strong>~100s of MB/s</strong> (call it 200&ndash;500 MB/s for a modern SATA SSD, north of a GB/s for NVMe). But <em>random</em> access is capped not by bandwidth but by IOPS — a few <strong>hundred IOPS</strong> on spinning rust, tens of thousands on a good SSD. Take a workload of small 1&nbsp;KB records:</p>
+
+<div class="math block">sequential: 250 MB/s &divide; 1 KB &asymp; 250,000 records/s &nbsp;&nbsp;|&nbsp;&nbsp; random (HDD): 300 IOPS &times; 1 KB &asymp; 300 records/s</div>
+
+<p>That is roughly a <strong>100&times;</strong>&ndash;1000&times; gap, and it does not come from a faster CPU or a cleverer language — it comes from <em>refusing to seek</em>. A traditional message broker that keeps a per-message index, deletes messages as they're consumed, and updates state in place is, structurally, a random-IO workload. Kafka deletes nothing on consume, indexes almost nothing, and only ever writes to the tail. This is exactly DDIA Ch.&nbsp;3's log-structured storage argument: an append-only log turns random writes into sequential ones, and that single decision is the dominant lever.</p>
+
+<h2>Clarify the contract — what "fast" must and must not mean</h2>
+<p>Before optimizing, pin down what guarantees Kafka is allowed to keep cheap, because "fast" is bought by narrowing the contract:</p>
+<ul>
+  <li><strong>Must:</strong> sustain very high <em>aggregate write and read throughput</em> for an append/replay workload, with durable, ordered-per-partition storage and many independent consumers reading the same data.</li>
+  <li><strong>Must NOT (deliberately):</strong> support per-message random update or delete, in-place mutation, low-latency request/response, or a global total order across partitions. Kafka is a <em>log</em>, not a database and not an RPC layer. The moment your problem needs "fetch this one record and mutate it," you've left Kafka's sweet spot — that's the <strong>Kafka vs RPC</strong> trade below.</li>
+</ul>
+
+<h2>Lever 1 — batching: amortize the fixed cost per message to near zero</h2>
+<p>Sequential IO removes the seek; batching removes the <em>per-message overhead</em>. Sending one message end-to-end is never just "write 1 KB." It is: a system call to hand bytes to the kernel, a TCP segment (with its headers and round-trip accounting), broker-side handling, optionally an <code>fsync</code>, and a replication acknowledgment. Those fixed costs are paid <em>per network/syscall event</em>, not per byte. So the question is how many messages you fold into one event.</p>
+
 <div class="callout ok">
-  <div class="label">Invariant to protect</div>
-  The design is only correct if the user-visible contract survives retries, partial failures, stale caches, and reordering. A concrete invariant to defend here: <strong>Tiny-message low-throughput config</strong> must be handled by <strong>Batch and compress before blaming hardware.</strong>.
-</div>
-<div class="callout warn">
-  <div class="label">Tempting but wrong</div>
-  A common shortcut is to choose <strong>Large batches vs small batches</strong> just because it buys throughput and compression. That shortcut fails when its cost matters: latency. Use it only when the workload matches the condition: analytics pipelines.
-</div>
+  <div class="label">Worked example — amortizing fixed cost</div>
+  Suppose each produce request carries a fixed overhead of <span class="math">O = 200 &micro;s</span> (syscall + TCP + broker dispatch + ack accounting) and each 1&nbsp;KB message costs <span class="math">m = 1 &micro;s</span> of actual data work.
+  <ul>
+    <li><strong>1 message/request:</strong> cost per message = <span class="math">O + m = 201 &micro;s</span> &rarr; <span class="math">&asymp; 4,975</span> msg/s. The overhead <em>is</em> the workload.</li>
+    <li><strong>1,000 messages/request:</strong> cost per message = <span class="math">O/1000 + m = 0.2 + 1 = 1.2 &micro;s</span> &rarr; <span class="math">&asymp; 833,000</span> msg/s. The fixed cost is amortized <strong>~1000&times;</strong> and you're now bound by data work, not overhead.</li>
+  </ul>
+  Same code, same hardware, <strong>~167&times;</strong> the throughput — purely from grouping. This is why a "Kafka is slow!" report almost always turns out to be a producer sending one tiny message per request (<code>linger.ms=0</code>, <code>batch.size</code> tiny): you're paying the 200&nbsp;&micro;s tax on every record.</div>
 
-<h2>1. Clarify the contract</h2>
-<p>The prompt is best treated as a product contract before it is treated as a component diagram. The system needs to do the following:</p>
-<ul>
-  <li>Explain Kafka-like performance from first principles.</li>
-  <li>Know which workloads fit an append log.</li>
-  <li>Understand partitions as throughput and ordering units.</li>
-  <li>Reason about batching and sequential IO.</li>
-  <li>Avoid using Kafka where request/response semantics are needed.</li>
-</ul>
+<p>Batching also unlocks <strong>compression</strong> (DDIA Ch.&nbsp;4, encoding): compressors find redundancy across records, so a batch of similar JSON events compresses far better than each event alone — and Kafka stores and ships the batch compressed, so compression buys network <em>and</em> disk <em>and</em> page-cache savings in one move. But batching is not free: holding messages to fill a batch <em>adds latency</em>. That is the central tunable, and it deserves a static table.</p>
 
-<h2>2. Put numbers on the shape</h2>
-<p>The exact numbers depend on the interviewer, but these are the estimates that should steer the architecture:</p>
-<ul>
-  <li>Sequential disk IO can be orders of magnitude faster than random IO.</li>
-  <li>Batching amortizes network, syscall, and replication overhead.</li>
-  <li>More partitions increase parallelism but also metadata and rebalancing cost.</li>
-  <li>Consumer lag is a queue length measured in offsets and time.</li>
-</ul>
-
-<h2>3. Define the surface area</h2>
-<p>Keep the API small. The API should express the product operation, not leak the internal queue, cache, or shard layout.</p>
 <table>
-  <thead><tr><th>API / operation</th><th>Why it exists</th></tr></thead>
+  <thead><tr><th>Batch / linger setting</th><th>Throughput</th><th>Added p99 latency</th><th>Compression ratio</th><th>Fits</th></tr></thead>
   <tbody>
-    <tr><td><code>produce(topic, key, batch)</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>fetch(partition, offset)</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>commit offset</code></td><td>Part of the minimal contract for this case.</td></tr>
+    <tr><td><strong>1 msg, linger 0</strong></td><td>~5K msg/s (overhead-bound)</td><td>~0 ms (no wait)</td><td>poor (per-msg)</td><td>low-latency, low-volume signals</td></tr>
+    <tr><td><strong>~64 KB, linger 5 ms</strong></td><td>~10&ndash;20&times; higher</td><td>+~5 ms</td><td>good</td><td>general-purpose default</td></tr>
+    <tr><td><strong>~1 MB, linger 100 ms</strong></td><td>~100&times; higher, near disk/NIC bound</td><td>+~100 ms</td><td>best (large window)</td><td>analytics / ingest pipelines</td></tr>
   </tbody>
 </table>
 
-<h2>4. Model the data</h2>
-<p>The data model is the first architecture. If the data ownership is vague, every later box-and-arrow decision will be vague too.</p>
-<div class="case-meta">
-<span class="chip">partition log</span><span class="chip">segment file</span><span class="chip">offset index</span><span class="chip">producer batch</span><span class="chip">consumer group</span>
+<p>The trade is monotone and unavoidable: <strong>throughput is bought with latency</strong>. <code>linger.ms</code> is literally "how long will I wait, accumulating messages, before flushing?" Set it to 0 and you optimize latency at the cost of overhead; raise it and you trade tail latency for amortized efficiency. There is no setting that wins both — you choose where on this curve your workload lives.</p>
+
+<h2>The physical layout — segments, the offset index, and the zero-copy path</h2>
+<p>A partition is not a fancy structure; it is a directory of <strong>segment files</strong> — append-only byte logs that roll over at a size/time limit. Alongside each segment is a sparse <strong>offset index</strong> mapping a logical offset to a byte position, so a consumer's "give me from offset N" becomes a binary search in a tiny index plus a sequential read. No B-tree, no per-message lock, no delete-on-consume.</p>
+
+<div class="ascii">
+  PARTITION = ordered sequence of append-only segment files
+  ┌──────────────────────────────────────────────────────────────┐
+  │  00000.log   00000.index        00512.log   00512.index  ...  │
+  │  ┌────────────────┐ ┌──────┐    ┌────────────────┐ ┌──────┐   │
+  │  │ rec rec rec ...│ │off→pos│   │ rec rec rec ...│ │off→pos│   │
+  │  └────────────────┘ └──────┘    └────────────────┘ └──────┘   │
+  │      ▲ append only          ▲ sparse: every ~4KB, not per-msg │
+  └──────┼─────────────────────────────────────────────────────────┘
+         │ producers only ever write here (the tail) → sequential
+
+  fetch(offset N): binary-search index → byte pos → SEQUENTIAL read forward
+
+  THE ZERO-COPY READ PATH  (consumer fetch served via sendfile)
+  ┌────────┐   DMA    ┌────────────┐   sendfile   ┌─────┐   DMA   ┌──────┐
+  │  DISK  │ ───────▶ │ PAGE CACHE │ ───────────▶ │ NIC │ ──────▶ │socket│
+  └────────┘ (kernel) └────────────┘ (kernel→kernel)└─────┘        └──────┘
+                            ▲
+                            └─ NO copy into user-space broker heap
+                               broker never touches the message bytes
+
+  contrast — the naive read (4 copies, 2 context switches):
+    disk → page cache → USER buffer → SOCKET buffer → NIC
+              (read())        (broker)      (write())
 </div>
 
-<h2>5. Linearized design</h2>
-<p>Walk the design in the order a request or event actually moves. This keeps the interview grounded and exposes the first bottleneck naturally.</p>
-<ol class="linear-list">
-<li><strong>1.</strong> Write messages to append-only partition logs.</li>
-<li><strong>2.</strong> Group messages into batches before network and disk writes.</li>
-<li><strong>3.</strong> Use OS page cache for hot log segments.</li>
-<li><strong>4.</strong> Let consumers fetch sequential ranges by offset.</li>
-<li><strong>5.</strong> Replicate partition leaders to followers for durability.</li>
-<li><strong>6.</strong> Retain logs by time or size so consumers can replay.</li>
-</ol>
+<h3>Deep dive 1 — the append-only shape avoids locks and indexes entirely</h3>
+<p>A mutable store needs an index to find a record and a lock to mutate it safely under concurrency; both are random-access, contention-prone structures. An append-only log sidesteps all of it. Writes go to one place — the tail — so the only synchronization is appending in order (and Kafka serializes per partition, which is also why a partition is the unit of ordering). There is nothing to lock for readers because <strong>readers never mutate</strong>: a consumer just remembers its own <em>offset</em> and reads forward. Critically, <strong>the consumer owns its offset, not the broker</strong>. The broker doesn't track "who has read what" or delete on consume — it retains by time/size and hands out byte ranges. This is the inversion that makes fan-out cheap: ten consumer groups reading the same partition are ten independent forward scans over the same page-cached bytes, costing the broker almost nothing extra. This is DDIA Ch.&nbsp;11's partitioned-log abstraction: the log is the source of truth, consumption is a cursor over it, and replay is just resetting the cursor.</p>
 
-<h2>6. Deep dives</h2>
-<h3>Append-only shape</h3>
-<p>Random updates require indexes and locks. Append logs mostly move the disk head forward and let consumers remember positions independently.</p>
-<h3>Batching</h3>
-<p>A single message is expensive; a batch of messages shares protocol overhead, compression, disk flushes, and replication acknowledgments.</p>
-<h3>Zero-copy intuition</h3>
-<p>Serving log bytes can avoid copying through user space. The broker becomes a coordinator of byte movement rather than a transformer of every message.</p>
+<h3>Deep dive 2 — page cache + sendfile: the bytes the broker never touches</h3>
+<p>Here is the part that surprises people: <strong>Kafka does not maintain its own message cache.</strong> It writes to the file and lets the OS <strong>page cache</strong> hold hot pages. Because producers append and consumers read the tail, the data a consumer wants was written moments ago and is almost certainly still in page cache — so a "read" is frequently served entirely from RAM with <em>zero</em> disk IO, and Kafka gets a giant cache for free, shared across processes, that survives a broker JVM restart and never doubles memory by caching the same bytes twice (once in JVM heap, once in OS cache).</p>
+<p>On top of that sits <strong>zero-copy via <code>sendfile</code></strong>. The naive way to serve a file to a socket copies bytes four times and crosses the user/kernel boundary twice: disk &rarr; page cache &rarr; user-space buffer &rarr; socket buffer &rarr; NIC. <code>sendfile(2)</code> tells the kernel "ship these page-cache bytes straight to this socket," so the data goes <strong>page cache &rarr; NIC</strong> without ever being copied into the broker's user-space heap. The broker becomes a <em>coordinator of byte movement</em>, not a transformer of bytes — it decides which range of which segment to send and lets the kernel DMA it out. This is also why broker-side transformations (decompress, re-encode, filter) are expensive: they force the bytes through user space and forfeit zero-copy. Kafka keeps the batch opaque on the hot path precisely to preserve it.</p>
 
-<h2>7. Trade-offs</h2>
+<div class="callout warn">
+  <div class="label">The sharpest senior question: "Walk me through every copy a message avoids from disk to socket."</div>
+  Answer it as a subtraction from the naive 4-copy path. (1) Disk &rarr; <strong>page cache</strong>: one DMA copy by the kernel — unavoidable, but often skipped entirely because the tail is already cached from the recent write. (2) Page cache &rarr; <strong>user-space buffer</strong>: <em>avoided</em> — <code>sendfile</code> never reads the bytes into the broker process. (3) User buffer &rarr; <strong>socket buffer</strong>: <em>avoided</em> — there is no user buffer. (4) Then DMA page-cache &rarr; <strong>NIC</strong>. So the message that would cross the kernel/user boundary twice and be copied four times instead crosses zero user boundaries and (on modern NICs with scatter-gather DMA) is copied effectively once. The broker CPU never touches the payload. That is the whole magic trick.</div>
+
+<h3>Deep dive 3 — partition parallelism is the scaling unit</h3>
+<p>Everything above makes a <em>single</em> partition fast. Partitions are how you make the <em>cluster</em> fast: a topic is split into P partitions spread across brokers, and within a consumer group each partition is consumed by exactly one consumer. So <strong>P is your maximum parallelism</strong> — for reads (at most P consumers do useful work in a group) and for writes (each partition is an independent sequential append on possibly different disks/brokers). Want 2&times; the throughput? Add partitions and consumers. This is DDIA Ch.&nbsp;6/Ch.&nbsp;11 partitioning applied to a log, and it carries the same tension we cover in <a href="07_partitioning.html">lesson 07</a>: the partition <em>key</em> decides distribution, so a skewed key (everything keyed by one tenant) creates a hot partition that no amount of total partitions will relieve — see the failure modes below. The cost of more partitions isn't throughput, it's metadata: more files, more open handles, longer leader-election/rebalance times, and more controller pressure.</p>
+
+<h2>Trade-offs</h2>
 <table>
   <thead><tr><th>Choice</th><th>Buys</th><th>Costs</th><th>Choose when</th></tr></thead>
   <tbody>
-<tr><td><strong>Large batches vs small batches</strong></td><td>throughput and compression</td><td>latency</td><td>analytics pipelines</td></tr>
-<tr><td><strong>More partitions vs fewer</strong></td><td>parallelism</td><td>weaker ordering and more overhead</td><td>high-volume topics</td></tr>
-<tr><td><strong>Long retention vs short</strong></td><td>replay</td><td>storage</td><td>event-sourced pipelines</td></tr>
-<tr><td><strong>Kafka vs RPC</strong></td><td>decoupling and replay</td><td>no immediate response</td><td>async workflows</td></tr>
+    <tr><td><strong>Large batches vs small</strong></td><td>throughput + compression (amortize fixed cost ~1000&times;)</td><td>added per-message latency (linger)</td><td>ingest/analytics; <em>not</em> latency-sensitive signals</td></tr>
+    <tr><td><strong>More partitions vs fewer</strong></td><td>read/write parallelism = P</td><td>weaker ordering, more files, slower rebalance</td><td>high-volume topics with a good key</td></tr>
+    <tr><td><strong>Long retention vs short</strong></td><td>replay, new consumers, event sourcing</td><td>disk, longer recovery scans</td><td>event-sourced / reprocessable pipelines</td></tr>
+    <tr><td><strong>Kafka (log) vs RPC</strong></td><td>decoupling, buffering, fan-out, replay</td><td>no synchronous response; eventual</td><td>async workflows; never for request/response</td></tr>
   </tbody>
 </table>
+<p>The sharpest of these is the last one, and it's where candidates most often misuse Kafka. Kafka is fast precisely <em>because</em> it gave up request/response: there is no "process this and tell me the answer." A producer fires and the data lands in a log; a consumer reads it whenever it gets there. If your call site needs an answer before it can proceed — a synchronous read, a "did this succeed?" — Kafka is the wrong tool, and bolting a reply-topic on top reinvents RPC badly. Use it for the workloads its physics rewards: high-volume, append-shaped, replayable streams where decoupling and buffering are features. See <a href="11_async_messaging.html">lesson 11</a> for where a log broker sits versus a traditional task queue, and <a href="02_latency_throughput.html">lesson 02</a> for why batching trades latency for throughput on the same utilisation curve.</p>
 
-<h2>8. Failure modes</h2>
+<h2>Failure modes</h2>
 <table>
-  <thead><tr><th>Failure</th><th>Mitigation</th></tr></thead>
+  <thead><tr><th>Failure</th><th>Why it happens</th><th>Mitigation</th></tr></thead>
   <tbody>
-<tr><td><strong>Tiny-message low-throughput config</strong></td><td>Batch and compress before blaming hardware.</td></tr>
-<tr><td><strong>Too many partitions</strong></td><td>Right-size partition count and monitor controller pressure.</td></tr>
-<tr><td><strong>Slow consumer</strong></td><td>Scale group or isolate it so retention is not exhausted.</td></tr>
-<tr><td><strong>Hot key</strong></td><td>Choose partition keys carefully or split the key.</td></tr>
+    <tr><td><strong>"Kafka is slow" with tiny messages</strong></td><td>linger 0 / tiny batch &rarr; paying the fixed per-request overhead on every 1&nbsp;KB record (the 201&nbsp;&micro;s case above).</td><td>Raise <code>batch.size</code> / <code>linger.ms</code> and enable compression before blaming hardware.</td></tr>
+    <tr><td><strong>Too many partitions</strong></td><td>Open file handles, controller metadata, and rebalance time all scale with partition count.</td><td>Right-size P to required parallelism; consolidate low-volume topics; monitor controller pressure.</td></tr>
+    <tr><td><strong>Slow consumer / lag</strong></td><td>Consumer falls behind the tail; reads now miss page cache and hit disk, and may fall off the retention window entirely.</td><td>Scale the group up to P, isolate the slow consumer, or lengthen retention so it can catch up.</td></tr>
+    <tr><td><strong>Hot partition</strong></td><td>Skewed partition key sends most traffic to one partition, defeating parallelism (lesson 07's hot shard).</td><td>Pick a higher-cardinality key, or split/salt the hot key.</td></tr>
+    <tr><td><strong>Broker transformation kills zero-copy</strong></td><td>Server-side decompress/filter/re-encode forces bytes through user space.</td><td>Keep batches opaque on the hot path; do transformation in consumers, not the broker.</td></tr>
   </tbody>
 </table>
 
-<h2>9. What to say in the interview</h2>
-<div class="callout ok">
-  <div class="label">Strong signal</div>
-  Lead with the dominant constraint: Append logs, batching, zero-copy, page cache, partition parallelism. Then defend the design by naming what you made faster, what you made more reliable, and what complexity you accepted.
+<h2>Interview prompts you should be ready for</h2>
+<div class="callout">
+  <ol>
+    <li><strong>Why is sequential IO so much faster than random, with numbers?</strong> <em>(senior answer)</em> Random access is bounded by IOPS (a few hundred on HDD), sequential by bandwidth (~100s of MB/s). For 1&nbsp;KB records that's ~300 records/s random vs ~250K/s sequential — a 100&times;&ndash;1000&times; gap. Kafka makes every write a tail append and every read a forward scan, so the disk does the only thing it's good at. DDIA Ch.&nbsp;3's log-structured argument.</li>
+    <li><strong>Walk me through every copy a message avoids from disk to socket.</strong> <em>(senior answer)</em> Naive path copies 4 times across 2 kernel/user boundaries: disk&rarr;page cache&rarr;user buffer&rarr;socket buffer&rarr;NIC. <code>sendfile</code> drops the two middle copies — page cache goes straight to the NIC, never into the broker's heap. The broker CPU never touches the payload; with scatter-gather DMA it's effectively one copy. And the first copy is often skipped because the tail is already in page cache from the recent write.</li>
+    <li><strong>How much does batching actually buy, and what does it cost?</strong> <em>(senior answer)</em> If fixed per-request overhead is ~200&micro;s and data work ~1&micro;s/msg, 1 msg/request &asymp; 5K msg/s; 1000 msgs/request &asymp; 833K msg/s — ~167&times;, purely from amortizing the fixed cost. The cost is latency: <code>linger.ms</code> is how long you wait to fill a batch. Throughput is bought with tail latency; there's no setting that wins both.</li>
+    <li><strong>Why doesn't Kafka keep its own cache?</strong> <em>(senior answer)</em> It leans on the OS page cache. Producers append and consumers read the tail, so hot data is in cache for free, shared across processes, surviving a JVM restart, with no double-buffering. A JVM heap cache would just duplicate what the kernel already holds and add GC pressure.</li>
+    <li><strong>Why is the partition the unit of both ordering and parallelism?</strong> <em>(senior answer)</em> Within a partition, appends are serialized so order is well-defined; within a consumer group, each partition is owned by one consumer, so P caps useful parallel consumers. Ordering and parallelism are the same knob from opposite ends — more partitions buys throughput but only per-partition ordering, never a global total order.</li>
+    <li><strong>When should you NOT use Kafka?</strong> <em>(senior answer)</em> When you need request/response or a synchronous answer — Kafka gave up exactly that to be fast. Also when you need per-record random read/update/delete (use a database), or a global total order across keys. A reply-topic to fake RPC reinvents RPC badly.</li>
+    <li><strong>A consumer is lagging and reads got slow — what changed?</strong> <em>(senior answer)</em> It fell off the tail, so its reads now miss page cache and hit disk (back to random-ish, slow IO), and risk falling off the retention window. Scale the group toward P, isolate it, or extend retention. The page-cache assumption only holds while you read near the tail.</li>
+    <li><strong>How does this page relate to the queue design in C23?</strong> <em>(senior answer)</em> C23 designs the queue — partitions, replication, consumer groups, delivery semantics. This page is the mechanism underneath: sequential IO, batching, page cache + sendfile, partition parallelism. C23 tells you <em>what</em> the log is; this tells you <em>why</em> it out-throughputs a conventional broker.</li>
+  </ol>
 </div>
 
-<h2>Related foundation lessons</h2>
+<h2>Related lessons</h2>
+<p>Read <a href="case_23_distributed_message_queue.html">C23</a> first for the queue design this page explains the speed of. <a href="11_async_messaging.html">Lesson 11</a> places a log broker against task queues and brokers generally. <a href="02_latency_throughput.html">Lesson 02</a> is the throughput-vs-latency curve that batching rides. <a href="04_data_modeling_storage.html">Lesson 04</a> covers the encoding/compression that batching unlocks, and <a href="07_partitioning.html">lesson 07</a> is the partitioning (and hot-shard) story applied here to partitions.</p>
 <div class="case-meta">
+<a class="chip" href="case_23_distributed_message_queue.html">C23 · queue design anchor</a>
 <a class="chip" href="11_async_messaging.html">Async messaging</a>
 <a class="chip" href="07_partitioning.html">Partitioning</a>
-<a class="chip" href="14_optimization.html">Optimization</a>
-<a class="chip" href="04_data_modeling_storage.html">Data modeling and storage</a>
+<a class="chip" href="02_latency_throughput.html">Latency &amp; throughput</a>
+<a class="chip" href="04_data_modeling_storage.html">Data modeling &amp; storage</a>
 </div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Kafka's speed is not magic; it is the disciplined avoidance of slow operations. Make writes sequential appends so the disk never seeks (~100&times; over random IO). Batch so the fixed per-request cost is amortized ~1000&times; — bought with latency, the one unavoidable trade. Lean on the OS page cache and <code>sendfile</code> so hot bytes flow disk&rarr;cache&rarr;NIC without ever entering the broker's user space. And use partitions as the unit that turns one fast log into a fast cluster. Every one of those is a refusal to do random, per-message, or extra-copy work. When the workload is append-shaped and replayable, that refusal is a superpower; when you need a synchronous answer, it's the wrong tool — that's the line C23 and this page draw together.</div>
 
 <footer class="lesson-nav">
   <a href="case_25_ad_click_aggregation.html"><span class="dir">Previous</span><span class="ttl">Previous case</span></a>

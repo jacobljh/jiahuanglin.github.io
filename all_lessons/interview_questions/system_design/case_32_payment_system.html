@@ -37,7 +37,7 @@
 <main>
 
 <h1>Design a payment system</h1>
-<p class="subtitle">Payments are not a single API call. They are a state machine around money movement, external providers, retries, and auditability.</p>
+<p class="subtitle">A payment is not an API call — it's a long-lived state machine wrapped around money that moves through a system you don't control. The whole design exists to survive the gap between "we asked the provider to charge the card" and "we know for certain whether it happened."</p>
 <div class="case-meta">
   <span class="chip">Source: Vol. 2 Ch. 11, archive</span>
   <span class="chip">Case drill</span>
@@ -45,108 +45,177 @@
 </div>
 
 <div class="callout">
-  <div class="label">How to read this case</div>
-  This page is an original educational walkthrough based on the case topic, not a transcription. Read it linearly: contract, estimates, data, flows, bottlenecks, trade-offs, then failure modes.
-</div>
+  <div class="label">First principle</div>
+  Every other system in this track owns its own data. A payment system does not — the authoritative event ("the card was charged") happens inside <strong>Visa / a bank / Stripe</strong>, asynchronously, and you learn about it through a flaky webhook that may arrive late, twice, or out of order. That single fact is forcing: you cannot make the charge atomic with your database write, so you must treat your DB as a <em>claim</em> about money that is continuously <strong>reconciled</strong> against the provider's <em>truth</em>. Correctness here means the design survives retries, partial failures, and duplicate delivery without ever charging a card twice or losing a charge.</div>
 
-<h2>0. Interview hinge</h2>
-<p>The hinge is the moment where the prompt stops being generic and the architecture becomes forced. For this case, that hinge is: <strong>Payment intent, ledger, idempotency, retry, PSP integration, reconciliation.</strong></p>
-<div class="callout ok">
-  <div class="label">Invariant to protect</div>
-  The design is only correct if the user-visible contract survives retries, partial failures, stale caches, and reordering. A concrete invariant to defend here: <strong>Double charge</strong> must be handled by <strong>Use idempotency keys and intent state transitions.</strong>.
-</div>
+<h2>The hinge: you don't own the truth</h2>
+<p>The moment that makes this problem hard is not throughput — payment QPS is small. It's that the operation crosses a trust boundary into a system with its own latency, its own retries, and its own idea of what happened. Card authorization through a provider takes on the order of <strong>1–2 seconds</strong> end to end (network to the acquirer, the acquirer to the card network, the issuing bank's fraud and funds check, and back). During that window your request is <em>in flight</em>: you have committed to charging the user but you do not yet know the outcome. If the user's connection drops, or your process crashes, or the response is lost on the wire, you are left holding a record that says "maybe." The architecture is the set of mechanisms that make "maybe" safe.</p>
+
 <div class="callout warn">
-  <div class="label">Tempting but wrong</div>
-  A common shortcut is to choose <strong>Sync confirmation vs async pending</strong> just because it buys simple UX. That shortcut fails when its cost matters: provider latency coupling. Use it only when the workload matches the condition: fast card auth.
+  <div class="label">The trade-off you must name out loud</div>
+  The naive design couples the user's HTTP request to the provider's auth latency: hold the connection open for 2 seconds, return success or failure synchronously. It feels simple, and for fast card auth it can work — but it makes the <em>user's</em> latency hostage to the <em>provider's</em> tail, and it gives you nowhere to stand when the response is lost. The senior move is to go <strong>async</strong>: persist a <code>PENDING</code> attempt, return immediately, and resolve the outcome through webhooks plus reconciliation. You trade a slightly more complex UX (a pending state) for a system that can actually recover from the 1% of charges that go sideways.</p>
 </div>
 
-<h2>1. Clarify the contract</h2>
-<p>The prompt is best treated as a product contract before it is treated as a component diagram. The system needs to do the following:</p>
+<h2>Clarify the contract</h2>
+<p>Treat the prompt as a product contract before a box diagram. The system must:</p>
 <ul>
-  <li>Create and confirm payment attempts.</li>
-  <li>Integrate with payment service providers.</li>
-  <li>Avoid double charge on retries.</li>
-  <li>Track state transitions and webhooks.</li>
-  <li>Reconcile internal state with provider settlement.</li>
+  <li><strong>Create</strong> a payment intent (one business purchase, one amount, one currency).</li>
+  <li><strong>Confirm</strong> a payment — request a charge from a provider — <em>at most once per intent</em> no matter how many times the client retries.</li>
+  <li><strong>Ingest provider webhooks</strong> (authorized, captured, failed, refunded, disputed) idempotently and out of order.</li>
+  <li><strong>Maintain a ledger</strong> that is the source of truth for money movement.</li>
+  <li><strong>Reconcile</strong> internal state against the provider's settlement reports daily.</li>
 </ul>
+<p>And explicitly what it need <em>not</em> do here: it need not <strong>be the provider</strong> — we do not touch the card network, run fraud scoring, or settle funds between banks. It need not store raw PAN (card numbers) — that is the provider's tokenization job and a PCI scope we deliberately avoid. And the two mechanisms most likely to dominate this conversation — <strong>idempotency-key plumbing</strong> and the <strong>double-entry ledger</strong> — are taught in depth elsewhere; we link to them and cover only the payment-flow delta (see Related lessons).</p>
 
-<h2>2. Put numbers on the shape</h2>
-<p>The exact numbers depend on the interviewer, but these are the estimates that should steer the architecture:</p>
-<ul>
-  <li>Payment QPS is usually lower than browsing QPS but correctness bar is much higher.</li>
-  <li>Provider latency can be seconds, so user flows need pending states.</li>
-  <li>Webhook delivery is at-least-once and out of order.</li>
-  <li>Audit storage is cheap compared with financial ambiguity.</li>
-</ul>
+<h2>Put numbers on it</h2>
+<p>The numbers don't size a cluster here — they size the <em>in-flight</em> problem, which is the real constraint. Take a busy merchant platform at <strong>1000 payments/s</strong> and a provider auth latency of <strong>2 s</strong>. By Little's Law, the number of charges simultaneously waiting on the provider is:</p>
+<p class="math block">in-flight PENDING = arrival rate × auth latency = 1000/s × 2 s = <strong>2000</strong> concurrent attempts</p>
+<p>So at any instant there are ~2000 records that say "we asked, we don't know yet." That is the population your timeout/retry/reconciliation logic must manage — not a cache to be evicted but money in limbo. Two more numbers fall out. Webhook delivery is <strong>at-least-once</strong>, so empirically <strong>1–5% of deliveries are duplicates</strong> (a provider retries when it doesn't see your 2xx fast enough): design for <span class="math">1000/s × 0.03 ≈ 30</span> duplicate webhooks/s that must be no-ops. And the ledger appends <strong>2 entries per payment</strong> (double-entry: one debit, one credit), so the ledger write rate is <span class="math">1000/s × 2 = 2000 rows/s</span> — append-only, never updated.</p>
 
-<h2>3. Define the surface area</h2>
-<p>Keep the API small. The API should express the product operation, not leak the internal queue, cache, or shard layout.</p>
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">Payments / s</div><div class="v">1000</div></div>
+  <div class="kpi"><div class="k">In-flight PENDING (λ×latency)</div><div class="v">2000</div></div>
+  <div class="kpi"><div class="k">Duplicate webhooks / s (~3%)</div><div class="v">~30</div></div>
+  <div class="kpi"><div class="k">Ledger appends / s (2× payments)</div><div class="v">2000</div></div>
+</div>
+
+<p>The takeaway the numbers force: throughput is trivial (a single Postgres handles 2000 append rows/s easily), but the <strong>2000 in-flight uncertain charges</strong> and the <strong>steady drizzle of duplicate webhooks</strong> are what the design must be built around. Storage is cheap relative to financial ambiguity — keep every event forever.</p>
+
+<h2>Data model &amp; API</h2>
+<p>The data model <em>is</em> the architecture. The central decision is separating <strong>intent</strong> (what the customer wants — one purchase) from <strong>attempt</strong> (what we tried — possibly several provider calls).</p>
 <table>
-  <thead><tr><th>API / operation</th><th>Why it exists</th></tr></thead>
+  <thead><tr><th>Entity</th><th>Role</th></tr></thead>
   <tbody>
-    <tr><td><code>create payment intent</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>confirm payment</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>provider webhook</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>refund</code></td><td>Part of the minimal contract for this case.</td></tr>
+    <tr><td><code>payment_intent</code></td><td>One per customer purchase: amount, currency, status, the customer's <strong>idempotency key</strong>. The thing the user sees.</td></tr>
+    <tr><td><code>payment_attempt</code></td><td>One per provider charge call, child of an intent. Holds the provider's request id. Multiple attempts can hang off one intent (retry after a transient failure) without ever creating a second <em>intent</em>.</td></tr>
+    <tr><td><code>provider_event</code></td><td>One row per webhook, keyed by the <strong>provider's event id</strong>. <code>INSERT</code>-if-absent is the dedup gate. This table is the bridge to the provider's truth.</td></tr>
+    <tr><td><code>ledger_entry</code></td><td>Append-only, double-entry. The source of truth for money. See C33.</td></tr>
   </tbody>
 </table>
+<p>API surface, kept small so it expresses the product op and not the internals: <code>POST /intents</code> (create), <code>POST /intents/:id/confirm</code> (carries an <code>Idempotency-Key</code> header), <code>POST /webhooks/provider</code> (the provider calls us), <code>POST /intents/:id/refund</code>.</p>
 
-<h2>4. Model the data</h2>
-<p>The data model is the first architecture. If the data ownership is vague, every later box-and-arrow decision will be vague too.</p>
-<div class="case-meta">
-<span class="chip">payment intent</span><span class="chip">payment attempt</span><span class="chip">idempotency key</span><span class="chip">ledger entry</span><span class="chip">provider event</span>
-</div>
-
-<h2>5. Linearized design</h2>
-<p>Walk the design in the order a request or event actually moves. This keeps the interview grounded and exposes the first bottleneck naturally.</p>
+<h2>Linearized design</h2>
+<p>Follow one payment from tap to settled, exposing the bottleneck (the in-flight gap) where it naturally appears.</p>
 <ol class="linear-list">
-<li><strong>1.</strong> Create a payment intent representing the business purpose and amount.</li>
-<li><strong>2.</strong> Use an idempotency key for every client confirm request.</li>
-<li><strong>3.</strong> Send a provider charge request from a durable payment attempt record.</li>
-<li><strong>4.</strong> Process provider responses and webhooks through a state machine.</li>
-<li><strong>5.</strong> Record financial effects as append-only ledger entries.</li>
-<li><strong>6.</strong> Run reconciliation against provider reports and settlement files.</li>
+  <li><strong>Create intent.</strong> Client calls <code>POST /intents</code>; we persist a <code>CREATED</code> intent with amount and the client's idempotency key.</li>
+  <li><strong>Confirm (idempotent).</strong> Client calls confirm with <code>Idempotency-Key</code>. We <code>INSERT</code>-if-absent on that key (the mechanics live in <strong>C35</strong>). First time: create a <code>payment_attempt</code> and move the intent to <code>PENDING</code>. A retry with the same key returns the <em>same</em> in-flight result — no new attempt, no second charge.</li>
+  <li><strong>Charge the provider — from a durable record.</strong> Only after the attempt row is committed do we call the provider. This ordering matters: if we crash mid-call, the durable attempt lets us recover and ask "what happened to this one?" rather than losing it.</li>
+  <li><strong>Return immediately; user sees PENDING.</strong> We do <em>not</em> block on the 2 s auth. The user gets a "processing" state; this is the async choice from the hinge.</li>
+  <li><strong>Webhook resolves the outcome.</strong> Provider posts <code>charge.authorized</code> / <code>captured</code> / <code>failed</code> to our webhook. We dedup on the provider event id, advance the state machine, and on success/capture append the ledger entries.</li>
+  <li><strong>Reconcile.</strong> A daily job pulls the provider's settlement file and compares it against our intents + ledger, surfacing any intent we think is PENDING but the provider actually charged (or vice versa).</li>
 </ol>
 
-<h2>6. Deep dives</h2>
-<h3>Intent vs attempt</h3>
-<p>The customer wants one purchase. The system may make multiple provider attempts. Separating intent from attempt prevents retries from becoming duplicate business orders.</p>
-<h3>Webhook ordering</h3>
-<p>A success webhook can arrive before the synchronous response, and duplicate webhooks are normal. The state machine must accept idempotent transitions.</p>
-<h3>Ledger</h3>
-<p>Balances should come from immutable entries, not mutable status fields. Status is for workflow; ledger is for money truth.</p>
+<div class="ascii">
+  PAYMENT STATE MACHINE  (provider events drive transitions; self-loops = duplicate webhooks)
 
-<h2>7. Trade-offs</h2>
+                  confirm (idempotency key)
+      ┌────────┐  ──────────────────────────▶  ┌─────────┐
+      │ CREATED│                                │ PENDING │ ◀─┐ duplicate "pending"
+      └────────┘                                └────┬────┘ ──┘  webhook ⇒ no-op
+                                                     │
+                  ┌──────────────────────────────────┼───────────────────────┐
+                  │ charge.authorized                 │ charge.failed         │
+                  ▼                                   ▼                       │
+            ┌────────────┐  capture            ┌──────────┐                   │
+        ┌─▶ │ AUTHORIZED │ ───────────────────▶│  FAILED  │ ◀────────────────┘
+   dup  │   └─────┬──────┘                      └──────────┘  (terminal)
+  auth ─┘         │ charge.captured
+                  ▼
+            ┌───────────┐  refund.succeeded    ┌──────────┐
+        ┌─▶ │ CAPTURED  │ ────────────────────▶│ REFUNDED │ ◀─┐ duplicate
+   dup  │   └───────────┘                      └──────────┘ ──┘ refund ⇒ no-op
+   cap ─┘  (terminal: money moved + ledger written)
+
+  Every inbound webhook: INSERT provider_event(event_id) → if row already exists, STOP (no-op).
+  The transition is only attempted on a FIRST-time event. This makes the whole machine idempotent.
+</div>
+
+<p>The self-loops are the point. Because delivery is at-least-once, the same <code>charge.captured</code> event will arrive more than once. Dedup on the provider event id collapses every duplicate into a no-op, so a state is only ever entered once and the ledger is only ever written once per real transition. This is DDIA Ch. 11's <strong>event sourcing</strong>: the provider events are an ordered (well, mostly — see below) log, and our intent state is a fold over that log.</p>
+
+<h2>Deep dives</h2>
+
+<h3>1. Sync confirmation vs. async pending — why you almost always go async</h3>
+<p>The seductive design returns the charge result on the confirm response: the user clicks Pay, you call the provider, you hold the HTTP request open for the 1–2 s auth, and you return "succeeded." Two things kill it. First, <strong>latency coupling</strong>: lesson 02's tail dominates — if the provider's p99 auth is 5 s, your p99 checkout is 5 s, and a provider hiccup becomes a checkout outage. Second, and worse, <strong>the lost response</strong>: if the network drops the provider's reply, or your server crashes after the provider charged but before you recorded it, the synchronous model has nowhere to put "we charged but don't know it." The user retries, you charge again.</p>
+<p>The async model decouples the two. Confirm persists a <code>PENDING</code> attempt and returns instantly; the user sees "processing." The real outcome arrives later by webhook, and the UX shows the final state (a push notification, a polled status, an emailed receipt). The user's latency is now bounded by <em>your</em> system, not the provider's tail. And because the attempt is durable before the provider call, a crash is recoverable: on restart you have a record that says PENDING and you go ask the provider (or wait for reconciliation) instead of guessing. The cost is real — you must build pending UX and handle the small window where the user has paid but hasn't seen confirmation — but it's the cost of a system that survives the 1% of charges that go wrong, and that's the whole job.</p>
+
+<h3>2. The ledger is the source of truth — status is not</h3>
+<p>A tempting shortcut is a mutable <code>balance</code> column and a <code>status</code> field on the intent. Don't. Balances must be derived from <strong>immutable, append-only double-entry ledger entries</strong>, not from a mutable counter. The reason is auditability: when finance asks "why does this account show $40," the answer must be a list of entries that sum to $40, each traceable to a payment, refund, or correction — not "because the column says so." Status is for <em>workflow</em> (drive the state machine, show the user a spinner); the ledger is for <em>money truth</em>. They serve different masters and must not be conflated.</p>
+<p>The payment-flow delta is just <em>when</em> we append: a single ledger transaction of two entries (debit the customer's receivable, credit the merchant payable, for instance) is written exactly once, on the first-time <code>captured</code> transition, inside the same DB transaction that advances the state machine (DDIA Ch. 7 atomicity — both or neither). A refund appends a <em>new</em> compensating pair; we never edit or delete the original. The double-entry mechanics — debit/credit invariants, available vs. posted balances, snapshotting — are the subject of <strong>C33</strong>; here we only need that the append is atomic with the state transition and happens once.</p>
+
+<h3>3. Reconciliation against provider events</h3>
+<p>Webhooks are best-effort; reconciliation is the safety net that makes the system actually correct. Every provider gives you a daily <strong>settlement report</strong> — the authoritative list of what they charged, captured, and settled. A batch job (DDIA Ch. 10 territory) joins that report against your intents and ledger and classifies every discrepancy:</p>
+<ul>
+  <li><strong>Provider charged, we show PENDING</strong> — a webhook was lost. Advance our state and append the missing ledger entries.</li>
+  <li><strong>We show CAPTURED, provider has nothing</strong> — we processed a phantom or a test event. Investigate; likely a correction entry.</li>
+  <li><strong>Amounts differ</strong> — partial capture, currency rounding, or a fee we didn't model. Correction entry.</li>
+</ul>
+<p>The philosophy: webhooks make the system <em>fast</em> (near-real-time updates), reconciliation makes it <em>correct</em> (eventually, every charge is accounted for). You need both. A design that relies on webhooks alone is wrong because at-least-once delivery still permits <em>zero</em> deliveries when a webhook endpoint is down for an hour — only the daily reconcile catches that.</p>
+
+<h3>The at-least-once dedup, concretely</h3>
+<p>Static walk-through of why the dedup gate matters. Fire <strong>N</strong> duplicate confirms (or N copies of one webhook) and watch whether the card gets charged once or N times:</p>
+<table>
+  <thead><tr><th>Scenario</th><th>Inbound</th><th>Dedup gate</th><th>Provider charges</th><th>Ledger pairs written</th></tr></thead>
+  <tbody>
+    <tr><td><strong>No idempotency / no dedup</strong></td><td>5× confirm, same intent</td><td>none</td><td><strong>5</strong> — double-charge bug</td><td>5</td></tr>
+    <tr><td><strong>Idempotency key on confirm</strong></td><td>5× confirm, same <code>Idempotency-Key</code></td><td><code>INSERT</code>-if-absent on key</td><td><strong>1</strong></td><td>1</td></tr>
+    <tr><td><strong>No event dedup</strong></td><td>4× <code>captured</code> webhook (provider retries)</td><td>none</td><td>1 (already charged)</td><td><strong>4</strong> — ledger inflated 4×</td></tr>
+    <tr><td><strong>provider_event dedup</strong></td><td>4× <code>captured</code> webhook</td><td><code>INSERT</code>-if-absent on event id</td><td>1</td><td><strong>1</strong></td></tr>
+  </tbody>
+</table>
+<p>The pattern is identical on both edges: an <code>INSERT</code>-if-absent on a stable key (the client's idempotency key inbound, the provider's event id outbound) turns "at-least-once" into "effectively-once." This is DDIA Ch. 9's recipe — you can't get exactly-once delivery, so you get at-least-once delivery plus idempotent processing, which is observably equivalent.</p>
+
+<h2>Trade-offs</h2>
 <table>
   <thead><tr><th>Choice</th><th>Buys</th><th>Costs</th><th>Choose when</th></tr></thead>
   <tbody>
-<tr><td><strong>Sync confirmation vs async pending</strong></td><td>simple UX</td><td>provider latency coupling</td><td>fast card auth</td></tr>
-<tr><td><strong>Mutable balance vs ledger</strong></td><td>easy reads</td><td>poor auditability</td><td>toy systems</td></tr>
-<tr><td><strong>One PSP vs multiple PSPs</strong></td><td>simplicity</td><td>less resilience and routing control</td><td>early stage</td></tr>
-<tr><td><strong>Immediate capture vs auth then capture</strong></td><td>faster settlement</td><td>less flexibility</td><td>digital goods</td></tr>
+    <tr><td><strong>Sync confirmation vs. async pending</strong></td><td>simple UX, no pending state</td><td>couples user latency to provider tail; no recovery for lost responses</td><td>fast card auth, low stakes, and you accept the double-charge risk on retry — rarely the right call</td></tr>
+    <tr><td><strong>Mutable balance vs. ledger</strong></td><td>trivially easy reads</td><td>zero auditability; impossible to explain a balance</td><td>toy systems only</td></tr>
+    <tr><td><strong>One PSP vs. multiple PSPs</strong></td><td>simplicity, one integration</td><td>no failover; no cost/approval-rate routing</td><td>early stage; add a second once a provider outage has cost you money</td></tr>
+    <tr><td><strong>Immediate capture vs. auth-then-capture</strong></td><td>faster settlement, fewer states</td><td>can't adjust amount after auth (shipping, tips)</td><td>digital goods that ship instantly; auth-then-capture for physical goods</td></tr>
   </tbody>
 </table>
+<p>The sharpest of these is the first, and it's worth narrating: candidates reach for sync because it demos cleanly. The senior signal is to say "I'd return PENDING and resolve async, because the provider owns the latency and the truth, and a synchronous design has nowhere to stand when the response is lost — which at 1000/s and a 2 s auth is happening to ~2000 charges at any instant." Naming the in-flight number is what separates a memorized answer from a derived one.</p>
 
-<h2>8. Failure modes</h2>
+<h2>Failure modes</h2>
 <table>
   <thead><tr><th>Failure</th><th>Mitigation</th></tr></thead>
   <tbody>
-<tr><td><strong>Double charge</strong></td><td>Use idempotency keys and intent state transitions.</td></tr>
-<tr><td><strong>Webhook duplicate</strong></td><td>Store provider event ID and process idempotently.</td></tr>
-<tr><td><strong>Provider outage</strong></td><td>Queue pending attempts or route to backup PSP.</td></tr>
-<tr><td><strong>Internal/provider mismatch</strong></td><td>Reconcile daily and create correction entries.</td></tr>
+    <tr><td><strong>Double charge on retry</strong></td><td>Idempotency key on confirm (C35); intent/attempt separation so retries reuse the intent.</td></tr>
+    <tr><td><strong>Duplicate / out-of-order webhook</strong></td><td><code>INSERT</code>-if-absent on provider event id; idempotent state-machine transitions (self-loops are no-ops).</td></tr>
+    <tr><td><strong>Provider outage</strong></td><td>Queue PENDING attempts and retry with backoff (lesson 13); route to a backup PSP if one is configured.</td></tr>
+    <tr><td><strong>Webhook endpoint down for hours</strong></td><td>Daily reconciliation against the settlement report catches everything webhooks missed.</td></tr>
+    <tr><td><strong>Provider charged, our DB write failed</strong></td><td>Provider event id is the source of truth; reconcile and replay. See the senior Q below.</td></tr>
   </tbody>
 </table>
 
-<h2>9. What to say in the interview</h2>
-<div class="callout ok">
-  <div class="label">Strong signal</div>
-  Lead with the dominant constraint: Payment intent, ledger, idempotency, retry, PSP integration, reconciliation. Then defend the design by naming what you made faster, what you made more reliable, and what complexity you accepted.
+<h2>Interview prompts you should be ready for</h2>
+<div class="callout">
+  <ol>
+    <li><strong>The provider charged the card but your DB write failed before you recorded it. Reconcile this.</strong> <em>(senior answer)</em> You can't make the external charge atomic with your local write, so don't try — make the external charge <em>recoverable</em>. The provider's <strong>event id is the source of truth</strong>; the charge is never lost, only your knowledge of it. Three layers catch it: (a) the durable <code>payment_attempt</code> written <em>before</em> the provider call means on restart you have a PENDING record to ask about; (b) the provider re-delivers the webhook (at-least-once), which our <code>INSERT</code>-if-absent processes whenever we recover; (c) the daily <strong>reconciliation</strong> against the settlement report is the backstop that guarantees every provider charge eventually lands in our ledger. To emit our own downstream events atomically with the DB write, use the <strong>outbox</strong> pattern (DDIA Ch. 11; mechanics in C35) — write the event to an outbox table in the same transaction, relay it after commit. The mantra: never hold money state only in a volatile place, and always have a batch truth to converge to.</li>
+    <li><strong>Why separate intent from attempt?</strong> <em>(senior answer)</em> The customer wants one purchase; the system may make several provider calls (transient failure, retry, fallback PSP). If retries created new intents, you'd get duplicate business orders. Intent is the stable, idempotent-keyed unit the user sees; attempts are the individual provider interactions hung off it. This is what lets a retry be safe.</li>
+    <li><strong>Why async + PENDING instead of returning the result synchronously?</strong> <em>(senior answer)</em> Provider auth is 1–2 s and owns the tail; coupling user latency to it makes a provider hiccup a checkout outage. Worse, a lost response in the sync model has nowhere to live, so the user retries and double-charges. Async persists a durable PENDING attempt, returns instantly, and resolves via webhook + reconcile — recoverable by construction.</li>
+    <li><strong>A webhook arrives out of order — <code>captured</code> before <code>authorized</code>. What happens?</strong> <em>(senior answer)</em> The state machine must tolerate it: either treat the transitions as a monotonic lattice (captured implies authorized) and advance to the furthest valid state, or buffer and apply once the prerequisite arrives. Either way dedup on event id and idempotency mean replaying in any order converges to the same final state — that's the event-sourcing guarantee (DDIA Ch. 11).</li>
+    <li><strong>Where does the idempotency key come from and how long does it live?</strong> <em>(senior answer)</em> The client generates it per logical purchase and sends it on confirm; we <code>INSERT</code>-if-absent and store the response so retries return the same result. TTL is a real decision — long enough to cover client retry windows (hours), not forever. The full mechanics (key + request hash to detect a reused key with a different body, TTL, response caching) are C35; here it just guarantees one charge per intent.</li>
+    <li><strong>How do you know your throughput numbers are fine but something else isn't?</strong> <em>(senior answer)</em> 2000 ledger rows/s and 1000 payments/s are trivial for one Postgres. The real load-bearing number is the <strong>~2000 in-flight PENDING attempts</strong> (λ×latency) — that population sizes your timeout, retry, and reconciliation logic. If a provider slows from 2 s to 6 s, in-flight triples to 6000; that's the metric to alert on (lesson 16), not CPU.</li>
+    <li><strong>Refund correctness — how do you avoid refunding twice?</strong> <em>(senior answer)</em> Same idempotency pattern: a refund carries its own key, advances CAPTURED→REFUNDED only on the first-time event, and appends a <em>new</em> compensating ledger pair — never edits the original entries. Duplicate refund webhooks self-loop to no-ops.</li>
+    <li><strong>Do you need distributed transactions / 2PC across you and the provider?</strong> <em>(senior answer)</em> No — and you can't, the provider won't enlist in your transaction. You use the saga / event-sourced pattern (DDIA Ch. 11, lesson 12): local atomic writes plus idempotent compensations and reconciliation. 2PC across a trust boundary you don't control is neither available nor offered.</li>
+  </ol>
 </div>
 
-<h2>Related foundation lessons</h2>
+<h2>Related lessons</h2>
+<p>This case is deliberately a <em>satellite</em>: two of its hardest mechanisms are anchored elsewhere, and you should link rather than re-derive. The <strong>idempotency-key and outbox mechanics</strong> — <code>INSERT</code>-if-absent, key TTL, request-hash to catch a reused key with a different body, transactional outbox relay — are taught in full in <a href="case_35_avoid_double_charge.html">C35 (idempotency anchor)</a>; here we used the key only as a gate and pointed at it. The <strong>double-entry ledger</strong> — debit/credit invariants, available-vs-posted balances, balance snapshotting — is anchored in <a href="case_33_digital_wallet.html">C33 (ledger anchor)</a>; we needed only that the append is atomic with the state transition. The general <strong>delivery-semantics / exactly-once-via-dedup</strong> framing is anchored in <a href="case_27_delivery_semantics.html">C27</a>, which is where at-least-once + idempotent processing is derived once for the whole set. On foundations: <a href="12_distributed_transactions.html">lesson 12 (distributed transactions)</a> gives the saga/outbox spine this case leans on, and <a href="09_consistency_cap.html">lesson 09 (consistency)</a> is why webhooks are eventually-consistent and reconciliation is the convergence mechanism.</p>
 <div class="case-meta">
-<a class="chip" href="12_distributed_transactions.html">Transactions and idempotency</a>
-<a class="chip" href="09_consistency_cap.html">Consistency</a>
-<a class="chip" href="13_fault_tolerance.html">Fault tolerance</a>
-<a class="chip" href="16_observability.html">Observability</a>
+  <a class="chip" href="case_33_digital_wallet.html">C33 · ledger anchor</a>
+  <a class="chip" href="case_35_avoid_double_charge.html">C35 · idempotency anchor</a>
+  <a class="chip" href="case_27_delivery_semantics.html">C27 · delivery semantics</a>
+  <a class="chip" href="12_distributed_transactions.html">Lesson 12 · transactions</a>
+  <a class="chip" href="09_consistency_cap.html">Lesson 09 · consistency</a>
+  <a class="chip" href="13_fault_tolerance.html">Lesson 13 · retries/backoff</a>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  A payment system is a state machine wrapped around money that lives in a system you don't own. Because the authoritative event happens inside the provider and reaches you through an at-least-once webhook, you cannot make the charge atomic with your write — so you build for recovery: a durable attempt before every provider call, an <code>INSERT</code>-if-absent dedup gate on both the client key and the provider event id, an append-only ledger as the money truth, and a daily reconciliation that converges your claims to the provider's truth. Go async with a PENDING state so user latency isn't hostage to the provider tail. At 1000 payments/s and 2 s auth, the load-bearing number isn't QPS — it's the 2000 in-flight uncertain charges, and the entire design exists to make every one of them safe.</div>
 </div>
 
 <footer class="lesson-nav">

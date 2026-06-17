@@ -37,7 +37,7 @@
 <main>
 
 <h1>Design a distributed unique ID generator</h1>
-<p class="subtitle">IDs look trivial until they carry ordering, sharding, privacy, and operational recovery requirements. The design is a contract hidden inside a number.</p>
+<p class="subtitle">You have 64 bits and a fleet of machines that don't trust each other's clocks. Every requirement — ordering, sharding, scale, privacy, recovery — is a fight over how you spend those bits. The design is a contract hidden inside a number.</p>
 <div class="case-meta">
   <span class="chip">Source: Vol. 1 Ch. 7, archive</span>
   <span class="chip">Case drill</span>
@@ -46,108 +46,208 @@
 
 <div class="callout">
   <div class="label">How to read this case</div>
-  This page is an original educational walkthrough based on the case topic, not a transcription. Read it linearly: contract, estimates, data, flows, bottlenecks, trade-offs, then failure modes.
+  This page is an original educational walkthrough based on the case topic, not a transcription. Read it linearly: the bit budget, the contract, the estimates that fall out of the arithmetic, the data model, the generation flow, then the deep dives where the clock turns a "trivial" counter into a distributed-systems problem.
 </div>
 
-<h2>0. Interview hinge</h2>
-<p>The hinge is the moment where the prompt stops being generic and the architecture becomes forced. For this case, that hinge is: <strong>Snowflake-style IDs, monotonicity, clock skew, region bits, collision budgets.</strong></p>
-<div class="callout ok">
-  <div class="label">Invariant to protect</div>
-  The design is only correct if the user-visible contract survives retries, partial failures, stale caches, and reordering. A concrete invariant to defend here: <strong>Duplicate worker IDs</strong> must be handled by <strong>Lease worker identity from a strongly consistent registry and fence expired leases.</strong>.
-</div>
-<div class="callout warn">
-  <div class="label">Tempting but wrong</div>
-  A common shortcut is to choose <strong>Central allocator vs local generator</strong> just because it buys simple global ordering. That shortcut fails when its cost matters: availability bottleneck. Use it only when the workload matches the condition: small systems with strict sequence needs.
+<div class="callout">
+  <div class="label">The hinge: a fixed-width integer with no central coordinator</div>
+  What makes this problem forcing is a single sentence: <strong>generate billions of unique 64-bit IDs per second across a fleet, with no per-ID round trip to a central authority, and have them come out roughly time-sorted.</strong> Drop any one clause and it's easy. Allow a central allocator and you have a counter behind a SPOF. Drop "64-bit" and you use a 128-bit UUID. Drop "time-sorted" and randomness solves uniqueness for free. Keep all three and you are forced into the Snowflake shape: <em>encode identity into the bits themselves</em> so that uniqueness is structural — no two machines can ever collide because the worker-ID field guarantees it — and ordering is free because the high bits are a timestamp. The entire design is then a negotiation over how to divide 64 bits among three competing claims.</div>
+
+<h2>1. The bit budget — the load-bearing arithmetic</h2>
+<p>Start here, because every later decision is just a consequence of this division. Twitter's Snowflake spends 64 bits like this:</p>
+
+<div class="ascii">
+   63                                                          0
+  ┌─┬───────────────────────────────────┬──────────┬────────────┐
+  │0│        41-bit  timestamp (ms)      │ 10-bit   │  12-bit    │
+  │ │     ms since a custom epoch        │ worker   │  sequence  │
+  └─┴───────────────────────────────────┴──────────┴────────────┘
+   ▲              ▲                            ▲          ▲
+ sign        1 + 41 = 42                 +10 = 52    +12 = 64 bits
+ (always 0 → positive signed int64, plays nice with every DB)
+
+  decoded example  id = 1541815603606036480
+    timestamp bits → 1675209600123 ms  → 2023-02-01 00:00:00.123 UTC
+    worker    bits → 42                 → datacenter-A / box-42
+    sequence  bits → 0                  → first ID minted that millisecond
 </div>
 
-<h2>1. Clarify the contract</h2>
-<p>The prompt is best treated as a product contract before it is treated as a component diagram. The system needs to do the following:</p>
+<p>Add them up out loud: <span class="math">1 + 41 + 10 + 12 = 64</span> bits. The sign bit is held at 0 so the value is always a positive <code>int64</code> — that matters because it slots into a standard signed BIGINT column without games. Now turn each field into a capacity number, because those numbers <em>are</em> the design constraints:</p>
+
 <ul>
-  <li>Generate IDs without a central bottleneck.</li>
-  <li>Avoid collisions across machines and regions.</li>
-  <li>Optionally preserve approximate time ordering.</li>
-  <li>Fit in common database integer or string fields.</li>
-  <li>Keep generation available during partial outages.</li>
+  <li><strong>Timestamp — 41 bits of milliseconds = lifespan.</strong> <span class="math">2^{41} = 2{,}199{,}023{,}255{,}552</span> ms. Divide by ms/year: <span class="math">2^{41} / (1000 \cdot 60 \cdot 60 \cdot 24 \cdot 365) \approx 69.7</span> years. So a 41-bit timestamp buys you ~<strong>69.7 years</strong> of IDs <em>counted from your custom epoch</em>, not from 1970 — picking a recent epoch (say 2020-01-01) is what claws those years back from Unix time.</li>
+  <li><strong>Sequence — 12 bits = burst per worker per ms.</strong> <span class="math">2^{12} = 4096</span> IDs per worker per millisecond. That is the per-worker ceiling <em>inside one tick of the clock</em>.</li>
+  <li><strong>Worker — 10 bits = fleet size.</strong> <span class="math">2^{10} = 1024</span> distinct workers can coexist without ever colliding.</li>
 </ul>
 
-<h2>2. Put numbers on the shape</h2>
-<p>The exact numbers depend on the interviewer, but these are the estimates that should steer the architecture:</p>
+<p>Multiply the last two for the theoretical ceiling: <span class="math">4096 \text{ IDs/ms/worker} \times 1024 \text{ workers} = 4{,}194{,}304</span> IDs per millisecond, i.e. <strong>~4.2 billion IDs/ms</strong>, or ~4.2&nbsp;<em>trillion</em> IDs/second fleet-wide. That number is comically large on purpose — it tells you the design is never globally bottlenecked. The bottleneck is always <em>local</em>, and that is the next paragraph.</p>
+
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">Lifespan (41-bit ms)</div><div class="v">≈ 69.7 yr</div></div>
+  <div class="kpi"><div class="k">Burst / worker / ms (2¹²)</div><div class="v">4096</div></div>
+  <div class="kpi"><div class="k">Workers (2¹⁰)</div><div class="v">1024</div></div>
+  <div class="kpi"><div class="k">Fleet ceiling / ms</div><div class="v">≈ 4.2 B</div></div>
+</div>
+
+<div class="callout warn">
+  <div class="label">The overflow that decides your design</div>
+  The fleet ceiling is irrelevant; the <em>per-worker</em> ceiling is what bites. Suppose one hot worker must mint <strong>5000 IDs in a single millisecond</strong>. Its sequence field tops out at <span class="math">4096</span>. The remaining <span class="math">5000 - 4096 = 904</span> IDs have nowhere to go inside that tick. The generator has exactly two honest moves: <strong>(a) block</strong> — busy-wait until the clock rolls to the next millisecond and reset the sequence to 0, smearing the burst across 2&nbsp;ms; or <strong>(b) borrow bits</strong> — re-allocate the layout so sequence has more room (13 bits → 8192/ms) at the cost of a shorter lifespan or smaller fleet. What it must <em>never</em> do is wrap the counter and reuse a <code>(timestamp, worker, sequence)</code> triple — that is a silent duplicate. Choosing (a) vs (b) is a back-of-envelope decision driven entirely by your real peak throughput per worker.</div>
+
+<h2>2. Clarify the contract</h2>
+<p>Treat the prompt as a product contract before a box diagram. What it must do:</p>
 <ul>
-  <li>A 41-bit millisecond timestamp covers roughly 69 years.</li>
-  <li>10 bits of worker identity gives 1024 workers before reallocation.</li>
-  <li>12 sequence bits allow 4096 IDs per worker per millisecond.</li>
-  <li>If peak generation exceeds the per-millisecond sequence budget, the generator must wait or borrow more bits.</li>
+  <li><strong>Uniqueness</strong> across machines and regions — the one non-negotiable.</li>
+  <li><strong>No central per-ID round trip</strong> — generation must be local and survive partial outages.</li>
+  <li><strong>Fit a 64-bit integer field</strong> — so it indexes and stores like any BIGINT key.</li>
+  <li><strong>Roughly time-sortable</strong> — k-sorted, not strictly monotonic, is the usual ask.</li>
+</ul>
+<p>And — just as important in an interview — what it need <strong>not</strong> do:</p>
+<ul>
+  <li><strong>Not strict global total order.</strong> Two IDs minted in the same millisecond on two workers have no defined order between them. If you genuinely need a single linear sequence, that is a consensus/sequencer problem (lesson 10), not an ID generator — say so explicitly.</li>
+  <li><strong>Not unguessable.</strong> A decodable Snowflake ID is the opposite of a secret (see deep dive 2). If you need opacity, that's a different requirement and a different design.</li>
+  <li><strong>Not gapless.</strong> Blocking on sequence overflow and discarding sequence numbers on a clock tick both leave gaps. Gaps are fine; duplicates are fatal.</li>
 </ul>
 
 <h2>3. Define the surface area</h2>
-<p>Keep the API small. The API should express the product operation, not leak the internal queue, cache, or shard layout.</p>
+<p>Keep the API tiny. It should express the operation, not leak the bit layout.</p>
 <table>
   <thead><tr><th>API / operation</th><th>Why it exists</th></tr></thead>
   <tbody>
-    <tr><td><code>next_id() -&gt; int64</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>reserve_worker_id(host)</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>decode(id) -&gt; timestamp, worker, sequence</code></td><td>Part of the minimal contract for this case.</td></tr>
+    <tr><td><code>next_id() -&gt; int64</code></td><td>The hot path. Local, lock-light, no network. Returns a packed 64-bit ID.</td></tr>
+    <tr><td><code>reserve_worker_id(host) -&gt; worker_id</code></td><td>Called once at boot. Leases a unique worker ID from the registry — the single point where coordination happens (lesson 10).</td></tr>
+    <tr><td><code>decode(id) -&gt; (timestamp, worker, sequence)</code></td><td>Unpacks the fields. Useful for debugging and sharding — and the source of the privacy leak in deep dive 2.</td></tr>
   </tbody>
 </table>
 
 <h2>4. Model the data</h2>
-<p>The data model is the first architecture. If the data ownership is vague, every later box-and-arrow decision will be vague too.</p>
+<p>The state is deliberately minimal. Per-worker, in memory, the generator holds only: the <strong>worker ID</strong> (leased at boot), the <strong>last timestamp</strong> it emitted (to detect rollback and ms-rollover), the <strong>sequence counter</strong> for the current ms, and the <strong>custom epoch</strong> constant. The only <em>shared, durable</em> state is the worker-ID registry — and that is exactly where the consistency requirement concentrates.</p>
 <div class="case-meta">
-<span class="chip">worker assignment</span><span class="chip">last timestamp</span><span class="chip">sequence counter</span><span class="chip">epoch</span>
+<span class="chip">worker_id (leased)</span><span class="chip">last_timestamp</span><span class="chip">sequence</span><span class="chip">custom epoch</span><span class="chip">worker registry (consensus)</span>
 </div>
 
-<h2>5. Linearized design</h2>
-<p>Walk the design in the order a request or event actually moves. This keeps the interview grounded and exposes the first bottleneck naturally.</p>
+<h2>5. Linearized design — follow one <code>next_id()</code></h2>
+<p>Walk the design in the order a single call actually executes. The bottleneck exposes itself at step 4.</p>
 <ol class="linear-list">
-<li><strong>1.</strong> Decide whether IDs need ordering, opacity, or only uniqueness.</li>
-<li><strong>2.</strong> If ordering matters, allocate bits to timestamp, region or worker, and sequence.</li>
-<li><strong>3.</strong> Assign worker IDs through a consensus-backed registry or static deployment metadata.</li>
-<li><strong>4.</strong> On each request, read the local monotonic clock and increment the sequence for that millisecond.</li>
-<li><strong>5.</strong> If the clock moves backward, stop, fence the worker, or switch to a reserved drift bucket.</li>
-<li><strong>6.</strong> Monitor sequence exhaustion, clock rollback, and duplicate detection downstream.</li>
+<li><strong>At boot:</strong> the worker calls <code>reserve_worker_id()</code> and <strong>leases</strong> a 10-bit ID from a strongly consistent registry (ZooKeeper/etcd). The lease is fenced (lesson 10) so a hung-then-resumed worker can't keep using a reassigned ID.</li>
+<li><strong>Read the clock:</strong> <code>now = current_millis()</code>.</li>
+<li><strong>Rollback guard:</strong> if <code>now &lt; last_timestamp</code>, the clock went backward — do <em>not</em> emit. Wait, or fail. (Deep dive 1; this is the whole point of the case.)</li>
+<li><strong>Sequence step:</strong> if <code>now == last_timestamp</code>, increment <code>sequence</code>. If that overflows 4096, <strong>busy-wait to the next millisecond</strong> and reset the sequence — the local bottleneck from §1. If <code>now &gt; last_timestamp</code>, reset <code>sequence = 0</code>.</li>
+<li><strong>Pack:</strong> <code>id = ((now - epoch) &lt;&lt; 22) | (worker_id &lt;&lt; 12) | sequence</code>. Update <code>last_timestamp</code>. Return.</li>
 </ol>
 
-<h2>6. Deep dives</h2>
-<h3>Why not UUID everywhere</h3>
-<p>UUIDs are easy and decentralized, but random UUIDs scatter B-tree inserts and are not naturally sortable. Time-ordered UUID variants reduce that cost but still need careful privacy thinking.</p>
-<h3>Clock is part of correctness</h3>
-<p>A time-ordered ID generator is a distributed system because clocks lie. The generator must define what happens when NTP steps backward or a VM resumes from pause.</p>
-<h3>Privacy leak</h3>
-<p>Decodable IDs expose creation time and sometimes region. That is useful for debugging but can leak business volume or user signup timing.</p>
+<div class="ascii">
+   boot:  reserve_worker_id() ──lease(fenced)──▶ ┌──────────────┐
+                                                 │ worker-ID    │
+                                                 │ registry     │  (etcd / ZK,
+                                                 │ (consensus)  │   strongly
+                                                 └──────────────┘   consistent)
 
-<h2>7. Trade-offs</h2>
+   hot path:  next_id()  ── NO network ──▶  ┌───────────────────────────┐
+                                            │ read clock                │
+                                            │ now < last?  → WAIT/FAIL  │ ◀ clock guard
+                                            │ now == last? → seq++       │
+                                            │   seq > 4095 → spin to     │ ◀ local bottleneck
+                                            │                next ms     │
+                                            │ pack: ts | worker | seq    │
+                                            └───────────────────────────┘
+                                                       │
+                                                       ▼  int64, k-sorted
+</div>
+
+<h2>6. The allocator — trading bits across requirements</h2>
+<p>There is no universal split. The "right" layout is whichever survives your worst-case peak throughput <em>and</em> your fleet size <em>and</em> your required lifespan. Read this table as: pick the row whose three capacity numbers all clear your requirements; the flagged rows are where a target throughput <em>overflows</em> the sequence budget and forces blocking.</p>
+
+<table>
+  <thead><tr><th>Bit split (ts / worker / seq)</th><th>Lifespan</th><th>Max workers</th><th>IDs / ms / worker</th><th>Verdict</th></tr></thead>
+  <tbody>
+    <tr><td>41 / 10 / 12 <em>(classic Snowflake)</em></td><td>≈ 69.7 yr</td><td>1024</td><td>4096</td><td>The default. Balanced; fine until one worker peaks &gt; 4096/ms.</td></tr>
+    <tr><td>41 / 13 / 9</td><td>≈ 69.7 yr</td><td>8192</td><td>512</td><td>Huge fleet, but 512/ms/worker overflows easily — <strong>blocks under any real burst.</strong></td></tr>
+    <tr><td>41 / 8 / 14</td><td>≈ 69.7 yr</td><td>256</td><td>16384</td><td>Few, very hot workers. Absorbs the 5000/ms case with headroom.</td></tr>
+    <tr><td>39 / 10 / 13</td><td>≈ 17.4 yr</td><td>1024</td><td>8192</td><td>Buy burst capacity by spending lifespan. <strong>Clears 5000/ms;</strong> re-epoch in ~17 yr.</td></tr>
+    <tr><td>42 / 12 / 9</td><td>≈ 139 yr</td><td>4096</td><td>512</td><td>Long life + big fleet, starved sequence — <strong>overflows at &gt; 512/ms.</strong></td></tr>
+  </tbody>
+</table>
+
+<p>Concretely: the 5000-IDs/ms hot worker from §1 <em>fails</em> on rows 1, 2 and 5 (it exceeds 4096, 512, 512) and must block. It <em>passes</em> on rows 3 and 4. Row 4 is the instructive trade: spending 2 timestamp bits drops lifespan from 69.7 to ~17.4 years but doubles per-worker burst to 8192/ms — a deliberate exchange of <em>future</em> capacity for <em>present</em> throughput. There is no free lunch; 64 bits is a zero-sum budget.</p>
+
+<h2>7. Deep dives</h2>
+
+<h3>7.1 The clock is part of correctness — what happens on NTP step-back</h3>
+<p>A time-ordered ID generator <em>is</em> a distributed system, because clocks lie. This is DDIA Ch. 8's core warning: the <strong>time-of-day clock</strong> (the wall clock NTP disciplines) can jump <em>backward</em> when NTP corrects drift, and a <strong>VM resumed from a pause/migration</strong> can see time leap or — worse for us — appear to stall and then jump. If <code>now</code> ever goes backward and we naively keep packing IDs, we can re-mint a <code>(timestamp, worker, sequence)</code> triple that already exists → a <strong>duplicate primary key</strong>, the one failure the whole design exists to prevent.</p>
+<p>The disciplines, in order of preference:</p>
+<ul>
+  <li><strong>Read a monotonic clock for the rollback guard.</strong> DDIA Ch. 8 distinguishes time-of-day from <em>monotonic</em> clocks, which only ever move forward. Compare against a monotonic source so a wall-clock correction can't fool the guard. (You still encode wall-clock ms in the ID for human-readable timestamps, but you <em>gate</em> on monotonic time.)</li>
+  <li><strong>On a small backward step: wait it out.</strong> If <code>now &lt; last_timestamp</code> by a few ms, busy-wait until the clock catches back up to <code>last_timestamp</code>, then resume. Costs a little latency, risks zero duplicates.</li>
+  <li><strong>On a large step or sustained skew: refuse and alert.</strong> If the gap is large (seconds), don't burn CPU waiting — fail <code>next_id()</code> loudly and let the worker be pulled from rotation. A brief generation outage is recoverable; a duplicate ID is forever.</li>
+  <li><strong>Advanced: a reserved drift bucket.</strong> Some designs steal a high sequence bit or a dedicated field as a "this ID was minted during a known clock anomaly" namespace, preserving uniqueness without waiting. More machinery; only worth it if even brief stalls are unacceptable.</li>
+</ul>
+
+<h3>7.2 Decodable IDs leak time and region</h3>
+<p>The very property that makes Snowflake nice — <code>decode(id)</code> hands you creation time and worker/region — is an information leak when the ID is public. Two concrete leaks: (1) the timestamp bits expose <strong>exactly when</strong> a record was created — scraping the IDs of new signups reveals your <em>growth rate and signup timing</em> to a competitor (the classic "enumerate user IDs to estimate company size" attack); (2) the worker bits can encode <strong>which datacenter/region</strong> served the request. For internal IDs this is a debugging gift. For IDs exposed in URLs it is a business-intelligence and privacy gift to outsiders. The honest options: keep Snowflake IDs internal and hand out a <em>separate</em> opaque public handle, or accept the leak when it doesn't matter (most internal records).</p>
+
+<h3>7.3 UUIDv4 vs UUIDv7 — the index-locality argument</h3>
+<p>The reflexive alternative is "just use UUIDs, no coordination at all." That works for uniqueness but collides head-on with how databases store primary keys. <strong>UUIDv4</strong> is 122 random bits: consecutive inserts land at <em>random</em> positions in a clustered B-tree index, so the working set of dirty index pages is huge, page splits are frequent, and write throughput craters. (DDIA Ch. 3: B-tree writes love locality; random keys are the pathological anti-pattern.) Snowflake's high-bit timestamp gives the opposite — near-sequential inserts that append to the right edge of the tree, hot in cache. <strong>UUIDv7</strong> is the modern compromise: a 48-bit Unix-ms timestamp prefix + random tail, so it is <em>time-sortable</em> like Snowflake (good B-tree locality, k-sorted) yet needs <em>no worker-ID coordination</em> at all — the random bits handle uniqueness probabilistically. The price is 128 bits instead of 64 (bigger keys, bigger indexes) and no clean decode of worker/region. If you can afford 128-bit keys and want zero coordination, reach for UUIDv7; if you need 64-bit keys or want decodable region bits, Snowflake earns its complexity.</p>
+
+<div class="ascii">
+  clustered B-tree, insert pattern over time
+
+  UUIDv4 (random)        UUIDv7 / Snowflake (time-prefixed)
+  ┌─┬─┬─┬─┬─┬─┬─┬─┐       ┌─┬─┬─┬─┬─┬─┬─┬─┐
+  │ │▓│ │▓│ │ │▓│ │       │ │ │ │ │ │ │ │▓│ ← all writes hit
+  │▓│ │ │ │▓│ │ │▓│       │ │ │ │ │ │ │ │▓│   the right edge,
+  └─┴─┴─┴─┴─┴─┴─┴─┘       └─┴─┴─┴─┴─┴─┴─┴─┘   page stays hot
+  splits everywhere,     sequential append,
+  whole tree is "hot"    cache-friendly, few splits
+</div>
+
+<h2>8. Trade-offs</h2>
 <table>
   <thead><tr><th>Choice</th><th>Buys</th><th>Costs</th><th>Choose when</th></tr></thead>
   <tbody>
-<tr><td><strong>Central allocator vs local generator</strong></td><td>simple global ordering</td><td>availability bottleneck</td><td>small systems with strict sequence needs</td></tr>
-<tr><td><strong>Random UUID vs time-sortable ID</strong></td><td>no clock dependency</td><td>index locality and ordering loss</td><td>external public identifiers</td></tr>
-<tr><td><strong>More worker bits vs more sequence bits</strong></td><td>larger fleet</td><td>lower per-worker burst capacity</td><td>many small generators</td></tr>
-<tr><td><strong>Opaque ID vs decodable ID</strong></td><td>privacy</td><td>less debugging and routing value</td><td>public URLs</td></tr>
+<tr><td><strong>Central allocator vs local generator</strong></td><td>simple, strict global ordering</td><td>availability bottleneck + per-ID round trip</td><td>small systems with a true total-order need</td></tr>
+<tr><td><strong>Random UUIDv4 vs time-sortable (Snowflake / UUIDv7)</strong></td><td>zero coordination, no clock dependency</td><td>index-locality loss, no ordering, 128-bit keys</td><td>fully decentralized external identifiers where DB locality is irrelevant</td></tr>
+<tr><td><strong>More worker bits vs more sequence bits</strong></td><td>larger fleet</td><td>lower per-worker burst (overflow → blocking)</td><td>many small, low-burst generators</td></tr>
+<tr><td><strong>Opaque ID vs decodable ID</strong></td><td>privacy (no time/region leak)</td><td>loses debugging + sharding-by-time value</td><td>public URLs and enumerable resources</td></tr>
   </tbody>
 </table>
+<p>The sharpest of these is the first. A central allocator (a single counter, or a DB sequence) is <em>seductively simple</em> and gives strict monotonic order — but it puts a network round trip and a SPOF on the hot path of every single insert in your system. The Snowflake bet is to <strong>trade strict ordering for availability</strong>: accept that two IDs in the same ms across workers are unordered, in exchange for a generator that never makes a network call on the hot path and survives the registry being down (you only need it at boot). That is the same availability-vs-coordination tension as lesson 09's CAP discussion, applied to a 64-bit integer.</p>
 
-<h2>8. Failure modes</h2>
+<h2>9. Failure modes</h2>
 <table>
   <thead><tr><th>Failure</th><th>Mitigation</th></tr></thead>
   <tbody>
-<tr><td><strong>Duplicate worker IDs</strong></td><td>Lease worker identity from a strongly consistent registry and fence expired leases.</td></tr>
-<tr><td><strong>Clock rollback</strong></td><td>Refuse to generate until time catches up or move to a reserved rollback sequence.</td></tr>
-<tr><td><strong>Sequence overflow</strong></td><td>Block until next millisecond or allocate more sequence bits.</td></tr>
-<tr><td><strong>Hot database inserts</strong></td><td>Use time-ordered IDs intentionally or add shard suffixes.</td></tr>
+<tr><td><strong>Duplicate worker IDs</strong> (two boxes lease the same ID)</td><td>Lease worker identity from a strongly consistent registry (etcd/ZK) and <strong>fence</strong> expired leases (lesson 10) so a resumed-after-pause worker can't reuse a reassigned ID.</td></tr>
+<tr><td><strong>Clock rollback</strong> (NTP step-back, VM resume)</td><td>Gate on a monotonic clock; on small step wait it out, on large step refuse + alert. Never emit while <code>now &lt; last_timestamp</code>.</td></tr>
+<tr><td><strong>Sequence overflow</strong> (&gt; 4096/ms on one worker)</td><td>Busy-wait to the next millisecond and reset sequence; or re-allocate bits (§6) for permanently hot workers.</td></tr>
+<tr><td><strong>Hot DB inserts</strong> (right-edge contention)</td><td>Time-ordered IDs are intentionally right-heavy — good for locality, bad for write-hotspotting one shard. Add a shard-suffix or hash-prefix when write throughput on the newest partition saturates.</td></tr>
   </tbody>
 </table>
 
-<h2>9. What to say in the interview</h2>
-<div class="callout ok">
-  <div class="label">Strong signal</div>
-  Lead with the dominant constraint: Snowflake-style IDs, monotonicity, clock skew, region bits, collision budgets. Then defend the design by naming what you made faster, what you made more reliable, and what complexity you accepted.
+<h2>10. Interview prompts you should be ready for</h2>
+<div class="callout">
+  <ol>
+    <li><strong>NTP steps the clock backward 50&nbsp;ms — what does your generator do?</strong> <em>(senior answer)</em> It must never emit while <code>now &lt; last_timestamp</code>, because that risks re-minting a <code>(ts, worker, seq)</code> triple — a duplicate. For a 50&nbsp;ms step I busy-wait until the monotonic clock catches back up to <code>last_timestamp</code>, then resume; a brief generation stall is fine. For a large jump I refuse and alert rather than spin. The guard should compare against a monotonic clock (DDIA Ch. 8), not the wall clock NTP just corrected, so the correction can't fool it. Optionally a reserved drift-bucket bit preserves uniqueness without waiting.</li>
+    <li><strong>Walk me through the bit budget.</strong> <em>(senior answer)</em> 1 sign + 41 timestamp + 10 worker + 12 sequence = 64. 2⁴¹ ms ≈ 69.7 years from a custom epoch; 2¹² = 4096 IDs/ms/worker; 2¹⁰ = 1024 workers; product ≈ 4.2&nbsp;billion IDs/ms fleet-wide. The fleet number is irrelevant — the real ceiling is 4096/ms on a single hot worker.</li>
+    <li><strong>One worker needs 5000 IDs in a millisecond. Now what?</strong> <em>(senior answer)</em> 5000 &gt; 4096, so the sequence field overflows. Either block — spin to the next ms and reset sequence, smearing the burst across 2&nbsp;ms — or re-allocate bits (e.g. 39/10/13 gives 8192/ms at the cost of dropping lifespan to ~17 yr). I'd never wrap and reuse a sequence value; that's a silent duplicate.</li>
+    <li><strong>Why not just use UUIDv4 everywhere?</strong> <em>(senior answer)</em> Uniqueness is free, coordination is zero — but 122 random bits scatter clustered-B-tree inserts (DDIA Ch. 3), causing page splits and tanking write throughput, and they're not sortable. UUIDv7 fixes both with a time prefix and still needs no coordination, at the cost of 128-bit keys. Snowflake wins when you need 64-bit keys or decodable region bits.</li>
+    <li><strong>How are worker IDs assigned without collisions?</strong> <em>(senior answer)</em> Lease them from a strongly consistent registry (etcd/ZooKeeper) at boot, with a fencing token (DDIA Ch. 9 / lesson 10). The fence is the subtle part: a worker that pauses past its lease, then resumes, must be prevented from using the ID that's since been reassigned — otherwise two boxes share a worker ID and collide.</li>
+    <li><strong>What does a public Snowflake ID leak?</strong> <em>(senior answer)</em> Creation time (timestamp bits) and often region/datacenter (worker bits). Enumerating signup IDs reveals growth rate and timing to competitors. If IDs are public and that matters, mint internal Snowflakes but expose a separate opaque handle.</li>
+    <li><strong>Is this strictly monotonic / a total order?</strong> <em>(senior answer)</em> No — it's k-sorted. Two IDs minted in the same ms on different workers have no defined order. If you need a true global total order, that's a sequencer/consensus problem (lesson 10), not an ID generator; conflating the two is a common mistake.</li>
+  </ol>
 </div>
 
 <h2>Related foundation lessons</h2>
+<p>This case leans on three foundations. The worker-ID assignment is the textbook use of <a href="10_consensus_coordination.html">lesson 10 (consensus &amp; coordination)</a> — a strongly consistent registry plus <em>fencing tokens</em> (DDIA Ch. 9) to stop a paused-then-resumed worker reusing a reassigned ID. The reason we <em>want</em> time-sortable IDs at all is <a href="04_data_modeling_storage.html">lesson 04's (data modeling &amp; storage)</a> B-tree write-locality argument (DDIA Ch. 3): sequential keys append to the index's hot right edge, random keys (UUIDv4) thrash it. And the flip side — time-ordered keys concentrating writes on the newest partition — is exactly <a href="07_partitioning.html">lesson 07's (partitioning)</a> hot-shard problem, which a shard-suffix mitigates. The decode/clock discipline draws on DDIA Ch. 8 (unreliable clocks; monotonic vs time-of-day).</p>
 <div class="case-meta">
 <a class="chip" href="01_the_method.html">Method and napkin math</a>
 <a class="chip" href="10_consensus_coordination.html">Consensus</a>
 <a class="chip" href="04_data_modeling_storage.html">Data modeling and storage</a>
 <a class="chip" href="07_partitioning.html">Partitioning</a>
 </div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  A distributed ID generator is the art of spending 64 bits well. 1 + 41 + 10 + 12 buys ~69.7 years, 1024 workers, and 4096 IDs/ms each — and the only real bottleneck is that per-worker 4096, which a hot worker overflows and must answer by blocking or re-allocating bits. Uniqueness comes from <em>structure</em> (the worker field), not coordination, so the hot path makes no network call. The two things that turn this from a counter into a distributed-systems problem are the clock — which can step backward and must never be allowed to mint a duplicate — and worker-ID leasing, which needs consensus and fencing. Decode the ID and you read its birth time and home region: a debugging gift internally, a privacy leak in public. When 64 bits and decodability aren't required, UUIDv7 buys you the same time-ordering with zero coordination.</div>
 
 <footer class="lesson-nav">
   <a href="case_03_key_value_store.html"><span class="dir">Previous</span><span class="ttl">Previous case</span></a>

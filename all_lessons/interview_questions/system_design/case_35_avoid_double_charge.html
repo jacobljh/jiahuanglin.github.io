@@ -37,117 +37,186 @@
 <main>
 
 <h1>Avoid double charges</h1>
-<p class="subtitle">Double charge prevention is the smallest payment design that proves whether you understand retries, state, and external side effects.</p>
+<p class="subtitle">The network can lose your <em>response</em> but not your <em>side effect</em>. The client retries; the charge already happened. Idempotency is the machinery that makes "do this once" survive a world where you can never be sure whether the last attempt landed.</p>
 <div class="case-meta">
   <span class="chip">Source: Archive</span>
-  <span class="chip">Case drill</span>
+  <span class="chip">Anchor: idempotency-key / outbox mechanics</span>
   <span class="chip">Trade-off first</span>
 </div>
 
 <div class="callout">
-  <div class="label">How to read this case</div>
-  This page is an original educational walkthrough based on the case topic, not a transcription. Read it linearly: contract, estimates, data, flows, bottlenecks, trade-offs, then failure modes.
+  <div class="label">First principle — the timeout tells you nothing</div>
+  A client fires <code>POST /pay</code>, waits 3 s, sees no response, and gives up. Did the charge happen? <strong>You cannot know from the client's side.</strong> The request may have died before reaching you; or it reached you, charged the card, and the <em>response</em> died on the way back. DDIA Ch. 8 calls this the network's <em>unbounded delay</em>: a timeout is a guess, not a fact. Because the client cannot tell "didn't happen" from "happened but I didn't hear," any safe client <strong>must retry</strong> — and any safe server must therefore make the retry a no-op that returns the original answer. That contract is <strong>idempotency</strong>, and this case is the anchor for its mechanics.</div>
+
+<h2>The retry storm, with numbers</h2>
+<p>Make the failure concrete before designing anything. The client's HTTP timeout is <strong>3 s</strong>. The payment provider (PSP) actually settles the authorization at <strong>4 s</strong> — slow, but successful. Here is the window that mints duplicate charges:</p>
+
+<div class="ascii">
+  t=0s   client sends POST /pay  ───────────▶ server ──▶ PSP (charging…)
+  t=3s   client TIMES OUT (no response)         │
+         client RETRIES POST /pay  ──────────▶ server ──▶ PSP (charging AGAIN?)
+  t=4s   first PSP call SUCCEEDS  ◀─────────────┘   ← card charged once
+  t=5s   second PSP call SUCCEEDS ◀──────────────────  ← card charged TWICE  ✗
+         ▲────────── duplicate-charge window = (PSP latency − client timeout) ──────────▲
 </div>
 
-<h2>0. Interview hinge</h2>
-<p>The hinge is the moment where the prompt stops being generic and the architecture becomes forced. For this case, that hinge is: <strong>Idempotency keys, outbox, state machine, duplicate webhook handling.</strong></p>
-<div class="callout ok">
-  <div class="label">Invariant to protect</div>
-  The design is only correct if the user-visible contract survives retries, partial failures, stale caches, and reordering. A concrete invariant to defend here: <strong>Same key different amount</strong> must be handled by <strong>Store request hash and reject mismatches.</strong>.
-</div>
-<div class="callout warn">
-  <div class="label">Tempting but wrong</div>
-  A common shortcut is to choose <strong>Permanent idempotency vs TTL</strong> just because it buys strong support history. That shortcut fails when its cost matters: storage growth. Use it only when the workload matches the condition: financial operations.
-</div>
+<p>The window is open for <span class="math">t<sub>settle</sub> − t<sub>timeout</sub> = 4 − 3 = 1 s</span> on <em>every</em> request whose true latency exceeds the client's patience. At scale this is not a corner case: if 0.5% of 2,000 payments/s straddle the timeout, that is <span class="math">2000 · 0.005 = 10</span> double-charge attempts <em>per second</em> — 864k/day of liability if unguarded. The fix is not "make the PSP faster" (you don't control it) — it is to make the second call <em>recognize itself</em> as a repeat and short-circuit. That recognition needs a stable name for the operation that is identical across retries: the <strong>idempotency key</strong>.</p>
 
-<h2>1. Clarify the contract</h2>
-<p>The prompt is best treated as a product contract before it is treated as a component diagram. The system needs to do the following:</p>
+<h2>Clarify the contract</h2>
+<p>Treat the prompt as a product contract before a box diagram. The system must:</p>
 <ul>
-  <li>Let clients retry safely after timeout.</li>
-  <li>Ensure one business intent creates at most one successful charge.</li>
-  <li>Handle duplicate provider webhooks.</li>
-  <li>Expose clear pending, succeeded, failed, and refunded states.</li>
-  <li>Support audit and customer support investigation.</li>
+  <li><strong>Make a retry with the same key a no-op</strong> that returns the original response — not a second charge.</li>
+  <li>Guarantee <strong>one business intent → at most one successful charge</strong>, even under concurrent retries on different servers.</li>
+  <li><strong>Dedup the PSP's webhooks</strong> — the provider also retries its callbacks at-least-once.</li>
+  <li>Expose a clean state machine: <code>pending → succeeded | failed → refunded</code>.</li>
+  <li>Support audit / dispute investigation for the full <strong>chargeback window</strong>.</li>
 </ul>
+<p>And explicitly what it need <strong>not</strong> do: it need not guarantee the charge happens <em>exactly once at the PSP</em> on the first try — that is impossible across a network (DDIA Ch. 9). It guarantees the <em>observable effect</em> is exactly-once: <strong>at-least-once delivery + dedup = effectively-once</strong>. We make the operation safe to repeat, then repeat freely.</p>
 
-<h2>2. Put numbers on the shape</h2>
-<p>The exact numbers depend on the interviewer, but these are the estimates that should steer the architecture:</p>
-<ul>
-  <li>Timeouts are common enough that retry must be a normal path.</li>
-  <li>Idempotency records need TTL or permanent retention depending on dispute window.</li>
-  <li>Webhook duplicates are guaranteed at scale.</li>
-  <li>Support tickets cost far more than storing idempotency metadata.</li>
-</ul>
+<h2>Sizing: the key TTL is the whole storage problem</h2>
+<p>The only real sizing question is <strong>how long you keep idempotency records</strong>, because everything downstream multiplies off it. The naive instinct — "expire keys after an hour" — is a bug. A retry can arrive late; worse, a customer can dispute a charge <em>months</em> later, and support must replay exactly what happened. So:</p>
+<p class="math block">TTL = max( PSP settlement window , card dispute / chargeback window ) ≈ 90–180 days</p>
+<p>Card-network chargeback windows run 120 days (Visa/Mastercard) up to 180. Take <strong>180 days</strong>. Now storage is mechanical: at <strong>2,000 payments/s</strong> and a record of ~<strong>1 KB</strong> (key, request hash, status, serialized response, timestamps):</p>
 
-<h2>3. Define the surface area</h2>
-<p>Keep the API small. The API should express the product operation, not leak the internal queue, cache, or shard layout.</p>
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">Keys / day</div><div class="v">2000 · 86400 ≈ 173 M</div></div>
+  <div class="kpi"><div class="k">Retention</div><div class="v">180 days</div></div>
+  <div class="kpi"><div class="k">Total keys</div><div class="v">173 M · 180 ≈ 31 B</div></div>
+  <div class="kpi"><div class="k">Storage (≈1 KB/key)</div><div class="v">≈ 31 TB</div></div>
+</div>
+
+<p>31 TB of dedup metadata is the price of correctness — and the trade-off table's first row exists precisely because someone always proposes a 1-hour TTL to shrink it. That choice trades 31 TB for the inability to honor a 90-day dispute, which costs far more in fraud and support than disk. The TTL is set by the <em>business window, not the engineer's comfort</em>. (Hot path stays in a fast store keyed for lookup; cold records age to cheaper storage but must remain queryable for the dispute window.)</p>
+
+<h2>Data model &amp; API</h2>
+<p>The data model <em>is</em> the architecture here. The key insight: the idempotency record and the payment intent are two different things — the key dedups <em>requests</em>; the intent tracks the <em>money</em>.</p>
 <table>
-  <thead><tr><th>API / operation</th><th>Why it exists</th></tr></thead>
+  <thead><tr><th>Table</th><th>Key columns</th><th>Purpose</th></tr></thead>
   <tbody>
-    <tr><td><code>POST /pay with Idempotency-Key</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>GET /payment_intent/{id}</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>POST /provider/webhook</code></td><td>Part of the minimal contract for this case.</td></tr>
+    <tr><td><code>idempotency_key</code></td><td><code>key</code> (PK, UNIQUE), <code>request_hash</code>, <code>status</code> {in_progress, completed}, <code>response_blob</code>, <code>intent_id</code>, <code>created_at</code></td><td>Dedup requests. The <strong>UNIQUE constraint on <code>key</code> is load-bearing</strong> — it is the atomicity primitive.</td></tr>
+    <tr><td><code>payment_intent</code></td><td><code>id</code> (PK), <code>amount</code>, <code>currency</code>, <code>status</code> {pending, succeeded, failed, refunded}, <code>psp_charge_id</code></td><td>The money's state machine. One intent per business intent.</td></tr>
+    <tr><td><code>provider_event</code></td><td><code>psp_event_id</code> (PK, UNIQUE)</td><td>Dedup inbound webhooks — same insert-if-absent trick on a different key.</td></tr>
+    <tr><td><code>outbox</code></td><td><code>id</code>, <code>intent_id</code>, <code>payload</code>, <code>sent_at</code> (null = pending)</td><td>Decouples the PSP call from the DB transaction (see deep dive).</td></tr>
+  </tbody>
+</table>
+<table>
+  <thead><tr><th>API</th><th>Contract</th></tr></thead>
+  <tbody>
+    <tr><td><code>POST /pay</code> + header <code>Idempotency-Key</code></td><td>Charge. Same key returns the same result; same key + different body → <code>422</code>.</td></tr>
+    <tr><td><code>GET /payment_intent/{id}</code></td><td>Read current state — the recovery path after a client timeout.</td></tr>
+    <tr><td><code>POST /provider/webhook</code></td><td>PSP settlement callback; deduped by <code>psp_event_id</code>.</td></tr>
   </tbody>
 </table>
 
-<h2>4. Model the data</h2>
-<p>The data model is the first architecture. If the data ownership is vague, every later box-and-arrow decision will be vague too.</p>
-<div class="case-meta">
-<span class="chip">payment intent</span><span class="chip">idempotency key</span><span class="chip">attempt</span><span class="chip">provider event</span><span class="chip">state transition</span>
-</div>
-
-<h2>5. Linearized design</h2>
-<p>Walk the design in the order a request or event actually moves. This keeps the interview grounded and exposes the first bottleneck naturally.</p>
+<h2>Linearized design</h2>
+<p>Follow one <code>POST /pay</code> through the system, then watch the duplicate try collapse on it.</p>
 <ol class="linear-list">
-<li><strong>1.</strong> Create a payment intent before contacting the provider.</li>
-<li><strong>2.</strong> Bind each client retry to an idempotency key and request fingerprint.</li>
-<li><strong>3.</strong> If the key exists, return the original result or current pending state.</li>
-<li><strong>4.</strong> Send provider requests from a durable attempt record.</li>
-<li><strong>5.</strong> Process webhooks idempotently by provider event ID.</li>
-<li><strong>6.</strong> Allow only valid state-machine transitions.</li>
+<li><strong>1. Fingerprint.</strong> Compute <code>request_hash = H(method, path, body)</code>. The client supplies <code>Idempotency-Key</code>; the hash binds the key to <em>this exact request</em>.</li>
+<li><strong>2. Insert-if-absent.</strong> Attempt <code>INSERT INTO idempotency_key(key, request_hash, status='in_progress')</code>. The UNIQUE constraint makes exactly one of N concurrent attempts win.</li>
+<li><strong>3a. Insert succeeds → first-ever request.</strong> Create the <code>payment_intent</code> (pending) and an <code>outbox</code> row <strong>in the same transaction</strong>. Commit. A separate worker drains the outbox and calls the PSP.</li>
+<li><strong>3b. Insert fails (key exists) → a repeat.</strong> Read the existing row. If <code>status=completed</code>, return the stored <code>response_blob</code> verbatim. If <code>in_progress</code>, return <code>409</code> / "retry shortly" (the first attempt is still running). If the stored <code>request_hash</code> ≠ this one, return <code>422</code> — the client reused a key with a different body.</li>
+<li><strong>4. PSP result lands</strong> (via outbox worker response or webhook). Transition the intent <code>pending → succeeded</code>, store the PSP response in <code>response_blob</code>, flip the key to <code>completed</code>.</li>
+<li><strong>5. Webhook dedup.</strong> The PSP also calls <code>/provider/webhook</code>, possibly twice. <code>INSERT psp_event_id</code>; on conflict, ack and drop. Same mechanic, different key.</li>
 </ol>
 
-<h2>6. Deep dives</h2>
-<h3>Timeout is unknown</h3>
-<p>A client timeout does not mean the provider charge failed. The only safe response is to query state or retry with the same idempotency key.</p>
-<h3>Request fingerprint</h3>
-<p>The same idempotency key with a different amount or merchant should be rejected. Otherwise a client bug can mask a dangerous mutation.</p>
-<h3>State machine</h3>
-<p>Payment states should move forward through allowed transitions. Free-form status updates invite impossible combinations.</p>
+<div class="ascii">
+   POST /pay  +  Idempotency-Key:K   request_hash = H(body)
+        │
+        ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │  IDEMPOTENCY TABLE   (key K is UNIQUE PRIMARY KEY)         │
+  │  ── atomic INSERT-IF-ABSENT (key K, status=in_progress) ──│
+  └──────────────────────────────────────────────────────────┘
+        │ INSERT wins                 │ INSERT fails (key exists)
+        ▼ (first request)             ▼ (a retry — read the row)
+   create intent(pending)      ┌─ status=completed → return stored response  ✓ (no charge)
+   + outbox row  ── SAME TXN   ├─ status=in_progress → 409 "retry shortly"
+        │                      └─ request_hash mismatch → 422  ✗ (client reused key)
+        ▼
+  ┌──────────────┐   poll/CDC   ┌──────────────┐
+  │   OUTBOX     │ ───────────▶ │ outbox worker│ ──▶ PSP charge ──▶ webhook ──┐
+  │ (unsent rows)│              └──────────────┘                              │
+  └──────────────┘                                                           ▼
+        ▲                                              transition intent → succeeded,
+        └────────────────────────── store response, mark key=completed ◀─────┘
+</div>
 
-<h2>7. Trade-offs</h2>
+<p>The bottleneck this exposes: step 2's insert is the single point every request funnels through, and it must be <em>atomic</em>. Get that wrong and the whole edifice leaks duplicates — which is the first deep dive.</p>
+
+<h2>Deep dives</h2>
+
+<h3>1. The simultaneous-miss race — why read-then-write is wrong</h3>
+<p>The trap implementation: <em>read</em> the key, if absent <em>then write</em> it. Now the sharpest senior scenario: <strong>two requests with the same key arrive simultaneously on two different servers, and both miss the cache.</strong> Server A reads "absent," Server B reads "absent," both proceed to charge the PSP, both write the key. Two charges. This is DDIA Ch. 7's classic write-skew / lost-update — a read-modify-write with a gap between read and write under concurrency.</p>
+<p>The fix is to never read-then-write. Make the existence check and the claim a <strong>single atomic operation</strong> at the place the data lives:</p>
+<ul>
+  <li><strong>Relational:</strong> a <code>UNIQUE</code> constraint on <code>key</code> plus <code>INSERT … ON CONFLICT DO NOTHING</code>. The database serializes the two inserts; exactly one returns "inserted," the loser sees the conflict and falls into the read-existing branch.</li>
+  <li><strong>Redis:</strong> <code>SET key value NX EX ttl</code> — set-if-not-exists in one round trip. <code>NX</code> is the atomicity.</li>
+</ul>
+<p>The loser must <em>not</em> charge — it polls the winner's row (the <code>in_progress</code> state) until it flips to <code>completed</code>, then returns that response. The principle generalizes well beyond payments and is the same one C35's neighbors lean on: <em>a distributed dedup is only correct if the check-and-claim is atomic where the data lives.</em> This is also why the idempotency key is not "client politeness" — it is the only stable name two independent servers can agree on without talking to each other.</p>
+
+<h3>2. Client-generated key vs. server-issued intent — and the mismatch trap</h3>
+<p>Who mints the key? Two models:</p>
+<ul>
+  <li><strong>Client-generated</strong> (Stripe-style): client sends a UUID in <code>Idempotency-Key</code>. Simple, one round trip — but the client can misuse it.</li>
+  <li><strong>Server-issued intent</strong>: client first <code>POST /payment_intent</code> to get an <code>intent_id</code>, then confirms it. Two round trips, but the server controls the namespace.</li>
+</ul>
+<p>The client-generated model has a dangerous failure: a buggy client reuses one key for <strong>two genuinely different payments</strong> — same key, <code>$10</code> then <code>$1000</code>. A naive server sees the key, returns the <em>first</em> result, and silently swallows the $1000 charge (or, worse, applies the $10 response to it). This is why <strong>step 1 stores the <code>request_hash</code></strong>. On a repeat, compare hashes: equal → it is a true retry, return the cached response; <strong>unequal → reject with <code>422</code></strong>, because "same key, different request" is definitionally a client bug, and guessing which one they meant is how you double-charge or lose a charge. The hash turns the key from a blind cache lookup into a verified identity claim.</p>
+
+<h3>3. The outbox — why you don't call the PSP inside the transaction</h3>
+<p>Step 3a created the intent and an outbox row in one transaction, then a worker calls the PSP. Why not just call the PSP directly while the row is being written? Because the PSP call is a <strong>side effect outside the database's transaction</strong>, and you get the <em>dual-write problem</em>: if you charge first then the DB commit fails, you have a charge with no record (and the retry double-charges); if you commit first then crash before charging, you have a record with no charge. There is no ordering that is safe, because two systems can't share one atomic commit.</p>
+<p>The <strong>transactional outbox</strong> (DDIA Ch. 11 — the outbox as log-based change capture; Ch. 9's exactly-once = at-least-once + dedup) breaks the deadlock: the intent and the "please charge" message are written to the <em>same</em> database in one transaction, so they commit or roll back together. A separate worker reads unsent outbox rows and calls the PSP — at-least-once (it may retry after a crash), which is exactly why the PSP call <em>also</em> carries an idempotency key so the PSP itself dedups. The DB is the single source of truth; the outbox is the durable, replayable intent-to-act. This is the messaging-side counterpart to C27's delivery-semantics: C27 owns the concept (why exactly-once is at-least-once + dedup); this case owns the concrete request/payment key implementation.</p>
+
+<h2>Trade-offs</h2>
 <table>
   <thead><tr><th>Choice</th><th>Buys</th><th>Costs</th><th>Choose when</th></tr></thead>
   <tbody>
-<tr><td><strong>Permanent idempotency vs TTL</strong></td><td>strong support history</td><td>storage growth</td><td>financial operations</td></tr>
-<tr><td><strong>Client-generated key vs server intent</strong></td><td>simple retry API</td><td>client misuse</td><td>public APIs</td></tr>
-<tr><td><strong>Synchronous provider call vs queued attempt</strong></td><td>faster answer</td><td>request tied to provider latency</td><td>low latency PSP</td></tr>
-<tr><td><strong>Webhook as truth vs internal intent as truth</strong></td><td>settlement awareness</td><td>external ordering complexity</td><td>final state updates</td></tr>
+<tr><td><strong>Long TTL (dispute window) vs short TTL</strong></td><td>honors chargebacks &amp; late retries; full audit</td><td>~31 TB of key storage</td><td>always for payments — TTL = dispute window, not engineer comfort</td></tr>
+<tr><td><strong>Client-generated key vs server-issued intent</strong></td><td>one round trip, simple API</td><td>client misuse → needs request-hash guard</td><td>public APIs; pair with hash mismatch → 422</td></tr>
+<tr><td><strong>Outbox worker vs synchronous PSP call</strong></td><td>no dual-write; survives crashes; replayable</td><td>extra hop, eventual completion latency</td><td>any external side effect inside a DB txn</td></tr>
+<tr><td><strong>Atomic INSERT-if-absent vs read-then-write</strong></td><td>correct under concurrent same-key retries</td><td>none worth mentioning</td><td>always — read-then-write is simply a bug</td></tr>
   </tbody>
 </table>
+<p>The sharpest one is the last: read-then-write <em>looks</em> correct in every single-threaded test and leaks duplicates only under the exact concurrency the retry storm guarantees. It is the difference between code that passes review and code that survives production — and the entire reason the UNIQUE constraint, not application logic, owns the dedup.</p>
 
-<h2>8. Failure modes</h2>
+<h2>Failure modes</h2>
 <table>
   <thead><tr><th>Failure</th><th>Mitigation</th></tr></thead>
   <tbody>
-<tr><td><strong>Same key different amount</strong></td><td>Store request hash and reject mismatches.</td></tr>
-<tr><td><strong>Duplicate webhook</strong></td><td>Deduplicate provider event IDs and make transitions idempotent.</td></tr>
-<tr><td><strong>Charge succeeds after user sees failure</strong></td><td>Expose pending state and reconcile provider result.</td></tr>
-<tr><td><strong>Refund repeated</strong></td><td>Use separate idempotency keys and refund state machine.</td></tr>
+<tr><td><strong>Same key, different amount</strong></td><td>Compare stored <code>request_hash</code>; reject mismatch with <code>422</code>.</td></tr>
+<tr><td><strong>Two same-key requests, both miss</strong></td><td>Atomic <code>INSERT … ON CONFLICT</code> / <code>SET NX</code>; loser reads winner's row.</td></tr>
+<tr><td><strong>Duplicate PSP webhook</strong></td><td>Dedup on <code>psp_event_id</code> UNIQUE; make transitions idempotent.</td></tr>
+<tr><td><strong>Charge succeeds after user saw "failed"</strong></td><td>Expose <code>pending</code>; reconcile via <code>GET /payment_intent</code> and webhook truth.</td></tr>
+<tr><td><strong>Crash between charge and DB write</strong></td><td>Outbox + PSP-side idempotency key; worker retries safely.</td></tr>
+<tr><td><strong>Repeated refund</strong></td><td>Separate refund idempotency key + refund state machine.</td></tr>
   </tbody>
 </table>
 
-<h2>9. What to say in the interview</h2>
-<div class="callout ok">
-  <div class="label">Strong signal</div>
-  Lead with the dominant constraint: Idempotency keys, outbox, state machine, duplicate webhook handling. Then defend the design by naming what you made faster, what you made more reliable, and what complexity you accepted.
+<h2>Interview Q&amp;A</h2>
+<div class="callout">
+  <ol>
+    <li><strong>Two requests with the same key arrive simultaneously on two servers — both miss the cache. Now what?</strong> <em>(senior answer)</em> Read-then-write loses here — both read "absent," both charge. The fix is an atomic check-and-claim where the data lives: a UNIQUE constraint with <code>INSERT … ON CONFLICT DO NOTHING</code>, or Redis <code>SET NX</code>. Exactly one insert wins and charges; the loser detects the conflict and polls the winner's <code>in_progress</code> row until it returns the stored response. The dedup must be owned by the store, not application logic.</li>
+    <li><strong>A client times out at 3 s but the PSP succeeds at 4 s. What breaks and how do you stop it?</strong> <em>(senior answer)</em> The client can't tell "didn't happen" from "happened, response lost," so it retries — and within the <span class="math">4−3=1 s</span> window the second call double-charges. The idempotency key makes the retry recognize itself: same key → return the original result, no second charge. You also forward the key to the PSP so it dedups too.</li>
+    <li><strong>How long do you keep idempotency keys?</strong> <em>(senior answer)</em> <code>max(settlement window, dispute window)</code> — typically 90–180 days, set by the card-network chargeback window, not by storage convenience. At 2,000 req/s × 180 days that's ~31 B keys ≈ 31 TB; a 1-hour TTL would "save" that storage at the cost of being unable to honor a dispute or a late retry, which is far more expensive.</li>
+    <li><strong>Why not just call the PSP inside the transaction that writes the intent?</strong> <em>(senior answer)</em> Dual-write problem: the PSP is outside the DB's atomic commit, so any ordering leaves a window where you have a charge with no record or a record with no charge. Use a transactional outbox — intent + "charge" message committed together — and a worker that calls the PSP at-least-once with an idempotency key. The DB stays the single source of truth.</li>
+    <li><strong>Client reuses one key for a $10 and a $1000 payment. What happens?</strong> <em>(senior answer)</em> Without a guard you'd return the $10 result for the $1000 request and lose money. Store a <code>request_hash</code> with the key; on a repeat, equal hash → true retry (return cached), unequal → <code>422</code>. "Same key, different body" is a client bug you must surface, never silently resolve.</li>
+    <li><strong>Isn't exactly-once impossible across a network?</strong> <em>(senior answer)</em> Exactly-once <em>delivery</em> is impossible (DDIA Ch. 9), but exactly-once <em>effect</em> isn't: at-least-once delivery + idempotent dedup = effectively-once. We embrace retries everywhere and make every operation safe to repeat.</li>
+    <li><strong>How do you dedup the provider's webhooks?</strong> <em>(senior answer)</em> Same mechanic as request keys: the PSP sends a stable <code>psp_event_id</code>; <code>INSERT</code> it with a UNIQUE constraint, ack-and-drop on conflict, and make the state transition idempotent (a second <code>pending→succeeded</code> is a no-op). The webhook is at-least-once just like the client.</li>
+    <li><strong>Where should the idempotency key live — DB or Redis?</strong> <em>(senior answer)</em> Whichever co-locates the key with the data you must mutate atomically. For payments the key lives with the intent in the relational store so the claim and the write share one transaction; Redis <code>SET NX</code> is fine as a fast pre-check but the durable, dispute-window record belongs in the database.</li>
+  </ol>
 </div>
 
-<h2>Related foundation lessons</h2>
+<h2>Related lessons</h2>
+<p>This case is the <strong>anchor for idempotency-key and outbox mechanics</strong> — insert-if-absent, key TTL, request-hash. For the <em>concept</em> of delivery semantics and why effectively-once is at-least-once + dedup, see <a href="case_27_delivery_semantics.html">C27 (delivery semantics)</a>; it owns the messaging concept, this case owns the request/payment-key implementation. The double-entry side of money movement — what the charge debits and credits — lives in <a href="case_33_digital_wallet.html">C33 (double-entry ledger)</a>; <a href="case_32_payment_system.html">C32 (orchestration)</a> and <a href="case_34_money_movement_reconciliation.html">C34 (reconciliation)</a> both link here for the dedup key. Foundation: <a href="12_distributed_transactions.html">lesson 12 (idempotency, outbox, sagas)</a> for the primitives, and <a href="13_fault_tolerance.html">lesson 13</a> for the backoff-with-jitter that keeps the retry storm from becoming a thundering herd.</p>
 <div class="case-meta">
-<a class="chip" href="12_distributed_transactions.html">Transactions and idempotency</a>
+<a class="chip" href="case_27_delivery_semantics.html">C27 delivery semantics</a>
+<a class="chip" href="case_33_digital_wallet.html">C33 ledger</a>
+<a class="chip" href="12_distributed_transactions.html">Transactions &amp; idempotency</a>
 <a class="chip" href="11_async_messaging.html">Async messaging</a>
-<a class="chip" href="09_consistency_cap.html">Consistency</a>
 <a class="chip" href="13_fault_tolerance.html">Fault tolerance</a>
 </div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  You cannot prevent retries — the network guarantees them by hiding whether your side effect landed. So you make retries <em>safe</em>: a client-supplied idempotency key, claimed by an atomic insert-if-absent (UNIQUE constraint / <code>SET NX</code>, never read-then-write), guarded by a stored request-hash so a reused key can't mask a different charge, retained for the dispute window (~180 days ≈ 31 TB), and fed to the PSP through a transactional outbox so the external charge never escapes the DB's atomic commit. At-least-once + dedup = effectively-once. That is the entire trick — and every payment case in this set links here for it.</div>
 
 <footer class="lesson-nav">
   <a href="case_34_money_movement_reconciliation.html"><span class="dir">Previous</span><span class="ttl">Previous case</span></a>

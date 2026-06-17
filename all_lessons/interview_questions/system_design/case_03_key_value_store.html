@@ -37,117 +37,173 @@
 <main>
 
 <h1>Design a key-value store</h1>
-<p class="subtitle">A key-value store is the smallest distributed database that still forces you to choose your consistency, durability, partitioning, and repair story.</p>
+<p class="subtitle">The smallest distributed database that still forces every hard choice: a <code>get</code> can read a value the system already wrote, yet hand you a stale one — and whether that happens is decided by arithmetic, not by hope.</p>
 <div class="case-meta">
-  <span class="chip">Source: Vol. 1 Ch. 6</span>
+  <span class="chip">Source: DDIA Ch. 3, 5, 6, 9</span>
   <span class="chip">Case drill</span>
   <span class="chip">Trade-off first</span>
 </div>
 
 <div class="callout">
-  <div class="label">How to read this case</div>
-  This page is an original educational walkthrough based on the case topic, not a transcription. Read it linearly: contract, estimates, data, flows, bottlenecks, trade-offs, then failure modes.
+  <div class="label">The hinge: a quorum is a promise made of inequalities</div>
+  Strip a key-value store down and two questions remain. <em>Where does a key live?</em> — a partitioning problem (DDIA Ch. 6). <em>When I read a key, do I see the last write?</em> — a replication/consistency problem (DDIA Ch. 5, 9). The forcing insight is that the second question has an <strong>arithmetic answer</strong>. With <span class="math">N</span> replicas, a write that waits for <span class="math">W</span> acks and a read that polls <span class="math">R</span> replicas are guaranteed to overlap on at least one node <em>iff</em> <span class="math">R + W &gt; N</span>. Freshness is not a feature you bolt on; it is whether two integers sum past a third. Everything else in this design — LSM storage, tombstones, read repair — is what you build <em>around</em> that inequality to keep it honest.</div>
+
+<h2>The dominant constraint: freshness is overlap</h2>
+<p>A leaderless, Dynamo-style store (DDIA Ch. 5) sends every write to all <span class="math">N</span> replicas and acknowledges as soon as <span class="math">W</span> of them reply; every read fans out to <span class="math">R</span> replicas and takes the freshest answer. The pigeonhole argument is the whole game: if the write touched <span class="math">W</span> nodes and the read touched <span class="math">R</span> nodes, and <span class="math">R + W &gt; N</span>, then by counting there is no way to pick <span class="math">R</span> nodes that all <em>miss</em> the <span class="math">W</span> that were written — at least one read replica must carry the new value. Set the numbers and the contract falls out:</p>
+
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">N = 3, W = 2, R = 2 → R+W = 4 &gt; 3</div><div class="v">quorums overlap → fresh read guaranteed</div></div>
+  <div class="kpi"><div class="k">N = 3, W = 1, R = 1 → R+W = 2 ≤ 3</div><div class="v">no overlap → stale-read window</div></div>
+  <div class="kpi"><div class="k">1B keys × 1 KB value</div><div class="v">≈ 1 TB logical data</div></div>
+  <div class="kpi"><div class="k">× RF 3 (N=3)</div><div class="v">≈ 3 TB stored</div></div>
+  <div class="kpi"><div class="k">+ LSM compaction temporarily ~2×</div><div class="v">≈ 6 TB peak disk</div></div>
+  <div class="kpi"><div class="k">durability: survives any 1 node</div><div class="v">W=2 of 3 ⇒ write on ≥2 disks before ack</div></div>
 </div>
 
-<h2>0. Interview hinge</h2>
-<p>The hinge is the moment where the prompt stops being generic and the architecture becomes forced. For this case, that hinge is: <strong>Partitioning, replication, quorum reads/writes, compaction, failure recovery.</strong></p>
-<div class="callout ok">
-  <div class="label">Invariant to protect</div>
-  The design is only correct if the user-visible contract survives retries, partial failures, stale caches, and reordering. A concrete invariant to defend here: <strong>Replica divergence</strong> must be handled by <strong>Run read repair and scheduled anti-entropy with checksums.</strong>.
-</div>
-<div class="callout warn">
-  <div class="label">Tempting but wrong</div>
-  A common shortcut is to choose <strong>Quorum vs primary-leader</strong> just because it buys availability during single-node failure. That shortcut fails when its cost matters: conflict resolution complexity. Use it only when the workload matches the condition: multi-region or high-write systems.
-</div>
+<p>The two quorum rows are the load-bearing calculation of this entire case. With <span class="math">N=3, W=2, R=2</span> you have bought yourself a guarantee that no amount of bad luck in node selection can produce a stale read on a healthy cluster — the read and write sets are forced to intersect. Drop to <span class="math">W=1, R=1</span> (the "fast and loose" config) and <span class="math">R+W = 2 \le N = 3</span>: a write can land on node A while your subsequent read happens to hit only node B, which has not yet received the replication stream. You read a value you yourself just overwrote. That is not a bug — it is exactly what <span class="math">W=1,R=1</span> <em>promises</em>. The knobs are a contract, and the candidate who can say "<span class="math">R+W&gt;N</span> overlaps the sets; <span class="math">W=1,R=1</span> opens a stale window" has understood DDIA Ch. 9's central result.</p>
 
-<h2>1. Clarify the contract</h2>
-<p>The prompt is best treated as a product contract before it is treated as a component diagram. The system needs to do the following:</p>
+<p>The storage numbers steer hardware, not consistency. One billion 1 KB values is ~1 TB of logical data; replication factor 3 triples it to ~3 TB physically stored. Then the LSM engine's compaction transiently <em>doubles</em> a level's footprint while it merges old and new SSTables side-by-side before deleting the inputs — so provision for ~6 TB of <em>peak</em> disk, not 3 TB. A cluster sized to the steady state stalls writes the first time compaction runs (see the failure table). Headroom for compaction is a first-class capacity input, not slack.</p>
+
+<h2>Clarify the contract</h2>
+<p>Treat the prompt as a product contract before a box diagram. The store <strong>must</strong>:</p>
 <ul>
-  <li>Put, get, and delete by key.</li>
-  <li>Scale beyond one machine for storage and write throughput.</li>
-  <li>Survive node failure without losing acknowledged writes.</li>
-  <li>Offer a clear consistency contract.</li>
-  <li>Repair divergent replicas in the background.</li>
+  <li><strong>Put / get / delete by key</strong> — opaque values, no secondary indexes, no range scans, no transactions across keys. That narrowness is what lets us partition freely.</li>
+  <li><strong>Scale storage and write throughput past one machine</strong> — so partitioning is mandatory, not optional.</li>
+  <li><strong>Survive node failure without losing an acknowledged write</strong> — durability is defined relative to the ack, which ties it to <span class="math">W</span>.</li>
+  <li><strong>Expose a legible consistency knob</strong> — let the caller trade freshness for latency per operation via <span class="math">R</span> / <span class="math">W</span>.</li>
+  <li><strong>Self-heal divergent replicas</strong> in the background.</li>
 </ul>
+<p>Equally important is what it need <strong>not</strong> do: no multi-key atomicity, no joins, no SQL, no strict serializability. If the interviewer asks for cross-key transactions, that is a different (and much harder) machine — say so. The value of a KV store is precisely that the contract is small enough to partition and replicate without coordination on the hot path.</p>
 
-<h2>2. Put numbers on the shape</h2>
-<p>The exact numbers depend on the interviewer, but these are the estimates that should steer the architecture:</p>
-<ul>
-  <li>If value size averages 1 KB, 1B keys is about 1 TB before indexes, replication, and compaction overhead.</li>
-  <li>A write with replication factor 3 creates three storage writes plus coordination metadata.</li>
-  <li>Quorum reads and writes add network fanout to the tail latency path.</li>
-  <li>Compaction can double temporary disk pressure during merges.</li>
-</ul>
-
-<h2>3. Define the surface area</h2>
-<p>Keep the API small. The API should express the product operation, not leak the internal queue, cache, or shard layout.</p>
+<h2>Data model &amp; API</h2>
+<p>Keep the surface tiny; the API should express the operation, never leak the ring, the memtable, or the SSTable layout.</p>
 <table>
-  <thead><tr><th>API / operation</th><th>Why it exists</th></tr></thead>
+  <thead><tr><th>Operation</th><th>Signature</th><th>Notes</th></tr></thead>
   <tbody>
-    <tr><td><code>put(key, value, options)</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>get(key, consistency)</code></td><td>Part of the minimal contract for this case.</td></tr><tr><td><code>delete(key)</code></td><td>Part of the minimal contract for this case.</td></tr>
+    <tr><td><strong>put</strong></td><td><code>put(key, value, W)</code> → <code>{version}</code></td><td>Returns a version stamp (version vector / timestamp) the client keeps for read-your-writes and CAS.</td></tr>
+    <tr><td><strong>get</strong></td><td><code>get(key, R)</code> → <code>{value, version}</code></td><td><span class="math">R</span> picks freshness vs latency per call; may return <em>multiple</em> sibling versions if writes conflicted.</td></tr>
+    <tr><td><strong>delete</strong></td><td><code>delete(key, W)</code> → <code>{version}</code></td><td>Writes a <strong>tombstone</strong>, not a hole — a delete is a write (see deep dive 3).</td></tr>
+    <tr><td><strong>cas</strong></td><td><code>cas(key, expected_version, value)</code></td><td>Conditional write; the principled fix for the lost-update race below.</td></tr>
   </tbody>
 </table>
+<p>The on-disk record per key is <code>(key, value, version, tombstone?)</code>. The <code>version</code> is the quiet hero: it is what read repair compares, what CAS checks, and what version vectors extend to detect concurrency rather than guess at it.</p>
 
-<h2>4. Model the data</h2>
-<p>The data model is the first architecture. If the data ownership is vague, every later box-and-arrow decision will be vague too.</p>
-<div class="case-meta">
-<span class="chip">memtable</span><span class="chip">write-ahead log</span><span class="chip">SSTables</span><span class="chip">partition ring</span><span class="chip">version vector or timestamp</span>
-</div>
-
-<h2>5. Linearized design</h2>
-<p>Walk the design in the order a request or event actually moves. This keeps the interview grounded and exposes the first bottleneck naturally.</p>
+<h2>Linearized design — follow a put, then a get</h2>
 <ol class="linear-list">
-<li><strong>1.</strong> Route the key through consistent hashing to a primary replica set.</li>
-<li><strong>2.</strong> Append the mutation to a write-ahead log before acknowledging durability.</li>
-<li><strong>3.</strong> Serve recent writes from memory and immutable sorted files on disk.</li>
-<li><strong>4.</strong> Replicate to multiple nodes and decide whether success means one, quorum, or all replicas.</li>
-<li><strong>5.</strong> Use read repair, hinted handoff, and anti-entropy scans to close divergence.</li>
-<li><strong>6.</strong> Compact immutable files to bound read amplification and reclaim deleted data.</li>
+  <li><strong>Route the key.</strong> Hash the key onto the consistent-hashing ring and walk clockwise to find its <span class="math">N</span> replicas. The ring mechanics — virtual nodes, why hashing beats <code>mod</code>, how rebalancing moves only <span class="math">1/N</span> of keys — are taught in full in <a href="case_02_consistent_hashing.html">C02</a>; here we just <em>use</em> the ring to name the replica set and move on.</li>
+  <li><strong>Durably log the mutation.</strong> The coordinator (any node, or the client) sends the write to all <span class="math">N</span> replicas. Each replica appends it to its <strong>write-ahead log</strong> (sequential disk, fast) and inserts it into an in-memory <strong>memtable</strong> before replying "ack."</li>
+  <li><strong>Wait for W acks.</strong> The write returns success once <span class="math">W</span> replicas have acked. With <span class="math">N=3, W=2</span> the value is on at least two disks before the client hears "ok" — survive any one node and the write lives.</li>
+  <li><strong>Flush and compact.</strong> When a memtable fills, it is flushed to an immutable sorted file (an <strong>SSTable</strong>) at level L0. Background compaction merges SSTables into larger, fewer, deeper levels (deep dive 2).</li>
+  <li><strong>Serve a get.</strong> The coordinator queries <span class="math">R</span> replicas. Each replica answers from its memtable + SSTables (newest first, short-circuited by bloom filters). The coordinator returns the version with the highest stamp.</li>
+  <li><strong>Repair on the read path.</strong> If the <span class="math">R</span> replicas disagree, the coordinator returns the freshest and writes it back to the stale replicas — <strong>read repair</strong> (DDIA Ch. 5). A background <strong>anti-entropy</strong> scan with Merkle trees catches keys that are read rarely.</li>
 </ol>
 
-<h2>6. Deep dives</h2>
-<h3>Consistency knob</h3>
-<p>N, R, and W are not magic variables; they are product promises. R+W&gt;N gives overlapping quorums, but stale reads can still happen with sloppy quorum, failed clocks, or concurrent writes.</p>
-<h3>Storage engine</h3>
-<p>An LSM-like engine makes writes sequential and fast, but reads may touch multiple files until compaction catches up. A B-tree would improve point-read predictability but amplify random writes.</p>
-<h3>Deletes are writes</h3>
-<p>A delete usually writes a tombstone. If compaction drops it too early, an old replica can resurrect the value. The system needs a retention window tied to repair guarantees.</p>
+<p>The first bottleneck shows up at step 4. LSM storage makes writes nearly free (sequential WAL + in-memory insert), which is exactly why a write-heavy KV store reaches for it — but it defers all the cost to compaction. Here is that write path, and a read fanning across the levels:</p>
 
-<h2>7. Trade-offs</h2>
+<div class="ascii">
+  WRITE PATH (LSM-tree, DDIA Ch. 3)                READ PATH (one replica)
+  ─────────────────────────────────               ────────────────────────
+   put(k,v)                                         get(k)
+     │                                                │
+     ▼                                                ▼
+   ┌──────────┐  append (sequential, fsync)        ┌──────────┐  in RAM, newest data
+   │   WAL    │ ───────────────────────────▶ disk  │ memtable │ ─── hit? return ──▶
+   └──────────┘                                     └────┬─────┘
+     │ also                                              │ miss
+     ▼                                                   ▼
+   ┌──────────┐  in RAM, sorted                     ┌──────────────────────────┐
+   │ memtable │                                     │ bloom filter per SSTable │  "definitely not here"
+   └────┬─────┘                                     └────┬─────────────────────┘   ⇒ skip the file
+        │ full ⇒ flush                                   │ "maybe here"
+        ▼                                                ▼
+   ┌─────────────────── L0  ▣ ▣ ▣  (recent, may overlap)
+   │   leveled              │  compaction merges + drops tombstones, deletes inputs
+   │   compaction           ▼
+   │                   L1  ▣▣▣▣▣▣            ◀── read walks L0→L1→L2… until found;
+   │                   L2  ▣▣▣▣▣▣▣▣▣▣▣▣          bloom filter gates each level so a
+   └──────────────────▶  …  (10× per level)      point read touches O(levels), not O(files)
+</div>
+
+<h2>Deep dives</h2>
+
+<h3>1. N / R / W are product promises, not magic numbers</h3>
+<p>The inequality <span class="math">R + W &gt; N</span> is necessary for fresh reads but <strong>not sufficient</strong> — and naming the gaps is the senior move (DDIA Ch. 9). The clean overlap argument quietly assumes the write reached a <em>clean</em> quorum of the key's <em>real</em> home nodes, that there is a single notion of "latest," and that writes are ordered. Each assumption can break:</p>
+<ul>
+  <li><strong>Sloppy quorum + hinted handoff.</strong> Under a partition, Dynamo lets a write satisfy <span class="math">W</span> on <em>any</em> reachable nodes — not the key's designated replicas — and stores a "hint" to forward later. The write is durable, but the <span class="math">W</span> nodes that took it may not overlap the <span class="math">R</span> nodes a later read consults. <span class="math">R+W&gt;N</span> held arithmetically; the <em>sets it was counting</em> were the wrong ones. Sloppy quorum buys availability and gives up the freshness guarantee for the duration.</li>
+  <li><strong>Clock skew.</strong> If "freshest" is decided by a wall-clock timestamp, a replica with a fast clock can stamp an <em>older</em> write as newer and win the merge. Quorums say nothing about clocks.</li>
+  <li><strong>Concurrent writes.</strong> Two clients writing the same key "at the same time" produce two values with no happens-before order. A quorum read sees both; <em>which</em> is correct is a question the store cannot answer alone.</li>
+</ul>
+<p>So <span class="math">R+W&gt;N</span> is the floor, not the ceiling. The honest pitch: "<span class="math">N=3,W=2,R=2</span> gives overlapping quorums and read-your-writes on a healthy cluster; under partitions I fall back to sloppy quorum and accept a stale window, repaired by read repair and anti-entropy; and I detect concurrency with version vectors rather than trusting clocks."</p>
+
+<h3>2. LSM-tree vs B-tree — the amplification you choose</h3>
+<p>Both are valid storage engines (DDIA Ch. 3); they differ in <em>which</em> amplification you pay. An <strong>LSM-tree</strong> only ever appends: WAL is sequential, memtable inserts are in-RAM, flushes write whole sorted files. That makes writes cheap and disk-friendly. The bill arrives twice later: a point read may have to check several SSTables across levels (<strong>read amplification</strong>, mitigated by bloom filters that let a read skip files that definitely lack the key), and every byte is rewritten several times as it migrates down the levels (<strong>compaction / write amplification</strong>). A <strong>B-tree</strong> updates pages in place: a point read is a predictable <span class="math">O(\log n)</span> page walk, but every write may rewrite a full page (and the WAL entry), giving steady write amplification and random I/O.</p>
+<table>
+  <thead><tr><th></th><th>LSM-tree (SSTables)</th><th>B-tree</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Writes</strong></td><td>Sequential, fast; cost deferred to compaction.</td><td>In-place page updates; random I/O, write amplification up front.</td></tr>
+    <tr><td><strong>Point reads</strong></td><td>May touch many SSTables; bloom filters keep it ~O(levels).</td><td>Predictable O(log n) page walk — the better tail.</td></tr>
+    <tr><td><strong>Space</strong></td><td>Better compression (sorted, immutable); transient ~2× during compaction.</td><td>Page fragmentation; values not duplicated across levels.</td></tr>
+    <tr><td><strong>Hazard</strong></td><td>Compaction backlog stalls writes; read amp grows if it falls behind.</td><td>Read tail predictable, but write throughput capped by random I/O.</td></tr>
+  </tbody>
+</table>
+<p>For a write-heavy KV store the LSM is the default precisely because sequential writes win — which is why Cassandra, RocksDB, and Dynamo-lineage stores use it. Choose the B-tree when point-read latency must be tight and predictable and the write rate is modest (the classic relational engine).</p>
+
+<h3>3. Deletes are tombstones — and a tombstone dropped too early resurrects the dead</h3>
+<p>In an append-only LSM you cannot erase the old value in place — it sits in some older SSTable. So a delete writes a <strong>tombstone</strong>: a marker version that says "this key is gone as of version V." Reads that find a tombstone return "not found"; compaction eventually drops the tombstone <em>and</em> the values it shadows. The subtle, dangerous part is <em>when</em> compaction may drop the tombstone. Suppose replica C was down or partitioned when the delete happened and never received the tombstone. If the other replicas compact the tombstone away too soon, then when C comes back, anti-entropy compares states, sees C "has" a value the others "lack," and dutifully <strong>replicates the deleted value back to life</strong> across the cluster.</p>
+<div class="callout warn">
+  <div class="label">The retention rule</div>
+  A tombstone must outlive the worst-case repair window: it can only be garbage-collected after you are certain every replica has seen it. In practice that means a configured GC grace period (Cassandra's <code>gc_grace_seconds</code>, default 10 days) ≥ the maximum time a node can be down and still rejoin, and a hard operational rule that a node down longer than that grace period must be <em>wiped and rebuilt</em>, never simply restarted — or it resurrects every key it missed a tombstone for.</p>
+</div>
+
+<h2>Trade-offs</h2>
 <table>
   <thead><tr><th>Choice</th><th>Buys</th><th>Costs</th><th>Choose when</th></tr></thead>
   <tbody>
-<tr><td><strong>Quorum vs primary-leader</strong></td><td>availability during single-node failure</td><td>conflict resolution complexity</td><td>multi-region or high-write systems</td></tr>
-<tr><td><strong>LSM vs B-tree</strong></td><td>write throughput</td><td>read and compaction amplification</td><td>write-heavy key-value workloads</td></tr>
-<tr><td><strong>Strong reads vs eventual reads</strong></td><td>freshness</td><td>latency and availability</td><td>account balances or locks</td></tr>
-<tr><td><strong>Client conflict resolution vs server resolution</strong></td><td>domain-specific correctness</td><td>harder client contract</td><td>offline or multi-master writes</td></tr>
+    <tr><td><strong>Leaderless quorum vs single-leader</strong></td><td>Availability + writes during single-node failure; no failover gap.</td><td>Conflict resolution, sibling versions, weaker ordering.</td><td>Multi-region or high-write, availability over linearizability.</td></tr>
+    <tr><td><strong>LSM vs B-tree</strong></td><td>Sequential, high write throughput.</td><td>Read + compaction amplification; compaction operational risk.</td><td>Write-heavy KV workloads (the default here).</td></tr>
+    <tr><td><strong>R+W&gt;N (strong) vs W=1,R=1 (fast)</strong></td><td>Guaranteed fresh reads / read-your-writes.</td><td>Higher tail latency; lower availability per op.</td><td>Balances, locks, anything where a stale read is a correctness bug.</td></tr>
+    <tr><td><strong>Version vectors vs last-write-wins</strong></td><td>Detects concurrency; never silently drops a write.</td><td>Returns siblings the client/app must merge.</td><td>You cannot tolerate silent data loss (carts, counters).</td></tr>
   </tbody>
 </table>
+<p>The sharpest trade is the last one. <strong>Last-write-wins is the cheapest conflict policy and the one that silently loses data.</strong> Picture two concurrent writes to the same key: client X sets <code>v1</code>, client Y sets <code>v2</code>, neither saw the other. LWW keeps whichever carries the larger timestamp and discards the other — and because timestamps come from wall clocks, a node with a fast clock can make the <em>earlier</em> write win. One of two acknowledged writes vanishes with no error, no log line, nothing. Version vectors instead record that <code>v1</code> and <code>v2</code> are <em>concurrent</em> (neither dominates) and return both as siblings, pushing the merge to the application (shopping carts union the items). You pay in a more complex client contract; you buy never silently destroying an acknowledged write. This is the lost-update story of DDIA Ch. 9, and it is the trap behind the senior question below.</p>
 
-<h2>8. Failure modes</h2>
+<h2>Failure modes</h2>
 <table>
-  <thead><tr><th>Failure</th><th>Mitigation</th></tr></thead>
+  <thead><tr><th>Failure</th><th>What happens</th><th>Mitigation</th></tr></thead>
   <tbody>
-<tr><td><strong>Replica divergence</strong></td><td>Run read repair and scheduled anti-entropy with checksums.</td></tr>
-<tr><td><strong>Compaction backlog</strong></td><td>Throttle writes or add capacity before read amplification explodes.</td></tr>
-<tr><td><strong>Clock-based last-write-wins loses data</strong></td><td>Use version vectors or compare-and-set for conflicting writes.</td></tr>
-<tr><td><strong>Hot partition</strong></td><td>Split hot keys, add cache, or introduce adaptive partitioning.</td></tr>
+    <tr><td><strong>Replica divergence</strong></td><td>Replicas drift after a missed write / partition.</td><td>Read repair on the hot path; scheduled anti-entropy with Merkle-tree checksums for cold keys.</td></tr>
+    <tr><td><strong>Compaction backlog</strong></td><td>Writes outrun compaction; read amplification and disk both balloon toward the ~6 TB peak.</td><td>Throttle writes, rate-limit compaction, or add capacity before L0 file count explodes.</td></tr>
+    <tr><td><strong>LWW silent data loss</strong></td><td>Concurrent writes + clock skew drop an acknowledged write with no error.</td><td>Version vectors to detect concurrency; CAS for read-modify-write; NTP is necessary but never sufficient.</td></tr>
+    <tr><td><strong>Tombstone resurrection</strong></td><td>A long-down replica re-spreads a deleted value.</td><td>GC grace ≥ max downtime; wipe-and-rebuild any node down past grace.</td></tr>
+    <tr><td><strong>Hot partition</strong></td><td>One popular key/range saturates its replica set.</td><td>Split the key, front it with a cache, or use adaptive partitioning (DDIA Ch. 6).</td></tr>
   </tbody>
 </table>
 
-<h2>9. What to say in the interview</h2>
-<div class="callout ok">
-  <div class="label">Strong signal</div>
-  Lead with the dominant constraint: Partitioning, replication, quorum reads/writes, compaction, failure recovery. Then defend the design by naming what you made faster, what you made more reliable, and what complexity you accepted.
+<h2>Interview prompts you should be ready for</h2>
+<div class="callout">
+  <ol>
+    <li><strong>Last-write-wins silently lost a write — walk me through how.</strong> <em>(senior answer)</em> Two clients write the same key concurrently, neither having read the other's value, so there is no happens-before order. LWW keeps exactly one — the higher timestamp — and discards the other. Because timestamps are wall-clock, a node with a fast clock can make the older write win, so the loser isn't even the "earlier" one. No error is raised; an acknowledged write just disappears. The fixes are to stop pretending the writes were ordered: use version vectors to detect that they were concurrent and surface both as siblings for the app to merge, or require CAS so a write that didn't see the latest version fails loudly instead of clobbering it. NTP narrows the skew but never closes it — clocks are not a correctness mechanism (DDIA Ch. 8, 9).</li>
+    <li><strong>Why does R+W&gt;N guarantee a fresh read, and when does the guarantee evaporate?</strong> <em>(senior answer)</em> Pigeonhole: a write lands on W replicas, a read polls R replicas, and if R+W&gt;N the two sets cannot be disjoint, so a read always touches at least one node with the latest write. It evaporates under sloppy quorum (the W writes went to non-home nodes, so the read set may miss them), under clock skew (if "freshest" is timestamp-decided), and under concurrent writes (no single "latest" exists). So R+W&gt;N is necessary, not sufficient.</li>
+    <li><strong>Why an LSM-tree over a B-tree here?</strong> <em>(senior answer)</em> A KV store is write-heavy and the LSM turns writes into sequential WAL appends plus in-RAM inserts — far cheaper than a B-tree's in-place random page writes. The cost is deferred: read amplification across levels (bounded by bloom filters) and compaction write amplification. I'd pick a B-tree only if point-read tail latency had to be tight and predictable and the write rate were modest.</li>
+    <li><strong>How do deletes work, and how can a deleted value come back?</strong> <em>(senior answer)</em> A delete is a tombstone write, not an in-place erase. If compaction drops a tombstone before every replica has seen it, a replica that missed the delete still holds the value; on rejoin, anti-entropy sees that "extra" value and replicates it back — resurrection. The guard is a GC grace period that exceeds the longest a node can be down and rejoin, plus wiping any node that's been down longer.</li>
+    <li><strong>You set N=3, W=2, R=2 — what's your durability and availability story?</strong> <em>(senior answer)</em> Durability: a write isn't acked until it's on two of three replicas' disks (WAL fsync), so any single node loss preserves it. Availability: with one node down you can still reach W=2 and R=2, so writes and reads continue; lose two and you can't form a quorum, so I'd fall back to sloppy quorum for availability at the cost of the freshness guarantee, then repair.</li>
+    <li><strong>Where does a key live, and why not just hash mod N machines?</strong> <em>(senior answer)</em> Consistent hashing onto a ring with virtual nodes — covered in C02. Plain hash-mod-N remaps almost every key when the machine count changes; the ring moves only ~1/N of keys on a membership change, which is what makes scaling and node failure survivable without a full reshuffle.</li>
+    <li><strong>Your compaction is falling behind under write load — what do you see and do?</strong> <em>(senior answer)</em> L0 SSTable count climbs (read amplification rises because each read checks more files), disk creeps toward the ~6 TB transient peak, and write latency degrades. I throttle or shed writes, rate-limit/parallelize compaction, and add capacity. The root cause is sizing for steady-state disk and ignoring the ~2× compaction transient — provision for the peak, not the average.</li>
+  </ol>
 </div>
 
 <h2>Related foundation lessons</h2>
+<p>This case sits at the intersection of three foundation lessons. The key reaches its replica set via the consistent-hashing ring built in <a href="case_02_consistent_hashing.html">C02</a> — route the key there, don't re-derive virtual nodes here. The quorum and leader/follower mechanics, hinted handoff, and read repair are the subject of <a href="08_replication.html">lesson 08</a>; the consistency-vs-availability framing of <span class="math">R+W&gt;N</span> and what "stale read" even means is <a href="09_consistency_cap.html">lesson 09</a>'s CAP material applied to a real store. The hot-partition failure mode and how rebalancing moves keys are <a href="07_partitioning.html">lesson 07</a>.</p>
 <div class="case-meta">
-<a class="chip" href="04_data_modeling_storage.html">Data modeling and storage</a>
-<a class="chip" href="07_partitioning.html">Partitioning</a>
-<a class="chip" href="08_replication.html">Replication</a>
-<a class="chip" href="09_consistency_cap.html">Consistency</a>
+  <a class="chip" href="case_02_consistent_hashing.html">C02 · Consistent hashing</a>
+  <a class="chip" href="07_partitioning.html">07 · Partitioning</a>
+  <a class="chip" href="08_replication.html">08 · Replication</a>
+  <a class="chip" href="09_consistency_cap.html">09 · Consistency &amp; CAP</a>
 </div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  A key-value store is where consistency stops being a vibe and becomes arithmetic: <span class="math">R+W&gt;N</span> forces the read and write quorums to overlap, so <span class="math">N=3,W=2,R=2</span> guarantees a fresh read while <span class="math">W=1,R=1</span> deliberately opens a stale window — the knobs <em>are</em> the contract. But the inequality is only a floor: sloppy quorum, clock skew, and concurrent writes can still hand you a stale read or silently drop a write under last-write-wins, so you detect concurrency with version vectors rather than trusting clocks. Underneath, an LSM-tree buys cheap sequential writes at the price of read and compaction amplification (size disk for the ~6 TB peak, not the 3 TB steady state), and a delete is a tombstone whose retention window must outlive your worst repair — drop it early and the dead come back. Get the arithmetic right, then defend it against the assumptions it quietly made.</div>
 
 <footer class="lesson-nav">
   <a href="case_02_consistent_hashing.html"><span class="dir">Previous</span><span class="ttl">Previous case</span></a>
