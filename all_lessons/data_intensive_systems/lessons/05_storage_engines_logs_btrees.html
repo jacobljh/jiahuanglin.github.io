@@ -15,73 +15,204 @@
     <a class="crumb-link" href="index.html">data_intensive_systems</a>
     <span class="crumb">/</span>
     <span class="crumb">05 &middot; logs and B-trees</span>
-    <span class="step-pill">lesson 5 / 16 &middot; ~11 min</span>
+    <span class="step-pill">lesson 6 / 17 &middot; ~16 min</span>
   </div>
 </header>
 
 <main>
 
+<p class="kicker">Part I &middot; Foundations of data systems</p>
 <h1>Storage Engines I: Logs, Hash Indexes, and B-Trees</h1>
-<p class="subtitle">A database write becomes durable by entering a log; a read becomes fast by using an index. The first storage fork is whether you overwrite pages or append history.</p>
+<p class="subtitle">Lesson 04 settled how a record turns into bytes and how those bytes stay readable as schemas drift. But once you have bytes you trust, you have to <em>put them somewhere</em> — and survive the machine losing power mid-write, and find one record again among a billion. This lesson opens the storage engine: the layer that turns a write into something durable and a read into something fast. We build it from the cheapest durable primitive there is — an append-only log — and stop at the B-tree, the index that powers almost every relational database you have used.</p>
 
-<div class="callout">
-  <div class="label">First principle</div>
-  <p>Storage engines are machines for trading write cost, read cost, space, and recovery time. The log is the primitive that makes durable change cheap.</p>
+<div class="callout source-note"><div class="label">Book source</div>Original synthesis inspired by Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, Chapter 3 (Storage and Retrieval) — the log-structured arc, the Bitcask hash index, the write-ahead log, and B-tree page mechanics. Prose and examples here are our own.</div>
+
+<div class="callout"><div class="label">Linear position</div>
+<strong>Prerequisite:</strong> Lesson 04 (encoding &amp; schema evolution) — you can turn a record into durable bytes and keep them readable across versions. Lesson 01 gave you the workload vocabulary (point read, range scan, write throughput, tail latency) we use to judge each design.<br>
+<strong>New capability:</strong> You can reason from first principles about <em>why</em> a write is cheap or expensive, design a point-lookup index and know when it falls over, explain why every serious database keeps a write-ahead log, and estimate how many disk pages a B-tree lookup and a B-tree write actually touch.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Five moves. (1) Build the simplest durable database — an append-only log — and see why sequential append is the cheapest durable write and how a crash is just a replay. (2) Notice reads are now hopeless without an <strong>index</strong>; build a Bitcask-style hash index for point lookups and find its two hard limits. (3) Introduce <strong>compaction</strong> to keep the log from growing forever. (4) Generalize the log into the <strong>write-ahead log (WAL)</strong> — the single ordered-durable-changes abstraction this whole track reuses as replication stream, CDC source, and audit trail. (5) Build the <strong>B-tree</strong>, walk a root-to-leaf lookup with real numbers, and price its defining cost: <strong>write amplification</strong>. A trade-off table closes the loop.</div>
+
+<h2>1 &middot; The cheapest durable database: an append-only log</h2>
+
+<p>Strip a database down to its job: remember a write even if the power dies one millisecond later. The smallest thing that does this is a file you only ever <em>append</em> to. To store <code>set(k, v)</code>, you write one record — the key, the value, maybe a timestamp — onto the end of the file and call <code>fsync</code> so the operating system actually flushes it to the physical disk. That's the whole write path.</p>
+
+<div class="ascii">log file (grows to the right, never overwritten)
++--------------+--------------+--------------+--------------+
+| set u1 = "A" | set u2 = "B" | set u1 = "C" | set u2 = "D" |
++--------------+--------------+--------------+--------------+
+offset 0        offset 14      offset 28      offset 42   &lt;- append here next
+                                  ^                  ^
+                          latest value of u1   latest value of u2</div>
+
+<p>Why is this the <em>cheapest</em> durable write? Because it is <strong>sequential</strong>. On a spinning disk the head never seeks — it writes a continuous track. On an SSD, large sequential writes align with the flash erase-block structure and avoid the read-modify-write churn that random writes cause. Either way, sequential I/O is often one to two orders of magnitude faster than scattered random I/O, and an append is the most sequential write pattern that exists: you always write to exactly one place, the end.</p>
+
+<p>Durability and recovery come almost for free. The log <em>is</em> the record of what happened, in the order it happened. After a crash you don't reconstruct state by guessing — you <strong>replay</strong>: read the file front to back, applying each record, and you arrive at the last consistent state the disk actually persisted. A half-written final record (torn by the crash) is detected by a length or checksum field and discarded. This idea — that an ordered, durable log is the source of truth and current state is a <em>derived</em> replay of it — is the spine of the entire track. Hold onto it.</p>
+
+<div class="callout"><div class="label">Worked number — why sequential wins</div>
+A commodity NVMe SSD might sustain <span class="math">~3,000 MB/s</span> of sequential writes but only <span class="math">~400 MB/s</span> equivalent throughput on tiny random 4 KB writes once you account for write-amplification inside the drive. For a stream of 200-byte records, appending sequentially can absorb on the order of <span class="math">10,000,000+ records/s</span> of raw bandwidth; scattering those same records to random offsets across a large file can drop you below <span class="math">1,000,000/s</span>. Same data, same drive — the <em>access pattern</em> alone is a 10&times; difference. That is why nearly every high-throughput store, from Kafka to LSM engines (lesson 06), is built on an append.</div>
+
+<h2>2 &middot; Reads break — so we add an index</h2>
+
+<p>The append-only log is a fantastic writer and a terrible reader. To answer <code>get(u1)</code> you must scan the whole file looking for the <em>last</em> record with key <code>u1</code> (the newest value wins — earlier ones are stale history). With a billion records that is a billion-record scan per lookup. Unusable.</p>
+
+<p>The fix is an <strong>index</strong>: a separate data structure, derived from the log, that maps a key to <em>where</em> its current value lives so you can jump straight to it instead of scanning. An index is pure read-side machinery — it adds no information, it just makes lookups fast. And here is the first universal law of storage engines: <strong>every index you add speeds reads and slows writes</strong>, because every write must now also update the index. There is no free index.</p>
+
+<p>The simplest useful index is a <strong>hash index</strong>, the design behind Bitcask (Riak's default engine). Keep an in-memory hash map: <code>key &rarr; byte offset of its latest record in the log</code>. Writes still append to the log <em>and</em> update the one map entry. Reads hit the map (O(1)), seek to that offset, and read one record.</p>
+
+<div class="ascii">in-memory hash index            on-disk log
++--------+-----------+          +----------------+
+|  u1    | offset 28 | -------> | ...set u1="C"  |  &lt;- one seek, one read
+|  u2    | offset 42 | ----+    +----------------+
++--------+-----------+     +--> | ...set u2="D"  |
+                               +----------------+</div>
+
+<p>This is genuinely good: writes stay append-cheap, reads are a single seek. But it has <strong>two hard limits</strong> baked into its shape, and naming them is the point of the exercise.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Limit 1 &middot; keys must fit in RAM</div><div class="v">The hash map holds <em>every</em> key. 1 billion keys at ~64 bytes of map overhead each is ~64 GB of RAM just for the index. When your key space outgrows memory, this engine simply cannot run. Bitcask is brilliant when keys are few and values churn fast (e.g. a session store), and useless for a huge sparse key space.</div></div>
+  <div class="topic-card"><div class="k">Limit 2 &middot; no range scans</div><div class="v">A hash scatters keys to random buckets, destroying order. <code>get(u1)</code> is fast, but "all keys between <code>2024-01</code> and <code>2024-03</code>" or "the next 100 keys after X" requires scanning everything. Any range query, prefix query, or sorted iteration is impossible. This single limitation is what motivates the B-tree in &sect;5.</div></div>
 </div>
+
+<h2>3 &middot; Compaction: keeping the log from eating the disk</h2>
+
+<p>An append-only log never deletes, so it grows without bound — every <code>set(u1, ...)</code> leaves the old value lying in the file forever. <strong>Compaction</strong> is the cleanup process that reclaims that space: it reads old log <strong>segments</strong> (the log is broken into fixed-size files), keeps only the <em>latest</em> value for each key, and writes a fresh, smaller segment, then deletes the originals.</p>
+
+<div class="ascii">before compaction (one segment, lots of dead history)
+[ u1="A" | u2="B" | u1="C" | u2="D" | u1="E" | u3="F" ]
+              dead    dead    dead    keep    keep   keep
+
+after compaction (only the live value of each key survives)
+[ u1="E" | u2="D" | u3="F" ]</div>
+
+<p>Compaction runs in the background on immutable old segments while new writes keep flowing to the current segment, so it never blocks the write path. This is the same "write sequentially now, clean up history later" bet that the LSM tree (lesson 06) makes its entire architecture out of — compaction is the bridge concept between this lesson and the next. The cost it introduces is real, though: compaction consumes disk bandwidth and CPU, and if it falls behind the write rate, dead data piles up and space balloons — a failure mode lesson 06 explores as compaction debt.</p>
+
+<h2>4 &middot; The write-ahead log (WAL): the unifying abstraction</h2>
+
+<p>So far the log <em>was</em> the database. But even databases that store data in mutable, overwrite-in-place structures (like the B-tree below) keep a log too — for a different reason. Picture overwriting a B-tree page in place when the power dies halfway through the page write. You don't get the old page or the new page; you get a <strong>torn</strong> page — half old bytes, half new — and the on-disk tree is corrupt. There is no record of what you intended, so recovery is guesswork.</p>
+
+<p>The <strong>write-ahead log (WAL)</strong> fixes this with one rule: <em>before</em> mutating any page, append a record describing the intended change to a sequential log and flush it. The mutation happens only after the intent is durable. The name says it: you <em>write ahead</em> to the log first.</p>
 
 <div class="ascii">write request
    |
    v
-append to WAL  ----crash recovery----> replay committed records
+(1) append intent to WAL  --[fsync]-->  durable, ordered record of "what I'm about to do"
    |
    v
-update index / pages
+(2) mutate the page(s) in place  (B-tree page, etc.)
    |
    v
-acknowledge once durability promise is met</div>
+(3) acknowledge the write to the client
 
-<h2>The append-only log</h2>
-<p>The simplest durable database is a file you append to. To set <code>k = v</code>, append a record. To recover after a crash, replay the file. Sequential append is the cheapest persistent write pattern, and it gives you an ordered history of changes.</p>
-<p>The problem is reads. If the log contains every historical value of <code>k</code>, finding the latest value by scanning from the beginning is too slow. So we add an index: a separate structure mapping key to location in the log. A hash index gives fast point lookups, but only if the keys fit in memory and range queries do not matter.</p>
-<p>Compaction keeps the log from growing forever: merge segments and keep only the newest value for each key. This already reveals the storage-engine pattern that will return in LSM trees: write sequentially now, clean up history later.</p>
+crash between (1) and (2)?  ->  on restart, REPLAY the WAL:
+      committed-but-unapplied changes are re-done;
+      incomplete transactions are rolled back.
+The on-disk pages can never be left in a state the WAL can't repair.</div>
 
-<h2>The write-ahead log</h2>
-<p>Even page-oriented databases rely on logs. If a B-tree page is overwritten in place and the machine loses power halfway through, the on-disk tree can be corrupted. The write-ahead log solves this by writing the intent to a sequential log before modifying pages. After a crash, replay the log to finish committed changes or roll back incomplete ones.</p>
-<p>This is not just an implementation detail. The same ordered log becomes the replication stream, the source for change data capture, and the audit trail for recovery. Once you see "ordered durable changes," you will see the same abstraction inside databases, Kafka, event sourcing, model registries, and workflow engines.</p>
+<p>Now the crucial move, and the reason this concept lives <em>here</em> and gets linked back to for the rest of the track: <strong>that same ordered, durable log is reused everywhere</strong>. It is not just a crash-recovery trick — it is the canonical "ordered durable changes" abstraction, and at least four systems are literally the same log read by a different consumer:</p>
 
-<h2>B-trees: sorted pages for reads and ranges</h2>
-<p>A B-tree stores keys in sorted order across fixed-size pages. A lookup walks from root to leaf, reading a small number of pages even for huge tables. Because keys are sorted, range scans are efficient: find the starting key and walk forward.</p>
-<p>The price is write amplification. Updating one record may dirty a whole page; inserts can split pages; maintaining secondary indexes means every write updates more structures. The WAL protects durability, but the engine still does random-ish page work. B-trees are excellent when you need low-latency reads, range queries, and mixed OLTP workloads.</p>
-<p>For interview thinking: a B-tree is not "better" than an LSM tree. It pays more at write time to make reads and ranges straightforward. That is the trade.</p>
+<div class="mini-flow">
+<div class="step"><span class="n">&rarr;</span><strong>Crash recovery</strong> — replay the WAL on restart to repair partial page writes (this lesson).</div>
+<div class="step"><span class="n">&rarr;</span><strong>Replication stream</strong> — ship the same log to follower replicas; they replay it to stay in sync (lesson 07, the replication log).</div>
+<div class="step"><span class="n">&rarr;</span><strong>Change data capture (CDC)</strong> — let downstream systems (search indexes, caches, data lakes) subscribe to the log to learn about every change (lesson 15).</div>
+<div class="step"><span class="n">&rarr;</span><strong>Audit trail / event source</strong> — the ordered log <em>is</em> the history; replaying a prefix reconstructs any past state (lesson 16).</div>
+</div>
 
+<p>Once you can see "an ordered log of durable changes, with current state as a replay of it," you will recognize the same shape inside PostgreSQL's WAL, MySQL's binlog, Kafka topics, RocksDB, event sourcing, and ML model/checkpoint registries that log every artifact write. We taught it once, here; later lessons will link back rather than re-derive it.</p>
 
-<h2>Trade-offs</h2>
+<h2>5 &middot; B-trees: sorted pages, cheap reads and ranges, costly writes</h2>
+
+<p>The hash index couldn't do range scans because it threw away order. The <strong>B-tree</strong> — the index under essentially every relational database (PostgreSQL, MySQL/InnoDB, SQLite) — keeps keys <em>sorted</em>, which buys back range queries and bounds memory at the same time.</p>
+
+<p>A B-tree breaks the key space into fixed-size <strong>pages</strong> (a page is the unit of disk I/O the engine reads and writes as one block, typically 4 KB or 8 KB). Pages form a shallow, wide tree. The root page holds keys plus pointers to child pages; each child narrows the range further; the bottom <strong>leaf</strong> pages hold the actual values (or pointers to them). The <strong>branching factor</strong> B is how many child pointers fit in one page — and because a 4 KB page holds hundreds of key+pointer entries, B is large (often 100&ndash;1000), which is why the tree is only a handful of levels deep even for enormous tables.</p>
+
+<div class="ascii">                     [ root page: keys split into B ranges ]
+                    /            |                    \
+        [ ...100s of keys ]  [ ...100s ]   ...   [ ...100s of keys ]   &lt;- internal pages
+         /     |     \
+   [leaf] ... [leaf] ...                                        [leaf]  &lt;- values live here
+
+lookup(k): start at root, binary-search this page for the child range
+           containing k, read that child page, repeat down to a leaf.
+           pages read = tree height = ~log_B(N).</div>
+
+<div class="callout"><div class="label">Worked number — how many pages a lookup touches</div>
+Take a table of <span class="math">N = 100,000,000</span> keys with branching factor <span class="math">B = 500</span>. The number of leaf-reachable slots after <em>h</em> levels is <span class="math">B^h</span>:<br>
+&bull; <span class="math">500^1 = 500</span><br>
+&bull; <span class="math">500^2 = 250,000</span><br>
+&bull; <span class="math">500^3 = 125,000,000</span> &ge; 100M &nbsp;&rarr; <strong>3 levels suffice</strong> (4 with the root counted, depending on how you count).<br>
+So a point lookup in 100 million keys reads only about <strong>3&ndash;4 pages</strong> from the tree. In practice the root and upper internal pages stay cached in RAM, so a cold lookup is often just <em>one</em> disk read at the leaf. That O(log) page count — staying flat as N grows by orders of magnitude — is exactly why B-trees scale. And because keys are sorted, a <strong>range scan</strong> finds the start key in those ~3 reads, then walks leaf pages left-to-right sequentially — the query the hash index could never do.</div>
+
+<p>So reads are cheap and ranges are cheap. The bill arrives at <strong>write</strong> time, and it has a name.</p>
+
+<div class="callout warn"><div class="label">The defining cost: write amplification</div>
+<strong>Write amplification</strong> is the ratio of bytes actually written to disk to the bytes of logical data the user changed. A B-tree is bad at it. Update one 200-byte record and the engine must:
+<ul>
+<li><strong>Rewrite a whole page.</strong> Pages are the unit of I/O, so changing one record dirties and rewrites its entire ~4 KB page. That alone is a <span class="math">4096 / 200 &approx; 20&times;</span> amplification for the data page.</li>
+<li><strong>Possibly split pages.</strong> If an insert overflows a full leaf, the engine splits it into two half-full pages and updates the parent's pointers — sometimes cascading splits up the tree.</li>
+<li><strong>Update every secondary index.</strong> A <strong>secondary index</strong> is an additional B-tree keyed on some other column (e.g. an index on <code>email</code> so you can look users up by email). Each one is its own tree, so a single row write that touches indexed columns dirties a page in <em>each</em> index. Three secondary indexes &rarr; up to four trees mutated per write.</li>
+<li><strong>Write the WAL first</strong> (&sect;4), so the same change is also appended to the log for durability.</li>
+</ul>
+Net: one tiny logical update can become tens of kilobytes of physical writes across several random page locations. Contrast the append log of &sect;1, where that same update is <em>one</em> sequential 200-byte append. That gap — sequential append vs. random in-place page rewrites — is the central tension lesson 06 resolves with the LSM tree.</div>
+
+<p>The takeaway is not that B-trees are worse. They pay more at write time to make point reads, range scans, and transactional in-place updates simple, predictable, and low-latency — exactly what OLTP workloads need. A B-tree is the right default when you need stable read latency and ranges; the LSM tree (lesson 06) trades the other direction for write-heavy ingest.</p>
+
+<h2>6 &middot; The trade-offs, side by side</h2>
+
 <table>
   <thead><tr><th>Choice</th><th>Buys</th><th>Costs</th></tr></thead>
   <tbody>
-    <tr><td><strong>Append-only log + hash index</strong></td><td>Very fast writes and point reads</td><td>Memory index, no range scans, compaction required</td></tr>
-    <tr><td><strong>B-tree primary index</strong></td><td>Good point reads, excellent ranges, mature transaction support</td><td>Random page updates and write amplification</td></tr>
-    <tr><td><strong>Many secondary indexes</strong></td><td>More queries become cheap</td><td>Every write must update every relevant index</td></tr>
-    <tr><td><strong>Write-ahead logging</strong></td><td>Crash recovery and replication source</td><td>Extra write path and log management</td></tr>
+    <tr><td><strong>Append-only log + hash index</strong></td><td>Fastest possible durable writes (sequential append); O(1) point reads via one seek</td><td>All keys must fit in RAM; no range scans; needs background compaction to bound disk</td></tr>
+    <tr><td><strong>B-tree primary index</strong></td><td>O(log) point reads (~3&ndash;4 pages for 100M keys); efficient range scans; mature in-place transactions</td><td>Write amplification: page rewrites, page splits, random I/O</td></tr>
+    <tr><td><strong>Each additional secondary index</strong></td><td>Makes another access pattern (lookup by that column) cheap</td><td>Every write that touches it must update one more B-tree &mdash; more write amplification</td></tr>
+    <tr><td><strong>Write-ahead log (WAL)</strong></td><td>Crash recovery from torn page writes; doubles as replication stream, CDC source, and audit trail</td><td>Extra sequential write per change; log must be managed, fsync'd, and truncated</td></tr>
   </tbody>
 </table>
 
-<div class="callout ok">
-  <div class="label">What you can now decide</div>
-  <p>You should be able to name the contract this mechanism offers, the workload or invariant that justifies it, and the bill it sends somewhere else: read latency, write latency, storage, availability, freshness, or operational complexity.</p>
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+<li><strong>No index, so reads scan history.</strong> A bare log is write-only in practice; a point read becomes a full file scan. Always pair the log with a read structure.</li>
+<li><strong>Hash index outgrows RAM.</strong> The key set silently exceeds memory and the engine thrashes or refuses to start. Hash indexes only fit bounded key spaces.</li>
+<li><strong>Compaction falls behind.</strong> Writes outrun the cleaner, dead versions accumulate, and disk usage balloons until the volume fills (revisited as compaction debt in lesson 06).</li>
+<li><strong>Skipping the WAL.</strong> A crash mid-page-write leaves a torn page and an unrecoverable tree; recovery becomes guesswork. The WAL exists precisely so partial writes are always repairable.</li>
+<li><strong>Index sprawl.</strong> Adding "just one more" secondary index to speed a query quietly multiplies write amplification on the hot write path; the write slowdown shows up far from the index you added.</li>
+</ul>
+  </div>
+  <div class="lesson-card"><h3>Decision checklist</h3><ul>
+<li>Is the dominant access pattern point lookups, range scans, or write throughput? (Lesson 01 vocabulary.)</li>
+<li>Does the key set fit in RAM? If not, a hash index is out — you need a B-tree or LSM.</li>
+<li>Do you need range/prefix/sorted queries? If yes, the structure must keep keys ordered (B-tree, LSM).</li>
+<li>Is there a write-ahead log, and is it <code>fsync</code>'d before pages are mutated and acknowledged?</li>
+<li>Could the same WAL be reused as your replication / CDC / audit source instead of building a second pipeline (lessons 07, 15, 16)?</li>
+<li>How many secondary indexes does each write maintain — and is that write amplification acceptable on the hot path?</li>
+<li>Is compaction (or page reclamation) keeping pace with the write rate, with headroom for bursts?</li>
+</ul>
+  </div>
 </div>
 
-<div class="callout warn">
-  <div class="label">What breaks if you skip this?</div>
-  <p>Without an index, reads scan history. Without a log, recovery after partial writes becomes guesswork. Without compaction or page cleanup, storage grows with every old version forever.</p>
-</div>
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>
+Design the storage for a <strong>feature store's online layer</strong>: it serves the latest feature vector for each entity ID to a model at serving time (point lookups, very high write churn, no range queries, key set in the tens of millions). (1) Would you reach for an append-log + hash index, a B-tree, or something else — and what assumption about the key set decides it? (2) Sketch the write path including the WAL, and say what a crash mid-write must not be able to corrupt. (3) Now add a second requirement: an offline job must read <em>every</em> feature change in order to rebuild a training table. Show how the WAL you already have becomes that feed for free, without a second write pipeline. (4) Estimate, for 50M keys and a B-tree with branching factor 400, how many pages a cold point lookup touches.</div>
 
-<h2>Design prompts</h2>
-<ol>
-  <li>Why does adding an index speed reads but slow writes?</li>
-  <li>Why is a WAL useful even if the database stores data in B-tree pages?</li>
-  <li>Pick B-tree or append-only hash index for a session store. What assumptions did you make?</li>
-</ol>
+<h2>Where this points next</h2>
+
+<p>The B-tree's whole cost was write amplification: in-place page rewrites scattered across the disk, every secondary index updated per write. Lesson 06 asks the obvious question — what if we refuse to overwrite pages at all and lean entirely into the append from &sect;1? The <strong>LSM tree</strong> does exactly that: writes go to an in-memory sorted buffer plus a WAL, flush to immutable sorted files, and get merged by the same compaction you just met — turning random writes back into sequential ones at the price of read amplification. The same lesson then turns the table sideways into <strong>columnar storage</strong> for analytics, where bytes are laid out by column so a scan reads only the fields a query asks for. Both are direct descendants of the log you built here.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+A storage engine trades write cost, read cost, space, and recovery time, and the append-only log is the primitive that makes durable change cheap: sequential append is the fastest durable write, and a crash is just a replay. Reads then demand an <strong>index</strong> — and every index speeds reads while slowing writes. A hash index gives O(1) point lookups but needs all keys in RAM and can't do ranges; <strong>compaction</strong> keeps its log bounded. The <strong>write-ahead log</strong> generalizes this: write intent sequentially before mutating pages so a torn page is always recoverable — and that one ordered, durable log is reused as the replication stream, CDC source, and audit trail across the rest of this track. The <strong>B-tree</strong> keeps keys sorted in fixed-size pages: a lookup in 100M keys reads only ~3&ndash;4 pages and ranges are cheap, but the bill is <strong>write amplification</strong> — a one-record update rewrites a whole page, may split pages, and dirties every secondary index. Lesson 06's LSM tree pays that bill the other way.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why is appending to a log the cheapest durable write? <em>(&sect;1 — it is purely sequential I/O, which is 10&times;+ faster than random I/O on both spinning disks and SSDs; you always write to one place, the end, and recovery is a front-to-back replay.)</em></li>
+  <li>You have a bare append-only log. Why are reads a problem, and what fixes them? <em>(&sect;2 — finding the latest value means scanning the whole file; an index maps key&rarr;location so you jump straight there. But every index slows writes, since each write must update it too.)</em></li>
+  <li>When does a Bitcask-style hash index break down? <em>(&sect;2 — two hard limits: all keys must fit in RAM, so a huge key space is impossible; and it can't do range/prefix/sorted scans because hashing destroys order.)</em></li>
+  <li>Why does even a B-tree database keep a write-ahead log? <em>(&sect;4 — overwriting a page in place can be torn by a crash, corrupting the tree; writing intent to a sequential log first makes every partial write recoverable via replay.)</em></li>
+  <li>What does it mean that the WAL is a "unifying abstraction"? <em>(&sect;4 — the same ordered durable log is reused as crash recovery, the replication stream (07), the CDC feed (15), and the audit/event-source history (16); current state is a replay of it.)</em></li>
+  <li>How many pages does a B-tree point lookup touch, and why does that matter? <em>(&sect;5 — about log_B(N): for 100M keys at B=500 that's ~3&ndash;4 pages, and it stays flat as N grows, with upper levels cached — so reads scale to huge tables.)</em></li>
+  <li>What is write amplification, and why is it the B-tree's defining cost? <em>(&sect;5 — bytes written to disk vs. bytes the user changed; one tiny update rewrites a whole ~4 KB page, may split pages, and dirties every secondary index plus the WAL, versus one sequential append in a log.)</em></li>
+</ul>
 
 <footer class="lesson-nav">
   <a href="04_encoding_schema_evolution.html">
