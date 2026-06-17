@@ -5,84 +5,248 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>09 - Autoscaling and AI-Aware Routing | Generative AI on Kubernetes</title>
 <link rel="stylesheet" href="style.css">
+<style>
+  .kicker { margin: 0 0 8px; font-family: var(--mono); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-mute); }
+  .source-note { border-left-color: var(--accent-2); }
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; }
+  .mini-flow { display: grid; gap: 8px; margin: 18px 0; }
+  .mini-flow .step { border: 1px solid var(--border); background: var(--bg-elev); border-radius: 8px; padding: 10px 12px; }
+  .mini-flow .n { font-family: var(--mono); color: var(--accent); font-size: 12px; margin-right: 6px; }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
 </head>
 <body>
 <header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">kubernetes_genai</a><span class="crumb">/</span><span class="crumb">09</span><span class="step-pill">lesson 9 / 18</span></div></header>
 <main>
+
 <p class="kicker">Part III - Production inference</p>
 <h1>Autoscaling and AI-Aware Routing</h1>
-<p class="subtitle">Token-based autoscaling, queue depth, cache-aware routing, LoRA-aware routing, AI gateways, and Gateway API Inference Extension.</p>
+<p class="subtitle">Lesson 08 taught you to measure a single replica — to find the batch size and concurrency where one GPU delivers the most tokens per second without blowing past your <abbr title="time to first token: latency from request arrival to the first output token">TTFT</abbr> budget. But production runs <em>many</em> replicas behind a load balancer, and two new questions appear at once: <em>when</em> do you add a replica, and <em>which</em> replica should each request go to? A naive Kubernetes setup answers both badly — it scales on CPU and balances at random — and for LLM serving both defaults are actively harmful. This lesson replaces them with signals and routing that match how LLM inference actually consumes a GPU: tokens, queue time, cache state, and adapter locality.</p>
 
-<div class="callout source-note"><div class="label">Source coverage</div>PDF Chapter 4: autoscaling, LLM-aware routing, AI gateways, and Gateway API Inference Extension.</div>
-<div class="callout"><div class="label">Learning objective</div>Route and scale on the signals that actually bind LLM serving: tokens, KV cache, queue time, adapter locality, and model readiness.</div>
+<div class="callout source-note"><div class="label">Source coverage</div>PDF Chapter 4: autoscaling, LLM-aware routing, AI gateways, and the Gateway API Inference Extension.</div>
 
-<h2>Linear Position</h2>
-<div class="position-grid">
-  <div><strong>Prerequisite</strong><span>Builds on <a href="08_benchmarking_runtime_tuning.html">08 - Benchmarking and Runtime Tuning</a>.</span></div>
-  <div><strong>New capability</strong><span>Route and scale on the signals that actually bind LLM serving: tokens, KV cache, queue time, adapter locality, and model readiness.</span></div>
-  <div><strong>Next dependency</strong><span>Prepares <a href="10_disaggregated_serving.html">10 - Disaggregated Serving</a>.</span></div>
+<div class="callout"><div class="label">Linear position</div><strong>Prerequisite:</strong> Lesson 08 (Benchmarking and runtime tuning) — you can characterize one replica's throughput/latency curve and you know the runtime terms: <abbr title="time to first token">TTFT</abbr>, <abbr title="time per output token, the steady-state decode latency">TPOT</abbr>, the <abbr title="key/value cache: per-token attention state held in GPU memory for every active sequence">KV cache</abbr>, prefill vs. decode, and prefix caching.<br><strong>New capability:</strong> Scale and route a <em>fleet</em> of replicas on LLM-native signals — choosing which warm model, cache state, adapter, and queue absorbs the next request, instead of treating replicas as interchangeable CPU boxes.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Five moves. (1) Frame the router as a scheduler sitting <em>above</em> the Kubernetes scheduler, and say why that layer has to exist. (2) Show why a CPU-based <abbr title="HorizontalPodAutoscaler: the Kubernetes controller that adds/removes pod replicas based on a metric">HPA</abbr> fails for LLMs and what to scale on instead — tokens, queue time, GPU saturation, KV pressure. (3) Make cache-aware routing concrete with a worked number: random load balancing destroys prefix-cache hit rate, and routing by prefix recovers it. (4) Add LoRA-aware routing and the AI-gateway boundary, then ground both in the Gateway API Inference Extension. (5) Failure modes, a checklist, and the hand-off into disaggregated serving.</div>
+
+<h2>1 · The router is a scheduler above the scheduler</h2>
+
+<p>Kubernetes already has a scheduler: it places pods onto nodes. But once your model server is running, a second scheduling decision happens on every single request — <em>which running replica handles this prompt?</em> By default a Kubernetes <code>Service</code> answers that question by spraying connections across endpoints roughly at random (round-robin / random L4 balancing). For a stateless web app that is correct: every pod is identical, so any pod is as good as any other.</p>
+
+<p>LLM replicas are <strong>not</strong> identical, even when they run the same model image. Each replica carries hidden state that makes it better or worse for <em>this specific</em> request:</p>
+
+<div class="mini-flow">
+<div class="step"><span class="n">→</span><strong>prefix cache state</strong> → a replica that already processed this prompt's prefix can skip recomputing it (cheap prefill, low TTFT)</div>
+<div class="step"><span class="n">→</span><strong>loaded LoRA adapters</strong> → a replica with the requested <abbr title="Low-Rank Adaptation: small fine-tuning weight deltas swapped onto a base model so one server can serve many fine-tunes">LoRA</abbr> already resident answers immediately; another must fetch and load it on the hot path</div>
+<div class="step"><span class="n">→</span><strong>queue depth and KV pressure</strong> → a replica whose KV cache is near full will queue or preempt the request; an emptier one will not</div>
+<div class="step"><span class="n">→</span><strong>readiness</strong> → a freshly scaled-up replica may be live on the network but still loading weights into HBM, so it serves errors or 30 s TTFTs</div>
 </div>
 
+<p>The mental model: <strong>an LLM router is a scheduler above the scheduler.</strong> The Kubernetes scheduler decides where pods <em>live</em>; the router decides which warm model, cache state, adapter, and queue should <em>absorb the next request</em>. It is the smallest piece of machinery that turns a flat pool of "identical" replicas into a fleet whose differences you can exploit. The cost is that routing becomes stateful and policy-heavy — fairness, cache locality, and latency can pull in different directions — which is exactly why the rest of this lesson is about choosing the right signal for each decision.</p>
 
-        <h2>Linear Story</h2>
-        <p>Generic autoscaling says: more requests, add pods. GenAI autoscaling says: more tokens, longer prompts, deeper queues, hotter adapters, colder caches, or saturated GPUs may require different actions. The book's routing chapter is important because the router is no longer a blind load balancer. It is a model-aware scheduler above Kubernetes scheduling.</p>
-        <pre class="ascii">request metadata
-  model/adaptor/prompt length/prefix/user policy
-        |
-        v
-AI gateway/router -> choose warm endpoint, cache locality, queue, policy</pre>
-        <p>A router can preserve prefix-cache locality, send LoRA requests to replicas where the adapter is already loaded, enforce tenant policy, shape traffic during rollout, and expose token-aware metrics. The cost is that routing becomes stateful and policy-heavy. Fairness, locality, and latency can conflict.</p>
-        <h2>Scaling Signals</h2>
-        <p>CPU is often a weak signal for LLM serving. Better signals include request queue time, active sequences, prompt tokens per second, output tokens per second, TTFT, TPOT, GPU utilization, HBM/KV pressure, and model load state. Scale-up must consider cold start: a new replica that needs minutes to fetch weights cannot immediately save a latency incident.</p>
-        <table class="trade-table"><thead><tr><th>Routing goal</th><th>Benefit</th><th>Trade-off</th></tr></thead><tbody>
-          <tr><td>Least queue</td><td>Simple latency balancing</td><td>May destroy cache locality</td></tr>
-          <tr><td>Prefix locality</td><td>Lower prefill cost</td><td>Can create uneven load</td></tr>
-          <tr><td>Adapter locality</td><td>Avoids LoRA load on hot path</td><td>Requires adapter inventory state</td></tr>
-          <tr><td>Tenant isolation</td><td>Clear policy and quota</td><td>May reduce utilization</td></tr>
-        </tbody></table>
-        <h2>Gateway Boundary</h2>
-        <p>An AI gateway is a useful boundary for authentication, rate limits, model selection, prompt logging policy, request shaping, and rollout control. Keep the boundary honest: the gateway should not hide runtime metrics, and runtime endpoints should still be observable directly during incidents.</p>
-        <h2>Gateway API Inference Extension</h2>
-        <p>The book's "API gateway to AI gateway" move becomes concrete in the Gateway API Inference Extension. The important API idea is <code>InferencePool</code>: instead of treating a Service as a flat set of pods, the gateway can treat an inference pool as a backend with an endpoint picker. The endpoint picker can look at inference-specific signals such as queue length, KV-cache utilization, active LoRA adapters, and model-server readiness before choosing a backend. This is the missing control loop in generic L7 routing.</p>
-        <p>The trade-off is a new failure mode: the endpoint picker itself is now on the request path or near it. Policies such as fail-open versus fail-close become product decisions. Fail-open protects availability but may route poorly during overload. Fail-close protects correctness and overload boundaries but can drop requests if the picker is unavailable. That is why the gateway belongs in observability and incident drills, not only in networking diagrams.</p>
+<h2>2 · Why a CPU HPA fails — scale on what binds</h2>
 
+<p>The default autoscaler is the <strong>HorizontalPodAutoscaler (HPA)</strong> driving on CPU utilization: when average pod CPU crosses, say, 70%, add a replica. This is the single most common mis-configuration in LLM serving, and it fails in <em>both</em> directions.</p>
 
-<h2>Mental Model</h2>
-<p>An LLM router is a scheduler above the scheduler. It chooses which warm model, cache state, adapter, and queue should absorb the next request.</p>
+<p>The reason is structural. LLM inference is bound by the GPU and by GPU memory bandwidth, not by the host CPU. A model server can have its GPU pinned at 100% — every streaming multiprocessor busy doing matrix multiplies, the KV cache full, requests piling up in the queue — while the host CPU, whose only job is to copy bytes and dispatch CUDA kernels, sits at 15%. The HPA looks at 15% CPU, concludes the pod is idle, and refuses to scale. Meanwhile <abbr title="time to first token">TTFT</abbr> is climbing because requests are waiting in the queue. Worse, on a quiet day the CPU can briefly spike on tokenization and trick the HPA into scaling <em>up</em> when the GPU is nearly idle, wasting an expensive accelerator. <strong>CPU is uncorrelated with the resource that actually binds.</strong></p>
 
-<h2>Operational Checklist</h2>
-<ul>
-<li>Scale on token throughput, queue time, and GPU saturation rather than raw HTTP requests.</li>
-<li>Route repeated prefixes to replicas with cache locality when the runtime can exploit it.</li>
-<li>Keep LoRA/adapters warm and route by adapter residency to avoid loading on the hot path.</li>
-<li>Use an AI gateway boundary for auth, rate limits, prompt logging policy, and model selection.</li>
+<p>Scale on the signals that bind LLM serving instead. None is universally best; they trade responsiveness against stability:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">CPU utilization (the default — avoid)</div><div class="v">Cheap and built-in, but uncorrelated with GPU load. Idle-looking CPU while the GPU queue saturates; spurious scale-ups on tokenization spikes. Almost never the right primary signal for LLM serving.</div></div>
+  <div class="topic-card"><div class="k">Requests in flight / RPS</div><div class="v">Better than CPU, but an LLM request is not a unit of work — a 50-token prompt and a 6,000-token prompt count the same. Underscales on long contexts, overscales on bursts of trivial requests.</div></div>
+  <div class="topic-card"><div class="k">Token throughput (prompt + output tokens/s)</div><div class="v">The honest unit of GPU work. Captures that long prompts and long generations cost more. The recommended primary scaling signal; needs the runtime to export per-replica token counters.</div></div>
+  <div class="topic-card"><div class="k">Queue time / pending requests</div><div class="v">A direct proxy for "users are waiting." Rising queue time is the earliest SLO-relevant symptom. Excellent scale-up trigger; pair with throughput so you do not thrash on momentary bursts.</div></div>
+  <div class="topic-card"><div class="k">GPU saturation + KV-cache utilization</div><div class="v">Closest to the physical bottleneck: GPU SM busy-% and how full the KV cache is. When KV is &gt;90% the replica is about to queue or preempt. Best paired with a queue-time trigger to act before SLOs break.</div></div>
+</div>
+
+<p>In practice a robust policy scales up on <em>queue time</em> or <em>KV-cache pressure</em> (early warning) and uses <em>token throughput</em> to size the steady-state replica count, while never trusting CPU. Custom and external metrics reach the HPA through the Kubernetes <code>custom.metrics.k8s.io</code> API, fed by an adapter such as Prometheus Adapter or KEDA scraping the runtime's <code>/metrics</code> endpoint.</p>
+
+<div class="callout warn"><div class="label">Scale-up is not instant — the cold-replica trap</div>
+Adding a replica is not adding a web pod. A new LLM replica must be scheduled onto a GPU node (possibly triggering a cluster-autoscaler node that takes minutes to boot), pull a multi-GB image, then load tens of GB of weights from storage into <abbr title="High-Bandwidth Memory: the GPU's on-package memory where weights and the KV cache live">HBM</abbr>. From "HPA decided to scale" to "replica can serve a token" is routinely 60 s to several minutes. A replica that is network-reachable but not finished loading is <em>worse than absent</em>: if it accepts traffic it returns errors or multi-second TTFTs precisely during the overload that triggered the scale-up. The fix is <strong>readiness gating</strong> — the model server must fail its Kubernetes readiness probe until weights are fully loaded, so the Service and router exclude it until it can actually serve.</p></div>
+
+<h2>3 · Cache-aware routing — the worked number</h2>
+
+<p>Here is where random load balancing does real damage. Recall from lesson 08 that prefill (processing the prompt) is compute-heavy, and that a runtime keeps a <strong>prefix cache</strong>: if a new prompt shares a leading prefix with one it already processed — a shared system prompt, a few-shot preamble, a conversation history — the replica reuses the cached KV state for that prefix and skips recomputing it. A prefix-cache hit can cut prefill compute and TTFT for that request to near zero.</p>
+
+<p>But the prefix cache is <em>local to each replica</em>. Replica A's cache does not help a request that lands on replica B. So the routing decision directly determines your hit rate. Random balancing scatters requests that <em>could</em> have hit a warm prefix across the whole fleet, where most land on a replica that never saw that prefix — a miss. <strong>Cache-aware routing</strong> instead sends requests that share a prefix to the <em>same</em> replica, concentrating hits.</p>
+
+<div class="callout"><div class="label">Worked number — random vs. cache-aware across 8 replicas</div>
+Suppose 70% of your traffic is <em>prefix-shareable</em> — those requests fall into a handful of common prefixes (a shared system prompt, a popular few-shot template). You run a pool of <span class="math">R = 8</span> replicas.<br><br>
+<strong>Random routing.</strong> A shareable request only hits the cache if it happens to land on the replica that last served its prefix. With random spray across 8 replicas, the chance the matching prefix is warm on the chosen replica is roughly <span class="math">1/R = 1/8 ≈ 12.5%</span>. So the effective prefix-cache hit rate on shareable traffic is about <span class="math">12.5%</span>, and the overall hit rate is about <span class="math">0.70 × 12.5% ≈ 9%</span> — call it ~10%. Ninety percent of the prefill work you <em>could</em> have skipped, you redo.<br><br>
+<strong>Cache-aware routing.</strong> Now route by prefix: all requests sharing a given prefix go to the replica that owns it. Shareable requests now hit a warm cache nearly every time — say <span class="math">~80%</span> after accounting for evictions and the first (cold) request that warms each prefix. Overall hit rate jumps to about <span class="math">0.70 × 80% ≈ 56%</span>, and on the shareable slice specifically it is ~80% vs. ~10%.<br><br>
+<strong>What it buys.</strong> Prefill compute and TTFT for a cache hit are near zero, so a ~70-percentage-point lift in hit rate on the shareable slice cuts prefill work on that slice by roughly the same proportion. If prefill is half of your total GPU compute, you have freed a large fraction of it — meaning either lower TTFT at the same load or the same TTFT on fewer replicas. The arithmetic is just <span class="math">hit_rate ≈ shareable% × P(prefix is warm on the chosen replica)</span>, and routing is the term you control.</p></div>
+
+<p>The widget below lets you drag the two knobs — number of replicas and the shareable fraction — and watch random vs. cache-aware hit rate diverge. The gap <em>widens</em> as you add replicas, because random's <span class="math">1/R</span> term shrinks while cache-aware does not depend on <span class="math">R</span> at all.</p>
+
+<div class="widget" id="cache-widget">
+  <div class="title">Cache-aware vs. random routing — prefix-cache hit rate</div>
+  <div class="hint">Two bars: the <strong>green</strong> bar is the overall prefix-cache hit rate under <strong>cache-aware</strong> routing (send shared prefixes to the same replica); the <strong>red</strong> bar is the same fleet under <strong>random</strong> routing, where a shareable request only hits if it lands on the one warm replica (<span class="math">1/R</span>). Drag the replica count and the shareable fraction. Notice random collapses as you add replicas, while cache-aware barely moves.</div>
+
+  <canvas class="dist-canvas" id="cache-canvas" width="760" height="220" style="height:220px;"></canvas>
+
+  <div class="controls" style="margin-top: 12px;">
+    <label class="inline">replicas R: <input type="range" id="cw-r" min="2" max="32" step="1" value="8"> <span class="val" id="cw-r-val">8</span></label>
+    <label class="inline">prefix-shareable traffic: <input type="range" id="cw-s" min="0" max="100" step="5" value="70"> <span class="val" id="cw-s-val">70%</span></label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">Cache-aware hit rate</div><div class="v" id="cw-k-aware">—</div></div>
+    <div class="kpi"><div class="k">Random hit rate</div><div class="v" id="cw-k-rand">—</div></div>
+    <div class="kpi"><div class="k">Prefill compute saved (cache-aware)</div><div class="v" id="cw-k-save">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">Show the core JS</summary>
+<pre><code>// shareable fraction s, replica count R, warm-when-aware ~0.80
+const awareHit  = s * 0.80;            // shared prefixes pinned to one replica
+const randomHit = s * (1 / R);         // shareable only hits if it lands on the warm replica
+// prefill on a hit is ~free; if prefill is ~half of GPU compute,
+// compute saved ≈ 0.5 * hitRate.</code></pre>
+  </details>
+</div>
+
+<h2>4 · LoRA-aware routing, the AI gateway, and a K8s-native standard</h2>
+
+<p><strong>LoRA-aware routing.</strong> The same locality logic applies to fine-tunes. A <abbr title="Low-Rank Adaptation">LoRA</abbr> adapter is a small set of weight deltas (often tens to a few hundred MB) layered on a shared base model, so one server can serve many fine-tunes by swapping adapters. But swapping an adapter that is not resident means fetching and loading it — adding latency on the request's hot path and a burst of memory traffic. <strong>LoRA-aware routing</strong> keeps a live inventory of which adapters are warm on which replicas and routes a request for adapter <code>X</code> to a replica that already has <code>X</code> loaded. The trade-off mirrors cache-aware routing: you gain locality at the cost of maintaining adapter-residency state and accepting less perfectly even load.</p>
+
+<p><strong>The AI gateway.</strong> All of this — auth, rate limits, prompt-logging policy, model selection, traffic shaping during a rollout — wants a single boundary in front of the pools. That boundary is the <strong>AI gateway</strong>: the place where a request is authenticated, checked against a tenant's quota, tagged with the model/adapter it is asking for, logged according to policy, and then handed to the router. Keep the boundary honest: the gateway must not <em>hide</em> runtime metrics, and the model-server endpoints must remain directly observable during an incident — otherwise the gateway becomes a blindfold exactly when you need to see.</p>
+
+<p><strong>Gateway API Inference Extension.</strong> In 2026 the K8s-native standard for this is the <a href="https://gateway-api-inference-extension.sigs.k8s.io/">Gateway API Inference Extension</a>. Its central idea is the <code>InferencePool</code>: instead of treating a <code>Service</code> as a flat set of interchangeable pods, the gateway treats an inference pool as a backend that has an <strong>endpoint picker</strong> (EPP). The picker looks at inference-specific signals — queue length, KV-cache utilization, which LoRA adapters are active on each replica, and model-server readiness — before choosing the backend. That is precisely the cache-aware / LoRA-aware / readiness logic of this lesson, lifted into a standard API rather than re-implemented per team.</p>
+
+<div class="callout warn"><div class="label">The picker is now on the request path</div>
+Making routing smart introduces a new failure surface: the endpoint picker itself sits on (or beside) every request. So <strong>fail-open vs. fail-close</strong> becomes a product decision. Fail-open (route somewhere, anywhere, if the picker is unavailable) protects availability but may route blindly during overload. Fail-close (reject if the picker cannot decide) protects correctness and overload boundaries but drops requests when the picker is down. Either way, the picker belongs in your observability and incident drills, not just in the networking diagram.</p></div>
+
+<h2>5 · Failure modes and the implementation checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+<li><strong>CPU HPA while the GPU queue is saturated.</strong> The classic. CPU reads 15%, the HPA refuses to scale, but TTFT is climbing because requests queue on a pinned GPU. <em>Signal:</em> rising queue time and KV-cache utilization with flat CPU and flat replica count. Scale on tokens/queue-time, not CPU.</li>
+<li><strong>Random load balancing destroys prefix-cache hit rate.</strong> Shareable requests scatter across the fleet and miss warm prefixes, redoing prefill that could have been free. <em>Signal:</em> per-replica prefix-cache hit rate near <span class="math">1/R</span> instead of the runtime's achievable hit rate; prefill compute far above what the shareable fraction predicts.</li>
+<li><strong>Cold replicas accept traffic before weights load.</strong> A scaled-up replica is network-reachable but still loading into HBM, so it serves errors or 30 s TTFTs during the very incident that triggered scale-up. <em>Signal:</em> an error/TTFT spike that starts the moment a new pod goes Ready and decays as it warms. Gate readiness on weight-load completion.</li>
+<li><strong>LoRA loaded on the hot path.</strong> A request for an adapter routes to a replica that does not have it; the adapter loads inline, spiking that request's latency. <em>Signal:</em> bimodal TTFT per adapter — fast on warm replicas, slow on cold ones. Route by adapter residency.</li>
+<li><strong>The gateway becomes a blindfold.</strong> All metrics flow through the gateway, so when it degrades you lose both routing <em>and</em> the ability to see the runtime behind it. <em>Signal:</em> an incident where you cannot tell whether the model servers or the gateway are at fault. Keep runtime endpoints directly observable.</li>
 </ul>
-
-<h2>Failure Modes</h2>
-<ul>
-<li>HPA scales on CPU while the GPU queue is saturated.</li>
-<li>Random load balancing destroys prefix-cache hit rate.</li>
-<li>Scale-up creates cold replicas that accept traffic before model load completes.</li>
+  </div>
+  <div class="lesson-card"><h3>Implementation checklist</h3><ul>
+<li>Is scaling driven by <strong>token throughput, queue time, or GPU/KV saturation</strong> — never raw CPU or undifferentiated HTTP request count?</li>
+<li>Does the model server <strong>fail its readiness probe until weights are fully loaded</strong>, so cold replicas are excluded from routing?</li>
+<li>When the runtime can exploit a prefix cache, does the router <strong>send shared prefixes to the same replica</strong> rather than spraying at random?</li>
+<li>Are <strong>LoRA adapters kept warm</strong> and requests routed by <strong>adapter residency</strong> so adapters never load on the hot path?</li>
+<li>Is there an <strong>AI-gateway boundary</strong> owning auth, rate limits, prompt-logging policy, and model selection — without hiding runtime metrics?</li>
+<li>Is the routing layer (e.g. an <code>InferencePool</code> endpoint picker) on a defined <strong>fail-open / fail-close</strong> policy and exercised in incident drills?</li>
+<li>Does scale-up account for the <strong>minutes-long cold start</strong> (image pull + weight load + possible node boot) so the autoscaler triggers early enough to matter?</li>
 </ul>
+  </div>
+</div>
 
-<h2>Cross-Links</h2>
-<ul>
-<li><a href="https://gateway-api-inference-extension.sigs.k8s.io/">Gateway API Inference Extension</a></li>
-<li><a href="../../sglang/lessons/05_cache_aware_scheduling.html">SGLang cache-aware scheduling</a></li>
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>You serve one base model with three LoRA fine-tunes across 6 replicas; 60% of traffic shares a common system-prompt prefix and is split unevenly across the three adapters. Design the routing + scaling policy: (1) name the <em>primary</em> scale-up signal and a second signal that sizes steady-state replica count; (2) state how you keep prefix-cache hit rate high <em>and</em> avoid loading an adapter on the hot path, and where those two goals conflict; (3) define the readiness gate and the fail-open/fail-close choice for the endpoint picker. Then estimate the random vs. cache-aware hit rate for the shareable slice using <span class="math">s × (1/R)</span> vs. <span class="math">s × 0.8</span>.</div>
+
+<h2>Where this points next</h2>
+
+<p>Cache-aware and LoRA-aware routing both rest on a hidden assumption: that a single replica does <em>both</em> prefill (compute-bound) and decode (memory-bandwidth-bound), so "warm prefix on this replica" is a meaningful, stable property. But those two phases stress the GPU so differently that the next architectural move is to split them onto <em>separate</em> pools — a prefill tier and a decode tier — and stream the KV cache between them. That changes everything about routing and scaling: you now scale and route each tier on its own bottleneck, and the cache locality you just learned to exploit becomes a thing you ship across the network. Lesson 10, <a href="10_disaggregated_serving.html">Disaggregated Serving</a>, builds that prefill/decode split and the KV-transfer machinery it requires. (For a deeper look at how a runtime actually implements the cache-aware scheduling this lesson routes toward, see <a href="../../sglang/lessons/05_cache_aware_scheduling.html">SGLang cache-aware scheduling</a>.)</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+An LLM router is a scheduler above the Kubernetes scheduler: it chooses which warm model, cache state, adapter, and queue absorbs the next request, because LLM replicas are not interchangeable. Scale on what binds — <strong>token throughput, queue time, GPU/KV saturation</strong> — never CPU, which reads idle while the GPU queue saturates, and gate readiness so cold replicas (minutes to load weights) never take traffic. Route on locality: <strong>cache-aware</strong> routing sends shared prefixes to the same replica, lifting hit rate from ~<span class="math">1/R</span> under random toward the runtime's achievable ~80% and cutting prefill compute proportionally; <strong>LoRA-aware</strong> routing keeps adapters off the hot path. An <strong>AI gateway</strong> owns auth, rate limits, prompt-logging, and model selection, and the <strong>Gateway API Inference Extension</strong>'s <code>InferencePool</code> + endpoint picker is the K8s-native standard that turns all of this into one API — at the price of a new failure surface that needs a fail-open/fail-close policy and a place in your incident drills.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why does a CPU-based HPA fail for LLM serving, and what do you scale on instead? <em>(§2 — LLM inference is GPU/HBM-bound, not CPU-bound, so CPU reads idle while the GPU queue saturates and TTFT climbs; scale on token throughput, queue time, and GPU/KV saturation, exported via custom/external metrics.)</em></li>
+  <li>Why is random load balancing harmful for LLMs when it is correct for a stateless web app? <em>(§1, §3 — LLM replicas carry hidden per-replica state — prefix cache, loaded adapters, queue/KV pressure — so they are not interchangeable; random spray scatters shareable prefixes and drops the hit rate to ~1/R.)</em></li>
+  <li>Work the cache-aware vs. random hit-rate number for 8 replicas and 70% shareable traffic. <em>(§3 — random ≈ 0.70 × 1/8 ≈ 9%; cache-aware ≈ 0.70 × 80% ≈ 56%; the shareable slice goes from ~10% to ~80% hit rate, cutting prefill compute on that slice proportionally.)</em></li>
+  <li>What is the cold-replica trap and how do you prevent it? <em>(§2 — a scaled-up replica is network-reachable before weights finish loading into HBM, so it serves errors/30 s TTFTs during the overload that triggered it; gate the readiness probe on weight-load completion so the Service/router excludes it.)</em></li>
+  <li>What is LoRA-aware routing and what does it cost? <em>(§4 — keep an inventory of which adapters are warm on which replicas and route adapter X to a replica that already has X, avoiding an on-path load; the cost is maintaining adapter-residency state and accepting less even load.)</em></li>
+  <li>What does the Gateway API Inference Extension add over a normal Service? <em>(§4 — an InferencePool backend with an endpoint picker that routes on inference signals — queue length, KV utilization, active LoRA adapters, readiness — making cache/LoRA/readiness-aware routing a standard API instead of a per-team hack.)</em></li>
+  <li>Why is the endpoint picker a fail-open/fail-close decision? <em>(§4 — the picker is on the request path, so if it is unavailable you must choose: fail-open routes blindly to protect availability, fail-close rejects to protect correctness/overload boundaries; either way it belongs in observability and incident drills.)</em></li>
 </ul>
-
-<h2>Takeaway And Interview Prompts</h2>
-<p><strong>Takeaway:</strong> An LLM router is a scheduler above the scheduler. It chooses which warm model, cache state, adapter, and queue should absorb the next request.</p>
-<ol>
-  <li>Draw the system boundary for <strong>Autoscaling and AI-Aware Routing</strong>. Which resource or policy binds first?</li>
-  <li>Pick two designs from this lesson. What does each optimize, and what does each make worse?</li>
-  <li>Design an incident around this failure mode: HPA scales on CPU while the GPU queue is saturated. What metric, log, or trace would reveal it?</li>
-</ol>
 
 <footer class="lesson-nav">
   <a href="08_benchmarking_runtime_tuning.html"><span class="dir">Previous</span><span class="ttl">08 - Benchmarking and Runtime Tuning</span></a>
   <a class="next" href="10_disaggregated_serving.html"><span class="dir">Next</span><span class="ttl">10 - Disaggregated Serving</span></a>
 </footer>
+
 </main>
+
+<script>
+(function(){
+  var canvas = document.getElementById('cache-canvas');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+
+  var rRng = document.getElementById('cw-r');
+  var sRng = document.getElementById('cw-s');
+  var rVal = document.getElementById('cw-r-val');
+  var sVal = document.getElementById('cw-s-val');
+  var kAware = document.getElementById('cw-k-aware');
+  var kRand  = document.getElementById('cw-k-rand');
+  var kSave  = document.getElementById('cw-k-save');
+
+  var WARM = 0.80; // achievable hit rate on shareable traffic when prefixes are pinned
+
+  function render(){
+    var R = parseInt(rRng.value, 10);
+    var s = parseInt(sRng.value, 10) / 100;
+    var awareHit  = s * WARM;
+    var randomHit = s * (1 / R);
+
+    var dpr = window.devicePixelRatio || 1;
+    var W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== Math.round(W*dpr)){ canvas.width = Math.round(W*dpr); canvas.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    var padX = 60, padTop = 22, padBot = 34;
+    var plotH = H - padTop - padBot;
+    var baseY = H - padBot;
+
+    // y axis grid (0..100%)
+    ctx.strokeStyle = '#e2e8f0'; ctx.lineWidth = 1;
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    for (var g=0; g<=100; g+=25){
+      var gy = baseY - (g/100)*plotH;
+      ctx.beginPath(); ctx.moveTo(padX, gy); ctx.lineTo(W-20, gy); ctx.stroke();
+      ctx.fillText(g + '%', 22, gy+4);
+    }
+
+    var bars = [
+      { label: 'cache-aware', v: awareHit, color: '#16a34a' },
+      { label: 'random',      v: randomHit, color: '#dc2626' }
+    ];
+    var slot = (W - padX - 20) / bars.length;
+    var bw = Math.min(140, slot*0.5);
+    for (var i=0;i<bars.length;i++){
+      var b = bars[i];
+      var cx = padX + slot*(i+0.5);
+      var h = b.v * plotH;
+      ctx.fillStyle = b.color;
+      ctx.fillRect(cx - bw/2, baseY - h, bw, h);
+      ctx.fillStyle = '#1f2937'; ctx.font = '13px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText((b.v*100).toFixed(0) + '%', cx, baseY - h - 8);
+      ctx.fillStyle = '#5b6573'; ctx.font = '12px monospace';
+      ctx.fillText(b.label, cx, baseY + 18);
+      ctx.textAlign = 'start';
+    }
+
+    rVal.textContent = R;
+    sVal.textContent = (s*100).toFixed(0) + '%';
+    kAware.textContent = (awareHit*100).toFixed(0) + '%';
+    kRand.textContent  = (randomHit*100).toFixed(0) + '%';
+    // prefill ~half of compute; saved fraction of total compute = 0.5 * hitRate
+    kSave.textContent  = '~' + (0.5*awareHit*100).toFixed(0) + '% of total GPU compute';
+  }
+
+  rRng.addEventListener('input', render);
+  sRng.addEventListener('input', render);
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
 </body>
 </html>

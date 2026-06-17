@@ -5,79 +5,270 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>06 - GPU Nodes as a Platform Layer | Generative AI on Kubernetes</title>
 <link rel="stylesheet" href="style.css">
+<style>
+  .kicker { margin: 0 0 8px; font-family: var(--mono); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-mute); }
+  .source-note { border-left-color: var(--accent-2); }
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; }
+  .mini-flow { display: grid; gap: 8px; margin: 18px 0; }
+  .mini-flow .step { border: 1px solid var(--border); background: var(--bg-elev); border-radius: 8px; padding: 10px 12px; }
+  .mini-flow .n { font-family: var(--mono); color: var(--accent); font-size: 12px; margin-right: 6px; }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
 </head>
 <body>
 <header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">kubernetes_genai</a><span class="crumb">/</span><span class="crumb">06</span><span class="step-pill">lesson 6 / 18</span></div></header>
 <main>
+
 <p class="kicker">Part II - GPU platform</p>
 <h1>GPU Nodes as a Platform Layer</h1>
-<p class="subtitle">Node Feature Discovery, GPU Feature Discovery, device plugins, NVIDIA GPU Operator, MIG, time slicing, and DRA.</p>
+<p class="subtitle">Lesson 05 got the model weights into the pod — the multi-gigabyte tensors are now sitting on a volume the container can read. But weights are inert without a chip to run them on, and a freshly provisioned GPU node does <em>not</em> announce itself to Kubernetes the way a CPU does. Plain Kubernetes counts CPU and memory natively; it has no built-in idea of what a GPU is, how many a node has, or whether one is already in use. This lesson is about the platform plumbing that turns a bare GPU box into a node the scheduler can target — and the sharing modes that decide whether one physical card serves one tenant or seven. Get this layer wrong and your pod lands on a GPU node, starts, and then fails the moment it asks for CUDA.</p>
 
-<div class="callout source-note"><div class="label">Source coverage</div>PDF Chapter 3: Kubernetes and GPUs; refreshed with current DRA status.</div>
-<div class="callout"><div class="label">Learning objective</div>Understand how GPUs become schedulable Kubernetes resources and what the platform must install before an LLM pod can use one.</div>
+<div class="callout source-note"><div class="label">Source coverage</div>PDF Chapter 3: Kubernetes and GPUs; refreshed with current DRA status (Kubernetes v1.36 era, 2026).</div>
 
-<h2>Linear Position</h2>
-<div class="position-grid">
-  <div><strong>Prerequisite</strong><span>Builds on <a href="05_model_weights_into_pods.html">05 - Getting Model Weights Into Pods</a>.</span></div>
-  <div><strong>New capability</strong><span>Understand how GPUs become schedulable Kubernetes resources and what the platform must install before an LLM pod can use one.</span></div>
-  <div><strong>Next dependency</strong><span>Prepares <a href="07_multi_gpu_topology.html">07 - Multi-GPU Inference and Topology</a>.</span></div>
+<div class="callout"><div class="label">Linear position</div><strong>Prerequisite:</strong> Lesson 05 (Getting model weights into pods) — the weights are reachable inside the container, but nothing yet guarantees the container can see a GPU device. You also know basic Kubernetes scheduling: a pod requests resources, the scheduler finds a node that has them.<br><strong>New capability:</strong> Understand how a GPU becomes a <em>schedulable Kubernetes resource</em> — the driver/discovery/plugin stack the platform must install first — and how to choose a sharing mode (whole-GPU, MIG, time-slicing, DRA) by trading isolation against utilization.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Five moves. (1) Establish the mental model: a GPU is not a number, it is a <em>stack</em> of layers that each must be present before a pod can use the chip. (2) Walk that stack as a pipeline — hardware to driver to discovery to plugin/DRA to scheduler to pod visibility — defining each component at first use and showing how the NVIDIA GPU Operator installs the whole thing as platform code. (3) Make the resource model concrete with a pod spec requesting <code>nvidia.com/gpu: 1</code>, and show exactly what information that single number throws away. (4) Compare the four sharing/isolation modes with a worked utilization example and an interactive packing widget. (5) Failure modes, a platform checklist, and the hand-off to multi-GPU topology.</p></div>
+
+<h2>1 · The GPU is a stack, not a count</h2>
+
+<p>When you write <code>resources: { limits: { cpu: "2" } }</code>, Kubernetes already understands CPU intimately — the kubelet measures it, cgroups enforce it, the scheduler bin-packs it. A GPU gets none of this for free. The kernel does not know how to talk to the card without a vendor driver; the container runtime does not know how to expose the device files; and the Kubernetes scheduler has no field called "GPU" at all. Every one of those gaps is filled by a separate piece of software, and if any layer is missing the symptom is the same maddening one: the pod schedules fine and then cannot find a GPU.</p>
+
+<p>So the mental model to carry through this lesson is: <strong>a GPU is a stack.</strong> Driver, runtime, device plugin (or DRA driver), node labels, topology, isolation mode, telemetry, and scheduling policy — each is a distinct layer, and "the GPU works" means all of them are present and agree. The book's Chapter 3 walks this stack precisely because most "my GPU pod doesn't work" incidents are platform incidents, not model incidents. The fix lives below the model server, not in it.</p>
+
+<div class="callout"><div class="label">Why "GPU: 1" is the wrong unit</div>
+A CPU core is roughly fungible — two cores on a node are interchangeable. A GPU is not. An H100 with 80 GB of HBM (High Bandwidth Memory — the on-package memory where model weights and the KV cache live) is a completely different resource from an L4 with 24 GB, yet a naive cluster advertises both as "1 GPU." Worse, two GPUs in the <em>same</em> node may or may not share a fast NVLink interconnect, which changes multi-GPU performance by an order of magnitude (lesson 07). Counting GPUs loses memory size, generation, isolation mode, and topology — all the things that actually determine whether your model fits and runs fast.</div>
+
+<h2>2 · The platform stack, layer by layer</h2>
+
+<p>Here is the full pipeline a request for a GPU traverses, from silicon to a process that can call CUDA. Each stage is a real component you install or rely on; the names matter because each is a separate failure point.</p>
+
+<div class="lesson-flow">
+  <div><strong>1 · Hardware</strong><span>The physical GPU on a node — e.g. an NVIDIA H100. Present but invisible to software until a driver loads.</span></div>
+  <div><strong>2 · Driver + runtime</strong><span>The kernel-mode NVIDIA driver, the CUDA libraries, and the <em>container toolkit</em> that injects device files (<code>/dev/nvidia*</code>) and libraries into containers. Without this the chip is dark.</span></div>
+  <div><strong>3 · Discovery</strong><span>Node Feature Discovery (NFD) and GPU Feature Discovery (GFD) inspect the node and write Kubernetes <em>labels</em> advertising what is there: GPU type, count, driver version, MIG state, topology.</span></div>
+  <div><strong>4 · Device plugin OR DRA driver</strong><span>The piece that registers the GPU with the kubelet as an allocatable resource. The classic <em>device plugin</em> advertises a count like <code>nvidia.com/gpu</code>; the newer <em>DRA driver</em> exposes claim-based requests (move 4).</span></div>
+  <div><strong>5 · Scheduler resource model</strong><span>The scheduler now sees a node offering <code>nvidia.com/gpu: 8</code> (or named MIG profiles, or DRA device classes) and matches pod requests to nodes that have free units.</span></div>
+  <div><strong>6 · Pod device visibility</strong><span>The pod lands, the runtime mounts the device, and the process inside finally sees a GPU when it calls <code>nvidia-smi</code> or initializes CUDA.</span></div>
 </div>
 
+<p>Two of these names deserve a sharper definition at first use. <strong>Node Feature Discovery (NFD)</strong> is a Kubernetes add-on that detects hardware and system features on each node and exposes them as node labels; <strong>GPU Feature Discovery (GFD)</strong> is the GPU-specific companion that adds labels like <code>nvidia.com/gpu.product=H100</code>, <code>nvidia.com/gpu.memory=81920</code>, and <code>nvidia.com/mig.strategy</code>. A <strong>device plugin</strong> is the kubelet extension mechanism (a gRPC service) by which a vendor advertises non-CPU/memory resources; NVIDIA's device plugin is what makes <code>nvidia.com/gpu</code> a thing the scheduler can count and allocate.</p>
 
-<h2>Linear Story</h2>
-<p>A Kubernetes cluster does not automatically know what a GPU is. The node needs drivers and runtime libraries. Kubernetes needs a way to discover accelerator properties. The scheduler needs a resource model. The pod needs a request that can be matched to a device. The book's Chapter 3 walks this stack because most "my GPU pod does not work" incidents are not model incidents at all.</p>
-<pre class="ascii">hardware -> driver/runtime -> discovery -> device plugin or DRA -> scheduler -> pod device visibility</pre>
-<p>Node Feature Discovery and GPU Feature Discovery label what exists. Device plugins expose resources such as <code>nvidia.com/gpu</code>. The NVIDIA GPU Operator automates driver, toolkit, device plugin, monitoring, and related components through cluster policy. DRA moves the model toward explicit resource claims and richer device selection. The platform lesson is that "GPU: 1" is often too little information for serious AI workloads.</p>
-<h2>Sharing Is Not Free</h2>
-<p>MIG slices a GPU into hardware-isolated instances. Time slicing shares a device over time. Whole-GPU allocation gives simple isolation and predictable performance. DRA can express richer requests and allocation flows. The trade-off is utilization versus isolation. Sharing can lift utilization for small inference jobs, but it can also create noisy neighbors, ambiguous accounting, and surprising latency variance.</p>
-<table class="trade-table"><thead><tr><th>Mode</th><th>Best for</th><th>Question to ask</th></tr></thead><tbody>
-  <tr><td>Whole GPU</td><td>Large models and strict latency</td><td>Can we afford unused headroom?</td></tr>
-  <tr><td>MIG</td><td>Hard partitioning on supported GPUs</td><td>Do slice sizes match workload memory?</td></tr>
-  <tr><td>Time slicing</td><td>Small or bursty jobs</td><td>Can tenants tolerate jitter?</td></tr>
-  <tr><td>DRA claims</td><td>Richer accelerator requests</td><td>Are drivers and cluster version ready?</td></tr>
+<p>Installing and version-matching all six layers by hand on every node is exactly the "snowflake node" trap. The <strong>NVIDIA GPU Operator</strong> exists to collapse it: it is a Kubernetes Operator that installs and lifecycle-manages the driver, container toolkit, device plugin, NFD/GFD, and DCGM telemetry (move 5) from a single cluster-level configuration. The platform lesson is that this stack is <em>code</em> — a declarative policy you version and review — not a checklist someone runs once over SSH and forgets.</p>
+
+<div class="callout warn"><div class="label">The whole stack must agree on versions</div>
+The most common silent breakage is a driver/runtime mismatch: the kernel driver is one CUDA generation, the container toolkit injects libraries from another, and the model server crashes on a cryptic <code>CUDA error: forward compatibility</code>. Because the GPU Operator pins these together, version skew is the strongest argument for letting it own the stack rather than assembling layers à la carte.</div>
+
+<h2>3 · The resource model — and what a single number hides</h2>
+
+<p>With the device plugin in place, requesting a GPU looks deceptively like requesting CPU. Here is the canonical whole-GPU pod spec:</p>
+
+<pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: llm-server
+spec:
+  containers:
+  - name: vllm
+    image: vllm/vllm-openai:latest
+    resources:
+      limits:
+        nvidia.com/gpu: 1        # whole GPU; this pod owns the device
+</code></pre>
+
+<p>Note that GPUs are requested only as a <code>limit</code>, and the count is an integer — you cannot ask for "0.5 GPU" through the basic device plugin. The pod that gets <code>nvidia.com/gpu: 1</code> owns the entire physical device with full memory and compute isolation. Simple, but the scheduler made its decision knowing only the integer <code>1</code>. It did not know whether that GPU has 24 GB or 80 GB of HBM, nor whether the node's two GPUs are NVLink-connected. A 70B-parameter model in 16-bit needs roughly <span class="math">70 × 2 = 140 GB</span> of weights plus KV cache — it will not fit on one 80 GB card, but <code>nvidia.com/gpu: 1</code> happily schedules it anyway, and the pod OOMs at load time. The number was the wrong unit (move 1) made operational.</p>
+
+<p>Hardware partitioning gives the scheduler richer units. With <strong>MIG (Multi-Instance GPU)</strong> — NVIDIA's feature that splits one physical GPU into hardware-isolated slices — a single A100 can be carved into up to seven instances, each with its own dedicated memory and compute. Those slices are advertised as named resources, so a pod requests a <em>profile</em>:</p>
+
+<pre><code>    resources:
+      limits:
+        nvidia.com/mig-1g.10gb: 1   # one MIG slice: ~1/7 compute, 10 GB HBM
+</code></pre>
+
+<p>Now the resource name itself carries memory and compute size (<code>1g.10gb</code> = one compute slice, 10 GB), so the scheduler is no longer flying blind on capacity. That is the difference: <code>nvidia.com/gpu: 1</code> says "a GPU, somewhere"; <code>nvidia.com/mig-1g.10gb: 1</code> says "10 GB of isolated GPU." Topology — which GPUs are NVLink-adjacent — is still not in either request, which is the whole subject of lesson 07.</p>
+
+<h2>4 · Sharing modes — utilization against isolation</h2>
+
+<p>One H100 can cost on the order of <span class="math">$2–$4 / GPU-hour</span> on a cloud, so leaving it 15% utilized by a small model is burning money. Sharing modes exist to raise utilization — but every form of sharing trades away some isolation, and isolation is the assumption your tenants are quietly relying on. The four modes, defined at first use:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Whole GPU</div><div class="v">One pod owns the entire device. Full memory and compute isolation, predictable latency. Wastes headroom whenever the workload is smaller than the card. The safe default for large models and strict latency SLOs.</div></div>
+  <div class="topic-card"><div class="k">MIG (Multi-Instance GPU)</div><div class="v">Hardware partitions one GPU into up to 7 isolated instances, each with dedicated memory and compute. <strong>Real</strong> isolation — a noisy slice cannot starve its neighbors. Limited to supported GPUs (A100/H100 class) and fixed profile sizes.</div></div>
+  <div class="topic-card"><div class="k">Time slicing</div><div class="v">Software interleaving: multiple pods take turns on the same GPU. Raises utilization for bursty/low-load jobs and works on any GPU. <strong>No memory isolation</strong> — pods share HBM and can OOM each other; one heavy tenant adds latency jitter to the rest. Oversubscription, not partitioning.</div></div>
+  <div class="topic-card"><div class="k">DRA (Dynamic Resource Allocation)</div><div class="v">A claim-based request model: a pod files a <em>ResourceClaim</em> describing the device it needs (type, memory, sharing) and a DRA driver allocates it. More expressive than fixed counts. Progressing through Kubernetes — beta/maturing in 2026, not yet a drop-in for every driver.</div></div>
+</div>
+
+<p>The sharpest distinction to internalize: <strong>MIG isolates, time slicing does not.</strong> MIG draws hardware fences — separate memory controllers, separate compute partitions — so a misbehaving tenant in one slice physically cannot touch another's memory or steal its cycles. Time slicing just rotates the GPU's attention between processes that all see the <em>same</em> memory; it improves average utilization but provides zero protection, so a single pod that allocates too much HBM can crash every other pod on the device. Use time slicing for cooperative, low-stakes, bursty workloads; never use it where one tenant's bug must not become another tenant's outage.</p>
+
+<table class="trade-table"><thead><tr><th>Mode</th><th>Isolation</th><th>Best for</th><th>Risk</th></tr></thead><tbody>
+  <tr><td>Whole GPU</td><td>Full (own device)</td><td>Large models, strict latency SLOs</td><td>Low utilization on small jobs — paying for unused HBM/compute</td></tr>
+  <tr><td>MIG</td><td>Full (hardware slices)</td><td>Many medium jobs needing real isolation on A100/H100</td><td>Fixed profiles can mismatch workload memory; not on all GPUs</td></tr>
+  <tr><td>Time slicing</td><td>None (shared memory)</td><td>Bursty, cooperative, low-load inference</td><td>Noisy neighbors, OOM contagion, latency jitter, fuzzy accounting</td></tr>
+  <tr><td>DRA claims</td><td>Depends on claim</td><td>Expressive requests as the API matures</td><td>Driver/version readiness; operators must debug ResourceClaims</td></tr>
 </tbody></table>
-<h2>Debugging Order</h2>
-<p>When a GPU workload fails, debug bottom-up. Does the node see the device? Does the driver match the runtime? Did discovery label it? Did the plugin or DRA driver advertise it? Did the scheduler place the pod on a compatible node? Does the container see the device file and libraries? Only after that should you debug the model server.</p>
-<h2>Current Status Note</h2>
-<p>As of the Kubernetes docs checked for this update, the core DRA path has reached stable Kubernetes releases, with setup documentation marking DRA stable in the v1.35 line and later docs expanding the DRA surface. Treat that as "the API is no longer a research idea," not "every accelerator driver and every advanced sharing feature is production-ready in your cluster." For GPUs, the practical readiness question is still vendor driver support, scheduler integration, observability, and whether your operators know how to debug ResourceClaims when allocation fails.</p>
 
+<div class="callout"><div class="label">Worked number — packing small models onto one card</div>
+Say you serve a fleet of small 7B-parameter models, each needing about <span class="math">7 × 2 = 14 GB</span> of HBM at load plus a few GB of KV cache — call it ~16 GB working set. On one 80 GB H100: whole-GPU gives you <strong>1 tenant</strong> at maybe 18% memory use — wasteful. MIG with <code>3g.40gb</code>/<code>2g.20gb</code> profiles lets you place <strong>3–4 isolated tenants</strong>, each guaranteed its own ~20 GB and protected from the others, lifting utilization past 70% with no contagion risk. Time slicing could pack even more pods onto the raw 80 GB, but they all share that pool — five 16 GB tenants total 80 GB with zero slack, so one model loading a slightly larger checkpoint OOM-kills a neighbor, and request bursts collide into latency spikes. Same hardware, three very different risk profiles: the right choice is set by your isolation requirement, not by the maximum pod count.</div>
 
-<h2>Mental Model</h2>
-<p>The GPU is not just a resource count. It is a stack: driver, runtime, device plugin or DRA driver, node labels, topology, isolation mode, telemetry, and scheduling policy.</p>
+<div class="widget" id="pack-widget">
+  <div class="title">Packing tenants onto one 80 GB GPU — time slicing vs MIG</div>
+  <div class="hint">Pack <strong>N</strong> small-model tenants (each ~16 GB working set) onto one 80 GB H100. <strong>Time slicing</strong> drops them all into one shared 80 GB pool — go over capacity and they OOM each other, and contention rises with every extra tenant. <strong>MIG</strong> hands each tenant an isolated ~20 GB slice (max 4), so it refuses to overcommit and contention stays flat. Drag <strong>N</strong> and watch utilization climb while the isolation story diverges.</div>
 
-<h2>Operational Checklist</h2>
-<ul>
-<li>Install discovery so nodes advertise accelerator type, count, driver, MIG state, and topology.</li>
-<li>Choose between whole GPU, MIG, time slicing, or DRA-style claims based on isolation and utilization needs.</li>
-<li>Treat GPU Operator configuration as platform code, not snowflake node setup.</li>
-<li>Validate DCGM metrics and runtime visibility before admitting tenant workloads.</li>
+  <canvas class="dist-canvas" id="pack-canvas" width="760" height="220" style="height:220px;"></canvas>
+
+  <div class="controls" style="margin-top: 12px;">
+    <label class="inline">tenants N: <input type="range" id="pk-n" min="1" max="6" step="1" value="3"> <span class="val" id="pk-n-val">3</span></label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">Time slicing — HBM used</div><div class="v" id="pk-ts-mem">—</div></div>
+    <div class="kpi"><div class="k">Time slicing — status</div><div class="v" id="pk-ts-stat">—</div></div>
+    <div class="kpi"><div class="k">MIG — tenants placed</div><div class="v" id="pk-mig-n">—</div></div>
+    <div class="kpi"><div class="k">MIG — isolation</div><div class="v" id="pk-mig-iso">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">Show the core JS</summary>
+<pre><code>const HBM = 80, PER = 16, SLICE = 20, MIG_MAX = 4;
+// time slicing: one shared pool, OOM if demand exceeds capacity
+const tsMem = N * PER;
+const tsOOM = tsMem &gt; HBM;                 // no isolation -> overcommit kills pods
+// MIG: hard slices, scheduler refuses beyond capacity
+const migPlaced = Math.min(N, MIG_MAX);    // each tenant fenced into ~20 GB
+// MIG tenants are always isolated; time-slice tenants never are.</code></pre>
+  </details>
+</div>
+
+<p>DRA deserves an honest maturity note. <strong>DRA (Dynamic Resource Allocation)</strong> generalizes the rigid "count of named resources" model into <em>ResourceClaims</em>: a pod describes the device it wants (a GPU with at least 40 GB, or a specific sharing arrangement) and a DRA driver matches and allocates it, much like a PersistentVolumeClaim does for storage. It is the strategic direction for accelerators on Kubernetes, and the core API has graduated into stable Kubernetes releases (the v1.34–v1.36 line moved DRA forward substantially). But "the API is stable" is not "every vendor driver and every advanced sharing feature is production-ready in your cluster." In 2026 the practical readiness questions are still vendor driver support, scheduler integration, telemetry, and whether your on-call engineers know how to debug a ResourceClaim that fails to allocate. Adopt it deliberately; do not overstate it.</p>
+
+<h2>5 · Where this breaks and what to install</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+<li><strong>Pod schedules but cannot see the device.</strong> The driver stack is incomplete — driver, toolkit, or device plugin missing or version-skewed — so the pod starts and then fails on CUDA init. Signal: the pod is <code>Running</code> but <code>nvidia-smi</code> inside it errors, or the model server crashes with a CUDA forward-compatibility message while the node label says a GPU exists.</li>
+<li><strong>Sharing breaks tenant isolation.</strong> You switch on time slicing to lift utilization, and now one tenant's oversized checkpoint OOM-kills another's pod, or a batch job adds latency jitter to an interactive one. Signal: correlated OOMKills or p99 latency spikes across unrelated pods on the same GPU node — the dependency is the shared, un-isolated device.</li>
+<li><strong>Scheduler sees only <code>nvidia.com/gpu: 1</code>.</strong> The integer hides HBM size and topology, so a model that needs 140 GB schedules onto an 80 GB card, or tensor-parallel ranks land on GPUs with no NVLink between them. Signal: OOM at model load, or multi-GPU throughput far below spec because the placement ignored topology (lesson 07).</li>
+<li><strong>Snowflake node setup.</strong> Drivers installed by hand drift across nodes; a reimaged node comes back missing a layer. Signal: a workload works on some GPU nodes and not others with no code difference — the difference is undocumented node state.</li>
 </ul>
-
-<h2>Failure Modes</h2>
-<ul>
-<li>Pods schedule onto GPU nodes but cannot see devices because the driver stack is incomplete.</li>
-<li>MIG or sharing mode improves utilization but violates tenant isolation assumptions.</li>
-<li>Schedulers see only &#x27;nvidia.com/gpu: 1&#x27; and miss the topology or memory requirements that determine performance.</li>
+  </div>
+  <div class="lesson-card"><h3>Implementation checklist</h3><ul>
+<li>Install discovery (NFD + GFD) so every node advertises accelerator <em>type, count, driver version, MIG state, and topology</em> as labels — you cannot schedule on what the cluster cannot see.</li>
+<li>Choose the sharing mode per workload from isolation + utilization needs: whole-GPU for large/strict, MIG for many isolated medium jobs, time slicing only for cooperative bursty load, DRA where the driver is genuinely ready.</li>
+<li>Treat GPU Operator configuration as <em>platform code</em> — versioned, reviewed, applied declaratively — not a one-off SSH session that produces snowflake nodes.</li>
+<li>Validate DCGM (Data Center GPU Manager — NVIDIA's GPU telemetry) metrics <em>and</em> in-container runtime visibility before admitting tenant workloads, so you confirm the device is both healthy and visible end to end.</li>
+<li>When a GPU workload fails, debug bottom-up: node sees device → driver matches runtime → discovery labeled it → plugin/DRA advertised it → scheduler placed it on a compatible node → container sees the device file. Debug the model server <em>last</em>.</li>
 </ul>
+  </div>
+</div>
 
-<h2>Cross-Links</h2>
-<ul>
-<li><a href="https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/">Kubernetes DRA</a></li>
-<li><a href="../../system_ml/lessons/03_interconnect.html">System ML interconnect</a></li>
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>You have a cluster of 80 GB H100 nodes and two tenants: Tenant A runs a latency-sensitive 70B chat model; Tenant B runs a fleet of small 7B classifiers that are idle most of the day. Decide the sharing mode for each, write the <code>resources:</code> block each pod would request, and name the one node label you would require discovery to expose to keep A off a card it cannot fit on. Then state what breaks if you put B on time slicing and B's checkpoint quietly grows by 5 GB.</div>
+
+<h2>Where this points next</h2>
+
+<p>This lesson made a <em>single</em> GPU schedulable and decided how many tenants share it. But the resource model still hides the thing that dominates large-model performance: how multiple GPUs are wired together. A 70B model that does not fit on one card must be split across several, and whether those cards share NVLink or only PCIe changes throughput by an order of magnitude — yet <code>nvidia.com/gpu: 2</code> says nothing about it. Lesson 07, <a href="07_multi_gpu_topology.html">Multi-GPU Inference and Topology</a>, adds the machinery the scheduler needs to place co-dependent GPUs correctly: tensor parallelism across a node, topology-aware scheduling, and gang scheduling so all the ranks of one model land together or not at all.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+A GPU is not a resource count; it is a <em>stack</em> — driver, runtime, container toolkit, discovery (NFD/GFD), device plugin or DRA driver, scheduler resource model, and pod visibility — and "the GPU works" means every layer is present and version-agreed. The NVIDIA GPU Operator installs and manages that stack as platform code, which is the cure for snowflake nodes and version skew. The basic request <code>nvidia.com/gpu: 1</code> grants a whole device with full isolation but throws away HBM size and topology; MIG advertises richer, hardware-isolated slices (<code>nvidia.com/mig-1g.10gb</code>), time slicing oversubscribes one card with <em>no</em> memory isolation, and DRA is the maturing claim-based future — choose among them by trading utilization against isolation, never just by maximum pod count. Validate DCGM telemetry and in-container device visibility before tenants arrive, and when GPU pods fail, debug the stack bottom-up before ever touching the model.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why doesn't Kubernetes understand a GPU the way it understands a CPU? <em>(§1, §2 — CPU/memory are native and cgroup-enforced; a GPU needs a vendor driver, container toolkit, discovery, and a device plugin/DRA driver to become a schedulable resource, so any missing layer means the pod schedules but cannot see the device.)</em></li>
+  <li>Walk the stack from hardware to a process calling CUDA. <em>(§2 — hardware → driver+runtime/container toolkit → discovery (NFD/GFD labels type/count/driver/MIG/topology) → device plugin or DRA driver → scheduler resource model → pod device visibility.)</em></li>
+  <li>What does <code>nvidia.com/gpu: 1</code> hide, and why does it matter? <em>(§1, §3 — it loses HBM size, GPU generation, isolation mode, and topology; a 140 GB model schedules onto an 80 GB card and OOMs, or tensor-parallel ranks land on non-NVLinked GPUs.)</em></li>
+  <li>Contrast MIG and time slicing precisely. <em>(§4 — MIG hardware-partitions a GPU into isolated slices with dedicated memory/compute (real isolation); time slicing software-interleaves processes over one shared memory pool (no isolation), so a tenant can OOM or add jitter to neighbors.)</em></li>
+  <li>What is DRA and how mature is it in 2026? <em>(§4 — Dynamic Resource Allocation: claim-based ResourceClaims describing the device needed, allocated by a DRA driver; the core API is stable in recent Kubernetes but vendor-driver and feature readiness is still uneven — beta/maturing, don't overstate.)</em></li>
+  <li>What does the NVIDIA GPU Operator do, and why call its config "platform code"? <em>(§2 — it installs and lifecycle-manages driver, toolkit, device plugin, NFD/GFD, and DCGM from one declarative cluster policy, replacing hand-built snowflake nodes and preventing driver/runtime version skew.)</em></li>
+  <li>A GPU pod is <code>Running</code> but the model server can't find CUDA. How do you debug? <em>(§5 — bottom-up: node sees device → driver matches runtime → discovery labeled it → plugin/DRA advertised it → scheduler placed it on a compatible node → container sees the device file; debug the model server last.)</em></li>
 </ul>
-
-<h2>Takeaway And Interview Prompts</h2>
-<p><strong>Takeaway:</strong> The GPU is not just a resource count. It is a stack: driver, runtime, device plugin or DRA driver, node labels, topology, isolation mode, telemetry, and scheduling policy.</p>
-<ol>
-  <li>Draw the system boundary for <strong>GPU Nodes as a Platform Layer</strong>. Which resource or policy binds first?</li>
-  <li>Pick two designs from this lesson. What does each optimize, and what does each make worse?</li>
-  <li>Design an incident around this failure mode: Pods schedule onto GPU nodes but cannot see devices because the driver stack is incomplete. What metric, log, or trace would reveal it?</li>
-</ol>
 
 <footer class="lesson-nav">
   <a href="05_model_weights_into_pods.html"><span class="dir">Previous</span><span class="ttl">05 - Getting Model Weights Into Pods</span></a>
   <a class="next" href="07_multi_gpu_topology.html"><span class="dir">Next</span><span class="ttl">07 - Multi-GPU Inference and Topology</span></a>
 </footer>
+
 </main>
+
+<script>
+(function(){
+  var canvas = document.getElementById('pack-canvas');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+
+  var nRng = document.getElementById('pk-n');
+  var nVal = document.getElementById('pk-n-val');
+  var tsMemEl = document.getElementById('pk-ts-mem');
+  var tsStatEl = document.getElementById('pk-ts-stat');
+  var migNEl = document.getElementById('pk-mig-n');
+  var migIsoEl = document.getElementById('pk-mig-iso');
+
+  var HBM = 80, PER = 16, SLICE = 20, MIG_MAX = 4;
+
+  function render(){
+    var N = parseInt(nRng.value, 10);
+    var dpr = window.devicePixelRatio || 1;
+    var W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== Math.round(W*dpr)){ canvas.width = Math.round(W*dpr); canvas.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    var padX = 16, gapY = 18, barH = 64;
+    var barW = W - 2*padX;
+    var yTop = 30, yBot = yTop + barH + gapY + 22 + barH - barH; // layout below
+
+    ctx.fillStyle = '#5b6573'; ctx.font = '12px monospace';
+    ctx.fillText('Time slicing — one shared 80 GB pool', padX, yTop - 8);
+
+    // time slicing bar: stack N tenants of PER GB into one 80GB track
+    var tsY = yTop;
+    ctx.strokeStyle = '#cbd5e1'; ctx.lineWidth = 1;
+    ctx.strokeRect(padX, tsY, barW, barH);
+    var tsMem = N * PER;
+    var over = tsMem > HBM;
+    for (var i=0;i<N;i++){
+      var segW = (PER / HBM) * barW;
+      var x = padX + i*segW;
+      var beyond = (i+1)*PER > HBM;
+      ctx.fillStyle = beyond ? 'rgba(220,38,38,0.55)' : 'rgba(37,99,235,0.45)';
+      ctx.fillRect(x+1, tsY+1, segW-2, barH-2);
+    }
+    // capacity line at 80GB == right edge already; mark it
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('80 GB', padX + barW - 38, tsY + barH + 14);
+
+    // MIG bar: fixed slices, only MIG_MAX exist
+    var migY = tsY + barH + 34;
+    ctx.fillStyle = '#5b6573'; ctx.font = '12px monospace';
+    ctx.fillText('MIG — 4 isolated 20 GB slices', padX, migY - 8);
+    var placed = Math.min(N, MIG_MAX);
+    var sliceW = barW / MIG_MAX;
+    for (var j=0;j<MIG_MAX;j++){
+      var sx = padX + j*sliceW;
+      ctx.strokeStyle = '#cbd5e1'; ctx.lineWidth = 1;
+      ctx.strokeRect(sx, migY, sliceW, barH);
+      if (j < placed){
+        ctx.fillStyle = 'rgba(22,163,74,0.45)';
+        ctx.fillRect(sx+2, migY+2, sliceW-4, barH-4);
+      }
+    }
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('each slice hardware-isolated', padX, migY + barH + 14);
+
+    nVal.textContent = N;
+    tsMemEl.textContent = tsMem + ' / ' + HBM + ' GB';
+    tsStatEl.textContent = over ? 'OVER — OOM contagion' : 'fits (but shared, no isolation)';
+    migNEl.textContent = placed + ' / ' + N + (N > MIG_MAX ? ' (rest unschedulable)' : '');
+    migIsoEl.textContent = placed > 0 ? 'all placed tenants isolated' : '—';
+  }
+
+  nRng.addEventListener('input', render);
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
 </body>
 </html>

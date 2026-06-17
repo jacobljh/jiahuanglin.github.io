@@ -5,81 +5,306 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>07 - Multi-GPU Inference and Topology | Generative AI on Kubernetes</title>
 <link rel="stylesheet" href="style.css">
+<style>
+  .kicker { margin: 0 0 8px; font-family: var(--mono); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-mute); }
+  .source-note { border-left-color: var(--accent-2); }
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; }
+  .mini-flow { display: grid; gap: 8px; margin: 18px 0; }
+  .mini-flow .step { border: 1px solid var(--border); background: var(--bg-elev); border-radius: 8px; padding: 10px 12px; }
+  .mini-flow .n { font-family: var(--mono); color: var(--accent); font-size: 12px; margin-right: 6px; }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
 </head>
 <body>
 <header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">kubernetes_genai</a><span class="crumb">/</span><span class="crumb">07</span><span class="step-pill">lesson 7 / 18</span></div></header>
 <main>
+
 <p class="kicker">Part II - GPU platform</p>
 <h1>Multi-GPU Inference and Topology</h1>
-<p class="subtitle">Data parallel, tensor parallel, pipeline parallel, single-node versus multinode inference, and topology-aware placement.</p>
+<p class="subtitle">Lesson 06 turned bare GPU machines into a schedulable platform layer: nodes labeled by accelerator type, the device plugin advertising <code>nvidia.com/gpu</code>, taints and node pools that keep the right pods on the right silicon. That all assumed the unit of serving is one GPU. But the moment a model's weights do not fit in one GPU's memory — or one GPU cannot serve enough concurrent users — you have to spread the work across several. This lesson is about the three fundamentally different ways to use more than one GPU, why they are <em>not</em> interchangeable, and why the physical wiring between those GPUs decides which one is even allowed.</p>
 
 <div class="callout source-note"><div class="label">Source coverage</div>PDF Chapter 3 and Chapter 4: multi-GPU inference, topology, and production placement.</div>
-<div class="callout"><div class="label">Learning objective</div>Decide when to replicate, shard, or distribute inference across GPUs, and how placement changes the bottleneck.</div>
 
-<h2>Linear Position</h2>
-<div class="position-grid">
-  <div><strong>Prerequisite</strong><span>Builds on <a href="06_gpu_nodes_platform.html">06 - GPU Nodes as a Platform Layer</a>.</span></div>
-  <div><strong>New capability</strong><span>Decide when to replicate, shard, or distribute inference across GPUs, and how placement changes the bottleneck.</span></div>
-  <div><strong>Next dependency</strong><span>Prepares <a href="08_benchmarking_runtime_tuning.html">08 - Benchmarking and Runtime Tuning</a>.</span></div>
+<div class="callout"><div class="label">Linear position</div><strong>Prerequisite:</strong> Lesson 06 (GPU Nodes as a Platform Layer) — you can label nodes, request GPUs from a pod, and steer pods onto specific accelerator types with taints/node pools.<br><strong>New capability:</strong> Decide when to <em>replicate</em> a model, <em>shard</em> it across GPUs on one node, or <em>distribute</em> it across nodes — and predict how each choice moves the bottleneck onto memory, compute, or the interconnect.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Five moves. (1) Frame the core question: replicate, shard within a node, or shard across nodes — and the mental model that separates them. (2) Define the three parallelism strategies precisely — data parallel / replication, tensor parallel, pipeline parallel — and what each one buys. (3) Work the numbers: does a 70B model fit one GPU? Does a 13B? Budget weights vs. KV cache separately, because "the model fits" does not mean "concurrency fits." (4) The topology layer: NVLink vs. InfiniBand vs. Ethernet, why tensor parallel turns every token into a communication event, and how to keep shards close on Kubernetes. (5) Failure modes, a checklist, and the hand-off to benchmarking, where you measure whether your placement guess was right.</p></div>
+
+<h2>1 · One GPU works — now what?</h2>
+
+<p>By lesson 06 you can put a model server in a pod, ask for one GPU, and have Kubernetes land it on the right node. The next question is forced on you by one of two limits. Either <strong>the model is too big</strong> — its weights exceed a single GPU's memory — or <strong>one replica is too slow</strong> — a single GPU cannot keep up with the request volume at your latency target. These two limits have completely different answers, and conflating them is the most common multi-GPU mistake.</p>
+
+<p>Two terms used throughout, defined now. <strong>HBM</strong> (high-bandwidth memory) is the fast on-package memory soldered to a GPU — an NVIDIA A100 has 80GB, an H100 80GB, an H200 141GB. It is where weights, the KV cache, and activations all have to live; when people say "fits on the GPU" they mean "fits in HBM." The <strong>KV cache</strong> is the per-request store of attention keys and values for every token already generated; it grows with sequence length and with the number of concurrent requests, and it competes with the weights for the same HBM. Keep both in mind — they reappear in the capacity math.</p>
+
+<p>The mental model for the whole lesson:</p>
+
+<div class="mini-flow">
+<div class="step"><span class="n">→</span><strong>Replication</strong> buys <em>throughput and fault isolation</em> — more independent copies, each handling its own requests.</div>
+<div class="step"><span class="n">→</span><strong>Tensor parallel</strong> buys <em>model fit</em> — one model too big for one GPU spread across several that act as one.</div>
+<div class="step"><span class="n">→</span><strong>Pipeline parallel</strong> buys <em>more model fit</em> when even a node's worth of GPUs is not enough, at the cost of pipeline bubbles.</div>
+<div class="step"><span class="n">→</span><strong>Multinode</strong> buys <em>capacity beyond one host</em>, but puts the network inside every token.</div>
 </div>
 
+<p>The decision rule that falls out of this: <strong>replicate until you cannot, then shard inside the fastest interconnect domain, and cross a node boundary only when forced.</strong> The rest of the lesson is making each clause precise.</p>
 
-<h2>Linear Story</h2>
-<p>Once one GPU works, the next question is whether to use more. More GPUs can mean more replicas, a single model sharded across devices, or a pipeline of stages. These are not interchangeable. Replication improves throughput and availability when each replica can hold the model. Tensor parallelism helps when one model or one desired concurrency target needs multiple GPUs. Pipeline parallelism splits layers and introduces bubbles and coordination.</p>
-<div class="lesson-flow">
-  <div><strong>Replicate</strong><span>Same model on many GPUs; route independent requests.</span></div>
-  <div><strong>Tensor parallel</strong><span>Shard matrix work inside layers; needs fast collectives.</span></div>
-  <div><strong>Pipeline parallel</strong><span>Shard layers; useful for very large models, sensitive to bubbles.</span></div>
-  <div><strong>Multinode</strong><span>Extends capacity, but network becomes part of every token.</span></div>
+<h2>2 · The three parallelism strategies</h2>
+
+<p>"Use more GPUs" is not one technique. The book lists three, and they differ in <em>what</em> they split and therefore <em>what</em> they cost.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Data parallel / REPLICATION</div><div class="v">Put a <strong>full copy of the model</strong> on each GPU. A load balancer sends independent requests to whichever replica is free. Each replica is self-contained — no cross-GPU communication during inference. Buys raw throughput (N replicas ≈ N× the requests/s) and fault isolation (one replica dies, the others serve). The default; reach for anything else only when this is impossible.</div></div>
+  <div class="topic-card"><div class="k">Tensor parallel (TP)</div><div class="v"><strong>Shard each layer's weight matrices</strong> across GPUs, so every GPU holds a slice of every layer. The GPUs must <strong>all-reduce</strong> (sum and redistribute partial results) at the boundary of every layer — for every token. Buys <em>model fit</em>: weights that exceed one GPU's HBM now fit across the group. Needs a fast interconnect (NVLink) because the all-reduce happens constantly.</div></div>
+  <div class="topic-card"><div class="k">Pipeline parallel (PP)</div><div class="v"><strong>Split the layers into stages</strong> — GPU 0 runs layers 1-20, GPU 1 runs 21-40, and so on. A request flows through the stages in sequence. Buys fit for models so large that even a full node's TP group is not enough. Cost: <strong>pipeline bubbles</strong> — GPUs idle while waiting for the previous stage's first output, hurting latency and utilization.</div></div>
+  <div class="topic-card"><div class="k">Multinode</div><div class="v">Any of the above stretched across <strong>more than one physical host</strong>. The cross-GPU traffic now leaves the box and crosses a network — InfiniBand if you are lucky, Ethernet if you are not. Buys capacity beyond a single server, at the price of slower collectives and a much larger failure surface.</div></div>
 </div>
-<h2>The Topology Lesson</h2>
-<p>Kubernetes scheduling decides where pods land, but inference performance depends on the physical graph underneath: PCIe, NVLink, NVSwitch, InfiniBand, rack placement, and sometimes secondary high-performance interfaces. If tensor-parallel ranks land across a slow boundary, every decode step pays. If replicas are packed without regard to cache and traffic, a cluster can have enough GPUs on paper and still miss latency targets.</p>
-<table class="trade-table"><thead><tr><th>Strategy</th><th>Buys</th><th>Costs</th></tr></thead><tbody>
-  <tr><td>Data parallel replicas</td><td>Simple scaling and failure isolation</td><td>Duplicates weights and warm caches</td></tr>
-  <tr><td>Tensor parallel</td><td>Fits larger models or raises bandwidth</td><td>Collective communication per layer/token</td></tr>
-  <tr><td>Pipeline parallel</td><td>Layer-level model fit</td><td>Pipeline bubbles and scheduling complexity</td></tr>
-  <tr><td>Multinode inference</td><td>Capacity beyond one host</td><td>Network latency and failure surface</td></tr>
+
+<p>The distinction that matters most: <strong>replication never communicates during inference; tensor and pipeline parallel do.</strong> A replica is an island. A tensor-parallel group is a single organism whose neurons are wired together — and the wire's speed becomes part of every token's latency. That is why the same GPUs can serve beautifully as four replicas and terribly as one TP-4 group spanning a slow link: the strategy, not the hardware, decides whether the interconnect is on the critical path.</p>
+
+<h2>3 · Does it fit? The capacity math</h2>
+
+<p>Whether you <em>can</em> replicate is a memory question, and you answer it with arithmetic, not intuition. The dominant term is the weights. A model in fp16 (2 bytes per parameter) needs roughly <span class="math">2 × params</span> bytes:</p>
+
+<div class="callout"><div class="label">Worked number — 70B vs. 13B</div>
+A <strong>70B</strong> model in fp16 needs <span class="math">70 × 10⁹ × 2 bytes ≈ 140 GB</span>. One 80GB A100/H100 holds 80GB. <span class="math">140 &gt; 80</span>, so the weights <em>cannot</em> fit one GPU — replication is off the table, and you need <strong>TP ≥ 2</strong>. With <strong>TP-2</strong> each GPU holds <span class="math">140 / 2 = 70 GB</span> of weights, leaving <span class="math">80 − 70 = 10 GB</span> per GPU for KV cache and activation scratch. Contrast a <strong>13B</strong> model: <span class="math">13 × 10⁹ × 2 ≈ 26 GB</span>, comfortably under 80GB. It fits one GPU with ~54GB to spare — so you <strong>replicate it, you do not shard it</strong>. Sharding a 13B model across two GPUs would only add all-reduce latency to every token for no fit benefit.</div>
+
+<p>But "the weights fit" is the wrong stopping point, because weights are not the only thing in HBM. You must budget <strong>four pools separately</strong>:</p>
+
+<table class="trade-table"><thead><tr><th>Memory pool</th><th>What it is</th><th>Scales with</th></tr></thead><tbody>
+  <tr><td>Weights</td><td>The model parameters, loaded once and shared by all requests</td><td>Model size and precision (fixed)</td></tr>
+  <tr><td>KV cache</td><td>Per-request attention keys/values for generated tokens</td><td>Concurrency × sequence length (grows)</td></tr>
+  <tr><td>Activation scratch</td><td>Transient buffers for the current forward pass</td><td>Batch size, hidden dim</td></tr>
+  <tr><td>Communication buffers</td><td>Staging for all-reduce / pipeline transfers (TP/PP only)</td><td>Shard count, message size</td></tr>
 </tbody></table>
-<h2>Decision Rule</h2>
-<p>Prefer replication until model size or per-replica throughput forces sharding. Keep tightly coupled ranks inside the fastest topology domain. Use scheduling labels, node pools, topology-aware policies, and runtime placement settings together; no single layer can fix topology alone.</p>
 
+<div class="callout warn"><div class="label">"It fits" ≠ "concurrency fits"</div>
+In the TP-2 case above, weights leave <strong>10 GB per GPU</strong> (20GB across the pair) for everything else. If each concurrent request's KV cache costs, say, ~1.2GB at your average sequence length, that 20GB serves only ~16 simultaneous requests before HBM is exhausted — and then new requests queue or get rejected, regardless of how much compute is idle. The model "fitting" tells you nothing about how many users you can serve. <strong>Always size the KV-cache pool against your target concurrency, not just the weights against HBM.</strong></div>
 
-<h2>Mental Model</h2>
-<p>Replication buys throughput and fault isolation. Tensor parallel buys model fit. Multinode sharding buys capacity at the price of interconnect latency and operational risk.</p>
+<div class="widget" id="fit-widget">
+  <div class="title">Does it fit? — replicate vs. shard, and is the interconnect the bottleneck</div>
+  <div class="hint">Set the <strong>model size</strong>, <strong>precision</strong>, per-GPU <strong>HBM</strong>, and <strong>TP degree</strong>. The bars show weights-per-GPU (blue) against the HBM ceiling, with the leftover for KV cache in green. The verdict line tells you whether to replicate, whether you need more TP, and — critically — whether your chosen TP degree would have to span a slow link.</div>
 
-<h2>Operational Checklist</h2>
-<ul>
-<li>Replicate small enough models before reaching for tensor parallelism.</li>
-<li>Keep tensor parallel inside fast interconnect domains when possible.</li>
-<li>Use topology labels, node pools, and scheduling policies to keep shards close.</li>
-<li>Budget separately for weight memory, KV cache memory, activation scratch, and communication.</li>
+  <canvas class="dist-canvas" id="fit-canvas" width="760" height="220" style="height:220px;"></canvas>
+
+  <div class="controls" style="margin-top: 12px;">
+    <label class="inline">params (B): <input type="range" id="ft-params" min="7" max="180" step="1" value="70"> <span class="val" id="ft-params-val">70</span></label>
+    <label class="inline">bytes/param: <input type="range" id="ft-bpp" min="1" max="4" step="1" value="2"> <span class="val" id="ft-bpp-val">2 (fp16)</span></label>
+    <label class="inline">HBM/GPU (GB): <input type="range" id="ft-hbm" min="24" max="141" step="1" value="80"> <span class="val" id="ft-hbm-val">80</span></label>
+    <label class="inline">TP degree: <input type="range" id="ft-tp" min="1" max="8" step="1" value="2"> <span class="val" id="ft-tp-val">2</span></label>
+    <label class="inline">NVLink GPUs/node: <input type="range" id="ft-nvl" min="1" max="8" step="1" value="8"> <span class="val" id="ft-nvl-val">8</span></label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">Weights / GPU</div><div class="v" id="ft-k-w">—</div></div>
+    <div class="kpi"><div class="k">Leftover / GPU (KV+scratch)</div><div class="v" id="ft-k-left">—</div></div>
+    <div class="kpi"><div class="k">Verdict</div><div class="v" id="ft-k-verdict">—</div></div>
+    <div class="kpi"><div class="k">Interconnect</div><div class="v" id="ft-k-ic">—</div></div>
+  </div>
+</div>
+
+<h2>4 · Topology — the wire decides what is allowed</h2>
+
+<p>Kubernetes decides <em>which node</em> a pod lands on. It does not, by default, know or care about the physical graph of links <em>between</em> GPUs — and that graph is what determines whether tensor parallel is fast or fatal. The interconnect hierarchy, fastest to slowest:</p>
+
+<table class="trade-table"><thead><tr><th>Link</th><th>Where</th><th>Rough bandwidth</th><th>Good for</th></tr></thead><tbody>
+  <tr><td>NVLink / NVSwitch</td><td>GPUs inside one node</td><td>~900 GB/s (NVLink 4)</td><td>Tensor parallel — the all-reduce is cheap enough to do every layer</td></tr>
+  <tr><td>InfiniBand</td><td>GPUs across nodes (HPC fabric)</td><td>~25-50 GB/s</td><td>Pipeline parallel across nodes; barely-tolerable TP if you must</td></tr>
+  <tr><td>Standard Ethernet</td><td>Generic cloud networking</td><td>~1-12 GB/s</td><td>Replication only — never put TP collectives over this</td></tr>
+</tbody></table>
+
+<p>Why this matters so much: <strong>tensor parallel makes every token a communication event.</strong> Each layer ends in an all-reduce across the TP group, and a model has dozens of layers, and you generate hundreds of tokens per response. If that all-reduce travels over NVLink at ~900 GB/s it is invisible; if it travels over Ethernet at ~10 GB/s it dominates, and your per-token latency (TPOT) collapses by an order of magnitude. A TP group that spans a slow link does not "run slower" — it stops being viable.</p>
+
+<p>So the placement rule is concrete: <strong>keep a tensor-parallel group entirely within one NVLink domain</strong> (one node, where the GPUs are NVSwitch-connected). On Kubernetes you enforce this with the same tools from lesson 06, now aimed at locality rather than just type:</p>
+
+<pre><code># Pin a TP-8 server to a single 8-GPU node so all-reduce stays on NVLink.
+# Request all 8 GPUs in one pod -> the scheduler must place it on one node.
+resources:
+  limits:
+    nvidia.com/gpu: 8        # whole node; TP group cannot be split across hosts
+# And steer to nodes that actually have NVSwitch:
+nodeSelector:
+  gpu.topology/nvlink-domain: "full"   # a label your node setup applies
+</code></pre>
+
+<p>For multinode (pipeline parallel across hosts, or TP-then-replicate layouts), you additionally want the cooperating pods placed <em>close</em> in the network — same rack, same InfiniBand partition. <strong>Pod affinity</strong> with a topology key keeps cooperating pods together; the gang-scheduling concern (all-or-nothing placement for a distributed group) is what the next lessons build toward. The point for now: topology-aware placement is a deliberate act. Left alone, the scheduler will happily pack two unrelated GPU pods onto the host you wanted whole, breaking the NVLink locality your TP group assumed.</p>
+
+<h2>5 · Choosing — the trade table</h2>
+
+<p>Putting it together, here is the decision as a table you can run top-to-bottom:</p>
+
+<table class="trade-table"><thead><tr><th>Strategy</th><th>Buys</th><th>Costs</th><th>When</th></tr></thead><tbody>
+  <tr><td>Replication</td><td>Throughput, fault isolation, simplicity (no collectives)</td><td>Duplicates weights and warm KV caches across copies</td><td>Model fits one GPU — the default; scale out, not up</td></tr>
+  <tr><td>Tensor parallel</td><td>Model fit when weights exceed one GPU's HBM</td><td>All-reduce every layer, every token; needs NVLink</td><td>Weights &gt; one GPU but ≤ one node's combined HBM</td></tr>
+  <tr><td>Pipeline parallel</td><td>Fit for models too big for even one node's TP group</td><td>Pipeline bubbles; latency and utilization hit</td><td>Model exceeds a single node; combine with TP within stages</td></tr>
+  <tr><td>Multinode</td><td>Capacity beyond a single host</td><td>Slower collectives over the network; larger failure surface</td><td>Forced by size; keep TP inside nodes, PP/replication across</td></tr>
+</tbody></table>
+
+<h2>6 · Where placement goes wrong</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+<li><strong>TP across a slow link.</strong> A tensor-parallel group is placed across nodes (or onto GPUs joined only by PCIe/Ethernet), so every layer's all-reduce crosses a slow boundary and every token pays. The signal: TPOT (time per output token) is 5-20× worse than a single-node TP run on the same model; network counters spike in lockstep with generation.</li>
+<li><strong>The scheduler packs your "whole" node.</strong> You assumed eight free GPUs on one host for a TP-8 group, but the platform placed an unrelated GPU pod there first, breaking NVLink locality or leaving the group split. The signal: intermittent latency depending on which node won the placement race; the fix is requesting the whole node or using affinity/anti-affinity.</li>
+<li><strong>KV cache ignored in capacity math.</strong> You sized GPUs so the weights just fit, declared victory, and shipped. Under real concurrency the KV cache exhausts HBM, requests queue or OOM, and compute sits idle. The signal: out-of-memory errors or a hard concurrency ceiling well below what the compute could handle.</li>
+<li><strong>Sharding a model that fits.</strong> A 13B model put behind TP-2 "to use the GPUs," adding all-reduce latency to every token for zero fit benefit when two independent replicas would have served more, faster. The signal: lower throughput and higher latency than the same GPUs running as replicas.</li>
+</ul>
+  </div>
+  <div class="lesson-card"><h3>Implementation checklist</h3><ul>
+<li>Did you compute weights = <span class="math">bytes/param × params</span> and check it against one GPU's HBM <em>before</em> reaching for TP? Replicate if it fits.</li>
+<li>Is every tensor-parallel group confined to a single NVLink/NVSwitch domain (one node), never split across a slower link?</li>
+<li>Are you using node selectors, whole-node GPU requests, pod affinity, or topology labels to keep cooperating shards physically close?</li>
+<li>Did you budget the four memory pools <em>separately</em> — weights, KV cache, activation scratch, communication buffers — and size KV cache against target concurrency?</li>
+<li>For multinode, is the slow boundary on the <em>least</em> chatty axis (replication or pipeline stages), with the chatty TP collectives kept inside nodes?</li>
+</ul>
+  </div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>You are given a cluster of 80GB-HBM nodes, eight GPUs each, NVSwitch within a node and Ethernet between nodes. Plan the serving layout for (a) a 13B model and (b) a 70B model, both fp16, targeting 64 concurrent requests at ~2GB KV cache each. For each: state whether you replicate or shard, the TP degree if any, how many GPUs/replicas you need to hold the KV cache, and which interconnect each communication path uses. Then identify the one placement constraint you must give Kubernetes so the plan is not silently broken by the scheduler.</div>
+
+<h2>Where this points next</h2>
+
+<p>You can now reason your way to a layout — replicate the 13B, TP-2 the 70B inside a node, keep the collectives on NVLink. But a layout chosen by arithmetic is a hypothesis, not a result. The next lesson, <strong><a href="08_benchmarking_runtime_tuning.html">08 - Benchmarking and Runtime Tuning</a></strong>, gives you the machinery to test it: how to measure TTFT (time to first token), TPOT, and throughput under realistic load, how to find the batch size and concurrency where latency knees upward, and how to tell whether the bottleneck your placement created is memory, compute, or — as this lesson warned — the interconnect. Placement decides what is possible; benchmarking tells you what actually happened.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+Using more than one GPU is three different moves, not one. <strong>Replication</strong> (data parallel) puts a full model copy per GPU and buys throughput and fault isolation with zero inference-time communication — it is the default, and you reach past it only when forced. <strong>Tensor parallel</strong> shards each layer's matrices across GPUs and buys model fit, but all-reduces every layer for every token, so it must live inside a fast NVLink domain. <strong>Pipeline parallel</strong> splits layers into stages for models too big for even a node, paying in bubbles. The fit question is arithmetic — a 70B fp16 model needs ~140GB, so it cannot fit one 80GB GPU and demands TP ≥ 2; a 13B (~26GB) fits and should be replicated, not sharded. But "the model fits" is never the whole story: budget weights, KV cache, activation scratch, and communication buffers <em>separately</em>, because the KV cache, not the weights, usually caps concurrency. Finally, the physical topology decides which strategy is even legal — TP across a slow link turns every token into a communication problem, so keep tensor-parallel groups inside one node and use Kubernetes labels, whole-node requests, and affinity to stop the scheduler from breaking the locality your plan assumed.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>What are the three ways to use more than one GPU, and what does each buy? <em>(§2 — replication: throughput + fault isolation, no communication; tensor parallel: model fit, all-reduce per layer/token; pipeline parallel: fit for very large models, at the cost of bubbles.)</em></li>
+  <li>A 70B model is fp16. Does it fit one 80GB GPU, and what do you do? <em>(§3 — 70B × 2 bytes ≈ 140GB &gt; 80GB, so no; you need TP ≥ 2. TP-2 puts ~70GB weights per GPU, leaving ~10GB for KV cache.)</em></li>
+  <li>A 13B model fits one GPU — should you ever shard it across two? <em>(§2, §3, §6 — no; sharding a model that fits only adds all-reduce latency to every token for zero fit benefit. Replicate it; two replicas serve more, faster.)</em></li>
+  <li>Why is tensor parallel so sensitive to the interconnect? <em>(§4 — TP all-reduces at the boundary of every layer for every token, so on NVLink it is invisible but on Ethernet it dominates; a TP group spanning a slow link stops being viable, not just slower.)</em></li>
+  <li>You sized GPUs so the weights fit. Why might concurrency still be tiny? <em>(§3 — the KV cache shares the same HBM and grows with concurrency × sequence length; once the leftover after weights is exhausted, requests queue or OOM regardless of idle compute.)</em></li>
+  <li>How do you keep a tensor-parallel group from being split across a slow link on Kubernetes? <em>(§4 — confine it to one NVLink domain: request the whole node's GPUs in one pod, use node selectors/topology labels for NVSwitch nodes, and affinity to co-locate cooperating pods.)</em></li>
+  <li>For a model that spans multiple nodes, which communication should cross the node boundary? <em>(§4, §5, §6 — the least chatty axis: replication or pipeline stages over InfiniBand/Ethernet, while the per-token TP collectives stay inside nodes on NVLink.)</em></li>
 </ul>
 
-<h2>Failure Modes</h2>
+<h2>Cross-links</h2>
 <ul>
-<li>Tensor parallel spans slow network links and turns every token into a communication problem.</li>
-<li>The platform packs unrelated GPU pods onto the same host and breaks expected NVLink locality.</li>
-<li>Capacity math ignores KV cache, so the model fits but concurrency does not.</li>
+<li><a href="../../system_ml/lessons/14_inference_tp_vs_replication.html">System ML — inference parallelism (TP vs. replication)</a></li>
+<li><a href="../../vllm/lessons/09_gqa_mqa.html">vLLM — GQA/MQA (shrinking the KV cache)</a></li>
 </ul>
-
-<h2>Cross-Links</h2>
-<ul>
-<li><a href="../../system_ml/lessons/14_inference_tp_vs_replication.html">System ML inference parallelism</a></li>
-<li><a href="../../vllm/lessons/09_gqa_mqa.html">vLLM GQA/MQA</a></li>
-</ul>
-
-<h2>Takeaway And Interview Prompts</h2>
-<p><strong>Takeaway:</strong> Replication buys throughput and fault isolation. Tensor parallel buys model fit. Multinode sharding buys capacity at the price of interconnect latency and operational risk.</p>
-<ol>
-  <li>Draw the system boundary for <strong>Multi-GPU Inference and Topology</strong>. Which resource or policy binds first?</li>
-  <li>Pick two designs from this lesson. What does each optimize, and what does each make worse?</li>
-  <li>Design an incident around this failure mode: Tensor parallel spans slow network links and turns every token into a communication problem. What metric, log, or trace would reveal it?</li>
-</ol>
 
 <footer class="lesson-nav">
   <a href="06_gpu_nodes_platform.html"><span class="dir">Previous</span><span class="ttl">06 - GPU Nodes as a Platform Layer</span></a>
   <a class="next" href="08_benchmarking_runtime_tuning.html"><span class="dir">Next</span><span class="ttl">08 - Benchmarking and Runtime Tuning</span></a>
 </footer>
+
 </main>
+
+<script>
+(function(){
+  var canvas = document.getElementById('fit-canvas');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+
+  var elP   = document.getElementById('ft-params');
+  var elB   = document.getElementById('ft-bpp');
+  var elH   = document.getElementById('ft-hbm');
+  var elT   = document.getElementById('ft-tp');
+  var elN   = document.getElementById('ft-nvl');
+  var vP = document.getElementById('ft-params-val');
+  var vB = document.getElementById('ft-bpp-val');
+  var vH = document.getElementById('ft-hbm-val');
+  var vT = document.getElementById('ft-tp-val');
+  var vN = document.getElementById('ft-nvl-val');
+  var kW = document.getElementById('ft-k-w');
+  var kL = document.getElementById('ft-k-left');
+  var kV = document.getElementById('ft-k-verdict');
+  var kI = document.getElementById('ft-k-ic');
+
+  var BPP_LABEL = {1:'1 (int8)', 2:'2 (fp16)', 3:'3', 4:'4 (fp32)'};
+
+  function render(){
+    var params = parseFloat(elP.value);
+    var bpp    = parseFloat(elB.value);
+    var hbm    = parseFloat(elH.value);
+    var tp     = parseFloat(elT.value);
+    var nvl    = parseFloat(elN.value);
+
+    var totalW = params * bpp;          // GB of weights
+    var perGPU = totalW / tp;           // GB of weights per GPU
+    var left   = hbm - perGPU;          // GB leftover per GPU
+
+    vP.textContent = params;
+    vB.textContent = BPP_LABEL[bpp] || bpp;
+    vH.textContent = hbm;
+    vT.textContent = tp;
+    vN.textContent = nvl;
+
+    var dpr = window.devicePixelRatio || 1;
+    var W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== Math.round(W*dpr)){ canvas.width = Math.round(W*dpr); canvas.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    var padX = 50, padTop = 24, padBot = 30;
+    var plotW = W - 2*padX, plotH = H - padTop - padBot;
+    var maxGB = Math.max(hbm, perGPU) * 1.1;
+    function y(gb){ return padTop + plotH - (gb/maxGB)*plotH; }
+
+    // HBM ceiling line
+    ctx.strokeStyle = '#dc2626'; ctx.setLineDash([5,4]); ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(padX, y(hbm)); ctx.lineTo(W-padX, y(hbm)); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#dc2626'; ctx.font = '11px monospace';
+    ctx.fillText('HBM ceiling ' + hbm + 'GB', padX, y(hbm) - 5);
+
+    // bar: weights (blue) + leftover (green) stacked, per GPU
+    var barW = Math.min(180, plotW*0.5);
+    var bx = padX + plotW*0.5 - barW/2;
+    var wTop = y(perGPU);
+    var base = y(0);
+    ctx.fillStyle = '#2563eb';
+    ctx.fillRect(bx, wTop, barW, base - wTop);
+    if (left > 0){
+      ctx.fillStyle = 'rgba(22,163,74,0.55)';
+      ctx.fillRect(bx, y(perGPU + left), barW, wTop - y(perGPU + left));
+    }
+    ctx.fillStyle = '#1e293b'; ctx.font = '12px monospace';
+    ctx.fillText('weights/GPU', bx + 6, Math.min(base - 8, wTop + 16));
+    ctx.fillText('per-GPU memory (TP=' + tp + ')', bx, padTop - 8);
+
+    // KPIs + verdict
+    kW.textContent = perGPU.toFixed(1) + ' GB';
+    if (left >= 0){
+      kL.textContent = left.toFixed(1) + ' GB';
+    } else {
+      kL.textContent = 'overflow ' + left.toFixed(1) + ' GB';
+    }
+
+    var verdict, ic, fits = perGPU <= hbm;
+    if (totalW <= hbm){
+      verdict = 'Fits 1 GPU - REPLICATE (TP unnecessary)';
+    } else if (fits){
+      verdict = 'Needs TP - this degree fits';
+    } else {
+      // smallest power-of-two-ish tp that fits
+      var need = Math.ceil(totalW / hbm);
+      verdict = 'Does NOT fit - raise TP to >= ' + need;
+    }
+    kV.textContent = verdict;
+
+    if (tp <= 1){
+      ic = 'n/a (single GPU)';
+    } else if (tp <= nvl){
+      ic = 'NVLink - fast (good)';
+    } else {
+      ic = 'spans nodes - SLOW LINK (fatal for TP)';
+    }
+    kI.textContent = ic;
+    kV.style.color = (totalW <= hbm || fits) ? '#16a34a' : '#dc2626';
+    kI.style.color = (tp <= nvl) ? '#16a34a' : '#dc2626';
+  }
+
+  [elP, elB, elH, elT, elN].forEach(function(el){ el.addEventListener('input', render); });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
 </body>
 </html>

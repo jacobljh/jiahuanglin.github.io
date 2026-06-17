@@ -5,81 +5,299 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>15 - Batch Scheduling and GPU Fairness | Generative AI on Kubernetes</title>
 <link rel="stylesheet" href="style.css">
+<style>
+  .kicker { margin: 0 0 8px; font-family: var(--mono); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-mute); }
+  .source-note { border-left-color: var(--accent-2); }
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; }
+  .mini-flow { display: grid; gap: 8px; margin: 18px 0; }
+  .mini-flow .step { border: 1px solid var(--border); background: var(--bg-elev); border-radius: 8px; padding: 10px 12px; }
+  .mini-flow .n { font-family: var(--mono); color: var(--accent); font-size: 12px; margin-right: 6px; }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
 </head>
 <body>
 <header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">kubernetes_genai</a><span class="crumb">/</span><span class="crumb">15</span><span class="step-pill">lesson 15 / 18</span></div></header>
 <main>
+
 <p class="kicker">Part IV - Customization and training jobs</p>
 <h1>Batch Scheduling and GPU Fairness</h1>
-<p class="subtitle">Bin packing, descheduling, gang scheduling, Kueue/Volcano-style queues, topology awareness, quotas, chargeback, and GPU-as-a-service.</p>
+<p class="subtitle">Lesson 14 got a single fine-tuning job running on Kubernetes — a distributed training workload that asks for several GPUs at once and runs for hours. But the moment a second team submits a job, you stop running <em>a</em> job and start running a <em>shared GPU platform</em>, and the questions change shape entirely. Who gets the scarce accelerators? Can a distributed job wait until <em>all</em> its workers are ready, or does it half-start and hold GPUs idle? Should a research experiment be allowed to block a production incident? And when finance asks what the cluster cost, can anyone answer? This lesson turns Kubernetes from a pod placer into a fair, accountable GPU platform — a scheduling contract welded to a financial one.</p>
 
 <div class="callout source-note"><div class="label">Source coverage</div>PDF Chapter 7: job scheduling optimization, gang scheduling, topology, quota, multitenancy, networking, and storage.</div>
-<div class="callout"><div class="label">Learning objective</div>Operate GPUs as a shared platform resource without starving teams, fragmenting topology, or hiding cost.</div>
 
-<h2>Linear Position</h2>
-<div class="position-grid">
-  <div><strong>Prerequisite</strong><span>Builds on <a href="14_fine_tuning_jobs.html">14 - Fine-Tuning Jobs on Kubernetes</a>.</span></div>
-  <div><strong>New capability</strong><span>Operate GPUs as a shared platform resource without starving teams, fragmenting topology, or hiding cost.</span></div>
-  <div><strong>Next dependency</strong><span>Prepares <a href="16_rag_on_kubernetes.html">16 - RAG on Kubernetes</a>.</span></div>
+<div class="callout"><div class="label">Linear position</div><strong>Prerequisite:</strong> Lesson 14 (<a href="14_fine_tuning_jobs.html">Fine-Tuning Jobs on Kubernetes</a>) — you can launch a single distributed training job that requests N GPUs and runs to completion, and you saw the <em>straggler</em> problem where a job stalls if not all its workers arrive together.<br><strong>New capability:</strong> Operate GPUs as a shared platform resource across many teams — admitting jobs by quota and priority, placing distributed jobs all-or-nothing on the right topology, and pricing the result — without starving teams, fragmenting topology, or hiding cost.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Five moves. (1) Frame GPU fairness as two contracts at once — a <em>scheduling</em> contract (who waits, who preempts, which topology survives) and a <em>financial</em> contract (who pays). (2) Define the scheduling primitives the chapter relies on: gang scheduling, bin packing, descheduling, and queues+quotas, each with the failure it prevents. (3) Work a concrete multitenancy scenario — three teams sharing 64 GPUs — and show how a best-effort job blocks a production incident until priority classes and preemption fix it. (4) Work the central tension — bin packing hits 95% utilization but leaves no NVLink island for the next big job — and introduce topology-aware scheduling as the cure. (5) Close the financial loop with chargeback/showback in dollars per GPU-hour and per useful token, then failure modes, a checklist, and the hand-off to RAG.</p></div>
+
+<h2>1 · Scheduling is now a product decision</h2>
+
+<p>When one team owns a GPU node, the scheduler's job is trivial: place the pod, done. The default Kubernetes scheduler does exactly this — it finds the first node that fits the pod's resource request and binds it. That policy, "first pod that fits," is perfectly fine for stateless web pods. It is a disaster for expensive accelerators shared by many teams, for three reasons that this lesson unpacks: it places pods <em>one at a time</em> (bad for jobs that need all their workers together), it is <em>greedy about packing</em> (bad for topology), and it knows <em>nothing about who owns what budget</em> (bad for fairness and cost).</p>
+
+<p>The mental model to carry through the lesson: <strong>GPU fairness is a scheduling contract plus a financial contract.</strong> The scheduling contract decides, mechanically, who waits in a queue, who is allowed to preempt whom, and which hardware topology a job is guaranteed. The financial contract decides who pays for the GPU-hours consumed and whether that spend bought anything useful. The platform fails the moment either contract is implicit — and, as the chapter stresses, <em>GPU fairness usually fails socially before it fails technically</em>: a team that does not know the preemption rules will be furious the first time their job is killed, even if the kill was correct.</p>
+
+<p>This is why projects like <strong>Kueue</strong> (a Kubernetes-native job queueing and quota controller) and <strong>Volcano</strong> (a batch scheduler with gang and fair-share semantics) exist. They are not competing "better schedulers"; they each move a piece of policy out of the implicit default and make it explicit and auditable. The real design question the chapter poses is not "which project is best?" but <em>where should each policy live</em> — in the batch scheduler, in a queue/admission controller, or in a platform API your teams call.</p>
+
+<h2>2 · The four scheduling primitives, defined</h2>
+
+<p>Four mechanisms do the structural work. Each one exists to prevent a specific failure you would otherwise hit on shared GPUs.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Gang scheduling</div><div class="v">All-or-nothing placement: a distributed job gets <em>all</em> its workers admitted together or <em>none</em>. Prevents the lesson-14 straggler problem — half-placed pods sitting idle on scarce GPUs while they wait (and rendezvous-block) for siblings that may never be scheduled.</div></div>
+  <div class="topic-card"><div class="k">Bin packing</div><div class="v">Pack pods tightly onto as few nodes as possible to raise utilization and free whole nodes. Great for the average — but it scatters small jobs across nodes and can <em>fragment</em> the contiguous topology a big job needs.</div></div>
+  <div class="topic-card"><div class="k">Descheduling</div><div class="v">A controller that evicts already-running pods to rebalance the cluster — e.g. consolidating fragmented small jobs to reopen a contiguous GPU island. The repair pass that undoes the damage greedy packing does over time.</div></div>
+  <div class="topic-card"><div class="k">Queues + quotas</div><div class="v">Kueue / Volcano admit jobs by team, priority class, and a quota (a team's guaranteed share, e.g. 16 of 64 GPUs). Jobs that exceed quota wait in a queue rather than starving others. Cohorts let idle quota be borrowed.</div></div>
 </div>
 
+<p><strong>Why gang scheduling is non-negotiable for training.</strong> A PyTorch distributed job needs <em>rendezvous</em>: every worker discovers the others, agrees on ranks, and only then begins collective operations (the all-reduce that averages gradients, covered in the System ML track). If only half the pods are scheduled, the job is not half-useful — it is <em>stuck</em>, holding scarce GPUs while blocked at the rendezvous barrier waiting for ranks that the default scheduler may never place because the GPUs are gone. Gang scheduling admits the group only when enough resources are free for <em>all</em> of it, so a job either runs or politely waits in the queue. Volcano-style schedulers center on this; Kueue expresses it through all-or-nothing admission of a job's pods.</p>
 
-<h2>Linear Story</h2>
-<p>Once teams share GPUs, scheduling becomes a product decision. Who gets scarce accelerators? Can a large distributed job wait until all ranks are available? Should small jobs backfill gaps? Should production preempt research? How do teams see cost? The book's scheduling chapter turns Kubernetes from a pod placer into a shared GPU platform.</p>
-<p>Core scheduling can place pods, but AI batch work often needs bin packing, descheduling, gang scheduling, topology awareness, quotas, multitenancy, high-performance networking, storage planning, and correlated observability. Tools such as Kueue and Volcano-style schedulers exist because "first pod that fits" is not a fair or efficient policy for expensive accelerators.</p>
-<h2>Fairness Is Multidimensional</h2>
-<table class="trade-table"><thead><tr><th>Goal</th><th>Policy</th><th>Trade-off</th></tr></thead><tbody>
-  <tr><td>High utilization</td><td>Bin pack and backfill</td><td>Can fragment topology for large jobs</td></tr>
-  <tr><td>Team fairness</td><td>Queues and quotas</td><td>May leave GPUs idle if quotas are rigid</td></tr>
-  <tr><td>Large-job success</td><td>Gang scheduling</td><td>Small jobs may wait behind big reservations</td></tr>
-  <tr><td>Performance</td><td>Topology-aware placement</td><td>Scheduler has fewer feasible placements</td></tr>
-  <tr><td>Cost control</td><td>Chargeback/showback</td><td>Requires trustworthy usage accounting</td></tr>
+<div class="callout warn"><div class="label">The data plane can starve the GPUs too</div>
+Scheduling decides <em>where</em> the work lands, but a distributed job's speed often depends on the network path as much as the GPU count. Secondary network interfaces and RDMA-capable fabrics (defined in lesson 07's topology discussion) carry the gradient all-reduce; if the scheduler places workers across a slow path, synchronization dominates and you pay for GPUs that mostly wait. Likewise, storage must stream training data and checkpoints fast enough to keep GPUs busy — a slow data plane turns a $30/hr GPU into an idle heater. The scheduler cannot fix a data plane that cannot keep up; topology-aware placement (§4) is partly about keeping the network short.</p></div>
+
+<h2>3 · A multitenancy scenario: when best-effort blocks production</h2>
+
+<p>Make it concrete. A cluster has <strong>64 GPUs</strong>. Three teams share it, each with a quota:</p>
+
+<div class="mini-flow">
+<div class="step"><span class="n">→</span><strong>Team Serving</strong> (production inference) — quota 32 GPUs, jobs run at <code>priorityClass: production</code></div>
+<div class="step"><span class="n">→</span><strong>Team Research</strong> (experiments) — quota 24 GPUs, jobs run at <code>priorityClass: research</code></div>
+<div class="step"><span class="n">→</span><strong>Team Batch</strong> (nightly evals) — quota 8 GPUs, jobs run at <code>priorityClass: best-effort</code></div>
+</div>
+
+<p>One night the cluster is quiet, so Team Batch's quotas let them <em>borrow</em> idle capacity (a cohort feature) and a best-effort eval sweep spreads across <strong>40 GPUs</strong> — far above their 8-GPU quota, which is allowed precisely because nothing else wanted them. Then a production incident hits: Team Serving needs to scale inference and submits a job for 16 more GPUs. But only 8 are truly free; the other 32 are split between Serving's own steady-state and Batch's borrowed 40. With no preemption policy, the production job <em>queues behind a best-effort eval sweep</em>. The incident drags on while a nightly job no one is watching holds the accelerators.</p>
+
+<p>The fix is two pieces of explicit policy. <strong>Priority classes</strong> rank workloads (production &gt; research &gt; best-effort). <strong>Preemption</strong> lets a higher-priority job that cannot otherwise be admitted evict lower-priority running pods. With both configured, the production job's admission triggers preemption of enough best-effort eval pods to free 16 GPUs; Batch's borrowed-over-quota work is the first to be reclaimed because it was running on capacity it had no guarantee to.</p>
+
+<pre><code># Kueue: a ClusterQueue gives each team a guaranteed quota and a borrowing cohort,
+# and admits jobs by priority. Higher-priority jobs preempt lower ones when needed.
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata: { name: serving-cq }
+spec:
+  cohort: shared-64gpu              # lets teams borrow each other's idle quota
+  resourceGroups:
+  - coveredResources: ["nvidia.com/gpu"]
+    flavors:
+    - name: a100
+      resources:
+      - name: "nvidia.com/gpu"
+        nominalQuota: 32            # Serving's guaranteed share
+  preemption:
+    reclaimWithinCohort: Any        # reclaim borrowed GPUs from lower priority
+    withinClusterQueue: LowerPriority</code></pre>
+
+<p>The lesson the chapter draws: <em>best-effort work must be able to use idle GPUs (utilization) but must be the first to lose them (fairness).</em> Borrowing without reclaim is how a nightly eval blocks an incident. The contract — Serving is guaranteed 32, can borrow more, and reclaims its 32 by preempting borrowers — must be published so Team Batch is not surprised when their job is killed mid-sweep.</p>
+
+<h2>4 · Utilization versus topology: the central tension</h2>
+
+<p>Now the harder trade-off, the one that makes GPU scheduling genuinely different from packing web pods. Bin packing maximizes a scalar — utilization — but large training and tensor-parallel jobs care about a <em>shape</em>: they need several GPUs that are physically close, connected by NVLink (NVIDIA's high-bandwidth intra-node GPU interconnect) within a node, or rack-local across nodes, so their collectives are fast. Bin packing and topology pull in opposite directions.</p>
+
+<p><strong>Worked example.</strong> Take 8 nodes, each with 8 NVLink-connected GPUs — 64 GPUs total. A flurry of small 2-GPU jobs arrives. A greedy bin-packer, optimizing utilization, scatters them to fill gaps wherever they fit:</p>
+
+<table class="trade-table"><thead><tr><th>Node</th><th>After greedy bin packing</th><th>Free GPUs</th><th>Largest free NVLink island</th></tr></thead><tbody>
+  <tr><td>node-1</td><td>3 × 2-GPU jobs</td><td>2</td><td>2</td></tr>
+  <tr><td>node-2</td><td>3 × 2-GPU jobs</td><td>2</td><td>2</td></tr>
+  <tr><td>node-3</td><td>3 × 2-GPU jobs</td><td>2</td><td>2</td></tr>
+  <tr><td>...</td><td>...</td><td>...</td><td>...</td></tr>
+  <tr><td>node-8</td><td>3 × 2-GPU jobs</td><td>2</td><td>2</td></tr>
 </tbody></table>
-<h2>Network, Storage, And HPC Bridges</h2>
-<p>Distributed training may depend on network paths as much as GPU count. Secondary network interfaces, RDMA-capable fabrics, and topology-aware placement can be the difference between useful scaling and expensive synchronization. Storage must feed data and checkpoints without turning GPUs into idle heaters. The scheduler cannot fix a data plane that cannot keep up.</p>
-<p>The book also calls out the bridge between HPC habits and Kubernetes habits. Slurm remains common where batch scheduling and tightly coupled GPU jobs are the center of gravity. Kubernetes-native platforms may integrate with Slurm or use projects such as Slinky-style bridges so research workflows and cloud-native services can coexist. Treat this as an ownership decision: do you want Kubernetes to be the batch scheduler, or do you want Kubernetes to host services around an HPC scheduler?</p>
-<h2>Rendezvous And Scheduler Comparisons</h2>
-<p>PyTorch distributed jobs need rendezvous: workers discover each other, agree on ranks, and begin collectives together. If only half the pods are scheduled, the job is not half useful; it is stuck. Gang scheduling solves that by admitting the group only when enough resources are available. Volcano-style schedulers emphasize batch and gang semantics. Kueue emphasizes queueing, quotas, cohorts, and admission control for Kubernetes jobs. The comparison is not "which project is best?" but "where should the policy live: batch scheduler, queue controller, or platform API?"</p>
-<h2>Operational Rule</h2>
-<p>Publish the rules. GPU fairness fails socially before it fails technically. Teams should know priority classes, preemption policy, quota, expected wait time, chargeback, and incident override rules.</p>
 
+<p>Cluster utilization is <span class="math">48 / 64 ≈ 75%</span> running, and if a few more small jobs land it climbs toward <span class="math">95%</span>. By the utilization dashboard, the cluster looks healthy. But now the next big job arrives: an 8-GPU tensor-parallel fine-tune that needs <em>8 NVLink-connected GPUs on one node</em>. There are <strong>16 GPUs free in total</strong> — more than enough by count — yet <strong>no single node has 8 free</strong>. The largest contiguous NVLink island is 2 GPUs. The big job cannot be placed despite 25% of the fleet being idle. Utilization optimized the average and starved the shape.</p>
 
-<h2>Mental Model</h2>
-<p>GPU fairness is a scheduling contract plus a financial contract. The platform must decide who waits, who preempts, who pays, and which topology is preserved.</p>
+<pre class="ascii">  greedy bin packing                 topology-aware (islands reserved)
+  node-1 [#][#][#][#][#][#][.][.]    node-1 [#][#][#][#][#][#][.][.]
+  node-2 [#][#][#][#][#][#][.][.]    node-2 [#][#][#][#][#][#][.][.]
+  node-3 [#][#][#][#][#][#][.][.]    node-3 [#][#][#][#][#][#][#][#]  <- still
+  ...                                ...                                whole
+  16 free, largest island = 2        16 free, largest island = 8
+  8-GPU job: CANNOT place            8-GPU job: places on node-3
+  (# = used GPU, . = free GPU)</pre>
 
-<h2>Operational Checklist</h2>
-<ul>
-<li>Use queues and quotas for teams, workloads, and priority classes.</li>
-<li>Use gang scheduling for distributed jobs that need all replicas before useful work begins.</li>
-<li>Use topology-aware scheduling for jobs that depend on NVLink, rack locality, or secondary networks.</li>
-<li>Expose chargeback or showback in dollars per GPU-hour and dollars per useful token or training run.</li>
+<p>Same 16 free GPUs, two different shapes. The greedy layout maximized a number; the topology-aware layout deliberately kept node-3 whole so the next big job has a home. The difference is invisible on a utilization gauge and decisive for the job that matters.</p>
+
+<div class="widget" id="pack-widget">
+  <div class="title">Bin packing vs. topology — utilization is not the whole story</div>
+  <div class="hint">A cluster of <strong>8 nodes × 8 NVLink GPUs</strong> (64 total). Drag the <strong>number of small 2-GPU jobs</strong> to fill the fleet, and toggle whether the scheduler <strong>reserves whole-node islands</strong> for big jobs. Watch utilization climb — but also watch how many <strong>8-GPU NVLink islands survive</strong> for the next tensor-parallel job. Greedy packing wins on the gauge and loses the islands; reserving costs a little utilization and keeps the big job placeable.</div>
+
+  <canvas class="dist-canvas" id="pack-canvas" width="760" height="200" style="height:200px;"></canvas>
+
+  <div class="controls" style="margin-top: 12px;">
+    <label class="inline">small 2-GPU jobs: <input type="range" id="pk-jobs" min="0" max="28" step="1" value="20"> <span class="val" id="pk-jobs-val">20</span></label>
+    <label class="inline"><input type="checkbox" id="pk-reserve"> reserve whole-node islands</label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">GPUs used</div><div class="v" id="pk-k-used">—</div></div>
+    <div class="kpi"><div class="k">Utilization</div><div class="v" id="pk-k-util">—</div></div>
+    <div class="kpi"><div class="k">Free 8-GPU islands</div><div class="v" id="pk-k-island">—</div></div>
+    <div class="kpi"><div class="k">Next 8-GPU job</div><div class="v" id="pk-k-fit">—</div></div>
+  </div>
+</div>
+
+<div class="callout"><div class="label">Worked number — the cost of fragmentation</div>
+That stranded 8-GPU job is the expensive one. If it would have run a 6-hour fine-tune on 8 A100s at <span class="math">$3/GPU-hour</span>, the job's compute is <span class="math">8 × 6 × $3 = $144</span> — but the real cost is the <em>delay</em>: it sits in the queue until a descheduler consolidates the small jobs (evicting and re-placing several, each a checkpoint-and-restart) to reopen one 8-GPU island. <strong>Two cures.</strong> (1) <em>Topology-aware scheduling</em>: tell the scheduler that the 2-GPU jobs prefer to <em>co-locate on already-fragmented nodes</em>, deliberately keeping some nodes whole — you trade a few points of peak utilization to preserve large-job islands. (2) <em>Descheduling</em>: a controller periodically evicts and re-packs small jobs to defragment, the way a disk defragmenter reopens contiguous space. The platform that runs at 95% utilization with zero free islands is <em>less</em> useful than one at 85% that can still admit the big job.</p></div>
+
+<p><strong>Topology-aware scheduling</strong> makes the scheduler reason about the interconnect, not just GPU counts. It keeps a distributed job inside a topology domain — same NVLink node, then same rack, then same secondary-network fabric — so its collectives stay on the fast path, and it reserves islands so large jobs are placeable. The cost: the scheduler has <em>fewer feasible placements</em>, so it is slower to admit and can leave GPUs idle waiting for the right-shaped hole. That is the deliberate trade — a worse average for a better worst case on the jobs that matter.</p>
+
+<h2>5 · Closing the financial loop: chargeback and showback</h2>
+
+<p>The scheduling contract decides who runs. The financial contract decides who <em>pays</em>, and it is the half most platforms skip — which is why "no one can explain GPU spend" is a near-universal failure. The chapter's prescription: expose cost at three granularities.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">$ / GPU-hour</div><div class="v">The raw input cost. An A100 at ~$3/hr; 64 of them is ~$192/hr, ~$138k/month if fully on. The denominator everyone starts with — but allocation, not usefulness.</div></div>
+  <div class="topic-card"><div class="k">$ / useful token</div><div class="v">For serving: cost divided by tokens actually generated for users. A job at 95% allocation but 30% GPU-busy is paying full price for idle silicon — this metric exposes it; raw GPU-hours hides it.</div></div>
+  <div class="topic-card"><div class="k">$ / training-run</div><div class="v">For training: total GPU-hours × rate for one completed run, attributed to the owning team. Makes "was this experiment worth it?" answerable, and makes a failed run's wasted spend visible.</div></div>
+</div>
+
+<p>The distinction between <strong>chargeback</strong> (teams are actually billed their share) and <strong>showback</strong> (teams are <em>shown</em> their share without a real invoice) is a maturity choice: showback first, to build the accounting and trust; chargeback once the numbers are trusted enough to drive a budget. Either way, the critical design point is that <em>platform metrics must not stop at allocation.</em> Allocation says a job <em>held</em> 8 GPUs; usefulness says whether those GPUs <em>did</em> anything. A team whose chargeback is in $/useful-token has a direct incentive to fix the batching and KV-cache settings from lessons 08–10; a team billed only in $/GPU-hour has no signal that their job ran at 30% utilization.</p>
+
+<div class="callout"><div class="label">Worked number — why $/useful-token catches what $/GPU-hour hides</div>
+A serving team holds 8 A100s at <span class="math">$3/GPU-hour = $24/hr</span>. By $/GPU-hour the cost is flat regardless of what the GPUs do. Now measure usefulness. At a healthy batch size the deployment serves <span class="math">2{,}000 tokens/s</span>; over an hour that is <span class="math">7.2M tokens</span>, so <span class="math">$24 / 7.2M ≈ $3.33 per 1M useful tokens</span>. But suppose batching is misconfigured and the GPUs sit at 30% busy, serving <span class="math">600 tokens/s</span> = <span class="math">2.16M tokens/hr</span>: now <span class="math">$24 / 2.16M ≈ $11.10 per 1M tokens</span> — <strong>3.3× more expensive for identical hardware</strong>. The $/GPU-hour bill is unchanged at $24/hr and looks fine; only $/useful-token reveals the waste and points the team straight at the batching and KV-cache knobs from lessons 08–10.</p></div>
+
+<div class="callout"><div class="label">The HPC bridge — a real ownership decision</div>
+The chapter flags that batch GPU scheduling is exactly what HPC schedulers like <strong>Slurm</strong> were built for, and many organizations already run Slurm for tightly coupled GPU jobs. Kubernetes-native platforms can integrate with Slurm or use Slinky-style bridges so research batch workflows and cloud-native services coexist. Treat it as an ownership decision, not a religious one: do you want <em>Kubernetes</em> to be the batch scheduler (Kueue/Volcano), or do you want Kubernetes to host the services <em>around</em> an HPC scheduler that owns the batch queue? Picking one keeps the scheduling contract in a single place.</p></div>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+<li><strong>Best-effort jobs block production.</strong> A low-priority job grabs scarce accelerators and an urgent production job queues behind it. <em>Signal:</em> high cluster utilization yet a production job stuck in <code>Pending</code> with no idle GPUs — the fix is priority classes plus preemption, not more hardware.</li>
+<li><strong>Bin packing destroys topology.</strong> Greedy packing hits 95% utilization but leaves no contiguous NVLink/rack island, so the next large job cannot be placed despite many free GPUs. <em>Signal:</em> "GPUs free &gt; job request, but job won't schedule" — count is fine, shape is gone. Cure with topology-aware placement and descheduling.</li>
+<li><strong>Cost is invisible.</strong> No one can explain GPU spend because metrics stop at <em>allocation</em>, not useful work. <em>Signal:</em> finance asks "what did this cluster do?" and the only answer is GPU-hours, with no $/useful-token or $/run to tie spend to value — so idle-but-allocated GPUs go unnoticed.</li>
+<li><strong>Rigid quotas idle GPUs.</strong> Hard per-team quotas with no borrowing leave a team's share idle while another queues. <em>Signal:</em> low utilization <em>and</em> pending jobs at the same time — quotas need cohorts/borrowing with reclaim.</li>
+<li><strong>Unpublished policy.</strong> Teams don't know the preemption, quota, or wait-time rules, so the first preemption feels like betrayal. <em>Signal:</em> escalations and side-channel "can you bump my job?" requests — GPU fairness failing socially before it fails technically.</li>
 </ul>
-
-<h2>Failure Modes</h2>
-<ul>
-<li>Best-effort jobs consume scarce accelerators and block production incidents.</li>
-<li>Bin packing improves utilization but destroys the topology needed by large jobs.</li>
-<li>No one can explain GPU spend because platform metrics stop at allocation, not useful work.</li>
+  </div>
+  <div class="lesson-card"><h3>Implementation checklist</h3><ul>
+<li>Use <strong>queues and quotas</strong> (Kueue/Volcano) keyed to teams, workloads, and explicit <em>priority classes</em>, with cohorts so idle quota can be borrowed and reclaimed.</li>
+<li>Use <strong>gang scheduling</strong> for any distributed job that needs all replicas to rendezvous before useful work begins — admit the group all-or-nothing, never half.</li>
+<li>Use <strong>topology-aware scheduling</strong> for jobs depending on NVLink, rack locality, or secondary/RDMA networks, and reserve islands so large jobs stay placeable.</li>
+<li>Run a <strong>descheduler</strong> to defragment over time, reopening contiguous islands greedy packing closed.</li>
+<li>Expose <strong>chargeback/showback</strong> in $/GPU-hour <em>and</em> $/useful-token or $/training-run, so spend ties to value and idle-but-allocated GPUs are visible.</li>
+<li>Decide and <strong>publish</strong> the scheduling contract: priority order, preemption policy, quotas, expected wait time, chargeback, and the incident-override rule.</li>
+<li>Confirm the data plane (network, storage) can feed the GPUs, so placement decisions aren't undone by a starved fabric.</li>
 </ul>
+  </div>
+</div>
 
-<h2>Cross-Links</h2>
+<div class="callout"><div class="label">Further reading</div>
 <ul>
-<li><a href="https://kueue.sigs.k8s.io/docs/tasks/run/jobs/">Kueue jobs</a></li>
-<li><a href="../../system_ml/lessons/12_3d_parallelism.html">System ML 3D parallelism</a></li>
-</ul>
+<li><a href="https://kueue.sigs.k8s.io/docs/tasks/run/jobs/">Kueue — running jobs</a>: how Kueue admits a Kubernetes <code>Job</code> against a ClusterQueue's quota, including all-or-nothing admission and preemption — the concrete API behind §3.</li>
+<li><a href="../../system_ml/lessons/12_3d_parallelism.html">System ML — 3D parallelism</a>: why tensor-parallel jobs need NVLink-local GPUs and rack-local fabrics in the first place — the workload side of the topology constraint §4 schedules around.</li>
+</ul></div>
 
-<h2>Takeaway And Interview Prompts</h2>
-<p><strong>Takeaway:</strong> GPU fairness is a scheduling contract plus a financial contract. The platform must decide who waits, who preempts, who pays, and which topology is preserved.</p>
-<ol>
-  <li>Draw the system boundary for <strong>Batch Scheduling and GPU Fairness</strong>. Which resource or policy binds first?</li>
-  <li>Pick two designs from this lesson. What does each optimize, and what does each make worse?</li>
-  <li>Design an incident around this failure mode: Best-effort jobs consume scarce accelerators and block production incidents. What metric, log, or trace would reveal it?</li>
-</ol>
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>You run 64 A100s shared by three teams. Write the scheduling contract: assign each team a quota and a priority class; decide whether best-effort work may borrow over quota and what reclaims it; choose where gang scheduling and topology-awareness apply (which jobs need an NVLink island vs. which can scatter). Then pick the chargeback metric you'd publish first ($/GPU-hour, $/useful-token, or $/training-run) and justify it. Finally, write the one sentence you'd post for the team whose job gets preempted during a production incident.</div>
+
+<h2>Where this points next</h2>
+
+<p>You can now run GPUs as a fair, accountable, multi-tenant platform — training and serving workloads share hardware under a published scheduling and financial contract. Part IV's customization arc is done. Lesson 16, <a href="16_rag_on_kubernetes.html">RAG on Kubernetes</a>, shifts from <em>training</em> a model on your data to <em>retrieving</em> your data at inference time: it adds the machinery — a vector database, an embedding service, and a retrieval step in front of the model server — that lets a model answer from a knowledge base it was never trained on. The scheduling discipline you just built still applies (the embedding and retrieval services are pods competing for the same nodes), but the new question becomes a data and latency one: how to keep the retrieval hop fast and the index fresh.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+Once teams share GPUs, scheduling becomes a product decision governed by two contracts at once: a <strong>scheduling</strong> contract (who waits, who preempts, which topology survives) and a <strong>financial</strong> contract (who pays). The default "first pod that fits" fails on all three axes, so you reach for <strong>gang scheduling</strong> (all-or-nothing admission so distributed jobs don't half-start and stall at rendezvous), <strong>queues + quotas + priority classes</strong> with borrowing and preemption (so best-effort work can use idle GPUs but is the first to lose them to a production incident), and <strong>topology-aware scheduling + descheduling</strong> (so bin packing's 95% utilization doesn't strand the next 8-GPU NVLink job behind a fragmented fleet). Close the loop with <strong>chargeback/showback</strong> in $/GPU-hour <em>and</em> $/useful-token or $/training-run, because metrics that stop at allocation hide idle silicon. And publish the contract — GPU fairness fails socially before it fails technically.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why isn't the default "first pod that fits" scheduler enough for shared GPUs? <em>(§1 — it places pods one at a time (bad for jobs needing all workers), packs greedily (bad for topology), and ignores ownership/budget (bad for fairness and cost).)</em></li>
+  <li>What problem does gang scheduling solve, and what breaks without it? <em>(§2 — all-or-nothing admission; without it a distributed job half-starts and stalls at the rendezvous barrier holding scarce GPUs idle while waiting for ranks the scheduler may never place.)</em></li>
+  <li>A best-effort eval job is blocking a production incident. What's the fix? <em>(§3 — priority classes plus preemption: borrowing-over-quota work can use idle GPUs but is reclaimed first; the production job preempts the best-effort pods to free its GPUs.)</em></li>
+  <li>The cluster is at 95% utilization but an 8-GPU job won't schedule with 16 GPUs free. Why, and how do you fix it? <em>(§4 — fragmentation: GPU count is fine but no contiguous NVLink island remains. Fix with topology-aware placement that reserves islands and a descheduler that defragments.)</em></li>
+  <li>Why isn't $/GPU-hour a sufficient cost metric? <em>(§5 — it measures allocation, not usefulness; a job at 95% allocation but 30% busy looks fine. $/useful-token and $/training-run tie spend to value and expose idle-but-allocated GPUs.)</em></li>
+  <li>Where should scheduling policy live — Kubernetes or an HPC scheduler? <em>(§1, §5 — an ownership decision: Kueue/Volcano make Kubernetes the batch scheduler, or Kubernetes hosts services around a Slurm-style scheduler via bridges; pick one so the contract lives in a single place.)</em></li>
+  <li>Why is "publish the rules" listed as an operational requirement, not a nicety? <em>(§1, §3 — GPU fairness fails socially before it fails technically: a team that doesn't know the preemption/quota/wait rules treats a correct preemption as betrayal, generating escalations and side-channel requests.)</em></li>
+</ul>
 
 <footer class="lesson-nav">
   <a href="14_fine_tuning_jobs.html"><span class="dir">Previous</span><span class="ttl">14 - Fine-Tuning Jobs on Kubernetes</span></a>
   <a class="next" href="16_rag_on_kubernetes.html"><span class="dir">Next</span><span class="ttl">16 - RAG on Kubernetes</span></a>
 </footer>
 </main>
+
+<script>
+(function(){
+  var canvas = document.getElementById('pack-canvas');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+
+  var jobsRng = document.getElementById('pk-jobs');
+  var jobsVal = document.getElementById('pk-jobs-val');
+  var reserve = document.getElementById('pk-reserve');
+  var kUsed   = document.getElementById('pk-k-used');
+  var kUtil   = document.getElementById('pk-k-util');
+  var kIsland = document.getElementById('pk-k-island');
+  var kFit    = document.getElementById('pk-k-fit');
+
+  var NODES = 8, PER = 8, TOTAL = NODES * PER;
+
+  // Place `jobs` 2-GPU jobs. Greedy: fill each node before moving on, so packing
+  // fragments many nodes to 6/8. Reserve: keep some nodes empty to preserve islands.
+  function layout(jobs, doReserve){
+    var node = new Array(NODES).fill(0);   // GPUs used per node
+    var keepWhole = doReserve ? 2 : 0;     // reserve 2 nodes as whole islands
+    var placeable = NODES - keepWhole;
+    var remaining = jobs;
+    // round-robin two-at-a-time across the placeable nodes so they fill evenly
+    // (mimics a packer that still leaves a 2-GPU tail on each touched node)
+    var i = 0;
+    while (remaining > 0){
+      var n = i % placeable;
+      if (node[n] + 2 <= PER){ node[n] += 2; remaining--; }
+      else { // node full; if all placeable full, spill into reserved nodes
+        var allFull = true;
+        for (var k=0;k<placeable;k++) if (node[k]+2<=PER) allFull=false;
+        if (allFull){
+          var spilled = false;
+          for (var r=placeable;r<NODES;r++){ if (node[r]+2<=PER){ node[r]+=2; remaining--; spilled=true; break; } }
+          if (!spilled) break; // truly full
+        }
+      }
+      i++;
+    }
+    return node;
+  }
+
+  function render(){
+    var jobs = parseInt(jobsRng.value, 10);
+    var node = layout(jobs, reserve.checked);
+
+    var dpr = window.devicePixelRatio || 1;
+    var W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== Math.round(W*dpr)){ canvas.width = Math.round(W*dpr); canvas.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    var padX = 16, padY = 18, gap = 6;
+    var cellW = (W - 2*padX - (PER-1)*gap) / PER;
+    var rowH = (H - 2*padY - (NODES-1)*gap) / NODES;
+
+    var used = 0, islands = 0;
+    for (var r=0;r<NODES;r++){
+      var u = node[r]; used += u;
+      if (PER - u >= 8) islands++;   // whole free node = an 8-GPU island
+      for (var c=0;c<PER;c++){
+        var x = padX + c*(cellW+gap);
+        var y = padY + r*(rowH+gap);
+        ctx.fillStyle = c < u ? '#dc2626' : '#16a34a';
+        ctx.fillRect(x, y, cellW, rowH);
+      }
+    }
+
+    var util = (used / TOTAL * 100);
+    kUsed.textContent   = used + ' / ' + TOTAL;
+    kUtil.textContent   = util.toFixed(0) + '%';
+    kIsland.textContent = islands;
+    kFit.textContent    = islands >= 1 ? 'places' : 'BLOCKED';
+    kFit.style.color    = islands >= 1 ? '#16a34a' : '#dc2626';
+    jobsVal.textContent = jobs;
+  }
+
+  jobsRng.addEventListener('input', render);
+  reserve.addEventListener('change', render);
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
 </body>
 </html>

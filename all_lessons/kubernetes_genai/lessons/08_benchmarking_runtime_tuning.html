@@ -5,76 +5,285 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>08 - Benchmarking and Runtime Tuning | Generative AI on Kubernetes</title>
 <link rel="stylesheet" href="style.css">
+<style>
+  .kicker { margin: 0 0 8px; font-family: var(--mono); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-mute); }
+  .source-note { border-left-color: var(--accent-2); }
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; }
+  .mini-flow { display: grid; gap: 8px; margin: 18px 0; }
+  .mini-flow .step { border: 1px solid var(--border); background: var(--bg-elev); border-radius: 8px; padding: 10px 12px; }
+  .mini-flow .n { font-family: var(--mono); color: var(--accent); font-size: 12px; margin-right: 6px; }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
 </head>
 <body>
 <header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">kubernetes_genai</a><span class="crumb">/</span><span class="crumb">08</span><span class="step-pill">lesson 8 / 18</span></div></header>
 <main>
+
 <p class="kicker">Part III - Production inference</p>
 <h1>Benchmarking and Runtime Tuning</h1>
-<p class="subtitle">Task evaluation, quantization, pruning, vLLM parameters, startup-time optimization, and repeatable load tests.</p>
+<p class="subtitle">Lesson 07 spread a model across several GPUs and showed how interconnect topology decides whether that split helps or hurts. You now have a serving deployment that <em>runs</em> — but someone files a ticket that says "the model feels slow," and you have no idea whether that means the queue is backed up, the prompts got longer, the batch is too big, or a quantization change last week quietly broke the task. This lesson turns that vague complaint into a controlled experiment. The core discipline is treating a benchmark as a <em>contract</em>: a number like "1,800 tokens/s" means nothing until you also state the prompt length, output length, concurrency, sampling settings, and hardware it was measured on. We will pin down that contract, walk the coupled runtime knobs that move the numbers, and prove with arithmetic why a tidy synthetic benchmark can lie about production by a factor of sixty.</p>
 
 <div class="callout source-note"><div class="label">Source coverage</div>PDF Chapter 4: model and runtime tuning, language-model evaluation, benchmark, vLLM tuning, and startup time.</div>
-<div class="callout"><div class="label">Learning objective</div>Turn &#x27;this model feels slow&#x27; into a controlled experiment over prompt mix, generation length, concurrency, and runtime knobs.</div>
 
-<h2>Linear Position</h2>
-<div class="position-grid">
-  <div><strong>Prerequisite</strong><span>Builds on <a href="07_multi_gpu_topology.html">07 - Multi-GPU Inference and Topology</a>.</span></div>
-  <div><strong>New capability</strong><span>Turn &#x27;this model feels slow&#x27; into a controlled experiment over prompt mix, generation length, concurrency, and runtime knobs.</span></div>
-  <div><strong>Next dependency</strong><span>Prepares <a href="09_autoscaling_ai_routing.html">09 - Autoscaling and AI-Aware Routing</a>.</span></div>
+<div class="callout"><div class="label">Linear position</div><strong>Prerequisite:</strong> Lesson 07 (Multi-GPU inference and topology) — you can place a model on one or many GPUs and reason about where its memory and bandwidth go. Lessons 04-06 gave you the serving runtime (vLLM, PagedAttention, the KV cache) and the latency vocabulary.<br><strong>New capability:</strong> A repeatable method for measuring serving performance under a stated workload, and for tuning the runtime knobs as a <em>coupled set</em> while watching latency, throughput, and task quality together — so you optimize the thing the user feels, not a benchmark artifact.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Five moves. (1) Define the <strong>workload contract</strong> — the parameters without which a throughput number is decoration. (2) Re-anchor <strong>TTFT vs TPOT</strong> and the roofline split: prefill is compute-bound, decode is memory-bandwidth-bound, so prefill-heavy and decode-heavy workloads must be benchmarked apart. (3) Work the <strong>60x number</strong> — how a 64-token synthetic prompt mispredicts a 4,000-token production prompt. (4) Treat the <strong>vLLM knobs as one coupled system</strong> — max-num-batched-tokens, max-num-seqs, KV-cache dtype, quantization, prefix caching, chunked prefill — and show with the widget how chasing peak throughput blows up p99 TTFT. (5) Pair every speed change with a <strong>quality check</strong>, then the failure modes, checklist, and hand-off to autoscaling.</p></div>
+
+<h2>1 · A benchmark is a workload contract</h2>
+
+<p>Imagine two teams both report "we get 2,000 tokens/second on an H100." One measured it sending 64-token prompts and asking for 8 tokens out, 256 requests at once. The other measured 4,000-token prompts asking for 1,000 tokens out, 4 requests at once. These are not the same model behaving inconsistently — they are <em>two entirely different workloads</em> that happen to share a hardware label. Comparing their tokens/s tells you nothing. The number is meaningless until the workload is pinned down.</p>
+
+<p>So the first artifact of any tuning effort is not a graph — it is a <strong>workload contract</strong>: the full set of parameters that, once fixed, make a measurement reproducible and comparable. Change any one of them and you are measuring a different thing.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Input length</div><div class="v">Tokens per prompt (and its distribution — mean is not enough; tails drive tail latency). Sets the <em>prefill</em> cost.</div></div>
+  <div class="topic-card"><div class="k">Output length</div><div class="v">Tokens generated per request. Sets how long <em>decode</em> runs and how much KV cache each request holds.</div></div>
+  <div class="topic-card"><div class="k">Concurrency</div><div class="v">How many requests are in flight at once. This is the knob that trades throughput against tail latency; it must be a controlled variable, never an accident of the load tool.</div></div>
+  <div class="topic-card"><div class="k">Sampling settings</div><div class="v">Greedy vs temperature/top-p, and especially whether generation stops early. Early stops shorten real output and inflate apparent tokens/s.</div></div>
+  <div class="topic-card"><div class="k">Hardware + topology</div><div class="v">GPU model, count, interconnect (NVLink vs PCIe — lesson 07), and tensor-parallel degree. Identical config on a different topology is a different result.</div></div>
+  <div class="topic-card"><div class="k">Model + runtime version</div><div class="v">Weights, quantization, vLLM/engine version, and the knob values below. A silent version bump is the most common reason a benchmark stops reproducing.</div></div>
 </div>
 
+<p>The mental model: a benchmark result is a function of all of these, written down together, or it is an anecdote. A throughput figure presented without its contract is the serving equivalent of a price with no currency.</p>
 
-<h2>Linear Story</h2>
-<p>Production tuning starts with a workload contract. A benchmark without prompt lengths, output lengths, concurrency, sampling settings, model version, hardware, and routing policy is mostly a story about the benchmark machine. The book moves from evaluation to runtime parameters because the platform must optimize both quality and throughput.</p>
-<p>LLM serving has two main timing surfaces. TTFT is dominated by queueing, routing, model readiness, and prefill. TPOT is dominated by decode scheduling, memory bandwidth, KV cache pressure, and batching. A change that improves throughput can make TTFT worse. A change that improves p50 can destroy p99. A quantization change can lower cost and silently degrade the task.</p>
-<h2>Runtime Knobs as a Coupled System</h2>
-<p>vLLM-style knobs such as maximum batched tokens, maximum sequences, GPU memory utilization, KV cache dtype, prefix caching, chunked prefill, speculative decoding, and quantization are coupled. Raising concurrency increases utilization until KV cache pressure causes queueing or preemption. Chunked prefill can mix long prompts with decode work, but it changes latency shape. Prefix caching is powerful only when routing and prompt structure create reuse.</p>
-<table class="trade-table"><thead><tr><th>Knob</th><th>Improves</th><th>Can hurt</th></tr></thead><tbody>
-  <tr><td>Higher batch/concurrency</td><td>Throughput and GPU utilization</td><td>Queueing and p99 latency</td></tr>
-  <tr><td>Quantization</td><td>Memory, cost, sometimes speed</td><td>Quality and runtime compatibility</td></tr>
-  <tr><td>Prefix caching</td><td>Repeated prompt prefill cost</td><td>Memory pressure if reuse is low</td></tr>
-  <tr><td>Chunked prefill</td><td>Mixed workload utilization</td><td>More complex latency tuning</td></tr>
+<h2>2 · Two clocks: TTFT vs TPOT, and why the workload shape matters</h2>
+
+<p>Earlier lessons introduced the two latencies that matter to a user. We need them sharp here because they are governed by <em>different physical resources</em>, which is the whole reason a single benchmark cannot characterize a model.</p>
+
+<div class="mini-flow">
+<div class="step"><span class="n">→</span><strong>TTFT (time to first token)</strong> — the wait from request arrival until the first output token. It is dominated by queue time, scheduling, and <em>prefill</em>: the one-shot forward pass that reads the entire prompt and fills the KV cache.</div>
+<div class="step"><span class="n">→</span><strong>TPOT (time per output token)</strong> — the steady-state gap between successive output tokens once generation starts. It is dominated by <em>decode</em>: one forward pass per token, each re-reading the model weights and the growing KV cache.</div>
+</div>
+
+<p><strong>Prefill is compute-bound; decode is memory-bandwidth-bound.</strong> That single sentence is the roofline intuition behind everything in this lesson. Prefill processes all prompt tokens in parallel through dense matrix multiplies, so it saturates the GPU's arithmetic units — more FLOPs, more tensor cores help. Decode generates one token at a time, so each step does very little arithmetic but must stream the full weight matrices and the KV cache out of HBM (high-bandwidth memory — the GPU's on-package RAM). Decode is gated by how fast you can <em>move</em> bytes, not multiply them. (The fix for that idleness — batching many decode steps together so one weight read serves many requests — is exactly why concurrency raises throughput.)</p>
+
+<p>The consequence for benchmarking is direct: a <strong>prefill-heavy</strong> workload (long prompts, short answers — RAG, summarization, classification) and a <strong>decode-heavy</strong> workload (short prompts, long answers — chat, code generation) stress different ceilings. A knob that helps one can be irrelevant or harmful to the other. So you benchmark them <em>separately</em>, with their own contracts, and you never average them into one headline number.</p>
+
+<div class="callout warn"><div class="label">Track the full vector, not one scalar</div>
+Every run must record <strong>together</strong>: TTFT (p50 and p99), TPOT, end-to-end tokens/s, GPU utilization, HBM occupancy, queue/wait time, and a <strong>task-quality score</strong>. Reporting tokens/s alone hides the three things that actually get you paged — a tail-latency blowup, a KV cache that overflowed and forced preemptions, and a quality regression that no speed metric can see.</p></div>
+
+<h2>3 · The 60x lie — when a synthetic benchmark mispredicts production</h2>
+
+<p>Here is the worked number that justifies the whole "contract" discipline. Prefill compute scales roughly linearly with prompt length (each token's attention also grows, but the dominant term for these sizes is the per-token matmul work). Suppose your engineering team benchmarks with neat 64-token prompts, while production traffic — a RAG assistant stuffing retrieved documents into context — averages <strong>4,000-token</strong> prompts.</p>
+
+<div class="callout"><div class="label">Worked number — prefill cost and the TTFT flip</div>
+The prefill work ratio is <span class="math">4000 / 64 ≈ 62×</span>. If a 64-token prefill takes ~5 ms, the 4,000-token prefill takes on the order of <span class="math">5 ms × 62 ≈ 310 ms</span> — and that lands entirely in TTFT, before the user sees anything. In the synthetic benchmark, prefill was negligible and TTFT looked great (~15 ms including queue); decode dominated the experience. In production, TTFT is now <strong>~325 ms</strong> and <em>prefill dominates</em> the user-perceived latency. The synthetic run optimized decode batching and declared victory; the real bottleneck — first-token wait on long prompts — was never measured. Same model, same GPU, two contracts, opposite conclusions about what to tune.</p></div>
+
+<p>There is a redeeming twist that the synthetic benchmark also misses, in the other direction. Production RAG prompts often share a long, <em>identical prefix</em> — the same system prompt, the same retrieved boilerplate. With <strong>prefix caching</strong> (the engine keeps the KV-cache blocks for a prefix it has already computed and reuses them across requests), the expensive 4,000-token prefill is paid <em>once</em> and skipped on every subsequent hit. A short-prompt benchmark has no shared prefix, so it can neither see the 60x penalty nor the cache that rescues it. Only a benchmark whose contract mirrors the real prompt structure — length <em>and</em> reuse — predicts production at all.</p>
+
+<h2>4 · The runtime knobs are one coupled system</h2>
+
+<p>vLLM-style engines expose a handful of knobs that look independent and are not. Move one and the others' best settings shift. Define them once, then see why they couple.</p>
+
+<table class="trade-table"><thead><tr><th>Knob</th><th>What it does</th><th>Improves</th><th>Can hurt</th></tr></thead><tbody>
+  <tr><td><code>max-num-seqs</code></td><td>Cap on concurrent sequences in a batch</td><td>Throughput, GPU utilization</td><td>p99 TTFT; KV pressure &rarr; preemption</td></tr>
+  <tr><td><code>max-num-batched-tokens</code></td><td>Token budget per scheduler step (prefill + decode)</td><td>Prefill throughput, fairness</td><td>Big prefills monopolize a step, stalling decode</td></tr>
+  <tr><td>KV-cache dtype (fp16 &rarr; fp8)</td><td>Bytes per cached key/value</td><td>~2x more concurrency in same HBM</td><td>Small quality loss on some tasks</td></tr>
+  <tr><td>Weight quantization (AWQ/GPTQ/int4)</td><td>Bytes per weight</td><td>HBM footprint, sometimes decode speed</td><td>Task quality, runtime/kernel compatibility</td></tr>
+  <tr><td>Prefix caching</td><td>Reuse KV blocks for shared prefixes</td><td>Repeated prefill cost (huge for RAG)</td><td>Wasted memory when reuse is low</td></tr>
+  <tr><td>Chunked prefill</td><td>Slice long prefills, interleave with decode</td><td>Mixed-workload utilization, decode fairness</td><td>More complex latency tuning</td></tr>
 </tbody></table>
-<h2>Evaluation Pairing</h2>
-<p>Every performance experiment should carry a quality check. Use task evals for correctness, style, safety, and regression. The platform should be able to say: this config is cheaper by 20%, but it changes answer quality by this measured amount on these tasks. That sentence is what turns tuning from folklore into engineering.</p>
 
+<p><strong>Quantization</strong> means storing weights (or the KV cache) in fewer bits than the trained fp16 — int8, int4, fp8. It shrinks HBM use and can speed memory-bound decode, but it is lossy: the model's answers can shift. <strong>Pruning</strong> is the sibling technique — removing weights (or whole structures) deemed redundant — same trade: smaller and faster, at some quality cost. Both are bets that the task you care about tolerates the approximation, and that bet must be <em>measured</em>, never assumed.</p>
 
-<h2>Mental Model</h2>
-<p>A benchmark is a workload contract. Without prompt length, output length, concurrency, sampling settings, and hardware topology, throughput numbers are mostly decoration.</p>
+<p>Why they couple: raise <code>max-num-seqs</code> and each extra sequence wants KV-cache space, so you hit HBM limits sooner — unless you switched KV dtype to fp8 (frees room) or enabled prefix caching (frees room when prefixes repeat) or quantized the weights (frees room for cache). Push <code>max-num-batched-tokens</code> high for prefill throughput and a single 4,000-token prefill can eat an entire scheduler step, stalling every other request's decode and spiking TPOT — which is exactly what chunked prefill exists to prevent. You cannot tune these one at a time; you fix the workload contract, sweep <em>one</em> knob, measure the full vector, and only then move the next.</p>
 
-<h2>Operational Checklist</h2>
-<ul>
-<li>Benchmark prefill-heavy and decode-heavy workloads separately.</li>
-<li>Track TTFT, TPOT, tokens per second, GPU utilization, HBM pressure, queue time, and quality metrics together.</li>
-<li>Tune max batched tokens, max sequences, KV cache dtype, quantization, and prefix caching as a coupled set.</li>
-<li>Compare quality before and after compression or quantization, not only speed.</li>
+<div class="callout bad"><div class="label">Peak throughput is a trap for p99</div>
+The seductive failure: crank <code>max-num-seqs</code> to maximize tokens/s. Throughput climbs because bigger batches amortize the memory-bound weight reads of decode — but every request now waits behind a fuller queue and a heavier prefill step, so <strong>p99 TTFT explodes</strong>. A config that wins the throughput headline can violate your latency SLO on the very tail of traffic that users complain about. The widget below makes this curve draggable.</p></div>
+
+<div class="widget" id="batch-widget">
+  <div class="title">Concurrency sweep — throughput vs p99 first-token latency</div>
+  <div class="hint">Drag <strong>max concurrency</strong> (the effective <code>max-num-seqs</code>) and watch the two curves diverge. <span style="color:#16a34a;font-weight:600;">Throughput</span> (tokens/s) rises with batch size because decode is memory-bandwidth-bound — one weight read serves many sequences — but saturates as the GPU's compute and bandwidth fill. <span style="color:#dc2626;font-weight:600;">p99 TTFT</span> climbs roughly with queue depth and explodes once you exceed what the hardware can keep in flight. The dashed line is your <strong>SLO</strong>. The sweet spot is the largest concurrency that still sits under it — not the peak of the throughput curve.</div>
+
+  <canvas class="dist-canvas" id="batch-canvas" width="760" height="260" style="height:260px;"></canvas>
+
+  <div class="controls" style="margin-top: 12px;">
+    <label class="inline">max concurrency: <input type="range" id="bw-c" min="1" max="256" step="1" value="32"> <span class="val" id="bw-c-val">32</span></label>
+    <label class="inline">p99 TTFT SLO (ms): <input type="range" id="bw-slo" min="100" max="1200" step="20" value="400"> <span class="val" id="bw-slo-val">400</span></label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">Throughput</div><div class="v" id="bw-k-tput">—</div></div>
+    <div class="kpi"><div class="k">p99 TTFT</div><div class="v" id="bw-k-ttft">—</div></div>
+    <div class="kpi"><div class="k">SLO status</div><div class="v" id="bw-k-slo">—</div></div>
+    <div class="kpi"><div class="k">Max safe concurrency</div><div class="v" id="bw-k-safe">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">Show the core model</summary>
+<pre><code>// throughput saturates (Amdahl-ish): more batch helps, with diminishing returns.
+tput  = TPUT_MAX * c / (c + K_HALF);            // tokens/s, saturating
+// p99 TTFT: a floor (prefill+overhead) plus queue cost that turns superlinear
+//           once concurrency exceeds what the GPU keeps in flight.
+ttft  = TTFT_FLOOR + A*c + B*Math.max(0, c-C_KNEE)**2;  // ms
+// pick the LARGEST c with ttft(c) <= SLO — not argmax(tput).</code></pre>
+  </details>
+</div>
+
+<h2>5 · Pair every speed number with a quality number</h2>
+
+<p>The single rule that turns runtime tuning from folklore into engineering: <strong>a performance experiment that does not also measure quality is incomplete.</strong> Quantization, pruning, and aggressive batching can all silently move the model's answers. The platform must be able to make a sentence like: "this fp8 KV-cache config is 20% cheaper and raises concurrency 1.9x, and it changes our task-eval score from 0.84 to 0.83 on the regression suite." Without the second clause you have not made a decision — you have made a guess that looks like a decision.</p>
+
+<p>So run a fixed <strong>task evaluation</strong> (the held-out set that represents what users actually need — correctness, format adherence, safety, refusal behavior) <em>before and after</em> every compression or knob change, and report the delta next to the speed delta. The dangerous quality losses are rarely uniform: int4 might be fine on chat but wreck a math or code task, fp8 KV cache might be invisible on short answers but drift on long ones. The eval set is the only instrument that catches it; tokens/s never will.</p>
+
+<div class="callout"><div class="label">The experiment loop</div>
+<strong>(1)</strong> Fix the workload contract (prefill-heavy and decode-heavy as separate contracts). <strong>(2)</strong> Establish a baseline: full metric vector + quality score. <strong>(3)</strong> Sweep <em>one</em> knob at a time. <strong>(4)</strong> Measure latency (p50/p99) + throughput + HBM + quality together. <strong>(5)</strong> Keep the change only if it improves the target metric <em>and</em> stays inside the p99 SLO <em>and</em> does not regress quality past your bar. Then move to the next knob, re-baselining because the knobs couple.</p></div>
+
+<h2>6 · Startup time is part of the workload too</h2>
+
+<p>One number the synthetic benchmark forgets entirely: how long a replica takes to become ready. A serving pod must pull a multi-gigabyte image, download or mount tens-of-GB of weights, allocate the KV cache, and warm the engine before it serves a single token — often 60-300 seconds. That latency is invisible at steady state but decisive the moment you autoscale (next lesson): if cold start is 4 minutes and a traffic spike arrives in 1, the new replicas are useless for the spike. So startup time belongs in the tuning budget — bake weights into the image or use a fast model-streaming mount, pre-allocate the cache, and measure cold-start as a first-class metric, not an afterthought.</p>
+
+<h2>7 · Where it breaks and what to check</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+<li><strong>Synthetic short-prompt benchmark predicts production badly.</strong> Real prompts are long and often share a cacheable prefix; a 64-token benchmark misses both the 60x prefill penalty and the prefix-cache rescue. <em>Signal:</em> p99 TTFT in production is many times the benchmark's, and it tracks prompt length, not concurrency.</li>
+<li><strong>Quantization improves cost but silently degrades the task.</strong> int4/fp8 shrinks HBM and may speed decode, but task accuracy slips on exactly the workload you care about. <em>Signal:</em> dashboards are all green while user-reported answer quality or eval scores fall — because nothing was watching quality.</li>
+<li><strong>Knobs tuned for peak throughput blow up p99.</strong> A huge <code>max-num-seqs</code> wins the tokens/s headline while violating the latency SLO on the tail. <em>Signal:</em> mean latency looks fine, p99 TTFT is 5-10x p50, and complaints cluster at peak traffic.</li>
+<li><strong>Knobs tuned in isolation.</strong> Raising concurrency without freeing KV space (fp8/prefix cache/quant) triggers cache overflow and preemptions. <em>Signal:</em> throughput drops as concurrency rises, with preemption/recompute counters climbing.</li>
+<li><strong>Early stops inflate tokens/s.</strong> Generation that hits a stop token at 50 tokens instead of the contracted 500 makes throughput look great while measuring a different workload. <em>Signal:</em> measured output length far below the contract.</li>
+</ul>
+  </div>
+  <div class="lesson-card"><h3>Implementation checklist</h3><ul>
+<li>Is there a written workload contract — input/output length distributions, concurrency, sampling, hardware, model + runtime version — attached to every result?</li>
+<li>Do you benchmark <strong>prefill-heavy and decode-heavy workloads separately</strong>, never averaged into one number?</li>
+<li>Does every run record the <strong>full vector together</strong>: TTFT (p50/p99), TPOT, tokens/s, GPU util, HBM occupancy, queue time, and a quality score?</li>
+<li>Are <code>max-num-batched-tokens</code>, <code>max-num-seqs</code>, KV-cache dtype, quantization, and prefix caching tuned as a <strong>coupled set</strong>, re-baselining after each change?</li>
+<li>Is there a <strong>p99 SLO</strong> that any throughput-maximizing config must respect, and do you pick the largest safe concurrency rather than the peak of the throughput curve?</li>
+<li>Do you run a fixed task eval <strong>before and after every compression</strong> and report the quality delta beside the speed delta?</li>
+<li>Is <strong>cold-start time</strong> measured as a first-class metric, since autoscaling depends on it?</li>
+</ul>
+  </div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>Write two workload contracts for one model: a prefill-heavy RAG workload (e.g. ~3,500-token prompts, 200-token answers, shared system prefix, concurrency 8) and a decode-heavy chat workload (~80-token prompts, 600-token answers, no shared prefix, concurrency 32). For each, predict which clock (TTFT or TPOT) dominates and which knob you would sweep first (prefix caching? chunked prefill? <code>max-num-seqs</code>? KV dtype?). Then state the p99 SLO and the one quality metric you would gate the change on. Justify why a single combined benchmark would have hidden the right answer for at least one of them.</div>
+
+<h2>Where this points next</h2>
+
+<p>You can now characterize a serving deployment under a stated load and tune it without fooling yourself. But all of that assumes a fixed number of replicas. Real traffic breathes — and the moment you add or remove replicas, two things you measured here become load-bearing: the <strong>cold-start time</strong> that decides whether new capacity arrives before the spike passes, and the <strong>latency/throughput curve</strong> that tells the autoscaler what "saturated" even means for a GPU (CPU and request-count signals lie for LLM serving). Lesson 09 — <strong>Autoscaling and AI-Aware Routing</strong> — builds the machinery that scales replicas on GPU-aware signals like queue depth and KV-cache pressure, and routes requests to exploit the prefix caching and warm replicas you tuned here.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+A benchmark is a workload contract: input/output length, concurrency, sampling, hardware, and model+runtime version, or the throughput number is decoration. The two clocks are governed by different resources — TTFT/prefill is compute-bound, TPOT/decode is memory-bandwidth-bound — so prefill-heavy and decode-heavy workloads must be measured separately and the full metric vector (TTFT p50/p99, TPOT, tokens/s, GPU util, HBM, queue time, <em>quality</em>) recorded together. A short-prompt synthetic benchmark can mispredict a long-prompt cacheable production workload by ~60x on prefill cost and flip which latency dominates. The runtime knobs — <code>max-num-batched-tokens</code>, <code>max-num-seqs</code>, KV-cache dtype, weight quantization, prefix caching, chunked prefill — are one coupled system: tune them together, sweep one at a time, keep p99 inside the SLO instead of chasing the peak of the throughput curve, and pair every speed change with a before/after task-eval delta. Quantization and pruning trade quality for cost; that trade is only honest when it is measured.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why is "2,000 tokens/s on an H100" a meaningless number on its own? <em>(§1 — throughput is a function of the workload contract; without input/output length, concurrency, sampling, and hardware+version it describes two different workloads sharing a label.)</em></li>
+  <li>Why must prefill-heavy and decode-heavy workloads be benchmarked separately? <em>(§2 — prefill is compute-bound and decode is memory-bandwidth-bound; they stress different ceilings, so a knob that helps one is irrelevant or harmful to the other and an averaged number hides both.)</em></li>
+  <li>How can a synthetic benchmark mispredict production by 60x? <em>(§3 — prefill cost scales with prompt length; 4,000/64 ≈ 62x, turning a ~5 ms prefill into ~310 ms that lands in TTFT, flipping which latency dominates. A short-prompt run also misses the shared-prefix cache that rescues it.)</em></li>
+  <li>Why can't you tune the vLLM knobs one at a time and stop? <em>(§4 — they couple: more concurrency needs KV space freed by fp8/quant/prefix caching; a big batched-token budget lets one prefill stall decode unless chunked prefill intervenes. Sweep one, re-baseline, repeat.)</em></li>
+  <li>Why is maximizing tokens/s the wrong objective? <em>(§4 — bigger batches raise throughput but blow up p99 TTFT; the right target is the largest concurrency that stays under the latency SLO, not the peak of the throughput curve.)</em></li>
+  <li>What makes a quantization or pruning decision honest? <em>(§5 — a before/after task-eval delta reported beside the speed/cost delta; the loss is non-uniform across tasks, so only the eval set catches it — tokens/s never will.)</em></li>
+  <li>Why does startup time belong in the tuning budget? <em>(§6 — cold start (image pull, weight load, cache alloc) is 60-300 s and invisible at steady state, but decisive for autoscaling: if cold start outlasts the spike, new replicas are useless. Measure it as a first-class metric.)</em></li>
 </ul>
 
-<h2>Failure Modes</h2>
-<ul>
-<li>A synthetic short-prompt benchmark predicts production badly because real prompts are long and cacheable.</li>
-<li>Quantization improves cost but silently degrades the task that matters.</li>
-<li>Runtime knobs are tuned for peak throughput and blow up p99 latency.</li>
-</ul>
+<footer class="lesson-nav"><a href="07_multi_gpu_topology.html"><span class="dir">Previous</span><span class="ttl">07 - Multi-GPU Inference and Topology</span></a><a class="next" href="09_autoscaling_ai_routing.html"><span class="dir">Next</span><span class="ttl">09 - Autoscaling and AI-Aware Routing</span></a></footer>
 
-<h2>Cross-Links</h2>
-<ul>
-<li><a href="../../vllm/lessons/05_optimizations.html">vLLM optimization catalog</a></li>
-<li><a href="../../gpu_kernel_serving/20_profiling_toolkit.html">GPU profiling toolkit</a></li>
-</ul>
-
-<h2>Takeaway And Interview Prompts</h2>
-<p><strong>Takeaway:</strong> A benchmark is a workload contract. Without prompt length, output length, concurrency, sampling settings, and hardware topology, throughput numbers are mostly decoration.</p>
-<ol>
-  <li>Draw the system boundary for <strong>Benchmarking and Runtime Tuning</strong>. Which resource or policy binds first?</li>
-  <li>Pick two designs from this lesson. What does each optimize, and what does each make worse?</li>
-  <li>Design an incident around this failure mode: A synthetic short-prompt benchmark predicts production badly because real prompts are long and cacheable. What metric, log, or trace would reveal it?</li>
-</ol>
-
-<footer class="lesson-nav">
-  <a href="07_multi_gpu_topology.html"><span class="dir">Previous</span><span class="ttl">07 - Multi-GPU Inference and Topology</span></a>
-  <a class="next" href="09_autoscaling_ai_routing.html"><span class="dir">Next</span><span class="ttl">09 - Autoscaling and AI-Aware Routing</span></a>
-</footer>
 </main>
+
+<script>
+(function(){
+  var canvas = document.getElementById('batch-canvas');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+
+  var cRng   = document.getElementById('bw-c');
+  var cVal   = document.getElementById('bw-c-val');
+  var sloRng = document.getElementById('bw-slo');
+  var sloVal = document.getElementById('bw-slo-val');
+  var kTput  = document.getElementById('bw-k-tput');
+  var kTtft  = document.getElementById('bw-k-ttft');
+  var kSlo   = document.getElementById('bw-k-slo');
+  var kSafe  = document.getElementById('bw-k-safe');
+
+  var CMAX = 256;
+  var TPUT_MAX = 4200;   // tokens/s ceiling
+  var K_HALF = 24;       // concurrency at half of max throughput
+  var TTFT_FLOOR = 60;   // ms: prefill + fixed overhead
+  var A = 1.1;           // linear queue term
+  var C_KNEE = 64;       // concurrency where it turns superlinear
+  var B = 0.06;          // quadratic blowup term
+
+  function tput(c){ return TPUT_MAX * c / (c + K_HALF); }
+  function ttft(c){ var over = Math.max(0, c - C_KNEE); return TTFT_FLOOR + A*c + B*over*over; }
+  function maxSafe(slo){
+    var best = 1;
+    for (var c=1;c<=CMAX;c++){ if (ttft(c) <= slo) best = c; }
+    return best;
+  }
+
+  function render(){
+    var c = parseInt(cRng.value,10);
+    var slo = parseInt(sloRng.value,10);
+    var dpr = window.devicePixelRatio || 1;
+    var W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== Math.round(W*dpr)){ canvas.width = Math.round(W*dpr); canvas.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    var padL = 50, padR = 50, padTop = 22, padBot = 34;
+    var plotW = W - padL - padR, plotH = H - padTop - padBot;
+
+    var TTFT_VIEW = 1200; // ms full-scale on right axis
+
+    function X(cc){ return padL + (cc/CMAX)*plotW; }
+    function Yt(t){ return padTop + plotH - (t/TPUT_MAX)*plotH; }      // throughput, left axis
+    function Yl(ms){ return padTop + plotH - Math.min(1,ms/TTFT_VIEW)*plotH; } // ttft, right axis
+
+    // axes
+    ctx.strokeStyle = '#cbd5e1'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, padTop); ctx.lineTo(padL, H-padBot); ctx.lineTo(W-padR, H-padBot); ctx.stroke();
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('concurrency (max-num-seqs)  →', padL, H-12);
+    ctx.fillStyle = '#16a34a'; ctx.fillText('tokens/s', padL-44, padTop+8);
+    ctx.fillStyle = '#dc2626'; ctx.fillText('p99 TTFT', W-padR-2, padTop+8);
+
+    // SLO dashed line (on TTFT scale)
+    var sloY = Yl(slo);
+    ctx.strokeStyle = '#b45309'; ctx.lineWidth = 1.5; ctx.setLineDash([6,4]);
+    ctx.beginPath(); ctx.moveTo(padL, sloY); ctx.lineTo(W-padR, sloY); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#b45309'; ctx.fillText('SLO', W-padR-26, sloY-4);
+
+    // throughput curve
+    ctx.strokeStyle = '#16a34a'; ctx.lineWidth = 2; ctx.beginPath();
+    for (var cc=1; cc<=CMAX; cc++){ var x=X(cc), y=Yt(tput(cc)); if(cc===1) ctx.moveTo(x,y); else ctx.lineTo(x,y); }
+    ctx.stroke();
+
+    // ttft curve
+    ctx.strokeStyle = '#dc2626'; ctx.lineWidth = 2; ctx.beginPath();
+    for (var cc2=1; cc2<=CMAX; cc2++){ var x2=X(cc2), y2=Yl(ttft(cc2)); if(cc2===1) ctx.moveTo(x2,y2); else ctx.lineTo(x2,y2); }
+    ctx.stroke();
+
+    // current concurrency marker
+    var cx = X(c);
+    ctx.strokeStyle = '#334155'; ctx.lineWidth = 1.5; ctx.setLineDash([3,3]);
+    ctx.beginPath(); ctx.moveTo(cx, padTop); ctx.lineTo(cx, H-padBot); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#16a34a'; ctx.beginPath(); ctx.arc(cx, Yt(tput(c)), 4, 0, 2*Math.PI); ctx.fill();
+    ctx.fillStyle = '#dc2626'; ctx.beginPath(); ctx.arc(cx, Yl(ttft(c)), 4, 0, 2*Math.PI); ctx.fill();
+
+    var tv = tput(c), lv = ttft(c), safe = maxSafe(slo);
+    cVal.textContent = c;
+    sloVal.textContent = slo;
+    kTput.textContent = Math.round(tv).toLocaleString() + ' tok/s';
+    kTtft.textContent = Math.round(lv) + ' ms';
+    var ok = lv <= slo;
+    kSlo.textContent = ok ? 'within SLO' : 'VIOLATED';
+    kSlo.style.color = ok ? '#16a34a' : '#dc2626';
+    kSafe.textContent = safe + ' seqs';
+  }
+
+  cRng.addEventListener('input', render);
+  sloRng.addEventListener('input', render);
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
 </body>
 </html>

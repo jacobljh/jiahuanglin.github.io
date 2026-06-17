@@ -5,80 +5,256 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>10 - Disaggregated Serving | Generative AI on Kubernetes</title>
 <link rel="stylesheet" href="style.css">
+<style>
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; }
+  .mini-flow { display: grid; gap: 8px; margin: 18px 0; }
+  .mini-flow .step { border: 1px solid var(--border); background: var(--bg-elev); border-radius: 8px; padding: 10px 12px; }
+  .mini-flow .n { font-family: var(--mono); color: var(--accent); font-size: 12px; margin-right: 6px; }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
 </head>
 <body>
 <header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">kubernetes_genai</a><span class="crumb">/</span><span class="crumb">10</span><span class="step-pill">lesson 10 / 18</span></div></header>
 <main>
+
 <p class="kicker">Part III - Production inference</p>
 <h1>Disaggregated Serving</h1>
-<p class="subtitle">Prefill/decode split, specialized hardware pools, KV transfer, LeaderWorkerSet-style patterns, and when complexity pays.</p>
+<p class="subtitle">Lesson 09 gave you autoscaling and routing that react to the <em>real</em> signals of LLM serving — tokens in flight, KV-cache occupancy, queue time. But all of that assumed a single kind of worker doing the whole job: read the prompt, then emit tokens. Inside that one worker live two phases with opposite appetites. Prefill chews through the whole prompt at once and is starved for raw compute; decode dribbles out one token at a time and is starved for memory bandwidth and steady, low-jitter timing. <strong>Disaggregated serving</strong> is the decision to stop running both phases on the same GPU — to split them onto separate, specialized pools — and this lesson is about when that split raises utilization and when it just hands you a distributed-systems problem with a state-transfer boundary in the middle.</p>
 
-<div class="callout source-note"><div class="label">Source coverage</div>PDF Chapter 4: disaggregated serving.</div>
-<div class="callout"><div class="label">Learning objective</div>Know when separating prefill and decode improves utilization and when it only adds a distributed-systems problem.</div>
+<div class="callout source-note"><div class="label">Source coverage</div>PDF Chapter 4 — disaggregated serving: the prefill/decode split, specialized hardware pools, KV-cache transfer, and LeaderWorkerSet-style multi-pod coordination.</div>
 
-<h2>Linear Position</h2>
-<div class="position-grid">
-  <div><strong>Prerequisite</strong><span>Builds on <a href="09_autoscaling_ai_routing.html">09 - Autoscaling and AI-Aware Routing</a>.</span></div>
-  <div><strong>New capability</strong><span>Know when separating prefill and decode improves utilization and when it only adds a distributed-systems problem.</span></div>
-  <div><strong>Next dependency</strong><span>Prepares <a href="11_observability_llm_serving.html">11 - Observability for LLM Serving</a>.</span></div>
+<div class="callout"><div class="label">Linear position</div><strong>Prerequisite:</strong> Lesson 09 (Autoscaling and AI-aware routing) — you can already scale and route on token throughput, KV-cache pressure, and queue depth, treating each model replica as one indivisible serving unit.<br><strong>New capability:</strong> Split that unit in two — a prefill pool and a decode pool on separately sized hardware — and judge, with a break-even number, whether the utilization you reclaim beats the cost of shipping the KV cache between them.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Five moves. (1) Recall the prefill/decode asymmetry and show how a <em>colocated</em> server makes the two phases interfere (head-of-line blocking). (2) Define disaggregation precisely and name the new artifact it creates — a KV cache that must be <em>transferred</em> over the interconnect. (3) Do the worked number: size the KV cache for a real prompt and compute the transfer time, so the break-even is concrete rather than hand-wavy. (4) Lay out the colocated-vs-disaggregated trade table and the LeaderWorkerSet-style coordination the multi-pod unit needs. (5) Failure modes, a checklist, and the hand-off into observability, where a request that now crosses two pools has to be traceable end to end.</div>
+
+<h2>1 · Two phases, one GPU, and the interference between them</h2>
+
+<p>Recall the two phases of autoregressive generation. <strong>Prefill</strong> takes the entire input prompt and runs it through the model in a single forward pass, in parallel across all prompt tokens. Its by-product is the <strong>KV cache</strong>: for every layer and every attention head, the key and value vectors computed for each prompt token, stored in GPU memory so later steps do not recompute them. Prefill is <strong>compute-bound</strong> — it does a large matrix multiply over the whole prompt at once, so it saturates the GPU's arithmetic units. <strong>Decode</strong> then generates the answer one token at a time: each step reads the entire KV cache, attends over it, produces one new token, and appends that token's K and V to the cache. Decode is <strong>memory-bandwidth-bound</strong> — each step moves a lot of cached state through the chip but does comparatively little arithmetic, so it is gated by how fast the GPU can stream memory, and it is sensitive to <em>jitter</em> because a stall shows up directly as a stutter in the user's token stream.</p>
+
+<p>In a <strong>colocated</strong> server — the normal case, where one replica does both phases — these two appetites share one GPU and one scheduler. That sharing is the problem. When a 4,000-token prompt arrives, its prefill monopolizes the compute units for a chunk of time, and the decode steps of <em>other</em> in-flight requests have to wait behind it. That wait is <strong>head-of-line blocking</strong>: a long, compute-heavy job at the front of the line stalls the short, latency-sensitive jobs behind it. The visible symptom is inter-token latency that spikes whenever a big prompt lands — users mid-stream see their tokens hitch even though their own request is tiny.</p>
+
+<div class="callout warn"><div class="label">Why one pool can never be sized right</div>
+A colocated pool has one hardware profile but two jobs with opposite needs. Buy GPUs with huge compute for prefill and you are paying for arithmetic units that decode leaves idle while it waits on memory bandwidth. Buy GPUs tuned for bandwidth and you starve prefill. Whatever you pick, one phase runs on the wrong machine, and the two phases keep fighting over the same scheduler. That structural mismatch is the entire motivation for splitting them.</p></div>
+
+<h2>2 · What disaggregation actually does — and the artifact it creates</h2>
+
+<p><strong>Disaggregated serving</strong> puts prefill on one pool of GPUs and decode on another. A request now flows across a boundary:</p>
+
+<pre class="ascii">request --> [ prefill pool ]  build KV cache
+                  |
+                  |  KV transfer over the interconnect
+                  v
+            [ decode pool ]  read KV, emit tokens --> stream to user</pre>
+
+<div class="mini-flow">
+<div class="step"><span class="n">→</span><strong>prefill pool</strong> → compute-optimized GPUs, sized for throughput on whole prompts; isolated from decode so a long prompt cannot stall anyone's token stream</div>
+<div class="step"><span class="n">→</span><strong>KV transfer</strong> → the K/V tensors built during prefill are copied from a prefill GPU to a decode GPU over the interconnect (NVLink, PCIe, or the network)</div>
+<div class="step"><span class="n">→</span><strong>decode pool</strong> → bandwidth-optimized GPUs, sized for steady low-jitter token emission; never blocked by prefill bursts</div>
 </div>
 
+<p>The payoff is <strong>specialization</strong>: size and tune each pool for its bottleneck, isolate prefill bursts from decode jitter, and scale the two queues independently. The price is a brand-new distributed artifact. In a colocated server the KV cache is a local object — it is built and consumed on the same GPU and never moves. The moment you split the phases, <strong>the KV cache must be transferred</strong>: every byte of key/value state that prefill produced has to travel to whichever decode worker will continue the request. <strong>KV transfer</strong> is that copy, and its cost — in bandwidth consumed and latency added before the first token — is the tax you pay for the split. Disaggregation pays only when the utilization you reclaim is worth more than this tax.</p>
 
-<h2>Linear Story</h2>
-<p>Disaggregated serving starts from one asymmetry. Prefill processes the prompt in parallel and tends to be compute-heavy. Decode emits tokens one step at a time and tends to be memory-bandwidth-heavy. If one pool of GPUs runs both phases, long prompts can interfere with short decode steps, and hardware may be poorly matched to the phase. The book introduces disaggregation as the production answer to that mismatch.</p>
-<pre class="ascii">request -> prefill pool -> KV state transfer -> decode pool -> token stream</pre>
-<p>The payoff is specialization. You can size prefill for compute and decode for memory bandwidth/latency. You can isolate long prompt bursts from decode jitter. You can tune queues separately. The cost is that a single request now crosses services, device pools, and a state transfer boundary. The KV cache becomes a distributed artifact.</p>
-<h2>The KV Transfer Test</h2>
-<p>Disaggregation is worth considering only when the utilization win beats the transfer and coordination cost. The KV state can be large. If prefill and decode pools are far apart, the network can eat the gain. If failure handling is weak, a request can succeed in prefill and disappear before decode. If autoscaling is independent, one queue can starve the other.</p>
-<table class="trade-table"><thead><tr><th>Question</th><th>If yes</th><th>If no</th></tr></thead><tbody>
-  <tr><td>Are prompts long or bursty?</td><td>Prefill isolation may help</td><td>Single pool may be simpler</td></tr>
-  <tr><td>Is KV transfer fast and local?</td><td>Disaggregation can pay</td><td>Network may dominate</td></tr>
-  <tr><td>Can ops trace one request across pools?</td><td>Debugging is feasible</td><td>Incidents become opaque</td></tr>
-  <tr><td>Can both queues scale together?</td><td>Control loop can stabilize</td><td>Autoscalers may fight</td></tr>
+<div class="callout"><div class="label">The one-sentence mental model</div>Prefill wants compute; decode wants memory bandwidth and low jitter. Disaggregation works when the GPU time you save by dedicating right-sized hardware to each phase exceeds the KV-transfer and scheduling overhead the split introduces — and that comparison has an actual number.</div>
+
+<h2>3 · The KV-transfer test, worked out</h2>
+
+<p>The size of a request's KV cache is not a vibe — it is a formula. For every prompt token you store, per layer, a key and a value vector across all attention heads:</p>
+
+<p><span class="math">KV bytes = 2 (K,V) × layers × heads × head_dim × tokens × bytes_per_elem</span></p>
+
+<p>Take a Llama-3-8B-class model: 32 layers, 32 heads, head_dim 128 (so hidden size 4096), serving in FP16 (2 bytes per element). A 4,000-token prompt produces:</p>
+
+<p><span class="math">2 × 32 × 32 × 128 × 4000 × 2 B</span> = <span class="math">2 × 32 × 4096 × 4000 × 2 B</span> ≈ <strong>2.1 GB</strong> of KV state for that single request.</p>
+
+<p>That 2.1 GB is what has to move from a prefill GPU to a decode GPU before the first answer token can be produced. Now put it on a link:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Intra-node NVLink (~400 GB/s effective)</div><div class="v">2.1 GB / 400 GB/s ≈ <strong>5 ms</strong>. Negligible next to a multi-hundred-ms prefill. Disaggregation across NVLink-connected GPUs is cheap.</div></div>
+  <div class="topic-card"><div class="k">Same-node PCIe Gen5 (~50 GB/s effective)</div><div class="v">2.1 GB / 50 GB/s ≈ <strong>42 ms</strong>. Noticeable but often tolerable — added to time-to-first-token, weighed against the utilization win.</div></div>
+  <div class="topic-card"><div class="k">Across nodes, 100 GbE (~10 GB/s effective)</div><div class="v">2.1 GB / 10 GB/s ≈ <strong>210 ms</strong> per request. This alone can rival or exceed the prefill it was meant to offload — the gain is erased.</div></div>
+  <div class="topic-card"><div class="k">Across nodes, slow/contended 10 GbE (~1 GB/s)</div><div class="v">≈ <strong>2.1 s</strong>. Disaggregation here is strictly worse than colocating. Never split across a link this slow.</div></div>
+</div>
+
+<p>The break-even reasoning falls straight out of those numbers. Colocating wastes some GPU time to interference; call the reclaimed time per request <span class="math">ΔT_save</span> (the prefill/decode stall you avoid plus the utilization you regain from right-sized pools). Disaggregating adds the transfer time <span class="math">T_kv</span> plus scheduling/coordination overhead <span class="math">T_sched</span>. <strong>Disaggregation pays only when <span class="math">ΔT_save &gt; T_kv + T_sched</span>.</strong> On NVLink <span class="math">T_kv</span> is ~5 ms and almost any interference saving wins; over a contended network <span class="math">T_kv</span> balloons to hundreds of ms or seconds and there is no realistic <span class="math">ΔT_save</span> that beats it. This is why the first design rule is <em>placement</em>: the prefill and decode pools must sit where the interconnect between them is fast.</p>
+
+<div class="callout"><div class="label">Two levers that shrink the tax</div>
+The KV size scales linearly with prompt length and with precision, so two things move the break-even in your favor. (1) <strong>Shorter prompts</strong> transfer less — a 500-token prompt is ~260 MB, eight times cheaper to move than the 4,000-token one. (2) <strong>Smaller KV precision</strong> (FP8 or quantized KV cache, lesson 08) halves or quarters the bytes. If your traffic is long-prompt, high-precision, and cross-node, disaggregation is fighting uphill; if it is short-prompt or NVLink-local, the tax is rounding error.</p></div>
+
+<div class="widget" id="disagg-widget">
+  <div class="title">KV-transfer break-even — does the split pay?</div>
+  <div class="hint">Set the per-request <strong>prompt length</strong> (sets KV-cache size), the <strong>interconnect bandwidth</strong> between pools (sets transfer time), and the <strong>interference you reclaim</strong> by isolating the phases. The bar compares the GPU time you <em>save</em> against the KV-transfer time you <em>add</em>. Green = disaggregation pays; red = it costs more than it saves. Model is Llama-3-8B-class (32 layers, hidden 4096, FP16).</div>
+
+  <canvas class="dist-canvas" id="disagg-canvas" width="760" height="200" style="height:200px;"></canvas>
+
+  <div class="controls" style="margin-top: 12px;">
+    <label class="inline">prompt tokens: <input type="range" id="dg-tok" min="256" max="8000" step="64" value="4000"> <span class="val" id="dg-tok-val">4000</span></label>
+    <label class="inline">link bandwidth (GB/s): <input type="range" id="dg-bw" min="1" max="400" step="1" value="50"> <span class="val" id="dg-bw-val">50</span></label>
+    <label class="inline">reclaimed interference (ms): <input type="range" id="dg-save" min="0" max="400" step="5" value="120"> <span class="val" id="dg-save-val">120</span></label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">KV-cache size</div><div class="v" id="dg-k-size">—</div></div>
+    <div class="kpi"><div class="k">KV transfer time</div><div class="v" id="dg-k-kv">—</div></div>
+    <div class="kpi"><div class="k">Net (save − transfer)</div><div class="v" id="dg-k-net">—</div></div>
+    <div class="kpi"><div class="k">Verdict</div><div class="v" id="dg-k-verdict">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">Show the core JS</summary>
+<pre><code>// KV bytes = 2 * layers * hidden * tokens * bytes_per_elem  (heads*head_dim = hidden)
+const kvBytes = 2 * 32 * 4096 * tokens * 2;          // FP16, Llama-3-8B-class
+const kvGB    = kvBytes / 1e9;
+const tKv_ms  = (kvGB / bwGBs) * 1000;               // transfer time over the link
+const net_ms  = reclaimedSave_ms - tKv_ms;           // > 0 => disaggregation pays
+// add a small fixed scheduling overhead to T_kv in practice (T_sched)</code></pre>
+  </details>
+</div>
+
+<h2>4 · The trade, and the multi-pod shape that runs it</h2>
+
+<table class="trade-table"><thead><tr><th></th><th>Colocated (one pool, both phases)</th><th>Disaggregated (split pools)</th></tr></thead><tbody>
+  <tr><td><strong>Buys</strong></td><td>Simple: one Deployment, one autoscaler, one trace per request. KV cache is local — never transferred. Easy to reason about and debug.</td><td>Right-sized hardware per phase; prefill bursts isolated from decode jitter; queues tuned and scaled independently; higher aggregate utilization when bottlenecks differ.</td></tr>
+  <tr><td><strong>Costs</strong></td><td>One hardware profile must serve two opposite appetites, so one phase always runs on the wrong machine; prefill bursts cause head-of-line blocking on decode.</td><td>KV cache becomes a distributed artifact that must be transferred (the tax); a request crosses two services and device pools; two autoscalers can fight; partial-request failure handling and tracing get harder.</td></tr>
 </tbody></table>
-<h2>Design Rule</h2>
-<p>Do not start with disaggregation. Start with measuring prefill and decode separately. Add disaggregation when those measurements show opposite bottlenecks and the platform is mature enough to operate a two-stage request path.</p>
-<h2>Leader-Worker Shape</h2>
-<p>A common Kubernetes shape for multi-pod inference is leader-worker: one logical model endpoint is backed by a leader pod plus worker pods that form the distributed runtime. The leader owns the external serving surface, readiness, and coordination. Workers own shards or phase-specific execution. This shape fits large models, tensor-parallel groups, and some disaggregated serving layouts because the platform can treat a group of pods as one serving unit.</p>
-<p>The platform challenge is lifecycle. All members must agree on model version, runtime config, topology, and readiness. A rollout cannot update the leader and leave workers on a mismatched artifact. A readiness check must mean the group is healthy, not only that the leader process is alive. A failure policy must decide whether losing one worker drains the whole group, restarts the group, or routes around it. That is the operational reason LeaderWorkerSet-style abstractions exist: they encode group identity and lifecycle so model-parallel serving is not hand-stitched from unrelated Deployments.</p>
 
+<p>Note the coupled-queue trap. A disaggregated system has <strong>two autoscalers</strong> — one for the prefill pool, one for the decode pool — but the two queues are not independent: every prefill completion becomes a decode arrival. If the prefill autoscaler scales up aggressively, it floods the decode queue; if decode is the bottleneck and back-pressures, prefill work piles up with nowhere to go. The two control loops can oscillate against each other. The fix is that <strong>admission control must see both queues</strong>: you do not admit a request the decode pool cannot eventually absorb, no matter how much prefill capacity is free.</p>
 
-<h2>Mental Model</h2>
-<p>Prefill wants compute; decode wants memory bandwidth and low jitter. Disaggregation works when the saved GPU time beats the KV transfer and scheduling overhead.</p>
+<h3>The LeaderWorkerSet-style shape</h3>
 
-<h2>Operational Checklist</h2>
-<ul>
-<li>Measure prefill and decode bottlenecks separately before splitting pools.</li>
-<li>Place prefill and decode pools where KV transfer bandwidth and latency are acceptable.</li>
-<li>Keep admission control aware of both queues, not just total request count.</li>
-<li>Plan failure handling for partially completed requests and transferred KV state.</li>
+<p>Multi-pod serving — whether disaggregated, or tensor-parallel where one model is sharded across several GPUs (lesson 07) — needs the platform to treat a <em>group</em> of pods as one logical serving unit. The common Kubernetes shape is <strong>leader-worker</strong>: a leader pod owns the external endpoint, readiness, and coordination, while worker pods run shards or phase-specific execution. The hard part is lifecycle: every member must agree on model version, runtime config, and topology. A rollout cannot update the leader and leave workers on a mismatched artifact; a readiness check must mean <em>the whole group is healthy</em>, not just that the leader process is alive; and a failure policy must decide whether losing one worker drains the group, restarts it, or routes around it.</p>
+
+<p>This is exactly what <strong>LeaderWorkerSet</strong>-style abstractions encode — group identity and group lifecycle — so model-parallel and disaggregated serving are not hand-stitched from unrelated Deployments that have no idea they belong together. The rule of thumb: if a request's correctness depends on several pods being in lockstep, you want a group abstraction, not N independent Deployments.</p>
+
+<div class="callout"><div class="label">Going deeper</div>For the inference-runtime side of the same split — how a serving engine like vLLM actually wires prefill and decode workers and moves the KV cache between them — see <a href="../../vllm/lessons/08_pd_disaggregation.html">vLLM P/D disaggregation</a>. For the systems theory of why the phases have opposite resource profiles and how the transfer cost is modeled, see <a href="../../system_ml/lessons/15_disaggregated_serving.html">System ML — disaggregated serving</a>.</div>
+
+<div class="callout"><div class="label">Design rule</div>Do not start with disaggregation. Start colocated, and <em>measure prefill and decode separately</em>. Split only when the measurements show genuinely opposite bottlenecks, the interconnect between the would-be pools is fast enough that <span class="math">T_kv</span> is small, and the platform is mature enough to operate a two-stage request path with group lifecycle and both-queue admission control. Until all three hold, disaggregation is a distributed-systems problem you are buying without a payoff.</div>
+
+<h2>5 · Where it goes wrong, and what to check</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+<li><strong>KV transfer erases the gain.</strong> The pools land on a slow or contended link, so <span class="math">T_kv</span> (hundreds of ms to seconds per request) rivals the prefill you offloaded. Signal: time-to-first-token gets <em>worse</em> after disaggregating, and the interconnect NICs sit near saturation.</li>
+<li><strong>The two autoscalers fight.</strong> Prefill and decode queues are coupled (each prefill becomes a decode arrival), so independent control loops oscillate — prefill scales up, floods decode, decode back-pressures, prefill piles up. Signal: replica counts and queue depths swing in anti-phase that never settles.</li>
+<li><strong>Lost requests at the boundary.</strong> A request completes prefill, the KV state is in flight or parked, and the decode worker (or the transfer) fails — the request vanishes between pools with no owner to retry it. Signal: a gap between prefill completions and decode starts in the traces.</li>
+<li><strong>Debuggability collapses.</strong> One request now spans two services and two device pools, so a latency spike or error has no single place to look. Signal: incidents take far longer because no one trace shows the whole journey.</li>
+<li><strong>Group lifecycle skew.</strong> A rollout updates some pods of a leader-worker group but not others, leaving the unit on mismatched model versions or topology. Signal: readiness reports green while outputs are wrong or the group silently degrades.</li>
 </ul>
-
-<h2>Failure Modes</h2>
-<ul>
-<li>KV transfer over the network erases the utilization gain.</li>
-<li>Two autoscalers fight each other because prefill and decode queues are coupled.</li>
-<li>Debuggability drops because a single request now crosses multiple services and device pools.</li>
+  </div>
+  <div class="lesson-card"><h3>Implementation checklist</h3><ul>
+<li>Have you measured prefill and decode bottlenecks <em>separately</em> on a colocated baseline before splitting, and confirmed the bottlenecks are genuinely opposite?</li>
+<li>Are the prefill and decode pools placed where KV-transfer bandwidth and latency make <span class="math">T_kv</span> small relative to the interference you reclaim?</li>
+<li>Does admission control see <em>both</em> queues, so you never admit work the decode pool cannot absorb?</li>
+<li>Is there an owner and a retry/cleanup path for a request that completed prefill but failed before or during decode — including freeing orphaned KV state?</li>
+<li>Does a single request get one end-to-end trace that spans both pools (set up in lesson 11)?</li>
+<li>Is the multi-pod unit managed as a group (LeaderWorkerSet-style) so version, topology, and readiness stay consistent across a rollout?</li>
+<li>Could KV precision (FP8/quantized) or shorter effective prompts shrink the transfer tax enough to change the verdict?</li>
 </ul>
+  </div>
+</div>
 
-<h2>Cross-Links</h2>
-<ul>
-<li><a href="../../vllm/lessons/08_pd_disaggregation.html">vLLM P/D disaggregation</a></li>
-<li><a href="../../system_ml/lessons/15_disaggregated_serving.html">System ML disaggregated serving</a></li>
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>You serve a Llama-3-8B-class model. Average prompt is 3,000 tokens; you are considering splitting prefill and decode onto two pools. Compute the per-request KV-cache size (use the §3 formula), then compute <span class="math">T_kv</span> for three placements: same-node NVLink (~400 GB/s), same-node PCIe (~50 GB/s), and cross-node 100 GbE (~10 GB/s). For each, state whether disaggregation can plausibly pay if isolating the phases reclaims ~80 ms of interference per request. Then decide which placement you would require before approving the split, and what you would change (KV precision? prompt length cap?) to make a marginal case pay.</div>
+
+<h2>Where this points next</h2>
+
+<p>Every failure mode above shares one root cause: a request that used to live on one GPU now crosses two pools, a transfer, and two control loops — and you cannot fix what you cannot see. A KV transfer eating the gain, two autoscalers oscillating, a request lost at the boundary, a leader-worker group skewed by a bad rollout — each is invisible until you have a trace that follows one request end to end and metrics that distinguish prefill time from decode time from transfer time. Lesson 11, <a href="11_observability_llm_serving.html"><strong>Observability for LLM Serving</strong></a>, builds exactly that machinery: the LLM-specific metrics (TTFT, inter-token latency, KV occupancy, queue time), the distributed traces that span pools, and the signals that let you tell whether a disaggregated split is paying off or quietly costing you.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+Prefill is compute-bound and bursty; decode is memory-bandwidth-bound and jitter-sensitive. On one colocated GPU they interfere — a long prefill head-of-line-blocks everyone's decode — and no single hardware profile fits both. <strong>Disaggregation</strong> splits them onto specialized pools, which buys right-sized hardware, isolation, and independent scaling, but creates a new artifact: the KV cache must be <em>transferred</em> over the interconnect. That transfer has a real size (<span class="math">2 × layers × hidden × tokens × bytes</span> — ~2 GB for a 4k-token Llama-8B prompt) and a real time that depends entirely on the link: ~5 ms on NVLink, ~200 ms across a 100 GbE network, seconds on a slow one. Disaggregation pays only when the reclaimed interference exceeds <span class="math">T_kv + T_sched</span>, which is why placement comes first. Watch the coupled-queue trap (admission control must see both queues), the boundary failure (own and retry partially completed requests), and group lifecycle (a LeaderWorkerSet-style abstraction keeps the multi-pod unit consistent). Measure colocated first; split only when the bottlenecks are opposite, the link is fast, and the platform can operate a two-stage path.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why do prefill and decode interfere on a colocated GPU? <em>(§1 — prefill is compute-bound and processes the whole prompt at once; a long prefill monopolizes the compute units and head-of-line-blocks the latency-sensitive, bandwidth-bound decode steps of other in-flight requests.)</em></li>
+  <li>What new artifact does disaggregation create, and why is it the central cost? <em>(§2 — the KV cache, which was a local object on one GPU, must now be transferred from a prefill GPU to a decode GPU over the interconnect; that transfer's bytes and latency are the tax the split must beat.)</em></li>
+  <li>Size the KV cache for a 4,000-token prompt on a Llama-3-8B-class model and explain what it depends on. <em>(§3 — 2 × 32 layers × 4096 hidden × 4000 tokens × 2 B ≈ 2.1 GB; it scales linearly with prompt length, layer/hidden size, and bytes-per-element, so longer prompts and higher precision cost more to move.)</em></li>
+  <li>State the break-even condition for disaggregation. <em>(§3 — it pays only when reclaimed interference ΔT_save &gt; T_kv + T_sched; on NVLink T_kv ≈ 5 ms so almost any saving wins, but across a contended network T_kv reaches hundreds of ms or seconds and erases the gain — so placement comes first.)</em></li>
+  <li>Why can two autoscalers fight, and what fixes it? <em>(§4 — prefill and decode queues are coupled because each prefill completion is a decode arrival, so independent control loops oscillate; admission control must see both queues and refuse work the decode pool cannot absorb.)</em></li>
+  <li>What does a LeaderWorkerSet-style abstraction give a disaggregated or model-parallel deployment? <em>(§4 — group identity and group lifecycle: every pod agrees on model version, config, and topology, readiness means the whole group is healthy, and a failure policy is defined — so the unit is not hand-stitched from unrelated Deployments.)</em></li>
+  <li>When should you NOT disaggregate? <em>(§3, §4 — when bottlenecks are not actually opposite, when the pools would sit across a slow/contended link so T_kv dominates, or when the platform cannot trace a two-pool request and handle partial-request failure; start colocated and measure first.)</em></li>
 </ul>
-
-<h2>Takeaway And Interview Prompts</h2>
-<p><strong>Takeaway:</strong> Prefill wants compute; decode wants memory bandwidth and low jitter. Disaggregation works when the saved GPU time beats the KV transfer and scheduling overhead.</p>
-<ol>
-  <li>Draw the system boundary for <strong>Disaggregated Serving</strong>. Which resource or policy binds first?</li>
-  <li>Pick two designs from this lesson. What does each optimize, and what does each make worse?</li>
-  <li>Design an incident around this failure mode: KV transfer over the network erases the utilization gain. What metric, log, or trace would reveal it?</li>
-</ol>
 
 <footer class="lesson-nav">
   <a href="09_autoscaling_ai_routing.html"><span class="dir">Previous</span><span class="ttl">09 - Autoscaling and AI-Aware Routing</span></a>
   <a class="next" href="11_observability_llm_serving.html"><span class="dir">Next</span><span class="ttl">11 - Observability for LLM Serving</span></a>
 </footer>
+
 </main>
+
+<script>
+(function(){
+  var canvas = document.getElementById('disagg-canvas');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+
+  var tokRng = document.getElementById('dg-tok');
+  var bwRng  = document.getElementById('dg-bw');
+  var saveRng= document.getElementById('dg-save');
+  var tokVal = document.getElementById('dg-tok-val');
+  var bwVal  = document.getElementById('dg-bw-val');
+  var saveVal= document.getElementById('dg-save-val');
+  var kSize  = document.getElementById('dg-k-size');
+  var kKv    = document.getElementById('dg-k-kv');
+  var kNet   = document.getElementById('dg-k-net');
+  var kVerd  = document.getElementById('dg-k-verdict');
+
+  // Llama-3-8B-class: 32 layers, hidden 4096 (heads*head_dim), FP16 (2 bytes), 2 for K and V.
+  function kvGB(tokens){ return (2 * 32 * 4096 * tokens * 2) / 1e9; }
+
+  function render(){
+    var tokens = parseInt(tokRng.value, 10);
+    var bw     = parseFloat(bwRng.value);     // GB/s
+    var save   = parseFloat(saveRng.value);   // ms reclaimed interference
+    var gb     = kvGB(tokens);
+    var tKv    = (gb / bw) * 1000;            // ms
+    var net    = save - tKv;                  // >0 => pays
+
+    var dpr = window.devicePixelRatio || 1;
+    var W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== Math.round(W*dpr)){ canvas.width = Math.round(W*dpr); canvas.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    var padX = 120, padTop = 30, padBot = 36;
+    var rowTop = padTop, rowBot = H - padBot;
+    var barY1 = rowTop + 16, barY2 = rowBot - 16, barH = 26;
+    var plotW = W - padX - 30;
+    var maxMs = Math.max(save, tKv, 50) * 1.15;
+
+    function bar(y, ms, color, label){
+      var w = Math.max(2, (ms / maxMs) * plotW);
+      ctx.fillStyle = color;
+      ctx.fillRect(padX, y, w, barH);
+      ctx.fillStyle = '#5b6573'; ctx.font = '12px monospace'; ctx.textAlign = 'right';
+      ctx.fillText(label, padX - 10, y + barH/2 + 4);
+      ctx.fillStyle = '#334155'; ctx.textAlign = 'left';
+      ctx.fillText(ms.toFixed(0) + ' ms', padX + w + 8, y + barH/2 + 4);
+    }
+
+    bar(barY1, save, '#16a34a', 'reclaimed');
+    bar(barY2, tKv, (tKv > save ? '#dc2626' : '#d97706'), 'KV transfer');
+
+    ctx.textAlign = 'left';
+    tokVal.textContent  = tokens;
+    bwVal.textContent   = bw.toFixed(0);
+    saveVal.textContent = save.toFixed(0);
+    kSize.textContent   = gb.toFixed(2) + ' GB';
+    kKv.textContent     = tKv.toFixed(1) + ' ms';
+    kNet.textContent    = (net >= 0 ? '+' : '') + net.toFixed(1) + ' ms';
+    kVerd.textContent   = net > 0 ? 'disaggregation pays' : 'split costs more';
+    kVerd.style.color   = net > 0 ? '#16a34a' : '#dc2626';
+  }
+
+  tokRng.addEventListener('input', render);
+  bwRng.addEventListener('input', render);
+  saveRng.addEventListener('input', render);
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
 </body>
 </html>

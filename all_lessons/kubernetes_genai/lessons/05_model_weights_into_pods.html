@@ -5,85 +5,293 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>05 - Getting Model Weights Into Pods | Generative AI on Kubernetes</title>
 <link rel="stylesheet" href="style.css">
+<style>
+  .kicker { margin: 0 0 8px; font-family: var(--mono); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-mute); }
+  .source-note { border-left-color: var(--accent-2); }
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; }
+  .mini-flow { display: grid; gap: 8px; margin: 18px 0; }
+  .mini-flow .step { border: 1px solid var(--border); background: var(--bg-elev); border-radius: 8px; padding: 10px 12px; }
+  .mini-flow .n { font-family: var(--mono); color: var(--accent); font-size: 12px; margin-right: 6px; }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
 </head>
 <body>
 <header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">kubernetes_genai</a><span class="crumb">/</span><span class="crumb">05</span><span class="step-pill">lesson 5 / 18</span></div></header>
 <main>
+
 <p class="kicker">Part I - Inference foundations</p>
 <h1>Getting Model Weights Into Pods</h1>
-<p class="subtitle">Init copies, PersistentVolumes, modelcars, OCI image volumes, node cache behavior, and cold-start economics.</p>
+<p class="subtitle">Lesson 04 gave each model version an immutable identity in a registry — a content-addressed artifact you can name, pin, and roll back. Knowing <em>which</em> bytes you want is only half the job. The runtime cannot serve weights it cannot read, and a 100 GB checkpoint does not arrive the way a 4 KB ConfigMap does. This lesson is about the delivery path: how the bytes physically travel from a registry or object store onto a node and into the pod's filesystem before the server reports ready. That path — not the model code — decides how long a scale-up takes, how much egress every replica burns, and whether a rollback is reproducible.</p>
 
-<div class="callout source-note"><div class="label">Source coverage</div>PDF Chapter 2: accessing model data in Kubernetes; refreshed with current Kubernetes image-volume status.</div>
-<div class="callout"><div class="label">Learning objective</div>Choose the model delivery path that minimizes cold start, drift, and operational surprise for the model size and rollout pattern.</div>
+<div class="callout source-note"><div class="label">Source coverage</div>PDF Chapter 2: accessing model data in Kubernetes; refreshed with current Kubernetes image-volume status (image volumes are stable as of Kubernetes v1.36).</div>
 
-<h2>Linear Position</h2>
-<div class="position-grid">
-  <div><strong>Prerequisite</strong><span>Builds on <a href="04_model_artifacts_registries.html">04 - Model Artifacts and Registries</a>.</span></div>
-  <div><strong>New capability</strong><span>Choose the model delivery path that minimizes cold start, drift, and operational surprise for the model size and rollout pattern.</span></div>
-  <div><strong>Next dependency</strong><span>Prepares <a href="06_gpu_nodes_platform.html">06 - GPU Nodes as a Platform Layer</a>.</span></div>
+<div class="callout"><div class="label">Linear position</div><strong>Prerequisite:</strong> Lesson 04 (Model Artifacts and Registries) — every model version now has an immutable, content-addressed identity you can pin and roll back to.<br><strong>New capability:</strong> Choose the model delivery path — PersistentVolume, init copy, modelcar, or OCI image volume — that minimizes cold start, drift, and operational surprise for a given model size and rollout pattern, and measure model load as its own metric.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Five moves. (1) Reframe a model as a deployable supply-chain artifact, not configuration, and separate the two questions every path answers — how do the bytes get <em>distributed</em>, and how does the runtime <em>read</em> them. (2) Decompose cold start into five terms and work a real number: an 80-second transfer floor for a 100 GB model at 10 Gbit/s, and how a warm node cache erases it. (3) Walk the four delivery paths — PV, init copy, modelcar, image volume — with the trade each makes. (4) State the operational rule: model load is its own metric, decomposable into node-cache / storage / CUDA / warmup so you can say <em>why</em> a pod was slow. (5) The 2026 status of image volumes, failure modes, a checklist, and the hand-off into GPU nodes.</p></div>
+
+<h2>1 · A model is a supply-chain artifact, not configuration</h2>
+
+<p>The instinct from ordinary backend work is to treat "the model" like any other piece of app config: bake it in, mount it, ship it. That instinct breaks at scale. A ConfigMap is kilobytes; a serving checkpoint for a mid-sized open model is tens to hundreds of gigabytes. <strong>Llama-3 70B</strong> in 16-bit weights is about <span class="math">70 × 10⁹ params × 2 bytes ≈ 140 GB</span>; even quantized to 8-bit it is ~70 GB. Those bytes do not live in your container image by default, they do not fit in etcd, and they are far too large to re-fetch casually. So the right mental model is the one this lesson keeps returning to:</p>
+
+<div class="callout"><div class="label">Mental model</div>A 100 GB model is not configuration. It is a deployable supply-chain artifact whose <em>delivery path</em> determines startup time, node pressure, rollback speed, and cache hit rate. Designing serving means designing how that artifact is distributed and read — with the same care you would give a binary release, not the casualness you give an environment variable.</div>
+
+<p>The single distinction that organizes every option is this: <strong>distributing the artifact</strong> (getting the bytes near the pod) is a different problem from <strong>reading the artifact</strong> (the runtime opening files and loading tensors into GPU memory). A path can be excellent at one and poor at the other. An OCI registry is built to distribute immutable, content-addressed layers and to benefit from node-level layer caching — but how the runtime then reads those bytes depends on whether they are unpacked to disk or mounted. A network filesystem is built to expose one copy of the bytes to many readers — but its read throughput under concurrent load is now on your critical path. Keep the two questions separate and the paths stop looking interchangeable.</p>
+
+<div class="mini-flow">
+<div class="step"><span class="n">→</span><strong>PersistentVolume (PV)</strong> → one copy of the bytes on shared storage (NFS, a CSI-backed network disk, an object-store-backed FUSE mount), mounted read-only into many pods. Distribution is "write once"; reading is a network/storage concern shared by every replica.</div>
+<div class="step"><span class="n">→</span><strong>Init container copy</strong> → an init container pulls the model from a source (object store, registry) into a pod-local <code>emptyDir</code> ephemeral volume before the main container starts. Each pod gets its own copy; the runtime then reads from fast local disk.</div>
+<div class="step"><span class="n">→</span><strong>OCI registry distribution + node cache</strong> → the model is packaged as an OCI artifact and distributed through the registry. The container runtime caches pulled layers on the node, so the <em>second</em> pod on that node pays nothing to fetch.</div>
+<div class="step"><span class="n">→</span><strong>Modelcar (sidecar)</strong> → the model is packaged in its own container image; a sidecar in the pod makes those bytes available to the model server via a shared volume. A pre-image-volume way to get OCI distribution and node-cache semantics.</div>
+<div class="step"><span class="n">→</span><strong>OCI image volume</strong> → a native Kubernetes feature that mounts an OCI artifact directly into the pod as a <em>read-only</em> volume. Same registry distribution and node cache as a modelcar, but no sidecar to manage — the platform does the mount.</div>
 </div>
 
+<h2>2 · The cold-start equation — and why scale-up is a network event</h2>
 
-        <h2>Linear Story</h2>
-        <p>Once the model is versioned, the platform must put it where the runtime can read it. The book covers PersistentVolumes, sidecar-style modelcars, and OCI image volume ideas because the delivery path controls cold start. A model server that starts instantly in a local demo may spend most of its production startup pulling and reading weights.</p>
-        <pre class="ascii">registry/object store/PV
-        |
-        v
-node cache or shared storage
-        |
-        v
-pod mount path -> runtime loads weights -> readiness true</pre>
-        <p>The key distinction is between distributing the artifact and reading the artifact. An OCI registry can distribute immutable bytes and benefit from node cache semantics. A PV can expose shared bytes to many pods. An init container can copy bytes into an ephemeral volume. Each path changes who pays for bandwidth, how rollback works, and whether scale-up is predictable.</p>
-        <h2>Cold-Start Equation</h2>
-        <p>Think of startup as: image pull + model fetch + model read + runtime initialization + warmup. Only the last two are model-server concerns. The first three are platform concerns. If a scale-from-zero path has to pull a 100 GB model over the network before readiness, autoscaling is no longer just scheduling more pods; it is staging huge artifacts under time pressure.</p>
-        <table class="trade-table"><thead><tr><th>Delivery path</th><th>Good fit</th><th>Trade-off</th></tr></thead><tbody>
-          <tr><td>PersistentVolume</td><td>Shared model data and stable clusters</td><td>Storage throughput and mount semantics become critical</td></tr>
-          <tr><td>Init copy</td><td>Simple workflows and local ephemeral speed</td><td>Repeated copy cost at every restart</td></tr>
-          <tr><td>Modelcar</td><td>OCI-style packaging before native image volumes</td><td>Sidecar lifecycle and multi-arch complexity</td></tr>
-          <tr><td>Image volume</td><td>Immutable OCI artifact mounted read-only</td><td>Runtime support and feature maturity must be verified</td></tr>
-        </tbody></table>
-        <h2>Operational Rule</h2>
-        <p>Measure model load as its own metric. Do not hide it inside pod startup. A healthy platform can answer: was this pod slow because the node lacked the model layer, because storage was slow, because CUDA initialization was slow, or because the runtime was compiling/warming kernels?</p>
-        <h2>Current Status Note</h2>
-        <p>The book's early-2026 caveats should be refreshed as Kubernetes evolves. As of the official Kubernetes task documentation checked for this update, image volumes are listed as <strong>Kubernetes v1.36 stable</strong> and enabled by default. That matters because the design discussion changes: the question is less "is this experimental?" and more "does my cluster version, container runtime, registry policy, and artifact format support the path I want?" Keep the external link in this lesson because runtime and registry support can still lag the API feature state.</p>
+<p>"Cold start" is the time from a pod being scheduled to the model server reporting <strong>ready</strong> (passing its readiness probe so it can take traffic). It is not one thing. Decompose it:</p>
 
+<pre class="ascii">cold start  =  image pull  +  model fetch  +  model read  +  runtime init  +  warmup
+              └──────────── platform concern ───────────┘   └─ model-server concern ─┘</pre>
 
-<h2>Mental Model</h2>
-<p>A 100 GB model is not configuration. It is a deployable supply-chain artifact whose delivery path determines startup time, node pressure, rollback speed, and cache hit rate.</p>
-
-<h2>Operational Checklist</h2>
 <ul>
-<li>Use PVs when many pods need shared read access and the storage backend has predictable throughput.</li>
-<li>Use modelcars or OCI image volumes when registry distribution, immutability, and node cache semantics are valuable.</li>
-<li>Pre-pull or prefetch large models before scale-up if cold-start SLOs matter.</li>
-<li>Measure node-local cache hit rate and model load time separately from HTTP process startup.</li>
+<li><strong>image pull</strong> — pulling the container image (runtime + server code) if it is not already on the node.</li>
+<li><strong>model fetch</strong> — moving the model bytes onto the node / into a volume the pod can read (this is the term the delivery path controls).</li>
+<li><strong>model read</strong> — the server opening the files and loading tensors from disk/network into host RAM and then GPU <strong>HBM</strong> (the GPU's high-bandwidth on-package memory).</li>
+<li><strong>runtime init</strong> — CUDA context creation, allocator setup, building/compiling kernels.</li>
+<li><strong>warmup</strong> — running a few dummy requests so lazily-compiled kernels and the KV cache allocator are hot before real traffic.</li>
 </ul>
 
-<h2>Failure Modes</h2>
-<ul>
-<li>The deployment scales from zero but spends minutes pulling weights before readiness.</li>
-<li>Every replica downloads the same model from a remote source and saturates egress or object storage.</li>
-<li>Mutable tags make rollback non-reproducible.</li>
-</ul>
+<p>The first three terms are <em>platform</em> concerns and the last two are <em>model-server</em> concerns. The mistake is letting the platform terms hide. Here is why they dominate on a cold node. Suppose you scale from zero and the only path to the bytes is fetching a 100 GB model over a 10 Gbit/s network link:</p>
 
-<h2>Cross-Links</h2>
-<ul>
-<li><a href="https://kubernetes.io/docs/tasks/configure-pod-container/image-volumes/">Kubernetes image volumes</a></li>
-<li><a href="../../data_intensive_systems/lessons/index.html">Data-intensive storage engines</a></li>
-</ul>
+<div class="callout"><div class="label">Worked number — the transfer floor</div>
+A 100 GB model is <span class="math">100 × 8 = 800</span> gigabits. Over a <span class="math">10 Gbit/s</span> link, the <em>best case</em> transfer time is <span class="math">800 / 10 = 80 seconds</span> — and that is before a single tensor is read into HBM, before CUDA initializes, before warmup. Real links rarely sustain line rate, so call it 90-120 s of pure fetch. Now make it concrete at fleet scale: an autoscaler adds <strong>20 replicas</strong> in a burst and each independently pulls the 100 GB model from the same object store. That is <span class="math">20 × 100 GB = 2 TB = 16 Tbit</span> of egress in one scale-up event, and if they share a 10 Gbit/s egress path they <em>serialize</em> — <span class="math">16 Tbit / 10 Gbit/s ≈ 1600 s ≈ 27 minutes</span> for the last replica to even start reading. Your "scale-up" just became a 27-minute network event with an object-store bill attached.</div>
 
-<h2>Takeaway And Interview Prompts</h2>
-<p><strong>Takeaway:</strong> A 100 GB model is not configuration. It is a deployable supply-chain artifact whose delivery path determines startup time, node pressure, rollback speed, and cache hit rate.</p>
-<ol>
-  <li>Draw the system boundary for <strong>Getting Model Weights Into Pods</strong>. Which resource or policy binds first?</li>
-  <li>Pick two designs from this lesson. What does each optimize, and what does each make worse?</li>
-  <li>Design an incident around this failure mode: The deployment scales from zero but spends minutes pulling weights before readiness. What metric, log, or trace would reveal it?</li>
-</ol>
+<p>The fix is to make <strong>model fetch</strong> approach zero on the common path, which is exactly what a warm node cache does. If the model bytes are already on the node — because a prior pod pulled the OCI layers, or because a PV already holds them, or because you pre-pulled before scaling — then for the next pod model fetch is a local-disk read at GB/s instead of a network transfer at Gbit/s. The same 100 GB read from a 5 GB/s local NVMe is <span class="math">100 / 5 = 20 seconds</span>, and four-fifths of cold start vanishes. This is the whole game: cold-start economics are dominated by whether the bytes are <em>already there</em>, and your delivery path is what decides cache-hit behavior. Drag the knobs below to feel the curve.</p>
+
+<div class="widget" id="cold-widget">
+  <div class="title">Cold-start cost — model size vs link bandwidth vs cache-hit rate</div>
+  <div class="hint">A scale-up adds <strong>N</strong> replicas. Each one is either a <em>cache hit</em> (bytes already on its node — reads from local disk) or a <em>cache miss</em> (must fetch over the network from the source). The bar shows time-to-ready for a single missing replica (fetch + read + init + warmup); the KPIs show the slowest replica in the burst and total egress. Push cache-hit rate up — or bandwidth up, or model size down — and watch both the tail latency and the egress bill collapse.</div>
+
+  <canvas class="dist-canvas" id="cold-canvas" width="760" height="200" style="height:200px;"></canvas>
+
+  <div class="controls" style="margin-top: 12px;">
+    <label class="inline">model size (GB): <input type="range" id="cs-size" min="5" max="200" step="5" value="100"> <span class="val" id="cs-size-val">100</span></label>
+    <label class="inline">link (Gbit/s): <input type="range" id="cs-bw" min="1" max="100" step="1" value="10"> <span class="val" id="cs-bw-val">10</span></label>
+    <label class="inline">cache-hit rate: <input type="range" id="cs-hit" min="0" max="100" step="5" value="0"> <span class="val" id="cs-hit-val">0%</span></label>
+    <label class="inline">replicas added: <input type="range" id="cs-n" min="1" max="40" step="1" value="20"> <span class="val" id="cs-n-val">20</span></label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">Fetch (1 miss)</div><div class="v" id="cs-k-fetch">—</div></div>
+    <div class="kpi"><div class="k">Time-to-ready (1 miss)</div><div class="v" id="cs-k-ready">—</div></div>
+    <div class="kpi"><div class="k">Slowest replica (burst)</div><div class="v" id="cs-k-tail">—</div></div>
+    <div class="kpi"><div class="k">Total egress this scale-up</div><div class="v" id="cs-k-egress">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">Show the core JS</summary>
+<pre><code>// misses fetch over a shared link and serialize on it; hits read from local disk.
+var misses   = Math.round(N * (1 - hitRate));
+var bits      = sizeGB * 8;                 // gigabits per model
+var fetch1    = bits / bwGbps;              // seconds, one miss alone
+var readLocal = sizeGB / LOCAL_GBps;        // local NVMe read (cache hit path)
+var ready1    = fetch1 + READ_INIT_WARMUP;  // single missing replica
+// the burst of misses shares the egress link -> they serialize:
+var tail      = misses * fetch1 + READ_INIT_WARMUP;
+var egressGB  = misses * sizeGB;</code></pre>
+  </details>
+</div>
+
+<h2>3 · The four delivery paths and what each trades</h2>
+
+<p>The paths are not ranked — they trade who pays for bandwidth, how rollback works, and whether scale-up is predictable. Pick by model size and rollout pattern.</p>
+
+<table class="trade-table"><thead><tr><th>Delivery path</th><th>Good fit</th><th>Trade-off</th></tr></thead><tbody>
+  <tr><td><strong>PersistentVolume</strong></td><td>Many pods need shared read access to the same bytes; storage backend has predictable, high concurrent-read throughput; model rarely changes.</td><td>Storage throughput and mount semantics are now on the critical path — every replica's read contends on the same volume, and a slow CSI driver throttles the whole fleet.</td></tr>
+  <tr><td><strong>Init copy</strong></td><td>Simple workflows; you want the main container reading from fast pod-local disk; per-pod isolation is fine.</td><td>Every pod restart re-copies the full model — repeated fetch cost, and a cold-node scale-up pays the network transfer per replica.</td></tr>
+  <tr><td><strong>Modelcar (sidecar)</strong></td><td>You want OCI distribution, immutability, and node-cache semantics on a cluster whose runtime predates native image volumes.</td><td>A sidecar lifecycle to manage, shared-volume plumbing, and multi-arch image complexity — operational surface that the native feature removes.</td></tr>
+  <tr><td><strong>OCI image volume</strong></td><td>Cluster on v1.36+; you want immutable, content-addressed model bytes mounted read-only with node-cache reuse and no sidecar.</td><td>Container runtime, registry policy, and artifact format must all support it — the API being stable does not mean your runtime/registry do.</td></tr>
+</tbody></table>
+
+<p>Notice how each path answers the two questions from §1 differently. The PV is shared distribution with shared reading — one copy, many concurrent readers, so it shines when reads parallelize and dies when they contend. The init copy is per-pod distribution with fast local reading — great read path, but it re-pays fetch on every restart. The modelcar and image volume both get distribution and node caching from the OCI registry; the image volume is simply the modelcar idea promoted into the platform so you no longer babysit a sidecar.</p>
+
+<div class="callout"><div class="label">Why immutability matters for rollback</div>An OCI image volume or modelcar references the artifact by digest (or a tag you pin to a digest). Rolling back is then exactly redeploying the previous digest — reproducible, content-addressed, the property lesson 04 bought you. A PV or an init copy that fetches "latest" from a mutable location has no such guarantee: the bytes under that name may have changed, so "roll back the Deployment" does not roll back the model.</div>
+
+<h2>4 · Measure model load as its own metric</h2>
+
+<p>The operational rule that ties this together: <strong>model load is its own metric, never hidden inside pod startup.</strong> If all you have is "pod took 6 minutes to become ready," you cannot act. A platform that has done this right can decompose that number and tell you exactly which term in the cold-start equation was slow:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Node lacked the layer</div><div class="v">Cache miss — the node had to fetch the model over the network. Signal: high <em>model fetch</em> time correlated with first-pod-on-node; near-zero on subsequent pods. Fix: pre-pull / better cache-hit rate.</div></div>
+  <div class="topic-card"><div class="k">Storage was slow</div><div class="v">PV / network filesystem read throughput collapsed under concurrent readers. Signal: <em>model read</em> time scales with replica count. Fix: faster CSI backend, fewer concurrent readers, or switch to per-pod local reads.</div></div>
+  <div class="topic-card"><div class="k">CUDA init was slow</div><div class="v">Context creation, allocator, kernel compilation. Signal: <em>runtime init</em> time independent of model size, sensitive to driver/runtime version. Fix: pinned base image, cached compiled kernels.</div></div>
+  <div class="topic-card"><div class="k">Runtime was warming</div><div class="v">The server is compiling/warming kernels and priming the KV cache. Signal: <em>warmup</em> time, first requests slow then fast. Fix: warmup requests gated before readiness, or accept a warm-up window.</div></div>
+</div>
+
+<p>Emit each of these as a separate timing (a span or a labeled histogram), distinct from the HTTP process-start time. The payoff is that an incident becomes a lookup instead of a guess: you read the slow term and go straight to its fix, rather than re-running the deploy and hoping.</p>
+
+<h2>5 · Where image volumes stand in 2026</h2>
+
+<p>The book's chapter was written when OCI image volumes were an early, experimental idea, so its caveats need refreshing. As of the current Kubernetes task documentation, <strong>image volumes are stable as of Kubernetes v1.36 and enabled by default.</strong> That changes the design conversation. The question is no longer "is this experimental, do I dare?" — it is the more concrete supply-chain question: <em>does my cluster version, my container runtime, my registry policy, and my artifact format all support the path I want?</em> A stable API does not mean your container runtime implements it, that your registry serves the artifact format, or that your image-pull policy allows it. Keep the external reference because runtime and registry support can still lag the API feature state, and the docs track the runtime support matrix.</p>
+
+<div class="callout"><div class="label">Verify the path, not just the version</div>Read it directly: <a href="https://kubernetes.io/docs/tasks/configure-pod-container/image-volumes/">Kubernetes image volumes</a>. Before committing a delivery path, confirm the four links in the chain — API version (v1.36+), container runtime support, registry artifact format, and your image-pull / admission policy — not just that the feature is "stable."</div>
+
+<h2>6 · Failure modes and a checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+<li><strong>Scale-from-zero stalls on the fetch.</strong> The Deployment scales from zero but spends minutes pulling weights before readiness, so autoscaling reacts far too late to the load that triggered it. Signal: <em>model fetch</em> dominates cold start and time-to-ready tracks model size, not request volume. The autoscaler is now staging huge artifacts under time pressure, not just scheduling pods.</li>
+<li><strong>The thundering-herd egress event.</strong> Every replica independently downloads the same model from a remote source, saturating egress or the object store and serializing on the shared link (see §2's 27-minute tail). Signal: egress bytes spike to <span class="math">N × model_size</span> on every scale-up; object-store throttling errors. Fix: node cache, PV, or pre-pull so only the first pod on a node fetches.</li>
+<li><strong>Mutable tags make rollback non-reproducible.</strong> The delivery path fetches "latest" or a tag that was re-pushed, so redeploying the previous Deployment spec does not bring back the previous bytes. Signal: two pods on the same spec serve different model behavior; a rollback "succeeds" but the regression persists. Fix: reference by digest, the immutability lesson 04 bought.</li>
+</ul>
+  </div>
+  <div class="lesson-card"><h3>Implementation checklist</h3><ul>
+<li>Use a <strong>PV</strong> when many pods need shared read access and the storage backend has predictable, high concurrent-read throughput — and you have load-tested reads at the replica count you will actually run.</li>
+<li>Use a <strong>modelcar or OCI image volume</strong> when registry distribution, immutability, and node-cache semantics are valuable — i.e. when reproducible rollback and "second pod on the node is free" matter more than a single shared copy.</li>
+<li>Pre-pull or prefetch large models onto nodes <em>before</em> scale-up if cold-start SLOs matter, so the autoscaler's pods hit a warm cache instead of a cold network.</li>
+<li>Measure node-local cache hit rate and model load time <strong>separately</strong> from HTTP process startup, and break model load into fetch / read / init / warmup so the slow term is a lookup, not a guess.</li>
+<li>Reference model bytes by <strong>digest</strong> (or a tag pinned to one) on every path, so a Deployment rollback is also a model rollback.</li>
+<li>Confirm the path's full support chain — cluster version, runtime, registry format, pull policy — before depending on it (§5).</li>
+</ul>
+  </div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>You serve a 100 GB model behind an HPA that can burst from 2 to 30 replicas, with a cold-start SLO of 60 seconds and nodes that hold ~4 model-sized layers in local cache. Pick a delivery path and defend it: estimate the fetch term for a cache hit vs miss at your node bandwidth, decide whether to pre-pull and to how many nodes, and name the one metric you would alert on to catch the thundering-herd egress failure before it shows up on the bill.</div>
+
+<h2>Where this points next</h2>
+
+<p>You can now get the right bytes onto a node and into a pod, and you can say <em>why</em> a cold start was slow. But every term in the cold-start equation assumed a node was there and capable — that it had the GPU, the HBM, the driver, and the room to mount the volume. Nodes with accelerators are not interchangeable commodity compute; they are a scarce, typed, expensive resource with their own scheduling and lifecycle rules. The next lesson — <strong>06 - <a href="06_gpu_nodes_platform.html">GPU Nodes as a Platform Layer</a></strong> — treats the GPU node as a platform abstraction: how Kubernetes discovers, labels, taints, and schedules accelerators, and why "just add a node" is its own multi-minute event that compounds the cold start you just learned to measure.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+A 100 GB model is a deployable supply-chain artifact, not configuration: its delivery path determines startup time, node pressure, rollback speed, and cache-hit rate. Separate <em>distributing</em> the bytes from <em>reading</em> them, then choose among PersistentVolume (one shared copy, many readers — fast when reads parallelize), init copy (per-pod local read, re-fetched every restart), modelcar (OCI distribution + node cache via a sidecar), and OCI image volume (the native, sidecar-free version, stable in Kubernetes v1.36). Cold start is image pull + model fetch + model read + runtime init + warmup; only the last two are the server's, and the platform terms dominate — a 100 GB model is an 80 s transfer floor at 10 Gbit/s and a 20-replica burst is a 2 TB egress event unless a warm node cache makes fetch ~free. So pin bytes by digest for reproducible rollback, pre-pull before scale-up when SLOs bite, and measure model load as its own decomposed metric — node-cache / storage / CUDA / warmup — so a slow start is a lookup, not a guess.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why treat a model as a supply-chain artifact rather than configuration? <em>(§1 — it is tens-to-hundreds of GB, does not fit in etcd or a ConfigMap, and its delivery path — not its code — controls startup time, node pressure, rollback reproducibility, and cache-hit rate.)</em></li>
+  <li>What two distinct questions does every delivery path answer? <em>(§1 — how the bytes are <em>distributed</em> near the pod vs how the runtime <em>reads</em> them; a path can be good at one and poor at the other, e.g. a PV distributes one copy but its concurrent read throughput is now your critical path.)</em></li>
+  <li>Decompose cold start, and which terms are the platform's? <em>(§2 — image pull + model fetch + model read + runtime init + warmup; the first three are platform concerns, only read+init+warmup are the model server's, and the platform terms dominate on a cold node.)</em></li>
+  <li>Work the cold-start number for a 100 GB model. <em>(§2 — 100 GB = 800 Gbit; at 10 Gbit/s that is an 80 s transfer floor before any read/init; a 20-replica burst is 2 TB of egress that serializes to ~27 min on a shared 10 Gbit/s link unless a warm node cache makes fetch ~free.)</em></li>
+  <li>Compare PersistentVolume vs init copy vs image volume, and when each wins. <em>(§3 — PV: one shared copy, many readers, wins when reads parallelize and storage is fast; init copy: per-pod fast local read but re-fetches every restart; image volume: native OCI distribution + node cache + read-only mount with reproducible digest rollback, on v1.36+.)</em></li>
+  <li>Why measure model load separately from pod startup? <em>(§4 — so an incident is a lookup: you can say it was slow because the node lacked the layer / storage was slow / CUDA init was slow / the runtime was warming, and go straight to the fix instead of re-running the deploy.)</em></li>
+  <li>How do you prevent a scale-up from becoming a thundering-herd egress event? <em>(§6, §2 — node cache / PV / pre-pull so only the first pod on a node fetches, reference bytes by digest, and alert on egress bytes spiking toward N × model_size per scale-up.)</em></li>
+</ul>
 
 <footer class="lesson-nav">
   <a href="04_model_artifacts_registries.html"><span class="dir">Previous</span><span class="ttl">04 - Model Artifacts and Registries</span></a>
   <a class="next" href="06_gpu_nodes_platform.html"><span class="dir">Next</span><span class="ttl">06 - GPU Nodes as a Platform Layer</span></a>
 </footer>
+
 </main>
+
+<script>
+(function(){
+  var canvas = document.getElementById('cold-canvas');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+
+  var sizeRng = document.getElementById('cs-size');
+  var bwRng   = document.getElementById('cs-bw');
+  var hitRng  = document.getElementById('cs-hit');
+  var nRng    = document.getElementById('cs-n');
+  var sizeVal = document.getElementById('cs-size-val');
+  var bwVal   = document.getElementById('cs-bw-val');
+  var hitVal  = document.getElementById('cs-hit-val');
+  var nVal     = document.getElementById('cs-n-val');
+  var kFetch  = document.getElementById('cs-k-fetch');
+  var kReady  = document.getElementById('cs-k-ready');
+  var kTail   = document.getElementById('cs-k-tail');
+  var kEgress = document.getElementById('cs-k-egress');
+
+  var LOCAL_GBps = 5;        // local NVMe read, GB/s (cache-hit path)
+  var READ_INIT_WARMUP = 30; // seconds: model read into HBM + CUDA init + warmup
+
+  function fmtTime(s){
+    if (s < 90) return s.toFixed(0) + ' s';
+    return (s/60).toFixed(1) + ' min';
+  }
+  function fmtBytes(gb){
+    if (gb >= 1000) return (gb/1000).toFixed(2) + ' TB';
+    return gb.toFixed(0) + ' GB';
+  }
+
+  function render(){
+    var sizeGB = parseFloat(sizeRng.value);
+    var bwGbps = parseFloat(bwRng.value);
+    var hit    = parseFloat(hitRng.value)/100;
+    var N      = parseInt(nRng.value, 10);
+
+    var bits   = sizeGB * 8;
+    var fetch1 = bits / bwGbps;                 // one miss, alone, seconds
+    var ready1 = fetch1 + READ_INIT_WARMUP;     // single missing replica time-to-ready
+    var misses = Math.round(N * (1 - hit));
+    // misses share the egress link -> serialize; one hit reads local disk quickly
+    var tail   = (misses > 0)
+      ? misses * fetch1 + READ_INIT_WARMUP
+      : (sizeGB / LOCAL_GBps) + READ_INIT_WARMUP;
+    var egress = misses * sizeGB;
+
+    sizeVal.textContent = sizeGB.toFixed(0);
+    bwVal.textContent   = bwGbps.toFixed(0);
+    hitVal.textContent  = (hit*100).toFixed(0) + '%';
+    nVal.textContent    = N;
+    kFetch.textContent  = fmtTime(fetch1);
+    kReady.textContent  = fmtTime(ready1);
+    kTail.textContent   = fmtTime(tail);
+    kEgress.textContent = fmtBytes(egress) + ' (' + misses + ' misses)';
+
+    // draw a single-replica time-to-ready stacked bar: fetch vs read+init+warmup
+    var dpr = window.devicePixelRatio || 1;
+    var W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== Math.round(W*dpr)){ canvas.width = Math.round(W*dpr); canvas.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    var padX = 20, padTop = 40, padBot = 40;
+    var barH = 30;
+    var plotW = W - 2*padX;
+
+    // scale: use the larger of this ready1 and a reference so the bar feels comparable
+    var ref = Math.max(ready1, (200*8/bwGbps) + READ_INIT_WARMUP) ; // worst-case-ish for steady axis
+    var scale = plotW / ref;
+
+    var y = padTop;
+    var fetchW = fetch1 * scale;
+    var restW  = READ_INIT_WARMUP * scale;
+
+    ctx.fillStyle = '#5b6573'; ctx.font = '12px monospace';
+    ctx.fillText('one missing replica: time-to-ready', padX, padTop - 14);
+
+    // fetch segment
+    ctx.fillStyle = '#dc2626';
+    ctx.fillRect(padX, y, fetchW, barH);
+    // read+init+warmup segment
+    ctx.fillStyle = '#16a34a';
+    ctx.fillRect(padX + fetchW, y, restW, barH);
+
+    ctx.fillStyle = '#fff'; ctx.font = '11px monospace';
+    if (fetchW > 60) ctx.fillText('fetch ' + fmtTime(fetch1), padX + 6, y + 19);
+    if (restW > 90)  ctx.fillText('read+init+warmup ' + fmtTime(READ_INIT_WARMUP), padX + fetchW + 6, y + 19);
+
+    // legend
+    ctx.font = '11px monospace';
+    ctx.fillStyle = '#dc2626'; ctx.fillRect(padX, y + barH + 16, 11, 11);
+    ctx.fillStyle = '#5b6573'; ctx.fillText('model fetch (platform / network)', padX + 18, y + barH + 25);
+    ctx.fillStyle = '#16a34a'; ctx.fillRect(padX, y + barH + 34, 11, 11);
+    ctx.fillStyle = '#5b6573'; ctx.fillText('read into HBM + CUDA init + warmup (model server)', padX + 18, y + barH + 43);
+  }
+
+  sizeRng.addEventListener('input', render);
+  bwRng.addEventListener('input', render);
+  hitRng.addEventListener('input', render);
+  nRng.addEventListener('input', render);
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
 </body>
 </html>

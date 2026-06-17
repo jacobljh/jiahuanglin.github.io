@@ -5,81 +5,257 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>11 - Observability for LLM Serving | Generative AI on Kubernetes</title>
 <link rel="stylesheet" href="style.css">
+<style>
+  .kicker { margin: 0 0 8px; font-family: var(--mono); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-mute); }
+  .source-note { border-left-color: var(--accent-2); }
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; }
+  .mini-flow { display: grid; gap: 8px; margin: 18px 0; }
+  .mini-flow .step { border: 1px solid var(--border); background: var(--bg-elev); border-radius: 8px; padding: 10px 12px; }
+  .mini-flow .n { font-family: var(--mono); color: var(--accent); font-size: 12px; margin-right: 6px; }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
 </head>
 <body>
 <header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">kubernetes_genai</a><span class="crumb">/</span><span class="crumb">11</span><span class="step-pill">lesson 11 / 18</span></div></header>
 <main>
+
 <p class="kicker">Part III - Production inference</p>
 <h1>Observability for LLM Serving</h1>
-<p class="subtitle">Logs, metrics, traces, TTFT, TPOT, throughput, queue metrics, GPU/DCGM, quality metrics, and OpenTelemetry GenAI signals.</p>
+<p class="subtitle">Lesson 10 split prefill and decode onto separate pools so each could scale on its own bottleneck. But the moment you disaggregate, the question "is it healthy?" stops having a single answer: prefill can be starved while decode is idle, or the GPUs can be pinned at 100% utilization while users wait twenty seconds for a first token. A green HTTP 200 tells you almost nothing about any of that. This lesson builds an observability stack that sees an LLM workload <em>in its own language</em> — token timing, queue depth, GPU memory pressure, and output quality — so that when something degrades, the telemetry points at the exact path that broke.</p>
 
 <div class="callout source-note"><div class="label">Source coverage</div>PDF Chapter 5: model observability.</div>
-<div class="callout"><div class="label">Learning objective</div>Build an observability stack that explains both infrastructure health and model behavior under load.</div>
 
-<h2>Linear Position</h2>
-<div class="position-grid">
-  <div><strong>Prerequisite</strong><span>Builds on <a href="10_disaggregated_serving.html">10 - Disaggregated Serving</a>.</span></div>
-  <div><strong>New capability</strong><span>Build an observability stack that explains both infrastructure health and model behavior under load.</span></div>
-  <div><strong>Next dependency</strong><span>Prepares <a href="12_safety_quality_guardrails.html">12 - Safety, Quality, and Guardrails</a>.</span></div>
+<div class="callout"><div class="label">Linear position</div><strong>Prerequisite:</strong> Lessons 06-10 (the serving runtime, batching, KV cache, autoscaling, and the disaggregated prefill/decode split) — you now run a multi-stage inference path whose stages can fail independently.<br><strong>New capability:</strong> An observability stack — logs, metrics, traces, and quality signals — that decomposes a request along four paths and tells you which one is out of bounds, instead of one aggregate "up/down".</div>
+
+<div class="callout"><div class="label">The plan</div>
+Five moves. (1) Reframe "healthy" for an LLM service as <em>four paths in bounds</em>, not one status code. (2) Define the token-path metrics that traditional monitoring lacks — TTFT and TPOT — and show with arithmetic why a single p50 latency is useless. (3) Walk the GPU path: what DCGM exposes and why GPU utilization alone lies. (4) Build the trace: spans for gateway, queue, prefill, decode, and streaming, tagged with model + version, and why segmenting beats averaging. (5) Add the quality path, then the failure modes, checklist, and the hand-off into guardrails.</p></div>
+
+<h2>1 · "Healthy" is four paths, not one status code</h2>
+
+<p>A classic web service is healthy when requests return 2xx quickly and the error rate is low. That model breaks for LLM serving because a single request is not one operation — it is a multi-stage pipeline that produces output incrementally over seconds. The HTTP status fires <em>once, at the start</em>, when the server accepts the streaming connection. Everything that actually matters to the user — how long until the first token, how smoothly the rest stream, whether the answer is correct — happens <em>after</em> the 200 is already sent.</p>
+
+<p>So the mental model for the rest of this lesson: an LLM request is healthy only when <strong>four independent paths</strong> are all inside their bounds. Each can fail while the others look fine, and each has its own telemetry.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Request path (HTTP / queue)</div><div class="v">The classic layer: arrival rate, HTTP status, and — new for LLMs — <strong>queue depth</strong> and <strong>queue wait time</strong>. A request can be accepted (200) yet sit in the runtime's queue for seconds because all batch slots are full. Queue metrics are how you see saturation that the status code hides.</div></div>
+  <div class="topic-card"><div class="k">Token path</div><div class="v"><strong>TTFT</strong> (time to first token), <strong>TPOT</strong> (time per output token), and <strong>throughput</strong> (tokens/sec). This is the layer the user actually feels: TTFT is the wait before anything appears; TPOT is how fast the rest streams. Defined in §2.</div></div>
+  <div class="topic-card"><div class="k">GPU path (DCGM)</div><div class="v"><strong>DCGM</strong> = Data Center GPU Manager, NVIDIA's metrics agent: SM (streaming-multiprocessor) occupancy, <strong>HBM</strong> (high-bandwidth memory) usage, utilization, power, and thermals. Tells you whether the expensive accelerators are doing useful work or stalled. Detailed in §3.</div></div>
+  <div class="topic-card"><div class="k">Quality path</div><div class="v">Eval scores, refusal rate, and hallucination rate. The path with no analogue in classic ops: a model can serve fast, within every latency bound, and still regress to wrong answers. Covered in §5.</div></div>
 </div>
 
+<p>The discipline this lesson teaches is to instrument all four and to <em>correlate</em> them by the same dimensions — model, version, tenant, route, prompt length, output length — so that "TTFT spiked" can be joined to "HBM hit 95%" on the same trace.</p>
 
-<h2>Linear Story</h2>
-<p>Traditional observability asks whether the service is up, how many requests it handles, and how long they take. LLM observability adds token timing, queue timing, GPU state, model version, prompt shape, cache behavior, and quality. The book's observability chapter is where the platform starts to see the workload in its own language.</p>
+<h2>2 · The token path — and why a single latency is a lie</h2>
+
+<p>Two metrics carry the token path. <strong>TTFT (time to first token)</strong> is the elapsed time from when the request is accepted to when the first output token is emitted; it is dominated by queue wait plus <em>prefill</em> (the one-shot forward pass over the whole prompt, lesson 06). <strong>TPOT (time per output token)</strong> is the average gap between successive tokens once generation has started; it is dominated by <em>decode</em> (one token at a time, memory-bandwidth bound). End-to-end latency for a streaming response is therefore:</p>
+
+<pre class="ascii">total = TTFT + TPOT × (output_tokens − 1)</pre>
+
+<p>This decomposition is the whole point, because the two terms move for completely different reasons. TTFT grows when the queue is deep or the prompt is long (prefill cost scales with prompt length). TPOT grows when decode is contended — more concurrent sequences sharing the GPU, or KV-cache pressure forcing evictions. A single aggregate latency number cannot tell these apart.</p>
+
+<div class="callout"><div class="label">Worked number — why p50 latency hides the diagnosis</div>
+Take one request: TTFT = 200 ms, then 500 output tokens at TPOT = 30 ms each. Total = <span class="math">200 + 30 × 499 ≈ 200 + 14{,}970 = 15.2 s</span>. Now a second request: a long 8k-token prompt pushes TTFT to 2{,}000 ms, but it only emits 40 tokens at the same 30 ms TPOT, so total = <span class="math">2{,}000 + 30 × 39 ≈ 3.2 s</span>. Their <em>total</em> latencies (15.2 s vs 3.2 s) tell you nothing actionable — the slow one is slow because it generated a lot, not because anything is wrong. But the <strong>decomposed</strong> view is diagnostic: request two's 2 s TTFT screams "prefill / prompt-length problem," while request one's healthy 200 ms TTFT and 30 ms TPOT say "this request is fine, it's just long." If you only logged end-to-end p50, you would chase the wrong layer. The fix is to report TTFT and TPOT as separate distributions, each <strong>segmented</strong> — TTFT by prompt length, TPOT by output length — because averaging across a 100-token prompt and an 8k-token prompt blends two unrelated populations into a meaningless middle.</p></div>
+
+<p>Throughput (tokens/sec, aggregated across all concurrent sequences) is the third token-path metric and the one that pays the bills: it is the denominator of your $/1M-tokens cost. Critically, throughput and per-request TPOT trade against each other — larger batches raise total tokens/sec but can raise each individual user's TPOT. You cannot reason about that trade if you only watch one of them, which is exactly the knob the widget in §4 makes draggable.</p>
+
+<h2>3 · The GPU path — why utilization alone lies</h2>
+
+<p>The instinct from VM/container ops is to watch one number: GPU utilization. <strong>DCGM</strong> (Data Center GPU Manager) is NVIDIA's host-level metrics exporter — it runs as a DaemonSet on every GPU node and scrapes per-GPU counters into Prometheus. The trap is that DCGM's headline "GPU utilization" (<code>DCGM_FI_DEV_GPU_UTIL</code>) only means "a kernel was running on the device during the sample window." It can read 100% while the GPU does almost no useful token work — for example, when the batch is tiny and decode is memory-bandwidth bound, or when tensor-parallel ranks (lesson 07) spend the window blocked in a collective waiting on a slow peer.</p>
+
+<p>So the GPU path needs more than one counter:</p>
+
+<div class="mini-flow">
+<div class="step"><span class="n">→</span><strong>SM occupancy</strong> → fraction of the streaming multiprocessors actually busy with compute. The honest "are we doing work?" signal, vs. the binary GPU-util flag.</div>
+<div class="step"><span class="n">→</span><strong>HBM usage</strong> → high-bandwidth memory consumed. This is where weights <em>and</em> the KV cache live; when it approaches the ceiling, the runtime starts evicting cache and rejecting or queueing requests.</div>
+<div class="step"><span class="n">→</span><strong>power &amp; thermals</strong> → a GPU throttling on power/temperature silently lowers clocks, which shows up as rising TPOT with no code change.</div>
+<div class="step"><span class="n">→</span><strong>tokens/sec ÷ utilization</strong> → the derived ratio that catches the "100% busy, low output" pathology that no single counter reveals.</div>
+</div>
+
+<div class="callout warn"><div class="label">Concrete reading — "high GPU, low tokens"</div>
+An H100 has 80 GB of HBM. Suppose weights for a served model take 16 GB and DCGM reports utilization at 98%, HBM at 78/80 GB, but tokens/sec is half of last week's baseline. The high HBM is the tell: the KV cache has filled memory, the runtime is evicting and re-prefilling, and the GPU is "busy" doing wasted recompute rather than new tokens. Utilization alone said "healthy and maxed out"; the <em>combination</em> of near-full HBM + collapsed tokens/sec said "cache pressure — shed load or add a replica." This is why GPU metrics must be correlated with the token path, never read in isolation.</p></div>
+
+<h2>4 · The trace — spans, segmentation, and the streaming gap</h2>
+
+<p>Metrics tell you a path is out of bounds <em>in aggregate</em>; a <strong>trace</strong> tells you where a single slow request spent its time. A trace is a tree of <em>spans</em> — timed intervals — and the LLM-specific work is to emit a span for each stage of the inference pipeline, each tagged with <code>model</code> and <code>model_version</code> attributes so you can slice by deployment:</p>
+
 <div class="lesson-flow">
-  <div><strong>Logs</strong><span>Runtime events, model load, routing decisions, errors, policy actions.</span></div>
-  <div><strong>Metrics</strong><span>TTFT, TPOT, tokens/sec, queue depth, GPU/HBM/DCGM, cache pressure.</span></div>
-  <div><strong>Traces</strong><span>Gateway, queue, prefill, decode stream, tools, guardrails, response.</span></div>
-  <div><strong>Quality</strong><span>Task scores, hallucination checks, safety blocks, user feedback.</span></div>
+  <div><strong>gateway</strong><span>Auth, routing, request validation. Cheap; if it dominates, the problem is the front door, not the model.</span></div>
+  <div><strong>queue</strong><span>Time waiting for a batch slot in the runtime. A fat queue span is the saturation signal the HTTP 200 concealed.</span></div>
+  <div><strong>prefill</strong><span>The forward pass over the whole prompt. Scales with prompt length; this span + queue ≈ TTFT.</span></div>
+  <div><strong>decode</strong><span>Token-by-token generation. Its duration ÷ tokens ≈ TPOT; segment by output length.</span></div>
+  <div><strong>stream</strong><span>Tokens flushed to the client over the wire. Easy to forget to instrument — and that omission is its own failure mode.</span></div>
 </div>
-<h2>Metric Taxonomy</h2>
-<p>TTFT answers "how long before the user sees the first token?" TPOT answers "how steady is generation once it starts?" Throughput answers "how many tokens per second does the system produce?" Queue metrics answer "is the runtime saturated or under-routed?" GPU metrics answer "are expensive accelerators doing useful work?" Quality metrics answer "is the model still doing the right task?" These must be correlated by model, version, tenant, route, prompt length, and output length.</p>
-<table class="trade-table"><thead><tr><th>Symptom</th><th>Likely layer</th><th>Metric to inspect</th></tr></thead><tbody>
-  <tr><td>Slow first token</td><td>queue, routing, prefill, cold model</td><td>TTFT breakdown</td></tr>
-  <tr><td>Uneven streaming</td><td>decode scheduling or GPU pressure</td><td>TPOT and active sequences</td></tr>
-  <tr><td>High GPU but low tokens</td><td>batch shape or communication</td><td>tokens/sec vs GPU utilization</td></tr>
-  <tr><td>Good latency, bad answers</td><td>model/config/retrieval/safety</td><td>eval and quality metrics</td></tr>
-</tbody></table>
-<h2>Privacy Trade-Off</h2>
-<p>Prompt logging is operationally tempting and legally sensitive. The platform needs sampling, redaction, access control, retention, and tenant policy. Observability that creates a data leak is not observability; it is a new incident source.</p>
 
+<p>A decomposed trace for the 15.2-second request from §2 reads like this — and immediately localizes the cost:</p>
 
-<h2>Mental Model</h2>
-<p>For LLMs, &#x27;healthy&#x27; means the request path, token path, GPU path, and quality path are all inside bounds. One green HTTP status is not enough.</p>
+<pre class="ascii">request (15.2 s)
+├─ gateway     12 ms   auth + route, model=llama-70b v=2026-05
+├─ queue      180 ms   waited for a decode slot
+├─ prefill    160 ms   500-token... no, 120-token prompt
+├─ decode    14.8 s    500 output tokens @ ~30 ms each   ← the time lives here
+└─ stream     0.9 s    flush to client (overlaps decode)</pre>
 
-<h2>Operational Checklist</h2>
-<ul>
-<li>Emit request, queue, prefill, decode, and streaming spans with model and version attributes.</li>
-<li>Track TTFT and TPOT separately and segment by prompt length and output length.</li>
-<li>Correlate GPU utilization, HBM usage, cache pressure, and model-server queue metrics.</li>
-<li>Keep prompt and completion logging governed by privacy policy, sampling, and retention rules.</li>
+<p>The lesson the trace teaches: this request is <em>not</em> a prefill or queue problem — 14.8 of 15.2 seconds is legitimate decode for 500 tokens. No amount of adding prefill replicas would help. Contrast that with a request whose <code>queue</code> span is 3 s: same total latency, completely different fix (the runtime is saturated — autoscale decode, lesson 09). Without the spans you cannot tell these apart from the outside.</p>
+
+<div class="callout"><div class="label">Standardize the attributes — OpenTelemetry GenAI</div>
+Do not invent ad-hoc attribute names. The <a href="https://github.com/open-telemetry/semantic-conventions-genai">OpenTelemetry GenAI semantic conventions</a> standardize a <code>gen_ai.*</code> namespace — <code>gen_ai.request.model</code>, <code>gen_ai.usage.input_tokens</code>, <code>gen_ai.usage.output_tokens</code>, <code>gen_ai.response.finish_reasons</code> — so your spans are portable across tools and your dashboards keep working when you swap a backend. Adopting the convention is what lets a generic trace UI know that this span is an LLM call and render token counts, not just a black-box duration.</p></div>
+
+<p>The single most common tracing bug here is dropping the <strong>streaming</strong> span. If the trace ends when the request is accepted (or when the first token leaves), the seconds of decode that the user actually experiences are invisible — TTFT looks fine and the trace looks short, yet users complain. You must keep the span open across the whole streamed response and record first-token time within it.</p>
+
+<div class="widget" id="lat-widget">
+  <div class="title">Latency decomposition — prompt length feeds TTFT, output length feeds TPOT</div>
+  <div class="hint">Drag <strong>prompt length</strong> (which grows prefill, and thus TTFT) and <strong>output length</strong> (which multiplies TPOT). The bar splits total latency into its <span style="color:#0891b2">TTFT</span> and <span style="color:#7c3aed">decode</span> parts. Watch how a long prompt and a long output produce the <em>same</em> total for completely different reasons — the split is the diagnosis, the total is not.</div>
+
+  <canvas class="dist-canvas" id="lat-canvas" width="760" height="150" style="height:150px;"></canvas>
+
+  <div class="controls" style="margin-top: 12px;">
+    <label class="inline">prompt length (tokens): <input type="range" id="lt-prompt" min="64" max="8192" step="64" value="512"> <span class="val" id="lt-prompt-val">512</span></label>
+    <label class="inline">output length (tokens): <input type="range" id="lt-output" min="16" max="1024" step="16" value="500"> <span class="val" id="lt-output-val">500</span></label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">TTFT (queue + prefill)</div><div class="v" id="lt-k-ttft">—</div></div>
+    <div class="kpi"><div class="k">Decode (TPOT × tokens)</div><div class="v" id="lt-k-decode">—</div></div>
+    <div class="kpi"><div class="k">Total latency</div><div class="v" id="lt-k-total">—</div></div>
+    <div class="kpi"><div class="k">Bottleneck path</div><div class="v" id="lt-k-which">—</div></div>
+  </div>
+</div>
+
+<h2>5 · The quality path — green metrics, wrong answers</h2>
+
+<p>The first three paths are about the request being <em>served</em>; the fourth is about it being <em>correct</em>. This path has no equivalent in classic ops, and it is the one that ships silent regressions, because operational dashboards stay green while the model gets worse. A prompt-template edit, a retrieval index that went stale, a quantized weight swap, or a base-model version bump can all leave TTFT, TPOT, and HBM untouched while answer quality falls off a cliff.</p>
+
+<p>So the quality path needs its own continuously-tracked signals, joined to the same <code>model</code> + <code>version</code> attributes as the spans: <strong>eval scores</strong> on a held-out task set run against live traffic samples; <strong>refusal rate</strong> (fraction of requests the model declines — a spike often means an over-tightened safety prompt, a drop means guardrails loosened); and <strong>hallucination rate</strong> (sampled, judged by a rubric or a stronger judge model). These are sampled, not measured on every request, and they are the bridge into the next lesson — guardrails are the enforcement layer that acts on what the quality path observes.</p>
+
+<div class="callout warn"><div class="label">Privacy is a constraint on the quality path, not an afterthought</div>
+The richest quality signal is the raw prompt and completion — and logging them is exactly what creates a data-leak incident. Prompt/completion capture must be governed: <strong>sample</strong> rather than log everything, <strong>redact</strong> PII before storage, gate access by role, set an explicit <strong>retention</strong> window, and respect per-<strong>tenant</strong> policy. Observability that exfiltrates user data is not observability; it is a new incident class. Treat the privacy policy as a hard input to what the quality path is even allowed to record.</p></div>
+
+<h2>6 · Failure modes and the checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+<li><strong>Only node-level GPU utilization is visible.</strong> You see a green DCGM utilization dashboard and conclude the system is healthy, but queue wait and token latency are uninstrumented — so saturation and a degraded TTFT stay mysterious. Signal: users report slowness while every GPU graph looks maxed-out-and-fine. Add queue depth, TTFT, and TPOT.</li>
+<li><strong>Tracing drops the streaming span.</strong> The trace ends at request acceptance or first token, so the seconds of decode the user lives through never appear, and TTFT/TPOT can't be reconstructed from the trace. Signal: short, healthy-looking traces alongside real complaints about response speed. Keep the span open across the whole stream.</li>
+<li><strong>Quality regressions ship because ops stays green.</strong> A template/index/weight change tanks answer quality with zero movement in latency or GPU metrics, so it passes every operational gate. Signal: rising thumbs-down or support tickets with no latency anomaly. Track eval/refusal/hallucination rates per version.</li>
+<li><strong>Averaging across segments.</strong> A single TTFT distribution blends 100-token and 8k-token prompts into a meaningless middle that hides the prefill problem. Signal: a stable aggregate metric while specific cohorts suffer. Segment TTFT by prompt length and TPOT by output length.</li>
+<li><strong>Metrics that can't be joined.</strong> GPU, token, and request metrics carry inconsistent labels, so "TTFT spiked" can never be correlated with "HBM hit 95%." Signal: every dashboard looks plausible in isolation and no one can build the causal chain. Tag everything with the same model/version/tenant/route dimensions.</li>
 </ul>
-
-<h2>Failure Modes</h2>
-<ul>
-<li>Only node-level GPU utilization is visible, so queueing and token latency remain mysterious.</li>
-<li>Tracing drops streaming spans and hides where TTFT is spent.</li>
-<li>Quality regressions ship because operational metrics stay green.</li>
+  </div>
+  <div class="lesson-card"><h3>Implementation checklist</h3><ul>
+<li>Do you emit request, queue, prefill, decode, and streaming spans, each tagged with <code>model</code> and <code>model_version</code> (ideally via the OpenTelemetry <code>gen_ai.*</code> conventions)?</li>
+<li>Are TTFT and TPOT tracked as <em>separate</em> distributions, segmented by prompt length and output length respectively?</li>
+<li>Is the streaming span kept open for the full response, with first-token time recorded inside it?</li>
+<li>Do you correlate GPU utilization, SM occupancy, HBM usage, and cache pressure with the token-path and queue metrics on shared labels?</li>
+<li>Is there a derived tokens/sec-per-utilization signal to catch the "100% busy, low output" pathology?</li>
+<li>Are eval, refusal, and hallucination rates sampled and tracked per model version, joined to the operational metrics?</li>
+<li>Is prompt/completion logging governed by sampling, redaction, access control, retention, and tenant policy?</li>
 </ul>
+  </div>
+</div>
 
-<h2>Cross-Links</h2>
-<ul>
-<li><a href="https://github.com/open-telemetry/semantic-conventions-genai">OpenTelemetry GenAI conventions</a></li>
-<li><a href="../../ml_system_design/lessons/index.html">ML system monitoring</a></li>
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>Sketch the span tree for one slow request in your serving stack and label each span with the metric it feeds (queue → queue wait, prefill → TTFT, decode → TPOT). Then write the three dashboard panels you would put on call: pick which segmentation each uses (prompt length vs. output length), which DCGM counter you correlate against, and the exact alert that would have caught last quarter's silent quality regression without firing on a merely-long generation.</div>
+
+<h2>Where this points next</h2>
+
+<p>This lesson built the <em>seeing</em> layer — telemetry that decomposes a request into request, token, GPU, and quality paths and tells you which one is out of bounds. The quality path in particular only <em>observes</em>: it reports refusal and hallucination rates, but it does not stop a bad output from reaching the user. Lesson 12, <strong><a href="12_safety_quality_guardrails.html">Safety, Quality, and Guardrails</a></strong>, adds the <em>acting</em> layer — input and output filters, policy enforcement, and quality gates that consume the very signals you just instrumented and block, rewrite, or escalate before the response ships. For the broader monitoring discipline behind all of this, see <a href="../../ml_system_design/lessons/index.html">ML system monitoring</a>.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+For an LLM service, "healthy" means four paths are all inside bounds — the request path (HTTP plus <strong>queue</strong> depth/wait), the token path (<strong>TTFT</strong> = queue + prefill, <strong>TPOT</strong> = per-token decode, throughput), the GPU path (DCGM: SM occupancy, HBM usage, power, not just the lying utilization flag), and the quality path (eval, refusal, hallucination rates). One green HTTP 200 sees none of them. Because total latency is <span class="math">TTFT + TPOT × (out − 1)</span>, a single p50 blends two unrelated causes; you must split TTFT from TPOT and segment each by prompt and output length, then emit per-stage spans (gateway → queue → prefill → decode → stream) tagged with model + version under the OpenTelemetry <code>gen_ai.*</code> conventions so GPU, token, and quality signals can be correlated. Never drop the streaming span, never read GPU utilization alone, and govern prompt/completion logging by privacy policy — observability that leaks data is just a new incident.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why is an HTTP 200 insufficient to call an LLM request healthy? <em>(§1 — the status fires once at stream acceptance; TTFT, TPOT, GPU pressure, and answer quality all happen afterward, so the four paths must be instrumented independently.)</em></li>
+  <li>Define TTFT and TPOT and write end-to-end latency in terms of them. <em>(§2 — TTFT = accept-to-first-token (queue + prefill); TPOT = average inter-token gap (decode); total = TTFT + TPOT × (output_tokens − 1).)</em></li>
+  <li>Why is a single p50 latency useless for diagnosis? <em>(§2 — it blends prefill-bound and decode-bound requests; a long-prompt request and a long-output request can share a total but need opposite fixes. Split and segment TTFT by prompt length, TPOT by output length.)</em></li>
+  <li>Why is GPU utilization a misleading health metric, and what do you watch instead? <em>(§3 — it only means "a kernel ran"; it reads 100% during memory-bound decode or collective stalls. Watch SM occupancy, HBM usage, power/thermals, and tokens/sec ÷ utilization.)</em></li>
+  <li>What spans should an LLM trace emit, and which one is most often missed? <em>(§4 — gateway, queue, prefill, decode, stream, tagged with model + version; the streaming span is the one most commonly dropped, hiding the decode time users feel.)</em></li>
+  <li>What does the OpenTelemetry GenAI convention buy you? <em>(§4 — a standard <code>gen_ai.*</code> attribute namespace for model, token counts, and finish reasons, making traces portable across tools and dashboards stable across backend swaps.)</em></li>
+  <li>How can a release pass every operational gate yet still be a regression? <em>(§5 — quality lives on a separate path; a template/index/weight change can leave latency and GPU metrics untouched while answers degrade. Track eval/refusal/hallucination per version, governed by privacy policy.)</em></li>
 </ul>
-
-<h2>Takeaway And Interview Prompts</h2>
-<p><strong>Takeaway:</strong> For LLMs, &#x27;healthy&#x27; means the request path, token path, GPU path, and quality path are all inside bounds. One green HTTP status is not enough.</p>
-<ol>
-  <li>Draw the system boundary for <strong>Observability for LLM Serving</strong>. Which resource or policy binds first?</li>
-  <li>Pick two designs from this lesson. What does each optimize, and what does each make worse?</li>
-  <li>Design an incident around this failure mode: Only node-level GPU utilization is visible, so queueing and token latency remain mysterious. What metric, log, or trace would reveal it?</li>
-</ol>
 
 <footer class="lesson-nav">
   <a href="10_disaggregated_serving.html"><span class="dir">Previous</span><span class="ttl">10 - Disaggregated Serving</span></a>
   <a class="next" href="12_safety_quality_guardrails.html"><span class="dir">Next</span><span class="ttl">12 - Safety, Quality, and Guardrails</span></a>
 </footer>
+
 </main>
+
+<script>
+(function(){
+  var canvas = document.getElementById('lat-canvas');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+
+  var promptRng = document.getElementById('lt-prompt');
+  var outputRng = document.getElementById('lt-output');
+  var promptVal = document.getElementById('lt-prompt-val');
+  var outputVal = document.getElementById('lt-output-val');
+  var kTtft  = document.getElementById('lt-k-ttft');
+  var kDec   = document.getElementById('lt-k-decode');
+  var kTot   = document.getElementById('lt-k-total');
+  var kWhich = document.getElementById('lt-k-which');
+
+  // simple, arithmetically honest model:
+  //   TTFT  = fixed queue (180 ms) + prefill that scales with prompt length
+  //   TPOT  = ~30 ms/token, fixed for this demo
+  var QUEUE_MS = 180;       // fixed queue wait
+  var PREFILL_PER_TOK = 0.36; // ms of prefill per prompt token
+  var TPOT_MS = 30;         // ms per output token
+
+  function render(){
+    var prompt = parseInt(promptRng.value, 10);
+    var output = parseInt(outputRng.value, 10);
+    var ttft = QUEUE_MS + prompt * PREFILL_PER_TOK;       // ms
+    var decode = TPOT_MS * (output - 1);                  // ms
+    var total = ttft + decode;                            // ms
+
+    var dpr = window.devicePixelRatio || 1;
+    var W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== Math.round(W*dpr)){ canvas.width = Math.round(W*dpr); canvas.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    var padX = 16, barTop = 46, barH = 46;
+    var plotW = W - 2*padX;
+    var ttftW = total > 0 ? (ttft/total)*plotW : 0;
+    var decW  = plotW - ttftW;
+
+    // bar segments
+    ctx.fillStyle = '#0891b2';
+    ctx.fillRect(padX, barTop, ttftW, barH);
+    ctx.fillStyle = '#7c3aed';
+    ctx.fillRect(padX + ttftW, barTop, decW, barH);
+
+    // labels
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '12px monospace';
+    if (ttftW > 70) ctx.fillText('TTFT ' + (ttft/1000).toFixed(2) + 's', padX + 8, barTop + 28);
+    if (decW > 90)  ctx.fillText('decode ' + (decode/1000).toFixed(2) + 's', padX + ttftW + 8, barTop + 28);
+
+    ctx.fillStyle = '#5b6573';
+    ctx.font = '11px monospace';
+    ctx.fillText('total response latency  →', padX, barTop - 12);
+    ctx.fillText('0 s', padX, barTop + barH + 18);
+    ctx.fillText((total/1000).toFixed(1) + ' s', padX + plotW - 34, barTop + barH + 18);
+
+    promptVal.textContent = prompt;
+    outputVal.textContent = output;
+    kTtft.textContent = (ttft/1000).toFixed(2) + ' s';
+    kDec.textContent  = (decode/1000).toFixed(2) + ' s';
+    kTot.textContent  = (total/1000).toFixed(2) + ' s';
+    kWhich.textContent = ttft > decode ? 'prefill / prompt-bound' : 'decode / output-bound';
+  }
+
+  promptRng.addEventListener('input', render);
+  outputRng.addEventListener('input', render);
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
 </body>
 </html>
