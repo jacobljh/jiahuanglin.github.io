@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>12 &middot; Multitenancy, Request Routing, and Sharding Operations</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">data_intensive_systems</a><span class="crumb">/</span><span class="crumb">12 &middot; multitenancy & ops</span><span class="step-pill">lesson 13 / 35 &middot; ~15 min</span></div></header>
+<main>
+<p class="kicker">Part 5 · Distribution</p>
+<h1>Multitenancy, Request Routing, and Sharding Operations</h1>
+
+<p class="subtitle">Lesson 11 gave you the <em>mechanics</em> of splitting data by key: range vs hash partitioning, the shard key as a performance contract, the celebrity hot key, and why <span class="math">hash(key) mod N</span> is a disaster for rebalancing. That was the algorithm. This lesson is the <strong>operations</strong> on top of it — running a real cluster that serves <em>many customers at once</em> without one starving the others, getting every request to the partition that owns its key while partitions are moving underneath you, and moving shards across machines in production without taking an outage. We can already split data by key; now we run a real multi-tenant cluster and move shards without an outage.</p>
+
+<div class="callout source-note"><div class="label">DDIA source</div>Arc drawn from Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, Chapter 6 (Partitioning) — request routing, rebalancing strategies, and partitioned secondary indexes — layered with operational practice (multitenancy isolation models, per-tenant quotas, and rebalance runbooks) that DDIA treats as engineering context. Original synthesis; the feature-store and tenant-quota framings are ours.</div>
+
+<div class="callout"><div class="label">Linear position</div>
+<strong>Prerequisite:</strong> Lesson 11 (<a href="11_partitioning_rebalancing.html">Partitioning, Hot Keys, and Rebalancing</a>) — you can choose a shard key, predict which queries scatter-gather, quantify hot-key skew, and you know why the node count must never appear in the placement function. We also lean on <a href="09_replication_quorums_conflicts.html">lesson 09</a> (each partition is itself a small replica set).<br>
+<strong>New capability:</strong> Choose a multitenancy model on its isolation/cost trade; stop a noisy neighbor from starving other tenants with quotas and resource limits; isolate or split a hot <em>tenant</em>; route a request to the partition owning its key through a routing tier or coordination service; and execute a safe, throttled rebalance from a runbook instead of triggering a rebalance storm.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Five moves. (1) Multitenancy models — shared table with <code>tenant_id</code>, schema-per-tenant, database/cluster-per-tenant — as a spectrum from cheap-and-weakly-isolated to expensive-and-strongly-isolated. (2) The noisy neighbor: a worked number for how one tenant's load starves the rest, and the quota/rate-limit/cgroup mitigations. (3) The hot <em>tenant</em> (the celebrity problem at tenant granularity) — dedicated shard, split, salt. (4) Request routing — how a client finds the partition owning a key (routing tier vs coordination service vs gossip) and the staleness problem during a move. (5) Rebalancing operations — manual vs automatic, the rebalance storm, throttling, and a concrete rebalance runbook.</div>
+
+<h2>1 · Multitenancy models: the isolation/cost spectrum</h2>
+
+<p>A <strong>tenant</strong> is one isolated customer of a shared system — one company on your SaaS app, one team in your feature store, one project in your vector index. <strong>Multitenancy</strong> is running many tenants on the same infrastructure. The whole point is to amortize cost: a thousand small tenants sharing one cluster is far cheaper than a thousand clusters. The whole danger is that "sharing" means a fault, a load spike, or a data leak in one tenant can reach another. Every multitenancy decision trades exactly that — <strong>density (cheap) against isolation (safe)</strong>.</p>
+
+<p>There are three canonical models, in increasing isolation and cost:</p>
+
+<div class="topic-grid">
+  <div class="topic-card">
+    <div class="k">Shared table (tenant_id column)</div>
+    <div class="v">All tenants' rows live in the <em>same</em> tables; every row carries a <code>tenant_id</code> and every query filters on it. Densest and cheapest — one schema, one connection pool, trivial to add a tenant (insert rows). Weakest isolation: a missing <code>WHERE tenant_id = ?</code> leaks data across tenants, one tenant's huge table bloats shared indexes, and you cannot give one tenant a different schema version or restore one tenant alone. Make <code>tenant_id</code> the leading column of the <strong>shard key</strong> (lesson 11) so a tenant's rows co-locate.</div>
+  </div>
+  <div class="topic-card">
+    <div class="k">Schema / database per tenant</div>
+    <div class="v">Each tenant gets its own schema (or logical database) inside a shared server. Middle ground: strong logical separation (a query physically cannot see another schema), per-tenant backup/restore and schema version, but still sharing the server's CPU, memory, and disk. Costs more metadata and connection management; thousands of schemas strain a single server's catalog.</div>
+  </div>
+  <div class="topic-card">
+    <div class="k">Cluster / database per tenant</div>
+    <div class="v">Each tenant gets its own database instance or cluster. Strongest isolation — separate process, separate disk, separate failure domain, independent scaling and compliance boundary, blast radius of one. Most expensive (idle capacity per tenant, N times the operational surface) and slowest to provision. Reserved for large or regulated tenants ("whales").</div>
+  </div>
+</div>
+
+<p>Most real systems are <strong>hybrid and tiered</strong>: the long tail of small tenants shares one pool (shared table), mid-size tenants get a schema each, and a handful of whales get dedicated clusters. The model is not global — it is a per-tenant <em>tier</em> you can promote a tenant through as it grows. The promotion path (shared row &rarr; own schema &rarr; own cluster) is exactly the hot-tenant mitigation of §3.</p>
+
+<h2>2 · The noisy neighbor: when one tenant starves the rest</h2>
+
+<p>The defining failure of dense multitenancy is the <strong>noisy neighbor</strong>: one tenant consumes a shared resource — CPU, disk I/O, connections, cache, storage — so aggressively that co-located tenants are starved, even though those tenants did nothing wrong. It is the hot-key problem of lesson 11 raised to <em>tenant</em> granularity, and it is invisible until it isn't: tenants A through Y see latency spikes and timeouts because tenant Z ran an unbounded query or a backfill.</p>
+
+<div class="callout"><div class="label">Worked number — what one noisy tenant costs</div>
+A shared cluster has <span class="math">100</span> tenants on a pool sized for <span class="math">100,000</span> queries per second (qps) total. Fair share is <span class="math">100,000 / 100 = 1,000 qps</span> per tenant. Suppose <span class="math">99</span> well-behaved tenants each run <span class="math">800 qps</span> (under fair share), so they use <span class="math">99 × 800 = 79,200 qps</span> — the cluster has <span class="math">100,000 − 79,200 = 20,800 qps</span> of headroom.<br><br>
+Now tenant Z launches a backfill at <span class="math">40,000 qps</span>. Demand is <span class="math">79,200 + 40,000 = 119,200 qps</span> against a <span class="math">100,000</span> ceiling — the cluster is <span class="math">119%</span> oversubscribed. Queueing collapses: every tenant's latency climbs as the pool saturates, and the well-behaved 99 are now failing their SLOs because of one neighbor. <strong>Z used 40% of the cluster while paying for 1%.</strong><br><br>
+With a <strong>per-tenant quota</strong> of, say, <span class="math">2,000 qps</span> (2× fair share, to allow bursts), Z is throttled at the door: it gets <span class="math">2,000 qps</span>, total demand is <span class="math">79,200 + 2,000 = 81,200 qps</span> &lt; <span class="math">100,000</span>, the cluster never saturates, and the other 99 tenants are unaffected. The quota converts a cluster-wide outage into one tenant's <span class="math">429 Too Many Requests</span>.</div>
+
+<p><strong>Mitigations</strong> all share one idea: turn an <em>implicitly</em> shared resource into an <em>explicitly</em> budgeted one, per tenant.</p>
+<ul>
+<li><strong>Per-tenant quotas and rate limiting.</strong> Cap each tenant's qps, connections, query cost, and storage. A token bucket per <code>tenant_id</code> at the routing tier (§4) lets bursts through but enforces a sustained ceiling. The worked number above is the whole argument.</li>
+<li><strong>Resource isolation at the OS / scheduler.</strong> When tenants run in their own processes or pods, pin CPU and memory with <strong>cgroups</strong> (the Linux kernel feature that caps a process group's CPU shares and memory) or Kubernetes pod limits, so a tenant physically cannot exceed its slice. A memory cap turns a runaway tenant's OOM into <em>that pod's</em> restart, not a shared-node crash.</li>
+<li><strong>Storage quotas.</strong> Cap bytes per tenant so one tenant's unbounded growth cannot fill the shared disk and stall everyone's writes.</li>
+<li><strong>Fair queueing / admission control.</strong> Schedule shared work round-robin across tenants rather than first-come-first-served, so a flood from one tenant cannot monopolize the queue.</li>
+<li><strong>Promote the heavy tenant out</strong> (§3) — move it to its own schema or cluster so it has no neighbors to be noisy toward.</li>
+</ul>
+
+<h2>3 · The hot tenant: the celebrity problem at tenant granularity</h2>
+
+<p>Lesson 11's hot key was one shard-key value drawing a disproportionate share of traffic. A <strong>hot tenant</strong> (a "whale") is the same pathology one level up: a single tenant whose data or load dwarfs the others. If <code>tenant_id</code> is the leading part of the shard key, a whale's entire dataset and traffic hash to <em>one partition</em> — exactly the celebrity problem, and hashing alone cannot spread one tenant across partitions because all its rows share the same <code>tenant_id</code>.</p>
+
+<p>The mitigations parallel the hot-key fixes from lesson 11, now applied to a tenant:</p>
+<ul>
+<li><strong>Dedicated shard / cluster.</strong> Promote the whale to its own partition set or its own cluster (the cluster-per-tenant tier of §1). It now has the whole machine to itself and no neighbors — the cleanest fix, and why tiering exists. This is the tenant-scale analogue of "front the hot key with its own capacity."</li>
+<li><strong>Split the tenant.</strong> If even one tenant exceeds a single partition, sub-partition <em>within</em> the tenant on a second key — e.g. shard key <code>(tenant_id, user_id)</code> so the whale's rows spread across many partitions while small tenants still co-locate on one. This is the compound-key idea from lesson 11.</li>
+<li><strong>Key-salting.</strong> For a hot write target inside a tenant (a per-tenant global counter, a shared inbox), append a small random salt <code>0..k</code> to spread writes across <code>k</code> partitions and merge on read — the random-suffix trick from lesson 11, scoped to the tenant. Cost: reads of that value fan out to the <code>k</code> salted sub-keys.</li>
+</ul>
+
+<div class="callout warn"><div class="label">ML-infra tie</div>A multi-team <strong>feature store</strong> or <strong>vector index</strong> is multi-tenant by team or model. One team's nightly backfill is a textbook noisy neighbor that can starve online inference reads for every other team — hence per-tenant write-rate quotas and isolated ingest pools. One enormous customer's embedding corpus is a hot tenant: give it dedicated shards, or sub-partition its vectors by sub-entity so a single team's index doesn't pin one node.</div>
+
+<h2>4 · Request routing: finding the partition that owns a key</h2>
+
+<p>Once data is partitioned <em>and</em> partitions can move (rebalancing, §5), a client with a key faces a question: <strong>which node owns this key right now?</strong> This is service discovery for data, and lesson 11 named three shapes. Here is what each costs operationally.</p>
+
+<div class="ascii">                    client: read key = "tenant42:user7"
+                                  |
+        +-------------------------+--------------------------+
+        |                         |                          |
+   (A) ROUTING TIER         (B) COORDINATION SVC        (C) GOSSIP
+   client -> proxy          client -> ZK/etcd           client -> any node
+        |                    (reads the map)            (node knows / forwards)
+        v                         |                          |
+  proxy holds map           returns owner = N3          node forwards to N3
+  forwards to N3                  |                          |
+        |                    client -> N3                    v
+        v                                                served by N3
+     served by N3
+
+   routing table (the map):  hash-range  ->  owning node
+   ------------------------------------------------------
+     0x0000 .. 0x3fff   ->  N1
+     0x4000 .. 0x7fff   ->  N2
+     0x8000 .. 0xbfff   ->  N3      <-  "tenant42:user7" hashes here
+     0xc000 .. 0xffff   ->  N4</div>
+
+<div class="topic-grid">
+  <div class="topic-card">
+    <div class="k">(A) Routing tier / proxy</div>
+    <div class="v">A dedicated layer in front of the cluster (e.g. a <code>mongos</code> router, a Vitess <code>vtgate</code>) holds the partition map and forwards each request to the owning node. Clients stay dumb; you can rate-limit and apply per-tenant quotas here (§2). Cost: an extra network hop and a tier to operate and scale.</div>
+  </div>
+  <div class="topic-card">
+    <div class="k">(B) Coordination service</div>
+    <div class="v">Clients (or the routing tier) consult a <strong>coordination service</strong> — ZooKeeper or etcd — that holds the <em>authoritative</em> partition-to-node map and pushes updates when it changes. The service is itself a consensus system (lesson 17). Cleanest source of truth; cost: a hard dependency on the coordination cluster's availability.</div>
+  </div>
+  <div class="topic-card">
+    <div class="k">(C) Gossip / any-node</div>
+    <div class="v">No central map. Each node knows enough of the topology (spread by a <strong>gossip protocol</strong> — nodes periodically exchange state) to forward a misdirected request to the right owner (Cassandra-style). No separate tier to run; cost: convergence is eventual, so the map can be briefly inconsistent across nodes, and a request may bounce an extra hop.</div>
+  </div>
+</div>
+
+<p><strong>Routing-table staleness is the operational hazard.</strong> The partition map is not static — a rebalance (§5) changes which node owns a range. Any client or proxy that <em>caches</em> the map can hold a stale entry and send a request to a node that no longer owns the key. Good systems handle this with a redirect-and-refresh protocol: the wrongly-addressed node replies "not mine, owner moved" (or forwards), and the client invalidates its cached map and refetches. The window between "partition moved" and "every cache learned" is the staleness window, and it is precisely why the cut-over step of a rebalance must be atomic and observable (§5).</p>
+
+<h3>Local vs global secondary indexes — the ops view</h3>
+
+<p>Lesson 11 introduced the two secondary-index layouts; the operational question is simply <strong>which queries stay single-shard</strong>. A <strong>local (document-partitioned) index</strong> lives beside the rows it indexes: writes touch one shard, but a query on the indexed field must <em>scatter-gather</em> across every shard (no single shard knows all the matches). A <strong>global (term-partitioned) index</strong> is partitioned by the indexed term: a query on that field hits <em>one</em> shard (single-shard read), but a write may update terms on several shards and the index lags. For multitenancy this often resolves cleanly: index by <code>tenant_id</code> (or make it the leading term) so a tenant's secondary lookups stay within that tenant's shard — single-shard, no cross-tenant fan-out. A query that omits <code>tenant_id</code> is the one that scatters, and you should know it is rare before you allow it.</p>
+
+<h2>5 · Rebalancing operations: don't trigger a storm</h2>
+
+<p>Rebalancing — moving partitions between nodes when you add or lose machines — was introduced mechanically in lesson 11 (fixed partitions, consistent hashing, dynamic splitting, so only ~<span class="math">1/N</span> of data moves). The operational question is <em>when and how fast</em> the moves run, and who decides.</p>
+
+<p><strong>Manual vs automatic.</strong> <em>Automatic</em> rebalancing — the system detects imbalance and moves partitions on its own — is convenient and dangerous. The danger is the <strong>rebalance storm</strong>: an automatic rebalancer reacts to a transient signal (a node that is slow because it is busy serving traffic) by moving partitions <em>off</em> it, which makes the <em>new</em> owners busy, which the rebalancer reads as more imbalance, so it moves more — a feedback loop where rebalancing traffic starves live traffic and cascades. A node that looks overloaded during a brief spike, or one that is briefly unreachable during a failover (lesson 09), can trip a full data migration when nothing was actually wrong. We model exactly this cascade in <a href="28_failure_timelines_and_drills.html">lesson 28</a>'s drills. For this reason DDIA recommends keeping a <strong>human in the loop</strong>: the system proposes a rebalance plan, an operator approves it. And every automatic mover must <strong>throttle</strong> — cap the bytes-per-second and the number of partitions moving at once — so migration never out-competes the workload it exists to serve.</p>
+
+<div class="callout"><div class="label">Worked number — throttled move time</div>
+You add 2 nodes to an 8-node cluster (8 &rarr; 10) holding <span class="math">10 TB</span> total on a fixed-partition scheme, so about <span class="math">2/10 = 20%</span> of the data — <span class="math">2 TB</span> — must migrate onto the new nodes. If you let it run unthrottled it competes for the full network and tanks live latency. So you <strong>throttle to 100 MB/s</strong> of background copy (a small slice of each node's bandwidth, chosen to leave headroom for live traffic).<br><br>
+Time to move = <span class="math">2 TB / 100 MB/s = 2,000,000 MB / 100 MB/s = 20,000 s ≈ 5.6 hours</span>. That is the price of safety: the rebalance is slow <em>on purpose</em>. Halving the throttle to <span class="math">50 MB/s</span> doubles it to ~11 hours but halves the impact on live queries — a knob you tune against your latency SLO, not a thing to maximize.</div>
+
+<div class="callout"><div class="label">Rebalance runbook</div>
+A safe shard move, step by step. Every step is observable and reversible until the cut-over.
+<ol>
+<li><strong>Add nodes.</strong> Bring the new nodes up, join them to the cluster, confirm health checks and that the coordination service (§4) sees them. They own no partitions yet.</li>
+<li><strong>Mark partitions to move.</strong> Compute the plan (which partitions migrate to which new node so each ends with ~<span class="math">1/N</span> of the load) and have a human review it. Do not move everything — move the minimum.</li>
+<li><strong>Copy in the background.</strong> Replicate the marked partitions to their new owners as a throttled background stream (the worked number above) while the <em>old</em> owners keep serving all reads and writes. Live traffic is untouched; the new copy tails the old one's log to stay current.</li>
+<li><strong>Cut over routing.</strong> When a partition's new copy is caught up, atomically flip its entry in the routing table / coordination service to the new owner, and signal caches to refresh (§4). This is the only moment ownership changes; keep the staleness window tiny.</li>
+<li><strong>Verify.</strong> Confirm the new owner is serving the partition, error rates and latency are flat, no misroutes, and per-tenant load is balanced. Watch for the rebalance-storm signature (climbing migration traffic). If anything is wrong, the old copy still exists — roll the routing entry back.</li>
+<li><strong>Decommission.</strong> Only after verification, delete the now-redundant old copies and reclaim their space. This is the irreversible step, done last and deliberately.</li>
+</ol>
+The shape is identical to a safe migration anywhere: <em>copy first, cut over atomically, verify, delete last</em> — never delete the source until the destination is proven.</div>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Noisy neighbor.</strong> One tenant's load/storage saturates a shared pool; co-located tenants miss SLOs. Symptom: cluster-wide latency spike traced to a single <code>tenant_id</code>'s qps or bytes.</li>
+    <li><strong>Hot tenant on one shard.</strong> A whale's data and traffic all hash to one partition (it shares one <code>tenant_id</code>). Symptom: one shard at capacity while peers idle; adding shards doesn't help.</li>
+    <li><strong>Cross-tenant leak.</strong> A query missing <code>WHERE tenant_id = ?</code> returns another tenant's rows. Symptom: a tenant sees data it never wrote — a correctness/compliance incident, not just performance.</li>
+    <li><strong>Stale routing table.</strong> A client/proxy caches an old map and hits a node that no longer owns the key. Symptom: misroutes and errors spiking right after a rebalance cut-over.</li>
+    <li><strong>Rebalance storm.</strong> Automatic rebalancing reacts to a transient spike or failover and cascades into mass data movement that starves live traffic. Symptom: a node addition (or a brief blip) tanks latency cluster-wide.</li>
+    <li><strong>Unthrottled migration.</strong> A move runs at full bandwidth and out-competes the workload it serves. Symptom: latency degrades for the whole duration of an otherwise-routine shard move.</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Decision &amp; runbook checklist</h3><ul>
+    <li>Pick a tenancy tier per tenant: shared table (long tail), schema-per-tenant (mid), cluster-per-tenant (whales/regulated). Plan the promotion path.</li>
+    <li>Set per-tenant quotas (qps, connections, storage) and enforce them at the routing tier; back them with cgroup/pod limits where tenants run in their own processes.</li>
+    <li>Make <code>tenant_id</code> the leading part of the shard key so a tenant co-locates and secondary lookups stay single-shard; know which queries omit it and scatter.</li>
+    <li>Identify whales early; have a dedicated-shard / split / salt plan ready before one pins a node.</li>
+    <li>Choose a routing shape (proxy tier / coordination service / gossip) and define the cache-refresh protocol for after a move.</li>
+    <li>Keep rebalancing human-approved and throttled; size the throttle against your latency SLO (compute the move time first).</li>
+    <li>Follow the runbook: add nodes &rarr; mark minimum partitions &rarr; copy in background &rarr; atomic cut-over &rarr; verify &rarr; decommission last. Never delete the source before the destination is proven.</li>
+  </ul></div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>You run a multi-tenant online <strong>feature store</strong>, shared-table model, hash-partitioned by <code>(tenant_id, entity_id)</code> across 8 partitions, serving 80,000 lookups/s across 200 tenants. (a) Fair share is how many qps per tenant, and what quota would you set to allow a 3× burst without letting any tenant exceed it? (b) One tenant launches a backfill at 30,000 qps with no quota — show the cluster goes oversubscribed and state what the 199 others experience; then show the quota from (a) prevents it. (c) That same tenant turns out to be a whale whose features won't fit one partition's slice — give two concrete fixes and the read-path cost of each. (d) You add 2 nodes (8 &rarr; 10) holding 6 TB total; with a fixed-partition scheme and a 75 MB/s throttle, how much data moves and how long does it take? Write the first three runbook steps you'd execute and the one signal that would make you abort.</div>
+
+<h2>Where this points next</h2>
+<p>We can now run a multi-tenant cluster: data split by key, tenants isolated by quota and tier, requests routed to the right partition even as shards move, and rebalances executed from a runbook instead of a panic. But notice what we have <em>not</em> made safe — what happens when one logical operation must touch more than one key, on possibly different partitions, while concurrent clients and crashes claw at it. A transfer between two tenants' balances, an order plus its inventory row: these must behave as a single all-or-nothing unit even though partitioning has scattered the keys across machines. That is the next pressure — <strong>transactions and isolation</strong> (<a href="13_transactions_isolation.html">lesson 13</a>): what atomicity and isolation actually promise, the ladder of isolation levels, and the anomalies each level does or doesn't prevent, with partition boundaries making all of it harder.</p>
+
+<div class="callout"><div class="label">Where is truth?</div>
+For a partitioned cluster the <strong>system of record</strong> for any key is the <em>shard that owns it</em> — the node holding the partition whose hash-range covers the key, per the routing table. <strong>Copies / derived views:</strong> the cached routing maps held by every client, proxy, and gossiping node — these are <em>derived state</em>, not truth. The authoritative map lives in the coordination service (ZooKeeper/etcd, lesson 17) or is converged by gossip. <strong>Freshness budget:</strong> the staleness window between a cut-over and every cache learning the new owner — kept tiny and bounded by the refresh protocol. <strong>Owner:</strong> the coordination service (or the gossip consensus) owns the map; the operator owns the rebalance plan. <strong>Deletion path:</strong> an old shard copy is deleted only in the runbook's final decommission step, after the new owner is verified. <strong>Reconciliation/repair:</strong> a wrongly-addressed node redirects-and-refreshes the stale client; a mismatched copy re-syncs from the owner's log. <strong>Evidence it is correct:</strong> flat error/misroute rates and balanced per-tenant load after cut-over, plus the source copy still present until verification passes.</div>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+Multitenancy trades density against isolation along a spectrum — shared table with <code>tenant_id</code> (cheap, weak), schema-per-tenant (middle), cluster-per-tenant (expensive, strong) — and real systems tier tenants across it. The defining failure is the <strong>noisy neighbor</strong>: one tenant starving a shared pool (worked: a 40,000-qps backfill oversubscribing a 100k cluster and breaking 99 innocent tenants), fixed by per-tenant quotas, rate limits, and cgroup/pod resource isolation. A <strong>hot tenant</strong> is the celebrity hot key at tenant granularity — all its rows share one <code>tenant_id</code> and land on one shard — fixed by a dedicated shard, splitting on a sub-key, or salting. <strong>Request routing</strong> gets a key to its owning shard via a proxy tier, a coordination service holding the authoritative map, or gossip; the operational hazard is a <em>stale routing table</em> after a move, handled by redirect-and-refresh. And rebalancing in production is human-approved and <strong>throttled</strong> to avoid a <em>rebalance storm</em>, executed from a runbook — add nodes, mark the minimum partitions, copy in the background, cut over atomically, verify, decommission last — because the source of truth is the shard owning a key, and the routing table that names it is itself derived state with a freshness budget.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>Walk the three multitenancy models and their trade. <em>(§1 — shared table with <code>tenant_id</code> is densest/cheapest but weakest isolation; schema-per-tenant adds logical separation and per-tenant backup at more metadata cost; cluster-per-tenant gives the strongest isolation and smallest blast radius but is most expensive. Real systems tier tenants across the spectrum.)</em></li>
+  <li>What is a noisy neighbor and how do you stop it? <em>(§2 — one tenant saturating a shared resource and starving co-located tenants; fixed by per-tenant quotas/rate limits at the routing tier and cgroup/pod resource limits, converting a cluster outage into one tenant's 429.)</em></li>
+  <li>One tenant runs 40k qps on a 100k cluster of 100 tenants — what happens, and what does a 2k-qps quota change? <em>(§2 — demand hits 119k vs a 100k ceiling, the pool saturates and all 99 others miss SLOs; a 2k quota caps that tenant so total demand stays ~81k under ceiling and no one else is affected.)</em></li>
+  <li>How is a hot tenant the same problem as a hot key, and how do you fix it? <em>(§3 — a whale's rows share one <code>tenant_id</code> so they all hash to one shard, just like a celebrity key; fix with a dedicated shard/cluster, sub-partitioning on a second key, or key-salting — the tenant-scale analogues of lesson 11's hot-key fixes.)</em></li>
+  <li>How does a client find which node owns a key, and what breaks during a rebalance? <em>(§4 — a routing tier/proxy, a coordination service holding the authoritative map, or gossip; the hazard is a stale cached routing table after a move, handled by the wrong node redirecting and the client refreshing its map.)</em></li>
+  <li>What is a rebalance storm and how do you avoid one? <em>(§5 — automatic rebalancing reacting to a transient spike/failover and cascading into mass data movement that starves live traffic; avoid with a human-in-the-loop approved plan and a throttle capping migration bandwidth/concurrency.)</em></li>
+  <li>Give the safe rebalance runbook and the invariant behind it. <em>(§5 — add nodes, mark the minimum partitions, copy in the background while old owners serve, cut over routing atomically, verify, decommission last; invariant: copy first and never delete the source until the destination is proven.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="11_partitioning_rebalancing.html"><span class="dir">&larr; Previous</span><span class="ttl">11 &middot; Partitioning, Hot Keys, and Rebalancing</span></a>
+  <a class="next" href="13_transactions_isolation.html"><span class="dir">Next &rarr;</span><span class="ttl">13 &middot; Transactions and Isolation</span></a>
+</footer>
+</main>
+<!-- reviewed:v1 -->
+</body>
+</html>

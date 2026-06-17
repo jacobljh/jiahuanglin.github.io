@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>29 &middot; Case: Social Home Timeline</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">data_intensive_systems</a>
+    <span class="crumb">/</span>
+    <span class="crumb">29 &middot; case: timeline</span>
+    <span class="step-pill">lesson 30 / 35 &middot; ~22 min</span>
+  </div>
+</header>
+
+<main>
+
+<p class="kicker">Part 12 · Applied & interviews</p>
+<h1>Case: Social Home Timeline</h1>
+<p class="subtitle">Lesson 06 introduced the <em>social home timeline</em> as this track's canonical load/latency example — the running illustration of how to describe load and budget tail latency. This is the full worked case. Lesson 28 gave us two things it leaned on: a library of <em>failure timelines</em> (how async replication loses writes, how a cache stampede topples a database) and a set of <em>quantitative drills</em> (Little's Law, fan-out amplification, partition sizing, storage growth). Here we spend both at once. We take a full senior-level system-design prompt — the social home timeline, the canonical Twitter question — and answer it end to end using only mechanisms the track already built: storage engines, replication, partitioning, the home-timeline cache, and a log. The whole case turns on one decision (fan-out-on-write vs fan-out-on-read) and one villain (the celebrity hot key from lesson 11). We will size it with real numbers and verify the arithmetic as we go.</p>
+
+<div class="callout source-note"><div class="label">DDIA source</div>This case is built directly on Martin Kleppmann, <em>Designing Data-Intensive Applications</em> — the Twitter home-timeline example is the running illustration of "describing load" in Chapter 1 (the fan-out problem), and the design draws on Chapter 5 (replication), Chapter 6 (partitioning / hot keys), and Chapter 11 (stream processing / the timeline-as-derived-data view). The interview framing, the numbers, and the rubric are our synthesis.</div>
+
+<div class="callout"><div class="label">Linear position</div>
+<strong>Prerequisite:</strong> Lesson 28 (Failure timelines and quantitative drills) — you can read an ASCII failure timeline and do back-of-envelope QPS, fan-out, storage, and latency-budget math. We also lean hard on lesson 11 (partitioning and the celebrity hot key) and the caching ideas from lesson 28's stampede timeline.<br>
+<strong>New capability:</strong> Drive a complete senior interview from prompt to rubric — clarify, size, design from named mechanisms, name one failure and its fix, and know exactly what separates a passing answer from a hire-strong one on this specific problem.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Six sections, the shared interview-case template. (1) The prompt, the functional and non-functional requirements, and the clarifying questions a strong candidate asks before writing anything. (2) Back-of-envelope sizing — users, read and write QPS, the follower fan-out distribution, timeline storage, and a p99 latency budget — every number checked. (3) The design walk: fan-out-on-write vs fan-out-on-read vs the hybrid, the home-timeline cache, and how the celebrity breaks pure push, with an ASCII architecture diagram and cross-links to the home lesson for each mechanism. (4) One failure timeline — a celebrity tweet melts the fan-out pipeline — and its mitigation. (5) The answer rubric: Good / Better / Red flags / Likely follow-ups. (6) Takeaway, a Checkpoint variant to design, and interview prompts with answers.</div>
+
+<h2>1 · The prompt and the questions to ask first</h2>
+
+<p><strong>The prompt (as an interviewer would give it).</strong> "Design the home timeline for a Twitter-like service. A user follows other accounts; when they open the app, they see a reverse-chronological feed of recent posts from everyone they follow. Posting and reading should both feel instant. Scale it to hundreds of millions of users."</p>
+
+<p>A weak candidate starts drawing boxes. A strong one first pins down what "the system" must and must not do, because the entire design hinges on the read/write ratio and on whether the feed must be perfectly fresh.</p>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Functional requirements</h3><ul>
+    <li><strong>Post a tweet</strong> — append a short message authored by a user (the <em>write</em> path).</li>
+    <li><strong>Read home timeline</strong> — for the logged-in user, return recent posts from all accounts they follow, newest first (the <em>read</em> path; this is the hard one).</li>
+    <li><strong>Follow / unfollow</strong> — maintain the social graph that defines whose posts land in a timeline.</li>
+    <li>Out of scope to keep focus: search, notifications, DMs, the ranked "For You" feed (we build the simpler reverse-chronological feed; ranking is an orthogonal layer on top).</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Non-functional requirements</h3><ul>
+    <li><strong>Read-latency dominated.</strong> Timeline reads are far more frequent than writes and must be fast — target <strong>p99 &lt; 200 ms</strong> for a timeline fetch.</li>
+    <li><strong>Eventual consistency is acceptable.</strong> A new tweet appearing in followers' timelines a few seconds late is fine; this is not a bank ledger. That single relaxation unlocks almost every optimization below.</li>
+    <li><strong>High availability</strong> over strict freshness — a slightly stale timeline beats an error page.</li>
+    <li><strong>Massive read fan-out, write amplification on post.</strong> One post may need to reach millions of timelines.</li>
+  </ul></div>
+</div>
+
+<div class="callout warn"><div class="label">Clarifying questions a strong candidate asks</div>
+<ul>
+<li><strong>What is the read/write ratio?</strong> (Reads dominate by ~100:1 — this is the whole reason fan-out-on-write is even considered.)</li>
+<li><strong>How fresh must the timeline be?</strong> Real-time, or is a few seconds of lag acceptable? (Seconds is fine — this is what lets us precompute.)</li>
+<li><strong>What is the follower distribution?</strong> Is it uniform, or is there a long tail with celebrities at millions of followers? (Heavily skewed — and this skew, the <a href="11_partitioning_rebalancing.html">lesson 11</a> hot key, is the crux of the whole problem.)</li>
+<li><strong>Reverse-chronological or ranked?</strong> (Reverse-chron for this design; ranking is a layer we can add later.)</li>
+<li><strong>Do we need to support reading the full history, or just the recent window?</strong> (Recent window for the home timeline; deep history is a separate fetch from the tweet store.)</li>
+</ul>
+The interviewer's answers set every number in section 2. Asking them is itself a strong signal — it shows you know that the design <em>depends</em> on the load shape, not the feature list.</div>
+
+<h2>2 · Back-of-envelope sizing</h2>
+
+<p>Pin down the load before choosing a mechanism. We will use round, defensible numbers and verify each step (the drills from <a href="28_failure_timelines_and_drills.html">lesson 28</a>).</p>
+
+<div class="callout"><div class="label">Assumptions (state them out loud)</div>
+&nbsp;&nbsp;• <span class="math">300,000,000</span> total users; <span class="math">150,000,000</span> daily active (DAU).<br>
+&nbsp;&nbsp;• Each DAU posts <span class="math">2</span> tweets/day and opens their timeline <span class="math">~30</span> times/day (read).<br>
+&nbsp;&nbsp;• Follower distribution: <strong>average 200 followers</strong>; long tail up to a <strong>celebrity at 100,000,000 followers</strong>.<br>
+&nbsp;&nbsp;• A tweet is <span class="math">~300</span> bytes of text plus metadata; call the timeline entry <span class="math">~300</span> bytes when materialized (tweet id + author id + timestamp, fattened with a little denormalized text).</div>
+
+<h3>Write QPS (tweets posted)</h3>
+<p>Writes per day = <span class="math">150,000,000 DAU × 2 = 300,000,000</span> tweets/day. Spread over <span class="math">86,400</span> seconds:</p>
+<div class="ascii">300,000,000 / 86,400  =  3,472  tweets/sec   (avg write QPS)
+peak ~= 3x avg          ~~ 10,000  tweets/sec</div>
+<p>Verify: <span class="math">3,472 × 86,400 = 299,980,800 &asymp; 3.0 &times; 10^8</span>. Good. <strong>Write QPS is modest</strong> — about 3.5k/s average. Hold that thought; the writes are cheap, it is what each write <em>triggers</em> that hurts.</p>
+
+<h3>Read QPS (timeline opens)</h3>
+<p>Reads per day = <span class="math">150,000,000 × 30 = 4,500,000,000</span> opens/day:</p>
+<div class="ascii">4,500,000,000 / 86,400  =  52,083  reads/sec   (avg read QPS)
+peak ~= 3x avg            ~~ 156,000  reads/sec</div>
+<p>Verify: <span class="math">52,083 × 86,400 = 4.5 &times; 10^9</span>. Good. <strong>Read:write ratio &asymp; 52,000 / 3,472 &asymp; 15:1</strong> on average, and worse at peak — and each read wants tens of recent posts merged from potentially hundreds of followees. This asymmetry is the entire argument for doing work at <em>write</em> time so reads stay cheap.</p>
+
+<h3>Fan-out: the number that decides the design</h3>
+<p>The cost of fan-out-on-write is: for every tweet, write one copy into <em>each follower's</em> materialized timeline. So the fan-out write rate is write QPS times the average follower count:</p>
+<div class="ascii">fan-out writes/sec = tweets/sec × avg_followers
+                   = 3,472 × 200
+                   = 694,400  timeline-inserts/sec   (avg)
+peak ~= 3x         ~~ 2,000,000  timeline-inserts/sec</div>
+<p>Verify: <span class="math">3,472 × 200 = 694,400</span>. So a 3.5k/s write stream <em>amplifies</em> into ~700k/s of timeline inserts — a <strong>200&times; write amplification</strong>. Large, but spreadable across a partitioned cache cluster. This is the price of cheap reads, and for the <em>average</em> account it is a price worth paying.</p>
+
+<div class="callout bad"><div class="label">The celebrity: where pure fan-out-on-write breaks</div>
+Now apply the same formula to one celebrity post with <span class="math">100,000,000</span> followers:<br>
+&nbsp;&nbsp;<span class="math">1 tweet × 100,000,000 followers = 100,000,000 timeline-inserts</span> for a <em>single</em> tweet.<br><br>
+At even a modest celebrity posting rate, this dwarfs the entire baseline fan-out. A few thousand high-follower accounts posting concurrently can demand <em>hundreds of millions</em> of inserts in a burst — the fan-out pipeline backs up, every follower's timeline goes stale, and the cluster melts. This is exactly the <strong><a href="11_partitioning_rebalancing.html">lesson 11</a> hot-key problem</strong>: the work for one key (one author) cannot be spread, because it is fundamentally one author's post multiplied by an enormous fan-out. Hashing the timeline by user spreads the <em>destinations</em> fine; it does nothing about the <em>volume</em> one celebrity generates. <strong>Pure push does not scale to the head of the distribution.</strong> The fix (section 3) is the hybrid: do not fan out celebrity posts at all — merge them in at read time.</div>
+
+<h3>Timeline storage</h3>
+<p>Materialize the recent window only: keep, say, the last <span class="math">800</span> entries per user's home timeline (enough for many screens of scroll; older reads fall through to the tweet store).</p>
+<div class="ascii">per-user timeline   = 800 entries × 300 bytes      = 240,000 bytes ~= 240 KB
+all active users    = 240 KB × 150,000,000 DAU      ~= 36 TB  (one copy)
+with replication 3x                                 ~= 108 TB</div>
+<p>Verify: <span class="math">800 × 300 = 240,000</span> bytes; <span class="math">240,000 bytes × 150,000,000 users = 36,000,000,000,000 bytes = 36 TB</span>; <span class="math">× 3 = 108 TB</span>. That is a large but ordinary in-memory + flash cache footprint, sharded across a few thousand cache nodes. The full tweet corpus (the system of record) is separate and larger, but it is written once and read rarely on the home path.</p>
+
+<h3>p99 latency budget</h3>
+<p>Target p99 &lt; 200 ms for a timeline read. With a precomputed timeline this is easy; the budget is dominated by the cache hit, not by any merge:</p>
+<div class="ascii">timeline read p99 budget (200 ms total)
+  ├─ network in / auth / routing        ~  20 ms
+  ├─ fetch materialized timeline (cache) ~  10 ms   (one partition, point read)
+  ├─ merge in live celebrity posts       ~  30 ms   (pull from a few hot authors)
+  ├─ hydrate tweet bodies (batch get)    ~  40 ms
+  └─ serialize + network out             ~  20 ms
+                                  total ~ 120 ms  (headroom under 200 ms)</div>
+<p>The whole point of fan-out-on-write is that the expensive merge happened at write time, so the read is mostly a single cache point-read (<a href="11_partitioning_rebalancing.html">lesson 11</a>: a query that includes the shard key — here <code>user_id</code> — routes to one partition). Contrast a pure fan-out-on-read design where the same fetch must scatter-gather across hundreds of followees' tweet lists and merge-sort them inline — that easily blows the 200 ms budget at the tail, because p99 tracks the <em>slowest</em> of hundreds of sub-queries.</p>
+
+<h2>3 · Design walk — push, pull, and the hybrid that wins</h2>
+
+<p>There are exactly two pure strategies, and a hybrid that takes the best of each. We build all three from track mechanisms.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Fan-out-on-write (push)</div><div class="v">When a user posts, immediately insert the tweet id into the materialized home timeline of <em>every</em> follower. Reads become a single cheap point-read of a precomputed list. <strong>Reads are O(1); writes are O(followers).</strong> Great for the average account; catastrophic for celebrities (the 100M-insert burst above).</div></div>
+  <div class="topic-card"><div class="k">Fan-out-on-read (pull)</div><div class="v">Store only each author's own tweet list. On read, fetch the tweet lists of everyone the user follows and merge-sort by time. <strong>Writes are O(1); reads are O(followees) scatter-gather.</strong> Trivial for posting; reads are slow and tail-latency-heavy for users who follow many accounts.</div></div>
+  <div class="topic-card"><div class="k">Hybrid (the answer)</div><div class="v">Push for ordinary authors; <em>do not</em> push for celebrities. At read time, take the precomputed timeline and <em>merge in</em> the recent posts of the (few) celebrities the user follows, pulled live. Cheap reads <em>and</em> bounded write fan-out. This is what real Twitter converged on.</div></div>
+</div>
+
+<p><strong>Why the hybrid is forced by the numbers.</strong> Section 2 showed both extremes fail at one end of the follower distribution: push fails at the head (celebrity write burst), pull fails for users who follow many accounts (read scatter-gather). The distribution is bimodal, so the strategy must be too — split the author population at a follower threshold and treat the two halves differently.</p>
+
+<div class="callout"><div class="label">The celebrity threshold is a tunable knob</div>
+Define an author as a <strong>celebrity</strong> when their follower count exceeds some threshold <span class="math">T</span> (say <span class="math">T = 100,000</span>). Below <span class="math">T</span>: fan out on write. At or above <span class="math">T</span>: do <em>not</em> fan out; their posts are pulled at read time. The vast majority of accounts (avg 200 followers) are well below <span class="math">T</span>, so almost all writes still get the cheap-read benefit. The handful above <span class="math">T</span> are exactly the accounts whose fan-out would melt the pipeline. A typical user follows only a few celebrities, so the read-time merge pulls from a small number of hot authors — bounded work, unlike pulling from <em>all</em> followees. The threshold trades write amplification against read-merge cost; tune it from the live follower histogram.</div>
+
+<h3>The write path (post a tweet)</h3>
+<div class="ascii">                       POST /tweet
+                            |
+                            v
+                   +------------------+
+                   |  Tweet service   |  1. append to tweet store (system of record)
+                   +------------------+     (LSM-backed, partitioned by tweet_id  -> L04/L11)
+                            |
+                            v
+                   author followers >= T ?
+                  /                        \
+              NO (ordinary)             YES (celebrity)
+                /                            \
+               v                              v
+      +-------------------+           +------------------------+
+      |  Fan-out worker   |           |  DO NOT fan out.       |
+      |  (async, off a    |           |  Mark author "hot";    |
+      |   log -> L19)     |           |  read path pulls live. |
+      +-------------------+           +------------------------+
+               |
+               | for each follower f:
+               v
+      insert (tweet_id, ts) into home_timeline[f]
+      (home-timeline cache, partitioned by follower user_id -> L11)</div>
+
+<p>Mechanisms, cross-linked: the <strong>tweet store</strong> is the durable system of record — an <a href="04_storage_engines_lsm_columnar.html">LSM-tree store (lesson 04)</a> partitioned by tweet id (<a href="11_partitioning_rebalancing.html">lesson 11</a>), each partition itself a replica set (<a href="08_replication_leader_lag_failover.html">lesson 08</a>). The <strong>fan-out</strong> runs <em>asynchronously off a log</em>: the tweet service appends a "tweet posted" event and fan-out workers consume it (the <a href="19_stream_processing.html">stream-processing pattern, lesson 19</a> — the timeline is <em>derived data</em>, a materialized view of "tweets joined with the follow graph," <a href="20_derived_data_correctness.html">lesson 20</a>). Doing fan-out asynchronously is what keeps the post request fast: posting returns as soon as the tweet is durable and the event is logged, not after a million inserts finish.</p>
+
+<h3>The read path (get home timeline)</h3>
+<div class="ascii">                    GET /home_timeline
+                            |
+                            v
+                +---------------------------+
+                | 1. point-read precomputed |  home_timeline[user]  (one partition -> L11)
+                |    timeline from cache    |  ~ last 800 ids, newest first
+                +---------------------------+
+                            |
+                            v
+                +---------------------------+
+                | 2. pull celebrities' recent posts |  for each celeb the user
+                |    posts the user follows         |  follows (a small set):
+                +---------------------------+         read their own tweet list
+                            |
+                            v
+                +---------------------------+
+                | 3. merge-sort by time,    |  precomputed list + live celeb posts
+                |    take top N             |
+                +---------------------------+
+                            |
+                            v
+                +---------------------------+
+                | 4. hydrate tweet bodies   |  batch-get from tweet store
+                |    (multi-get)            |
+                +---------------------------+
+                            |
+                            v
+                       reverse-chron feed</div>
+
+<p>Step 1 is the <strong>home-timeline cache</strong> — the precomputed materialized view, sharded by the reader's <code>user_id</code> so the read is a single-partition point lookup (the <a href="11_partitioning_rebalancing.html">lesson 11</a> performance contract: the shard key <em>is</em> the read key). Step 2 is the hybrid's pull half, and it is cheap precisely because we only pull the <em>celebrities</em> a user follows, not all followees. Steps 1 and 2 together are why the design beats both pure strategies: the heavy merge over ordinary authors was already paid at write time, and the only live merge is over the small celebrity set.</p>
+
+<div class="callout warn"><div class="label">Consistency: it is eventual, and that is fine (lesson 16)</div>
+The home-timeline cache is <em>derived data</em> that lags the tweet store by however long the async fan-out takes — typically seconds. A tweet is durable the instant the post returns (it is in the tweet store), but it <em>appears</em> in followers' timelines only after the fan-out worker processes it. That lag is the eventual consistency we negotiated in section 1 (<a href="16_consistency_causality_linearizability.html">lesson 16</a>). The one place users notice: a user should see <em>their own</em> just-posted tweet immediately (read-your-writes). Handle that on the read path by always merging the user's own recent posts in client-side, rather than waiting for fan-out to reflect them — the same read-your-writes concern lesson 08 raised for replica lag.</div>
+
+<h2>4 · Failure timeline — a celebrity tweet stalls the fan-out pipeline</h2>
+
+<p>Suppose the celebrity threshold is misconfigured (set too high, or a fast-growing account crosses 100M followers before it is reclassified). A pure-push fan-out then fires for that account. Here is what the on-call engineer sees.</p>
+
+<div class="ascii">actors:  CELEB        FANOUT-LOG        FANOUT-WORKERS       TIMELINE-CACHE      ORDINARY USERS
+         |            |                 |                    |                   |
+t0       posts ------>| event appended  |                    |                   |
+         |            |---------------->| pick up event      |                   |
+t0+1s    |            |                 | begin 100M inserts  |                   |
+         |            |                 |------------------->| write storm        |
+t0+5s    |            | (normal tweets  | workers saturated   | cache CPU pegged   |
+         |            |  keep arriving) | on the one event    |                    |
+t0+10s   |            | BACKLOG GROWS   | ordinary fan-out    | hot partitions     | timelines go
+         |            | (consume<produce| starved behind celeb| evicting / slow    | STALE (no new
+         |            |  -> L28 drill)  |                     |                    |  tweets appear)
+t0+60s   |            | backlog = 60s   | still draining      | p99 read climbs    | "feed frozen"
+                                            one celebrity event                       reports spike</div>
+
+<p><strong>Root cause.</strong> One log event expanded into 100M units of work that cannot be parallelized away — the <a href="11_partitioning_rebalancing.html">lesson 11</a> hot key, now expressed as a hot <em>event</em> on the fan-out log. Ordinary tweets queue behind it (the consume rate fell below the produce rate, so the backlog grows without bound — the CDC/backlog drill from <a href="28_failure_timelines_and_drills.html">lesson 28</a>). Every follower's timeline goes stale because the workers are pinned on the celebrity's inserts.</p>
+
+<div class="callout ok"><div class="label">Mitigation</div>
+<strong>Immediate:</strong> reclassify the account as a celebrity (above <span class="math">T</span>), drop its in-flight fan-out, and let the read path pull its posts live instead. The 100M-insert job evaporates.<br>
+<strong>Structural:</strong> (1) Enforce the celebrity threshold <em>before</em> enqueuing fan-out, not after — never let a high-follower account enter the push path. (2) Make the threshold dynamic, driven by the live follower histogram, so a fast-growing account is reclassified automatically. (3) Give celebrity-scale events a separate, rate-limited lane so a misclassification cannot starve ordinary fan-out (priority isolation on the log). (4) Cap and shed: if fan-out backlog exceeds a bound, demote the offending author to pull. The general lesson — the same one lesson 11 taught for hot keys — is that <em>you must detect the hot key and route it down a different path</em>; you cannot out-scale a single key by adding machines.</div>
+
+<h2>5 · Answer rubric</h2>
+
+<p>What an interviewer is actually scoring on this specific problem.</p>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Good answer (baseline)</h3><ul>
+    <li>Clarifies the read/write ratio and freshness requirement before designing.</li>
+    <li>Identifies that reads dominate and proposes <strong>fan-out-on-write</strong> to make reads a cheap precomputed lookup.</li>
+    <li>Sizes write QPS, read QPS, and timeline storage with reasonable numbers.</li>
+    <li>Separates the durable tweet store (system of record) from the home-timeline cache (derived).</li>
+    <li>Notes the feed can be eventually consistent.</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Better answer (senior signal)</h3><ul>
+    <li>Recognizes pure push <em>breaks for celebrities</em> and derives the 100M-insert burst from the fan-out formula — unprompted.</li>
+    <li>Proposes the <strong>hybrid</strong> with a tunable celebrity threshold, and explains the read-time merge over only the celebrities a user follows.</li>
+    <li>Ties the hot author explicitly to the <strong>partitioning hot-key problem (lesson 11)</strong> and explains why adding machines does not help.</li>
+    <li>Runs fan-out <strong>asynchronously off a log</strong> (derived-data / stream view) so the post request stays fast; handles read-your-writes for the user's own posts.</li>
+    <li>Gives a p99 latency budget and shows the merge is cheap because it was precomputed.</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Red flags</h3><ul>
+    <li>Jumps to boxes-and-arrows without asking the read/write ratio or freshness.</li>
+    <li>Proposes <strong>pure fan-out-on-read</strong> for the whole system and never confronts the read tail-latency for users who follow many accounts.</li>
+    <li>Proposes <strong>pure fan-out-on-write</strong> and waves away the celebrity case ("we'll just add more workers") — the one thing you cannot scale by adding workers.</li>
+    <li>Makes the post request <em>block</em> on the full synchronous fan-out, so posting a tweet takes seconds.</li>
+    <li>Demands strong consistency / a transactional timeline when eventual is plainly fine, and pays a huge cost for it.</li>
+    <li>Confuses partitioning the timeline (spreads destinations) with solving the celebrity volume (it does not).</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Likely follow-ups</h3><ul>
+    <li>"A celebrity gains 50M followers overnight — what changes?" (Dynamic threshold; reclassify to pull; section 4.)</li>
+    <li>"How do followers see a tweet that was posted while their timeline was being fanned out?" (Async lag + read-your-writes merge.)</li>
+    <li>"Now make it a <em>ranked</em> feed, not reverse-chron." (Ranking layer on top of the candidate set the timeline produces; reuse pull + score.)</li>
+    <li>"How do you handle unfollow / deleted tweets in precomputed timelines?" (Filter at read time, or lazily clean; do not try to delete from millions of timelines synchronously.)</li>
+    <li>"Size the fan-out worker fleet." (From the ~700k inserts/sec avg, ~2M peak — a partition-count / throughput drill.)</li>
+  </ul></div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it — design the variant</div>
+Redesign for <strong>Instagram-style image posts with a ranked feed</strong> instead of reverse-chronological text. (a) The media is large (a 2 MB image vs a 300-byte tweet) — explain why you still fan out only <em>references</em> (post ids), never the bytes, and where the bytes live (object store / CDN). (b) A ranked feed means reads must <em>score</em> candidates, not just merge by time — show how the home-timeline cache becomes a <em>candidate set</em> that a ranking model consumes at read time, and what that does to your p99 budget vs section 2. (c) Engagement is even more skewed than follower count (a viral post draws orders of magnitude more reads than an ordinary one) — identify the new hot key on the <em>read</em> path and propose a fix (hint: <a href="11_partitioning_rebalancing.html">lesson 11</a> cache / key-split). (d) State which numbers from section 2 change and re-derive the storage figure for fanning out references only.</div>
+
+<h2>Where this points next</h2>
+<p>The timeline case stressed one mechanism above all — the <strong>hot key</strong> from partitioning, and the read/write asymmetry that makes precomputation worth it. The next case keeps the user as the entity but inverts the pressure: a <strong>global profile store</strong> (lesson 30) where the hard part is not fan-out volume but <em>geography</em> — serving low-latency reads from many regions while a user's own edits must be visible to them immediately (read-your-writes, <a href="08_replication_leader_lag_failover.html">lesson 08</a>/<a href="16_consistency_causality_linearizability.html">lesson 16</a>) and concurrent edits from different regions must be reconciled (<a href="09_replication_quorums_conflicts.html">lesson 09</a>). Same template — prompt, sizing, design, failure, rubric — pointed at the multi-region consistency trade-off (CAP/PACELC) instead of the fan-out one.</p>
+
+<div class="callout"><div class="label">Where is truth?</div>
+<strong>System of record:</strong> the <em>tweet store</em> (durable, LSM-backed, partitioned by tweet id) plus the <em>follow graph</em> — together they fully determine every timeline. <strong>Derived views:</strong> the home-timeline cache (a materialized view of "tweets joined with the follow graph," one precomputed list per reader). <strong>Freshness budget:</strong> seconds — the async fan-out lag — with read-your-writes preserved for the author's own posts by client-side merge. <strong>Owner:</strong> the timeline/fan-out service owns the cache; the tweet service owns the record. <strong>Deletion path:</strong> deletes and unfollows hit the tweet store / graph (the truth) immediately; the precomputed timelines are <em>not</em> mutated synchronously across millions of followers — instead they are filtered at read time against the current tweet store and graph, and lazily cleaned. <strong>Reconciliation/repair:</strong> a timeline is fully rebuildable by replaying the tweet log against the follow graph, so a corrupt or lost cache shard is repaired by recompute, never by trusting the cache. <strong>Evidence of correctness:</strong> the read-time filter against the record guarantees a deleted tweet never renders; spot-checking a rebuilt timeline against a fresh recompute (and monitoring fan-out backlog against its freshness budget) shows the view tracks the truth.</div>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+The social home timeline is a <strong>read-heavy, eventually-consistent fan-out</strong> problem, and its whole design follows from two numbers: reads dominate writes ~15:1 (so precompute at write time to make reads cheap), and the follower distribution is bimodal (so no single strategy fits both ends). <strong>Fan-out-on-write</strong> (push a tweet id into every follower's materialized timeline) gives O(1) reads but O(followers) writes; <strong>fan-out-on-read</strong> (pull and merge followees' tweets) gives O(1) writes but slow scatter-gather reads. The celebrity — a <a href="11_partitioning_rebalancing.html">lesson 11</a> hot key, 100M inserts for one tweet — breaks pure push, and you cannot fix a single hot key by adding machines. The answer is the <strong>hybrid</strong>: push for ordinary authors below a tunable follower threshold, pull celebrities' posts and merge them in at read time. Run the fan-out <em>asynchronously off a log</em> (the timeline is a derived materialized view) so posting stays fast, serve reads from a home-timeline cache sharded by reader id (a single-partition point read), and accept seconds of staleness while preserving read-your-writes for the author's own posts.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>Fan-out-on-write vs fan-out-on-read — what does each cost? <em>(§3 — push precomputes each follower's timeline so reads are an O(1) point lookup but writes are O(followers); pull stores only each author's own tweets so writes are O(1) but reads scatter-gather and merge O(followees), with bad tail latency for users who follow many accounts.)</em></li>
+  <li>Why does pure fan-out-on-write break for celebrities, and why can't you just add workers? <em>(§2–§4 — one celebrity post with 100M followers is 100M timeline inserts; that work is for a single key (one author) so it cannot be spread across partitions — the lesson 11 hot-key problem. Adding workers does not help because the volume is inherent to one key; you must route it down a different path: don't push it, pull it at read time.)</em></li>
+  <li>How does the hybrid decide push vs pull, and why is the read-time merge cheap? <em>(§3 — split authors at a tunable follower threshold T: below T push on write, at/above T don't fan out and pull live at read. The merge is cheap because a typical user follows only a few celebrities, so the live pull is over a small set, not all followees, while ordinary authors were already precomputed.)</em></li>
+  <li>Why run fan-out asynchronously off a log, and what consistency does that give? <em>(§3 — so the post request returns as soon as the tweet is durable and the event is logged, not after up to millions of inserts; the timeline is then a derived materialized view (lesson 19/20) that lags by seconds — eventual consistency, which we negotiated as acceptable, with a read-time merge of the user's own posts to preserve read-your-writes.)</em></li>
+  <li>Walk the p99 read budget and say why precomputation is what makes it fit. <em>(§2 — ~120 ms of a 200 ms budget: a single-partition cache point read for the precomputed timeline, a small live merge of celebrity posts, and a batch hydrate of tweet bodies. The expensive O(followees) merge was paid at write time, so the read avoids the scatter-gather over hundreds of followees that would blow the tail in a pure-pull design.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="28_failure_timelines_and_drills.html"><span class="dir">&larr; Previous</span><span class="ttl">28 &middot; Failure Timelines and Quantitative Drills</span></a>
+  <a class="next" href="30_case_global_profile_store.html"><span class="dir">Next &rarr;</span><span class="ttl">30 &middot; Case: Global Profile Store</span></a>
+</footer>
+
+</main>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

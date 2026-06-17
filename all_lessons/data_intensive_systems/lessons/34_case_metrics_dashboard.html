@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>34 &middot; Interview Case: Metrics / Observability Dashboard</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">data_intensive_systems</a>
+    <span class="crumb">/</span>
+    <span class="crumb">34 &middot; case: metrics</span>
+    <span class="step-pill">lesson 35 / 35 &middot; ~18 min</span>
+  </div>
+</header>
+
+<main>
+
+<p class="kicker">Part 12 · Applied & interviews</p>
+<h1>Interview Case: Metrics / Observability Dashboard</h1>
+<p class="subtitle">The previous case (lesson 33) built a <strong>model registry</strong> — a small, append-only system of record where every byte matters, the "promote to prod" pointer is linearizable, and losing a write is unacceptable. This case turns the dial all the way to the opposite pole. A metrics and observability backend ingests <em>millions</em> of time-series at once, is overwhelmingly write-heavy, and — crucially — <strong>tolerates approximation and loss</strong>: a dropped sample or a p99 computed from a sketch is fine if the dashboard stays fresh. The same toolbox (partitioning, columnar storage, the durable log, materialized aggregates) builds it, but the invariant flips from <em>integrity</em> to <em>timeliness</em>. That contrast is the heart of the interview.</p>
+
+<div class="callout source-note"><div class="label">DDIA source</div>Synthesis over Martin Kleppmann, <em>Designing Data-Intensive Applications</em> — column-oriented storage and materialized aggregates / data cubes (Ch.3), partitioning by key (Ch.6), the partitioned event log and stream processing (Ch.11), and the derived-data close on <em>timeliness vs integrity</em> (Ch.12). Original interview framing; the time-series engine here is modeled on the design space of Prometheus, M3DB, VictoriaMetrics, InfluxDB, and Monarch — not any one product.</div>
+
+<div class="callout"><div class="label">Linear position</div>
+<strong>Prerequisite:</strong> partitioning and hot keys (<a href="11_partitioning_rebalancing.html">L11</a>), LSM + columnar storage and materialized aggregates (<a href="04_storage_engines_lsm_columnar.html">L04</a>), the partitioned log and stream ingest (<a href="19_stream_processing.html">L19</a>), and timeliness-vs-integrity (<a href="20_derived_data_correctness.html">L20</a>).<br>
+<strong>New capability:</strong> design a write-heavy, high-cardinality time-series store end to end — partition by series id, ingest through a log, store columnar and time-partitioned, roll up to cheap downsampled tiers, age data from hot to cold, and answer dashboard queries (including p99 over millions of series) with <em>approximate</em> aggregates inside a query-latency budget.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Six moves, following the shared case template. (1) The prompt, requirements, and the clarifying questions a strong candidate opens with. (2) Back-of-envelope sizing — series count, ingest points/sec, raw vs rolled-up storage, retention, query p99 budget. (3) The design walk — ingest fan-in through a log, partition by series id, columnar time-partitioned storage, rollup/downsampling tiers, hot/cold separation, and approximate aggregates — cross-linking each mechanism to its home lesson. (4) A concrete failure timeline (an ingest fan-in overload) and its mitigation. (5) A four-bucket answer rubric. (6) Takeaway plus interview prompts with answers.</div>
+
+<h2>1 · The prompt and what to ask first</h2>
+
+<p><strong>The prompt.</strong> "Design the storage and query backend for a metrics and observability platform. Services across the fleet emit time-series — CPU, request latency, error counts, queue depth, and thousands of custom application metrics — tagged with labels like host, region, service, endpoint, and status code. Engineers open dashboards that plot these over the last hour, the last day, or the last quarter, and alerting rules evaluate them continuously. Make ingest keep up at fleet scale and make dashboards load fast." This is a textbook write-heavy, read-light, append-mostly workload — almost the inverse of the model registry.</p>
+
+<p><strong>Functional requirements.</strong> Ingest tagged samples (a metric name plus a set of label key-value pairs plus a timestamp and a float value) from millions of sources; store them durably enough; serve range queries ("series X over the last 6 hours") and aggregations ("p99 latency by region over the last day", "sum of error rate across all hosts") fast; support retention with cheap long-term history.</p>
+
+<p><strong>Non-functional requirements.</strong> Ingest must absorb a write-heavy fan-in without dropping more than a tiny, bounded fraction even under spikes. Dashboard query <strong>p99 must sit inside a few hundred milliseconds</strong> for recent windows. Old data must get <em>cheap</em> — a quarter of history cannot cost the same per point as the last hour. And the system explicitly <strong>tolerates lossy and approximate answers</strong>: a missing scrape or a p99 from a sketch is acceptable; freshness and availability beat exactness.</p>
+
+<div class="callout warn"><div class="label">Clarifying questions a strong candidate asks</div>
+<ul>
+<li><strong>What is the cardinality?</strong> The number of <em>distinct series</em> (metric name × every label combination) dominates the whole design. "1,000 metrics" is trivial; "1,000 metrics × 10,000 hosts × 20 endpoints" is ten million series and a different system. Always pin down cardinality before anything else.</li>
+<li><strong>Is this a system of record, or telemetry?</strong> If a regulator or a billing pipeline reads it, integrity is non-negotiable and the design changes. For ops telemetry, we may drop and approximate — confirm we are in the telemetry world (cross-link <a href="20_derived_data_correctness.html">L20</a> timeliness-vs-integrity).</li>
+<li><strong>What query shapes matter?</strong> Mostly recent dashboards and alerts (last minutes to hours) with occasional long-range historical zoom-outs? That justifies hot/cold tiers and rollups. If long-range raw-resolution scans were common, the storage plan would differ.</li>
+<li><strong>What resolution and retention per tier?</strong> Raw at 10-15 s steps for a few days, then 1-min and 1-hour rollups kept for months or years?</li>
+<li><strong>Are high-percentile latencies needed?</strong> If yes, we must ingest <em>histograms</em>, not raw scalars, because you cannot recover a p99 by averaging pre-aggregated means.</li>
+</ul></div>
+
+<h2>2 · Back-of-envelope sizing</h2>
+
+<p>Pin numbers down first; they drive every later choice. Assume a fleet emitting <span class="math">10,000,000</span> active series (10 million distinct metric+label combinations), each scraped every <span class="math">15 s</span>.</p>
+
+<div class="callout"><div class="label">Worked sizing</div>
+<strong>Ingest rate.</strong> 10,000,000 series ÷ 15 s = <span class="math">666,667</span> points/sec, round to <span class="math">~700,000</span> points/sec sustained. A single point is a (series-id, timestamp, value) tuple. This is the write-heavy fan-in: nearly a million writes a second, every second, forever.<br><br>
+<strong>Raw storage, naive.</strong> A naive row is ~16 bytes (8-byte timestamp + 8-byte float) plus per-row series identification — call it 50 bytes uncompressed. 700,000 pts/s × 50 B × 86,400 s/day = <span class="math">~3 TB/day</span>. Over 7 days of raw that is <span class="math">~21 TB</span> — before replication. Unacceptable to keep at that cost for long.<br><br>
+<strong>Raw storage, compressed columnar.</strong> Time-series compress brilliantly: delta-of-delta on timestamps (the step is nearly constant) and XOR-of-floats (Gorilla-style) on values routinely hit <span class="math">~1.3-2 bytes per point</span>. At 1.5 B/point: 700,000 × 1.5 × 86,400 = <span class="math">~91 GB/day</span> of raw. Seven days raw ≈ <span class="math">~635 GB</span>, times a replication factor of 3 ≈ <span class="math">~1.9 TB</span>. Columnar + delta encoding bought a <strong>~33×</strong> reduction over the naive row. (This is the <a href="04_storage_engines_lsm_columnar.html">L04</a> columnar win, applied to time.)<br><br>
+<strong>Rolled-up storage.</strong> Downsample raw 15 s to 1-min (4× fewer points) for 30 days, and to 1-hour (240× fewer points) for 1 year. 1-min tier: 91 GB/day ÷ 4 × 30 ≈ <span class="math">~683 GB</span>. 1-hour tier: 91 GB/day ÷ 240 × 365 ≈ <span class="math">~138 GB</span>. A full year of history thus costs <em>less</em> than a single week of raw — old data got cheap, which was a hard requirement.<br><br>
+<strong>Query p99 budget.</strong> "p99 latency by region, last 6 hours" over the raw tier would touch 6 h × 3,600 ÷ 15 = <span class="math">1,440</span> points per series × however many series match the label filter. If the filter matches 50,000 series that is <span class="math">72,000,000</span> points scanned — too slow for a 300 ms budget. Hitting the <strong>1-min rollup</strong> instead drops it to 360 pts/series × 50,000 = <span class="math">18,000,000</span>, and a <strong>1-hour rollup with a pre-merged histogram</strong> drops it to ~6 pts/series × 50,000 = <span class="math">300,000</span> — comfortably inside budget. The rollup tier is not just a storage saving; it is what makes the read budget achievable.</div>
+
+<p>The sizing already dictates the architecture: 700k writes/sec forces an ingest buffer and partitioning; 3 TB/day naive forces columnar compression; the 300 ms read budget over millions of series forces rollups and pre-aggregated histograms.</p>
+
+<h2>3 · Design walk — build it from the track's mechanisms</h2>
+
+<p>Read the pipeline left to right: a write-heavy fan-in lands in a durable log, is partitioned by series id, is written columnar and time-partitioned, is continuously rolled up into cheaper tiers, and ages from hot local storage to cold object storage. Each stage maps to a lesson.</p>
+
+<div class="ascii">                      INGEST  (write-heavy fan-in, ~700k pts/s)
+  millions of agents ─┐
+  host / service ─────┼──► [ load balancer ] ──► [ ingest tier ]
+  scrapers ───────────┘                              │  parse, label, assign series-id
+                                                      ▼
+                              ┌───────────────────────────────────────┐
+                              │  PARTITIONED DURABLE LOG  (L19)         │
+                              │  topic partitioned by hash(series-id)   │  ← buffer absorbs spikes,
+                              │  P0  P1  P2  ...  Pn                     │    decouples ingest from storage
+                              └───────────────────────────────────────┘
+                                                      │  consumers per partition
+                                                      ▼
+                      STORAGE  (partition by series-id — L11)
+       ┌─────────────────────────────────────────────────────────────────────┐
+       │  shard 0          shard 1          shard 2     ...   shard n          │
+       │  ┌───────────┐    ┌───────────┐                                      │
+       │  │ HOT tier  │    │ HOT tier  │   columnar, time-partitioned blocks   │
+       │  │ recent ~2h│    │ recent ~2h│   (L04): per-series columns,          │
+       │  │ in-memory │    │ in-memory │   delta-of-delta ts + XOR floats      │
+       │  │ + WAL     │    │ + WAL     │                                       │
+       │  └─────┬─────┘    └─────┬─────┘                                       │
+       │        │ flush + compact│                                            │
+       │        ▼                ▼                                            │
+       │  ┌────────────────────────────────────────────────────────────┐     │
+       │  │  ROLLUP / DOWNSAMPLE  (materialized aggregates — L04)        │     │
+       │  │  raw 15s (7d)  ─►  1-min (30d)  ─►  1-hour (1y)              │     │
+       │  │  each step stores min/max/sum/count + a histogram sketch    │     │
+       │  └────────────────────────────────────────────────────────────┘     │
+       └───────────────────────────────┬─────────────────────────────────────┘
+                  age out ↓ (recent = hot/local SSD, old = cold object store)
+                          ┌──────────────────────────────┐
+                          │  COLD tier: object storage     │  cheap, slower, immutable blocks
+                          └──────────────────────────────┘
+                                                      ▲
+                      QUERY  (read-light, p99 ≤ ~300 ms) ──┘
+       dashboard / alert ─► [ query layer ] ─► pick the COARSEST tier that
+                            satisfies the window+step ─► fan out to matching
+                            shards ─► merge sketches ─► return p99/sum/rate</div>
+
+<h3>3.1 Ingest: a log absorbs the fan-in</h3>
+<p>Millions of agents push samples into a stateless ingest tier that parses each sample, resolves its label set to a stable <strong>series id</strong> (a hash of metric name + sorted labels), and appends to a <strong>partitioned durable log</strong> (the <a href="19_stream_processing.html">L19</a> event log: an ordered, append-only, replicated log split into partitions). The log is the shock absorber — it decouples a bursty 700k-points/sec write rate from the storage tier's flush cadence, and on a storage-node restart the consumer simply replays from its last offset. We are explicitly <em>not</em> running a transaction or a quorum write per sample; that would be system-of-record machinery this workload does not need. A bounded buffer that may shed load under extreme spikes is the right call here — timeliness over integrity (<a href="20_derived_data_correctness.html">L20</a>).</p>
+
+<h3>3.2 Partition by series id</h3>
+<p>The log topic and the storage shards are both <strong>partitioned by hash(series-id)</strong> (<a href="11_partitioning_rebalancing.html">L11</a>): each series lives on exactly one shard, so all writes and all reads for that series route to one place — a single-hop point lookup, no cross-shard coordination on the write path. Hashing the series id spreads the ~700k writes/sec evenly and tames the timestamp hot-end trap (range-partitioning by time would send <em>every</em> current write to the newest partition — the classic L11 hot end). The residual risk is a single <strong>hot series</strong>: one extremely high-frequency metric whose lookups all land on one shard. The L11 fix transfers directly — front it with a cache, or split that one series across sub-keys. A query that filters by label but <em>not</em> by an exact series (most dashboard queries) is a deliberate <strong>scatter-gather</strong>: it fans out to all shards holding matching series and merges, which is fine for a read-light workload but is why we keep shard count and per-shard scan cost low via rollups.</p>
+
+<h3>3.3 Columnar, time-partitioned storage</h3>
+<p>Within a shard, data is written <strong>columnar and time-partitioned</strong> (<a href="04_storage_engines_lsm_columnar.html">L04</a>). Recent writes accumulate in an in-memory head block backed by a WAL (the <a href="03_storage_engines_logs_btrees.html">L03</a> write-ahead log for crash recovery), then flush to immutable time-bounded blocks (e.g. 2-hour blocks) that LSM-style compaction later merges. Storing each series' timestamps and values as separate compressed columns is what unlocks the encodings from the sizing: <strong>delta-of-delta</strong> on the near-constant 15 s timestamp step and <strong>XOR-of-floats</strong> on slowly-changing values, together giving ~1.5 bytes/point — the 33× reduction over naive rows. Columnar also means a query reads only the columns and time-ranges it needs, not whole rows.</p>
+
+<h3>3.4 Rollup / downsampling into materialized aggregates</h3>
+<p>A background job continuously <strong>downsamples</strong> raw blocks into coarser tiers — raw 15 s → 1-min → 1-hour — and at each step stores not just an average but a <strong>materialized aggregate</strong> (the L04 data-cube idea applied to time): min, max, sum, count, and a <em>histogram sketch</em> per bucket. These are precomputed answers, so a "last quarter, hourly" query reads a few hundred pre-merged points instead of scanning millions of raw ones. Crucially, you cannot recover a p99 by averaging means — so the rollup must carry an aggregable representation of the distribution, which leads to the next piece.</p>
+
+<h3>3.5 Approximate aggregates for percentiles over cardinality</h3>
+<p>Computing an exact p99 latency "across all hosts in a region" would require collecting every raw sample from tens of thousands of series and sorting — impossible inside 300 ms. Instead the system stores <strong>approximate, mergeable sketches</strong>:</p>
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">t-digest / DDSketch</div><div class="v">Quantile sketches: a few KB per series-bucket that answer "p50, p90, p99" within bounded relative error, and — the key property — two sketches <em>merge</em> into a sketch for the union. So a region-wide p99 is a merge of per-series sketches, not a global sort.</div></div>
+  <div class="topic-card"><div class="k">HdrHistogram / fixed-bucket</div><div class="v">Pre-bucketed latency histograms (counts per latency band). Summing counts across series is exact addition; the percentile is then read off the merged buckets. Bucket boundaries bound the error.</div></div>
+  <div class="topic-card"><div class="k">HyperLogLog (HLL)</div><div class="v">For "how many distinct hosts/users emitted this", an HLL sketch estimates cardinality in ~1.5 KB with a few percent error, mergeable across shards — vastly cheaper than tracking exact distinct sets at this scale.</div></div>
+</div>
+<p>Mergeability is the whole point: each sketch is stored per series-per-bucket in the rollup tiers, and a scatter-gather query simply <em>merges</em> the sketches returned by each shard. This is the <a href="20_derived_data_correctness.html">L20</a> timeliness-vs-integrity trade made concrete — we accept a bounded approximation in exchange for answering p99 over ten million series inside a tight budget.</p>
+
+<h3>3.6 Hot / cold tiering</h3>
+<p>Recent data (last few hours, raw resolution) lives <strong>hot</strong> on local SSD or in memory where dashboards and alerts hammer it; older blocks age out to <strong>cold</strong> object storage (immutable, cheap, slower) once they have been rolled up. The query layer transparently spans both. This mirrors the LSM tiering instinct from L04 and keeps the expensive fast tier small while history stays affordable.</p>
+
+<h3>Contrast with a system of record</h3>
+<p>The model registry (lesson 33) is a <strong>system of record</strong>: every write must survive, the promote pointer is linearizable (<a href="16_consistency_causality_linearizability.html">L16</a>), and <em>integrity</em> is the non-negotiable invariant. This metrics store flips every one of those. It tolerates dropped samples, computes percentiles from sketches, never needs a linearizable write, and treats <em>timeliness and availability</em> as the invariants. Same mechanisms (log, partitioning, columnar storage, materialized aggregates), opposite priorities — naming that flip out loud is the senior signal the interviewer is listening for (<a href="20_derived_data_correctness.html">L20</a>).</p>
+
+<h2>4 · Failure timeline — ingest fan-in overload</h2>
+
+<p>The defining failure of a write-heavy fan-in is a coordinated write spike that outruns the storage tier — for example, a fleet-wide incident causes every service to emit a burst of error and latency metrics at once, and a new noisy label (a per-request id mistakenly used as a label) explodes cardinality.</p>
+
+<div class="ascii">t0  Normal: ~700k pts/s, log lag ~0, query p99 ~120 ms.
+t1  Incident: every service spikes error/latency metrics; a deploy adds a
+    high-cardinality label (request_id) → active series jumps 10M → 60M.
+t2  Ingest rate hits ~3M pts/s. The partitioned log absorbs the burst
+    (lag grows but writes still ACK) — the buffer is doing its job.
+t3  Storage consumers fall behind: flush + compaction can't keep up; hot-tier
+    memory fills with new series; head blocks grow; WAL replay time balloons.
+t4  Dashboards for the incident (the moment engineers MOST need them) slow:
+    query p99 climbs to seconds as scatter-gather hits oversized head blocks.
+t5  MITIGATION kicks in (see below): cardinality limiter drops the runaway
+    label, per-tenant ingest quotas shed lowest-priority series, log lag drains.
+t6  Recovered: series back to ~12M, lag ~0, query p99 back under 300 ms.
+    Dropped samples during t2-t5 are accepted — timeliness over integrity.</div>
+
+<p><strong>Mitigations.</strong> (1) A <strong>cardinality limiter</strong> at the ingest tier rejects or drops series from labels whose distinct-value count blows past a threshold — the single most important guard, since unbounded cardinality is the number-one way these systems die. (2) <strong>Per-tenant / per-priority ingest quotas</strong> so a runaway service sheds its own low-value series first, not everyone's. (3) The <strong>log buffer</strong> turns a hard outage into graceful lag — writes keep being accepted while consumers catch up, and bounded load-shedding drops the least-important samples rather than failing the whole pipeline. Because the workload tolerates loss, deliberately dropping a bounded fraction to protect freshness and availability is the <em>correct</em> behavior, not a bug — exactly the timeliness-vs-integrity choice from <a href="20_derived_data_correctness.html">L20</a>.</p>
+
+<h2>5 · Answer rubric</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Good answer (baseline)</h3><ul>
+    <li>Identifies the workload as write-heavy, high-cardinality, read-light time-series.</li>
+    <li>Partitions by series id (<a href="11_partitioning_rebalancing.html">L11</a>) and uses columnar storage (<a href="04_storage_engines_lsm_columnar.html">L04</a>) for compression.</li>
+    <li>Separates recent hot data from old cold data, and downsamples old data to keep it cheap.</li>
+    <li>Gives at least one real sizing number (series count, points/sec, or storage/day).</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Better answer (senior signal)</h3><ul>
+    <li>Leads with <strong>cardinality</strong> as the first clarifying question and the driver of the whole design.</li>
+    <li>Puts a <strong>partitioned log</strong> (<a href="19_stream_processing.html">L19</a>) in front of storage to absorb the fan-in and enable replay.</li>
+    <li>Stores <strong>mergeable sketches</strong> (t-digest / histogram / HLL) so p99 and distinct-counts work over millions of series within budget.</li>
+    <li>Explicitly names the <strong>timeliness-vs-integrity</strong> flip (<a href="20_derived_data_correctness.html">L20</a>) versus a system of record, and justifies dropping/approximating.</li>
+    <li>Shows the rollup tier doing double duty: cheaper storage <em>and</em> a smaller read scan that meets the query p99 budget.</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Red flags</h3><ul>
+    <li>Range-partitioning by <strong>timestamp</strong> — sends every current write to one hot partition (the L11 hot end).</li>
+    <li>Storing raw samples forever in a relational table with a row per point; no compression, no rollup.</li>
+    <li>Claiming exact p99 by averaging pre-aggregated means — mathematically impossible; reveals no grasp of percentiles.</li>
+    <li>Treating it as a system of record (per-sample transactions, quorum writes, linearizable inserts) — massive over-engineering for telemetry.</li>
+    <li>Ignoring cardinality; no plan for a label that explodes the series count.</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Likely follow-ups</h3><ul>
+    <li>"A single metric becomes a hot series — what happens and how do you fix it?" (L11 hot key: cache or split.)</li>
+    <li>"How do you compute p99 across 50,000 series in 200 ms?" (Mergeable sketches over the rollup tier, not raw scans.)</li>
+    <li>"What stops one team's bad deploy from taking down ingest for everyone?" (Cardinality limits + per-tenant quotas + load shedding.)</li>
+    <li>"What if a storage node crashes mid-flush?" (Replay from the log offset; WAL recovers the head block.)</li>
+    <li>"How would the design change if this fed billing?" (Becomes a system of record — integrity wins; no dropping/approximation.)</li>
+  </ul></div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>You are handed a metrics backend with <span class="math">5,000,000</span> active series scraped every <span class="math">10 s</span>, retained raw for 3 days. (a) Compute the sustained ingest rate in points/sec and the compressed raw storage for 3 days at 1.5 bytes/point with replication factor 3. (b) A dashboard asks for "p99 request latency by service, last 12 hours" and there are 8,000 matching series — show why scanning the raw tier blows a 250 ms budget, then describe which rollup tier and which sketch you would query instead and roughly how many points that touches. (c) An engineer adds a <code>user_id</code> label and active series jumps to 40,000,000 — walk the failure timeline and name the two ingest-side guards that contain it. (d) State, in one sentence each, why partitioning by series id (not by timestamp) and storing histograms (not raw means) are both forced by the requirements.</div>
+
+<h2>Where this points next</h2>
+<p>This case closes the applied tour: across lessons 29-34 the same handful of mechanisms — the durable log, partitioning, replication, columnar storage, materialized aggregates, and the timeliness-vs-integrity dial — re-combined to build six very different systems, the metrics store sitting at the lossy-and-approximate extreme. The track's arc, drawn from the first edition of <em>Designing Data-Intensive Applications</em>, still holds entirely. But the field has moved since 2017. The final lesson steps back to ask what the <strong>2nd edition</strong> adds — cloud/serverless storage-compute separation, event sourcing, vector search, durable execution, local-first sync, formal methods, and a dedicated ethics chapter — and where each extends the foundations you just used.</p>
+
+<div class="callout"><div class="label">Where is truth?</div>
+<strong>System of record:</strong> there isn't a strict one — this is telemetry, so the closest thing to truth is the raw samples in the hot tier (and the partitioned ingest log that briefly holds them), and even those are allowed to drop under load. The emitting services are the real origin; the store is a best-effort observation of them. <strong>Copies / derived views:</strong> the 1-min and 1-hour rollup tiers and their mergeable sketches (t-digest, histograms, HLL), plus cold object-storage blocks — all derived by downsampling the raw tier. <strong>Freshness budget:</strong> timeliness is the headline invariant — dashboards stay within a few-hundred-ms query p99 and ingest lag near zero in steady state; under spikes, bounded lag and bounded sample loss are accepted rather than blocking. <strong>Owner:</strong> the observability-platform team owns the store; each tenant/service owns its own series and label hygiene. <strong>Deletion path:</strong> data expires by retention (raw days, 1-min weeks, 1-hour a year) and runaway series are dropped by the cardinality limiter — deletion is a TTL/eviction policy, not a transactional erase. <strong>Reconciliation/repair:</strong> rollups are recomputable by re-downsampling the raw tier while it still exists; a crashed storage node replays from its log offset and recovers the head block from the WAL; there is no cross-tier consistency to reconcile because coarser tiers are pure functions of finer ones. <strong>Evidence of correctness:</strong> approximate by design — sketches carry bounded relative error, so "correct" means within the stated error band; ingest lag, drop counters, and cardinality metrics are themselves monitored to prove the store is keeping up rather than silently losing more than the budget allows.</div>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+A metrics / observability backend is the write-heavy, high-cardinality mirror image of a system of record. Sizing comes first and is driven by <strong>cardinality</strong> (millions of distinct series); a <strong>partitioned durable log</strong> (L19) absorbs the ~700k-points/sec fan-in and decouples ingest from storage; data is <strong>partitioned by series id</strong> (L11, never by timestamp, which would create a hot end) and written <strong>columnar and time-partitioned</strong> (L04) so delta-of-delta + XOR encoding compress ~33×; a continuous <strong>rollup / downsampling</strong> pipeline materializes coarser tiers (L04 data cubes) carrying <strong>mergeable sketches</strong> (t-digest, histograms, HLL) so p99 and distinct-counts answer over millions of series inside a tight query-p99 budget; and recent <strong>hot</strong> data ages to cheap <strong>cold</strong> object storage. The unifying decision is the <strong>timeliness-vs-integrity</strong> flip (L20): unlike the model registry, this system deliberately tolerates dropped samples and approximate answers to keep dashboards fresh and available — and saying that out loud is the senior signal.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>What is the single most important clarifying question for a metrics backend, and why? <em>(§1 — cardinality: the count of distinct series drives storage, partitioning, query cost, and the failure modes; everything else is downstream of it.)</em></li>
+  <li>Why partition by series id rather than by timestamp? <em>(§3.2 — hashing series id spreads ~700k writes/sec evenly and avoids the L11 timestamp hot end where every current write piles onto the newest partition; series-keyed reads stay single-hop.)</em></li>
+  <li>How do you answer "p99 by region over the last day" across millions of series in under 300 ms? <em>(§2, §3.5 — query the coarse rollup tier and merge mergeable quantile sketches (t-digest / histograms) per shard; never sort raw samples and never average means.)</em></li>
+  <li>Why does this store tolerate loss while a model registry does not? <em>(§3.6, §5 — telemetry's invariant is timeliness and availability, not integrity (L20); a dropped scrape or an approximate p99 is acceptable, so load-shedding and sketches are correct, whereas a registry's every write must survive.)</em></li>
+  <li>What makes old data cheap without losing usefulness? <em>(§2, §3.4 — downsampling raw → 1-min → 1-hour materialized aggregates (L04), so a year of history costs less than a week of raw while still serving long-range dashboards.)</em></li>
+  <li>A new label explodes the series count overnight — what breaks and what saves you? <em>(§4 — ingest rate and hot-tier memory spike, consumers lag, query p99 climbs; a cardinality limiter drops the runaway label and per-tenant quotas shed low-priority series, while the log buffer turns the burst into graceful lag.)</em></li>
+  <li>Why must the rollup tier store histograms, not just averages? <em>(§3.4, §3.5 — percentiles are not recoverable from means; only a mergeable distribution representation (sketch / bucket histogram) lets a scatter-gather merge per-series results into a region-wide p99.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="33_case_model_registry.html"><span class="dir">&larr; Previous</span><span class="ttl">33 &middot; Case: Model Registry</span></a>
+  <a class="next" href="index.html"><span class="dir">Back to index &rarr;</span><span class="ttl">Data-Intensive Systems &mdash; full syllabus</span></a>
+</footer>
+
+</main>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

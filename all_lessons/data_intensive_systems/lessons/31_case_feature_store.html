@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>31 &middot; Interview Case: ML Feature Store</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">data_intensive_systems</a>
+    <span class="crumb">/</span>
+    <span class="crumb">31 &middot; case: feature store</span>
+    <span class="step-pill">lesson 32 / 35 &middot; ~18 min</span>
+  </div>
+</header>
+
+<main>
+
+<p class="kicker">Part 12 · Applied & interviews</p>
+<h1>Interview Case: ML Feature Store</h1>
+<p class="subtitle">The global profile store (lesson 30) was an ML-adjacent system — a user's attributes, read low-latency and locally, written from anywhere. This case turns the dial all the way: the feature store is where this track's ML angle reaches its sharpest case. A feature store has to serve the <em>same</em> numbers to a model two completely different ways — as a single-row point lookup under a few-millisecond budget at inference time, and as a column scan over months of history when you build a training set — and the entire difficulty is making those two paths agree. Get the timestamps wrong and the model trains on the future; compute a feature two ways and the model sees one distribution in the lab and a different one in production. This is the case where point-in-time correctness and train-serve skew, not raw QPS, sink candidates.</p>
+
+<div class="callout source-note"><div class="label">DDIA grounding</div>A feature store is a textbook <em>derived-data</em> system in DDIA's sense (Chapter 12): the features are not the source of truth, they are a materialized view computed from upstream events and tables. The online/offline split is the <strong>batch (Ch.10) vs stream (Ch.11)</strong> duality made concrete; point-in-time correctness is event-time join semantics (Ch.11); the online store is a partitioned low-latency key-value store (Ch.6). Original synthesis; the feature-store framing and the worked numbers are ours.</div>
+
+<div class="callout"><div class="label">How to use this case</div>
+This is a senior-interview walkthrough, not a new mechanism. The feature-store <em>mechanisms</em> live in <a href="23_feature_stores_ml_pipelines.html">lesson 23 (Feature stores and ML data pipelines)</a>; this is the worked case built on them. Everything here is assembled from earlier lessons — access patterns (<a href="02_query_languages_access_patterns.html">L02</a>), LSM/columnar storage (<a href="04_storage_engines_lsm_columnar.html">L04</a>), partitioning and hot keys (<a href="11_partitioning_rebalancing.html">L11</a>), batch joins (<a href="18_batch_processing.html">L18</a>), and stream/CDC/event-time (<a href="19_stream_processing.html">L19</a>) — and cross-linked to its home lesson. Read it as "how a strong candidate reasons from those primitives to a design, and where weak candidates fall."</div>
+
+<h2>1 · The prompt, requirements, and the questions to ask first</h2>
+
+<p><strong>The prompt.</strong> "Design a feature store for our recommendation and fraud models. Data scientists need to build training sets from historical features, and online services need to fetch a user's and an item's features at request time to score a model. Make the offline and online sides consistent."</p>
+
+<p>The phrase "make them consistent" is the whole interview. There are two consumers of the same logical feature, and they could not be more different in their access pattern (<a href="02_query_languages_access_patterns.html">L02</a>):</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Online store — point lookup at inference</div><div class="v">A serving request needs "the current feature vector for user 12345 and item 678", right now, within a few milliseconds, so the model can score and return a ranking. This is a <strong>key-value point lookup</strong> by entity id: latest value only, tiny payload, brutal latency budget, very high QPS.</div></div>
+  <div class="topic-card"><div class="k">Offline store — training-set build</div><div class="v">A data scientist needs "for every labeled event over the last 6 months, the feature values <em>as they were</em> at that event's time." This is a <strong>large batch column scan</strong> joined against a label table — throughput, not latency, matters; it reads history, not just the present.</div></div>
+</div>
+
+<p><strong>Functional requirements.</strong> Register a feature definition once. Materialize it to both stores from the same definition. Online: get the latest feature vector for a set of entity ids. Offline: generate a point-in-time-correct training set from a list of (entity, label, timestamp) rows. Keep online features fresh as upstream data changes.</p>
+
+<p><strong>Non-functional requirements.</strong> Online p99 lookup well under the model's serving budget (we will size it). High read QPS, write rate driven by event volume. Offline correctness is non-negotiable — <em>no label leakage</em>. The number a model sees offline and online for the same entity at the same time must be the <em>same number</em> (no train-serve skew). Freshness measured in seconds-to-minutes for streaming features.</p>
+
+<div class="callout warn"><div class="label">Clarifying questions a strong candidate asks first</div>
+<strong>(1) What is the model's end-to-end serving latency budget,</strong> and how much of it can the feature fetch take? That fixes the online p99 target. <strong>(2) How many entities, how many features per entity, and what is the online read QPS?</strong> That sizes the online store and tells us if there are hot entities. <strong>(3) How fresh must features be</strong> — is "user clicks in the last minute" a feature (streaming, <a href="19_stream_processing.html">L19</a>), or are daily aggregates fine (batch, <a href="18_batch_processing.html">L18</a>)? <strong>(4) Are features computed in one place</strong> or will the serving service recompute them from raw inputs — because that is exactly how train-serve skew is born (<a href="05_encoding_schema_evolution.html">L05</a>). <strong>(5) What is the label and its timestamp</strong>, since point-in-time correctness is defined relative to it. A candidate who jumps straight to "use Redis" without asking (1), (4), and (5) has already missed the case.</div>
+
+<h2>2 · Back-of-envelope sizing</h2>
+
+<p>Assume the interviewer gives, or you propose: <strong>50,000,000 entities</strong> (users plus items), <strong>200 features</strong> per entity, each feature averaging <strong>8 bytes</strong> (mostly floats and small ints). Online read QPS <strong>100,000</strong> requests per second, each request fetching one user and a slate of, say, 50 candidate items (so it reads ~51 entity rows). The model's serving budget is <strong>50 ms</strong> end to end and the feature fetch may use at most <strong>10 ms at p99</strong>.</p>
+
+<p><strong>Online store size.</strong> Per-entity row is <span class="math">200 features × 8 bytes = 1,600 bytes</span>, call it ~2 KB with keys and overhead. Total: <span class="math">50,000,000 × 2 KB = 100 GB</span> of hot data. With a replication factor of 3 (each partition is a replica set, <a href="09_replication_quorums_conflicts.html">L09</a>) that is <span class="math">300 GB</span>. This fits comfortably in RAM across a small cluster — the online store is small precisely because it keeps <em>latest values only</em>.</p>
+
+<p><strong>Online lookup throughput and the fan-out tax.</strong> 100,000 requests per second, each touching ~51 entity rows, is <span class="math">100,000 × 51 = 5,100,000</span> key lookups per second. Spread over, say, <strong>20 partitions</strong> hash-partitioned by entity id (<a href="11_partitioning_rebalancing.html">L11</a>), that is ~255,000 lookups/sec per partition — fine for an in-memory KV store. The catch is the <em>per-request</em> fan-out: each request hits up to 51 different partitions, so its latency is the <em>slowest</em> of 51 parallel lookups. If a single lookup is p99 = 3 ms, the p99 of the max-of-51 is well above 3 ms — this tail amplification (<a href="06_reliability_scalability_slos.html">L06</a>) is why the 10 ms budget is tight and why you batch the multi-get into one round trip per partition, not 51 separate calls.</p>
+
+<p><strong>Offline store size.</strong> The offline store keeps <em>history</em>, not just latest. If each entity's features change ~10 times per day and we retain 6 months: <span class="math">50,000,000 entities × 10 changes/day × 180 days × 2 KB ≈ 180 TB</span> before compression. Columnar encoding (<a href="04_storage_engines_lsm_columnar.html">L04</a>) compresses feature columns hard (run-length, dictionary, delta) — call it 5x — so ~36 TB on cheap object storage. This is a warehouse/lakehouse scan workload, not a point-lookup workload: completely different storage engine for the same logical feature.</p>
+
+<div class="callout"><div class="label">Worked number — why latest-only keeps the online store small</div>
+The ratio is the whole point. Latest-only online: <span class="math">50,000,000 × 2 KB = 100 GB</span>. Full 6-month history offline: <span class="math">~180 TB</span> raw. The history is roughly <span class="math">1,800×</span> larger. You cannot and must not serve point lookups out of a 36-180 TB columnar store, and you cannot build a point-in-time training set out of a latest-only KV store — it has thrown the history away. <strong>The size ratio alone forces the two-store design.</strong> The job is to keep them computing the same feature from the same definition.</div>
+
+<h2>3 · Design walk — two stores, one definition</h2>
+
+<p>Build it from the track's mechanisms. The architecture has one feature <em>definition</em> feeding two materializations.</p>
+
+<div class="ascii">                         ┌───────────────────────────┐
+   raw events / tables    │   FEATURE DEFINITION        │   one definition,
+   (clicks, orders, ...)  │   "user_7d_click_count =    │   computed ONCE
+        │                 │    count(clicks WHERE ...)" │
+        │                 └─────────────┬───────────────┘
+        │                               │ same logic, two materializers
+        ▼                               │
+  ┌───────────┐   CDC / stream (L19)    │              ┌──────────────────────┐
+  │ source of │ ─────────────────────────────────────▶ │ STREAMING / BATCH      │
+  │  truth DB │   logical decoding,                     │ compute (L18 / L19)    │
+  └─────┬─────┘   event log, watermark                  └──────┬──────────┬──────┘
+        │                                                       │          │
+        │ batch snapshot (L18)                          fresh latest    full history
+        ▼                                                       │          │
+                                                                ▼          ▼
+   ┌───────────────────────────────┐         ┌────────────────────┐  ┌──────────────────────┐
+   │  ONLINE STORE                  │         │  ONLINE STORE       │  │  OFFLINE STORE         │
+   │  KV, in-RAM, partitioned by    │◀────────┤  (latest value      │  │  columnar history on   │
+   │  entity_id (L11). LATEST only. │  upsert │   per entity_id)    │  │  object store (L04).   │
+   │  point lookup, p99 &lt; 10 ms     │         └────────────────────┘  │  append-only, ts-keyed │
+   └───────────────┬────────────────┘                                 └───────────┬────────────┘
+                   │ multi-get(entity_ids)                                          │ as-of join (L18)
+                   ▼                                                                ▼
+        ┌────────────────────┐                                        ┌────────────────────────┐
+        │  MODEL SERVING      │   score()                              │  TRAINING-SET BUILDER   │
+        │  (inference)        │                                        │  join labels AS OF ts   │
+        └────────────────────┘                                        └────────────────────────┘</div>
+
+<p><strong>The online store: a partitioned latest-value KV (L04, L11).</strong> An in-memory key-value store (Redis-like, or a managed wide-column store), keyed by entity id, holding only the current feature vector. It is hash-partitioned by <code>entity_id</code> (<a href="11_partitioning_rebalancing.html">L11</a>), so a lookup for one entity routes to exactly one partition — a single-hop point lookup, the cheap query the shard key was chosen to make cheap. A serving request batches its ~51 entity ids into one multi-get per partition. Each partition is a replica set (<a href="09_replication_quorums_conflicts.html">L09</a>) for availability and read fan-out.</p>
+
+<p><strong>The offline store: columnar history (L04).</strong> An append-only, timestamp-keyed columnar table on object storage (Parquet/ORC, queried by a warehouse engine). Every feature value ever computed is kept with its <em>event time</em> (<a href="19_stream_processing.html">L19</a>), so the training-set builder can ask "what was this feature at time T?". Columnar layout (<a href="04_storage_engines_lsm_columnar.html">L04</a>) is exactly right: training reads a few feature columns across millions of rows, never whole rows.</p>
+
+<p><strong>Freshness via CDC/streaming (L19).</strong> For features that must be fresh ("clicks in the last 7 days"), do <em>not</em> poll the source DB. Tap its replication log via change data capture (<a href="19_stream_processing.html">L19</a>) — logical decoding emits an ordered stream of every change — and a stream processor maintains the rolling aggregate and <em>upserts the latest value</em> into the online store while <em>appending</em> the timestamped value to the offline history. Slow-moving features ("user's country") can be a nightly batch snapshot (<a href="18_batch_processing.html">L18</a>) instead. The log is the shared source that keeps both stores derived from the same events — the derived-data discipline of L20.</p>
+
+<h3>3a · Point-in-time correctness — the join that prevents label leakage</h3>
+
+<p>This is the crux of the offline side. A training row is "(entity, label, label_timestamp)" — for example, "user 12345 churned, observed at 2026-03-01". To build features for that row you must join the feature history <strong>as of</strong> <code>label_timestamp</code>: take the most recent feature value <em>at or before</em> the label's event time, never a later one. This is a stream-table join on event time (<a href="19_stream_processing.html">L19</a>), executed in batch as an as-of (sort-merge) join (<a href="18_batch_processing.html">L18</a>).</p>
+
+<div class="ascii">feature history for user 12345 (event-time ordered):
+   ts=Feb-20  7d_clicks=4
+   ts=Feb-27  7d_clicks=9          label observed here ▼  (label_ts = Mar-01)
+   ts=Mar-05  7d_clicks=31  ◀── LEAK: this is AFTER the label
+
+CORRECT  (as-of join, value at or before label_ts):  7d_clicks = 9  (the Feb-27 value)
+WRONG    (naive join to latest value):               7d_clicks = 31 (Mar-05 — the future)</div>
+
+<p>The wrong join — joining the label to the <em>current</em> (latest) feature value, or to any value timestamped after the label — leaks information from after the prediction moment into training. The model learns from the future, scores beautifully offline, and collapses in production where the future is not available. <strong>Label leakage is the single most common and most expensive feature-store bug,</strong> and it is silent: nothing crashes, the metrics just lie. The defense is structural: store every feature value with its event time, and make the training-set builder do an as-of join, never a latest-value join.</p>
+
+<h3>3b · Train-serve skew — the same feature computed two ways</h3>
+
+<p>The second crux is on the consistency between stores. <strong>Train-serve skew</strong> is when the feature value a model trained on differs from the value it is served at inference, for the same entity at the same logical time. It arises whenever the same feature is computed by two different code paths: a Python/Spark job builds the training column one way, and the online serving service recomputes it from raw inputs another way — a different rounding, a different time-zone boundary for "last 7 days", a different default for nulls, a stale lookup table. The model now sees one distribution in training and a subtly different one in production.</p>
+
+<p>The defenses, all from earlier lessons: <strong>(1) Compute the feature once, in one place,</strong> and write the result to both stores — never recompute at serving time. The online and offline values then come from the same computation. <strong>(2) A single feature definition / schema</strong> with explicit encoding (<a href="05_encoding_schema_evolution.html">L05</a>): the same dtype, the same null handling, the same units, enforced by a schema registry so a definition change is versioned and both materializers move together. Skew is, at bottom, two encodings of "the same" feature drifting apart — exactly the schema-evolution problem L05 warns about. <strong>(3) Monitoring:</strong> log served feature values and compare their distribution to the training distribution; a divergence is skew before it becomes a model regression.</p>
+
+<h2>4 · Failure timeline — a CDC stall silently staling the online store</h2>
+
+<p>One concrete failure for this system: the freshness pipeline stalls, and the online store serves stale features while the offline store stays correct — so the skew is invisible until production metrics drop.</p>
+
+<div class="ascii">actor      t0 ───────── t1 ───────── t2 ───────── t3 ───────── t4
+CDC/stream  consuming    consumer     backlog       restart       caught up
+processor   normally     CRASHES      grows         from offset   (after replay)
+            (lag ~2s)    (no commit)  (lag ↑↑)      (L19 replay)  (lag ~2s)
+
+online      fresh        FROZEN at t1 value (no upserts arriving) ...           fresh
+store                    └─ serves a 7d_click_count that is minutes-to-hours old
+
+offline     fine         fine — batch path independent, history still appended  fine
+store
+
+model       good         scores on STALE online features → ranking quality      good
+serving                  drops; offline eval on correct features looks fine →
+                         the skew is between stores, hard to spot</div>
+
+<p><strong>Root cause:</strong> the stream processor maintaining online freshness crashed without committing its offset; on restart it must replay from the last committed offset (<a href="19_stream_processing.html">L19</a>), and until it catches up the online store is frozen at the pre-crash value. <strong>User-visible symptom:</strong> ranking/fraud quality degrades, while offline evaluation on the (still-correct) history looks healthy — a classic store-to-store skew that offline tests cannot catch. <strong>Mitigations:</strong> (1) monitor and alert on <em>CDC lag</em> (consume offset vs produce offset) and on feature <em>freshness</em> (max age of any online value), not just on crashes — lag is the leading indicator; (2) make the upserts idempotent and keyed by (entity, feature, event_time) so replay re-applies cleanly without double counting; (3) ensure the consumer commits offsets only after a successful upsert (effectively-once via idempotent writes) so a crash replays rather than skips; (4) serve a freshness timestamp alongside each feature so the model (or a guard) can detect and down-weight stale inputs.</p>
+
+<h2>5 · Answer rubric</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Good answer (baseline)</h3><ul>
+    <li>Splits into an <strong>online store</strong> (low-latency point lookup, latest value, partitioned by entity id) and an <strong>offline store</strong> (batch history for training).</li>
+    <li>Sizes the online store from #entities × features × bytes, picks an in-memory KV, and gives a p99 lookup budget.</li>
+    <li>Knows training sets join features to labels and that the online store is fed from upstream data.</li>
+    <li>Names hot entities as a partitioning risk and proposes caching or key-splitting (<a href="11_partitioning_rebalancing.html">L11</a>).</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Better answer (senior signal)</h3><ul>
+    <li>Leads with <strong>point-in-time correctness</strong>: stores every feature value with its event time and does an <em>as-of</em> join (<a href="18_batch_processing.html">L18</a>/<a href="19_stream_processing.html">L19</a>) so no value after the label leaks in.</li>
+    <li>Names <strong>train-serve skew</strong> and prevents it structurally — compute once from <em>one definition</em>, write to both stores, enforce a shared schema/encoding (<a href="05_encoding_schema_evolution.html">L05</a>); never recompute at serving time.</li>
+    <li>Drives freshness from <strong>CDC/streaming</strong> off the source's log (<a href="19_stream_processing.html">L19</a>), upserting latest online and appending history offline, with idempotent writes.</li>
+    <li>Reasons about the size ratio (latest-only vs full history, ~1,800×) to justify the two engines, and about per-request fan-out tail latency (<a href="06_reliability_scalability_slos.html">L06</a>).</li>
+    <li>Treats the whole thing as <strong>derived data</strong> (L20): the stores are materialized views, the log is the shared source of truth.</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Red flags</h3><ul>
+    <li>Builds training sets by joining labels to the <strong>latest</strong> feature value — silent label leakage, the model trains on the future.</li>
+    <li>Recomputes features independently in the serving path "for speed" — invites train-serve skew, then debugs a model regression for weeks.</li>
+    <li>Serves point lookups out of the columnar/warehouse store, or builds training sets out of the latest-only KV (which has no history).</li>
+    <li>Polls the source DB for freshness instead of tapping its log; or treats a hot celebrity entity as just more QPS.</li>
+    <li>"Make them consistent" answered with a distributed transaction across both stores — ignores that these are async derived views, not a system of record.</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Likely follow-ups</h3><ul>
+    <li>"Show me the as-of join — what exactly prevents leakage?" (value at-or-before label_ts, sorted-merge on event time.)</li>
+    <li>"A feature is computed in Spark for training and in the serving service for online. How do you guarantee they match?" (one definition, compute once, shared schema, skew monitoring.)</li>
+    <li>"One item goes viral — what happens to its partition, and your fix?" (hot key, <a href="11_partitioning_rebalancing.html">L11</a>: cache or split the key.)</li>
+    <li>"Your CDC consumer falls behind by an hour — what does the model see and how do you catch it?" (stale online features; alert on lag/freshness, §4.)</li>
+    <li>"Add a brand-new feature — how does it reach both stores without a backfill mess?" (versioned definition, backfill offline from history, then start online materialization.)</li>
+  </ul></div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>You run the feature store above: 50,000,000 entities, 200 features, online p99 budget 10 ms, freshness from CDC. (a) A data scientist reports a model that scores AUC 0.95 offline but 0.71 in production. Give the two most likely feature-store causes and the one diagnostic that distinguishes them. (b) Write, in words, the join that builds a point-in-time-correct training row for "(user 12345, churned, label_ts = Mar-01)" given a feature history with values at Feb-20, Feb-27, and Mar-05 — which value is correct and why. (c) The "7-day click count" is computed in a nightly Spark job for training and recomputed live in the ranking service for serving; describe how skew could creep in and the change that eliminates it by construction. (d) An item goes viral and 25 percent of all online lookups hit its entity id; compute the imbalance on 20 partitions and give your fix and its read-path cost.</div>
+
+<h2>Where this points next</h2>
+<p>The feature store leaned on one mechanism over and over without dwelling on it: features reach both stores by tapping the source database's log via CDC, never by the application writing the source <em>and</em> the derived store separately. That discipline deserves a case of its own, because the tempting alternative — write to Postgres, then write to the search index too — is the single most common distributed-data bug there is. The next case, <strong>building a search index from Postgres without dual writes</strong> (lesson 32), makes the dual-write trap explicit and shows the log-driven fix in full: outbox/logical decoding to a stream to an idempotent indexer, with reindex/backfill and an eventual-consistency lag budget. It is the flagship "don't dual-write" case, and the feature store was its warm-up.</p>
+
+<div class="callout"><div class="label">Where is truth?</div>
+<strong>System of record:</strong> the upstream source databases and their replication log (the raw events and tables features are computed from) plus the versioned <em>feature definition</em> — neither feature store is authoritative. <strong>Copies / derived views:</strong> the online store (latest-value KV, a materialized view of "current feature per entity") and the offline store (columnar timestamped history) — both derived from the same log by the same definition. <strong>Freshness budget:</strong> streaming features converge in seconds-to-minutes (CDC lag); a published online freshness SLA (max age per feature); the offline path is independent and may lag more without harm. <strong>Owner:</strong> the feature-platform team owns the definition and both materializers; the source-system teams own the records. <strong>Deletion path:</strong> a deletion in the source emits a CDC tombstone that upserts/removes the online value and appends a delete-marked row to history (history is append-only, so the record of "deleted at T" is itself kept for point-in-time correctness). <strong>Reconciliation/repair:</strong> both stores are fully rebuildable by replaying the log against the definition — backfill the offline history, then re-materialize the online latest values; a lost or skewed store is repaired by recompute, never by trusting one store against the other. <strong>Evidence of correctness:</strong> the as-of join proves no future value enters training (no leakage); comparing served-feature distributions against training distributions detects train-serve skew; alerting on CDC lag versus the freshness budget shows the online view is tracking the source.</div>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+A feature store serves the same logical feature two ways, and the entire case is making the two agree. The <strong>online store</strong> is a partitioned (<a href="11_partitioning_rebalancing.html">L11</a>) in-memory key-value store of <em>latest</em> values for few-millisecond point lookups at inference (<a href="02_query_languages_access_patterns.html">L02</a>); the <strong>offline store</strong> is a columnar (<a href="04_storage_engines_lsm_columnar.html">L04</a>) append-only <em>history</em> on cheap storage for batch training-set builds — and the ~1,800× size ratio between latest-only and full history forces the split. <strong>Point-in-time correctness</strong> means joining each label to the feature value at-or-before its event time (an as-of join, <a href="18_batch_processing.html">L18</a>/<a href="19_stream_processing.html">L19</a>); a latest-value join leaks the future and is the classic silent leakage bug. <strong>Train-serve skew</strong> — the same feature computed two ways diverging — is prevented structurally: compute once from one versioned definition with a shared encoding (<a href="05_encoding_schema_evolution.html">L05</a>), write to both stores, never recompute at serving time. Freshness rides <strong>CDC/streaming</strong> off the source's log (<a href="19_stream_processing.html">L19</a>) with idempotent upserts, which is also why both stores are best understood as derived materialized views, not systems of record.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>Why two stores instead of one? <em>(§1, §2 — online needs latest-only point lookups under a few-ms budget; offline needs full history for batch training-set builds. The access patterns and the ~1,800× size ratio between latest and 6-month history force different engines: in-memory KV vs columnar.)</em></li>
+  <li>What is point-in-time correctness and why does it matter? <em>(§3a — join each label to the feature value at-or-before the label's event time, never a later one. A latest-value join leaks information from after the prediction moment; the model learns the future and collapses in production. Defense: store event time, do an as-of join.)</em></li>
+  <li>What is train-serve skew and how do you prevent it? <em>(§3b — the same feature computed two ways (training job vs serving recompute) diverges. Prevent by computing once from one versioned definition with a shared encoding/schema (L05), writing to both stores, and never recomputing at serving time; monitor served-vs-training distributions.)</em></li>
+  <li>How do you keep online features fresh? <em>(§3 — tap the source DB's replication log via CDC (L19), maintain rolling aggregates in a stream processor, upsert latest to online and append timestamped history to offline; nightly batch (L18) for slow features. Don't poll the source DB.)</em></li>
+  <li>A model scores great offline but poorly in production — feature-store causes? <em>(§3a, §3b, §4 — label leakage from a latest-value training join, train-serve skew from a recomputed serving feature, or a stalled CDC pipeline serving stale online values while offline stays correct.)</em></li>
+  <li>An item goes viral — what breaks and what's the fix? <em>(§2, L11 — its entity id is a hot key, so all its lookups hit one partition; hashing can't spread one key. Fix by caching the hot entity or splitting its key into sub-keys, adding a small read-side fan-out.)</em></li>
+  <li>Why is a feature store best modeled as derived data, not a system of record? <em>(§3, L20 — both stores are materialized views computed from upstream events via the log; "consistency" is async eventual convergence of two views, not a cross-store distributed transaction.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="30_case_global_profile_store.html"><span class="dir">&larr; Previous</span><span class="ttl">30 &middot; Case: Global Profile Store</span></a>
+  <a class="next" href="32_case_search_index_no_dual_write.html"><span class="dir">Next &rarr;</span><span class="ttl">32 &middot; Case: Search Index Without Dual Writes</span></a>
+</footer>
+
+</main>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

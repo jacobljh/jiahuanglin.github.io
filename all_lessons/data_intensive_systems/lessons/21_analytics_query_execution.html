@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>21 &middot; Analytics and Query-Execution Internals</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">data_intensive_systems</a><span class="crumb">/</span><span class="crumb">21 &middot; analytics execution</span><span class="step-pill">lesson 22 / 35 &middot; ~15 min</span></div></header>
+<main>
+<p class="kicker">Part 9 · Derived views</p>
+<h1>Analytics and Query-Execution Internals</h1>
+<p class="subtitle">Lesson 20 established the architecture: one system of record, many <em>derived views</em>, each rebuildable from a log. The analytical data warehouse is the largest derived view most companies run — a columnar copy of the business's facts, rebuilt by batch jobs, that an analyst queries interactively. Which raises the question this lesson answers: a query over a <em>billion</em> rows returns in seconds. How? Lesson 04 gave half the answer — columnar storage reads only the columns you project. This lesson gives the other half: the query-execution engine on top of that layout — how a SQL string becomes a plan, how the optimizer picks join order, and the three tricks (vectorized execution, code generation, compression-aware operators) that make scanning billions of rows feel instant. A warehouse is a derived view; here is the machinery that makes it fast.</p>
+
+<div class="callout source-note"><div class="label">DDIA source</div>Arc drawn from Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, Chapter 3 (Storage and Retrieval) — the column-oriented storage and data-warehousing section (star/snowflake schemas, data cubes, column compression, vectorized processing) — extended with standard query-execution practice (parse &rarr; plan &rarr; cost-based optimizer, Volcano vs vectorized vs compiled execution, predicate pushdown, late materialization). Original synthesis; no DDIA prose or figures reproduced.</div>
+
+<div class="callout"><div class="label">Linear position</div>
+<strong>Prerequisite:</strong> Lesson 04 — <strong>columnar storage</strong> (bytes laid out by column, so a scan reads only projected columns; run-length and dictionary compression; sort order for block-skipping) and the OLTP-vs-OLAP split. Lesson 20 — a <strong>derived view</strong> is a deterministic function of the system of record, rebuildable from a log. We build the execution engine on top of the columnar layout 04 introduced; we do not re-derive that layout.<br>
+<strong>New capability:</strong> Explain <em>why a warehouse feels fast</em> — trace a SQL query through parse &rarr; logical plan &rarr; cost-based optimizer &rarr; physical plan, and name the execution techniques (vectorized batches, query compilation, late materialization, compression-aware operators) that turn a billion-row scan into a few seconds — and model analytical data with star/snowflake schemas and data cubes.</div>
+
+<div class="callout"><div class="label">The plan</div>
+<p>Five moves. (1) Model the data: the <strong>star schema</strong> (one central fact table of measures + dimension tables around it), the normalized <strong>snowflake</strong> variant, and <strong>data cubes / materialized aggregates</strong> that precompute rollups. (2) Trace the <strong>query-execution pipeline</strong>: SQL &rarr; parse &rarr; logical plan &rarr; physical plan, and the <strong>cost-based optimizer</strong> that uses statistics to pick join order and algorithms. (3) The first speed trick: <strong>vectorized execution</strong> — process a column batch per operator call instead of a row at a time — with a worked throughput number against the row-at-a-time (Volcano) model. (4) Two more tricks: <strong>query compilation</strong> (codegen the plan to machine code) and <strong>compression-aware / late-materialized</strong> execution (work on encoded data; fetch wide columns only after filtering). (5) Failure modes, the checklist, "Where is truth?" for the warehouse, and the hand-off to search and vector indexes.</p></div>
+
+<h2>1 &middot; Modeling analytical data: star, snowflake, and cubes</h2>
+
+<p>Lesson 04 answered <em>how</em> to store analytical data (by column); the prior question is <em>how to shape</em> it. An OLTP database normalizes aggressively — split data into many narrow tables, store each fact once, join at read time — to keep small updates cheap. A warehouse optimizes the opposite workload: a few queries, each scanning enormous numbers of rows but touching a handful of columns. So warehouse modeling deliberately <em>denormalizes</em> for scan-friendly joins, and it converges on a recurring shape: the <strong>star schema</strong>.</p>
+
+<p>One central <strong>fact table</strong> holds the events or measurements — one row per click, sale, impression, or sensor reading — each row mostly <em>foreign keys</em> plus a few numeric <strong>measures</strong> (revenue, quantity, latency). Around it sit <strong>dimension tables</strong>: the descriptive context a fact points at — who, what, when, where (the user, the product, the date, the store). The fact table is long and thin (billions of rows, few columns); each dimension is short and wide (thousands to millions of rows, many descriptive columns). Drawn out, facts sit at the center with dimensions radiating off — hence &ldquo;star.&rdquo;</p>
+
+<div class="ascii">Star schema — one fact table in the center, dimensions around it
+
+           dim_date                 dim_user
+        [date_key, day,          [user_key, name,
+         month, quarter]          country, segment]
+                \                    /
+                 \                  /
+                  +------------------+
+                  |   FACT_SALES     |   &lt;- one row per sale
+                  |  date_key   (FK) |      mostly foreign keys
+                  |  user_key   (FK) |      + numeric measures
+                  |  product_key(FK) |
+                  |  store_key  (FK) |
+                  |  revenue, qty    |   &lt;- the measures you aggregate
+                  +------------------+
+                 /                  \
+                /                    \
+        dim_product               dim_store
+     [product_key, name,       [store_key, city,
+      category, brand]          region, format]</div>
+
+<p>A typical query joins the fact table to a few dimensions, filters on dimension columns (&ldquo;last quarter,&rdquo; &ldquo;in Europe&rdquo;), and aggregates a measure (&ldquo;sum revenue grouped by category&rdquo;). Because the fact table is columnar (lesson 04), the scan reads only the foreign-key columns and the measure it sums — back to the ~3%-of-bytes win. The denormalization (carrying foreign keys flat on every fact row rather than chasing a chain of joins) is exactly what keeps that scan cheap.</p>
+
+<p>The <strong>snowflake schema</strong> is the variant where dimensions are themselves normalized: instead of one wide <code>dim_product</code> carrying <code>category</code> and <code>brand</code> as text, <code>dim_product</code> points to a separate <code>dim_category</code> table, which may point to <code>dim_department</code>, and so on — dimensions branching into sub-dimensions like a snowflake's arms. It saves a little storage and removes redundancy but adds joins back to the read path, the very cost a warehouse was avoiding. The usual call: keep the <em>fact</em> table denormalized always, and only snowflake a dimension when it is genuinely large or shared.</p>
+
+<p><strong>Data cubes and materialized aggregates.</strong> Even with columnar scans, summing a billion fact rows on every dashboard refresh is wasteful when the same rollups are asked for again and again. A <strong>data cube</strong> (or OLAP cube) precomputes aggregates — sums, counts, averages — across combinations of dimensions, so &ldquo;revenue by country by month&rdquo; is a lookup into a small precomputed grid rather than a fresh scan. A <strong>materialized aggregate</strong> (or materialized view, lesson 20) is the same idea in a relational warehouse: store the grouped-and-summed result and read it directly. The trade is <em>storage and flexibility for speed</em>: you pay storage to hold the grid and lose the ability to drill into a dimension you did not precompute, in exchange for instant rollups on the ones you did. Warehouses often keep raw facts for ad-hoc queries <em>and</em> a few materialized aggregates for the hot dashboard paths (lesson 34).</p>
+
+<p>These tables do not appear by magic: building the fact and dimension tables from raw event logs is a <strong>batch job</strong> — a deterministic transform over a bounded input — which is exactly lesson 18, and it is what makes the warehouse a <em>derived</em> view.</p>
+
+<h2>2 &middot; The query-execution pipeline: SQL to a physical plan</h2>
+
+<p>You type a SQL string; the engine must turn it into machine work. The pipeline has four stages, and the interesting decisions happen in the third.</p>
+
+<div class="mini-flow">
+<div class="step"><span class="n">1</span><strong>Parse</strong> — turn the SQL text into an <em>abstract syntax tree</em>, checking syntax and resolving names (does <code>revenue</code> exist? which table is it on?). Pure mechanical translation; no choices yet.</div>
+<div class="step"><span class="n">2</span><strong>Logical plan</strong> — a tree of relational operators describing <em>what</em> to compute, not <em>how</em>: scan, filter, join, aggregate, project. <code>SELECT category, SUM(revenue) FROM fact JOIN dim_product ... WHERE quarter='Q1' GROUP BY category</code> becomes Aggregate(Join(Filter(Scan fact), Scan dim_product)). Many physical plans can satisfy one logical plan.</div>
+<div class="step"><span class="n">3</span><strong>Optimize</strong> — the <strong>cost-based optimizer</strong> rewrites and re-orders the logical plan and assigns a concrete algorithm to each operator, choosing the variant it estimates to be cheapest. This is where the work is. Detailed below.</div>
+<div class="step"><span class="n">4</span><strong>Physical plan</strong> — an executable tree: which join algorithm (hash join, sort-merge, nested-loop), which join order, which scans, where filters run. This is what actually executes.</div>
+</div>
+
+<p><strong>What the optimizer decides.</strong> Two choices dominate, and both depend on <em>statistics</em> — precomputed summaries of each table (row counts, distinct-value counts per column, min/max, histograms) that the engine refreshes periodically:</p>
+
+<ul>
+  <li><strong>Join order.</strong> Joining A, B, C can be done as (A&#8904;B)&#8904;C or A&#8904;(B&#8904;C) or others. The intermediate result sizes differ enormously: join the two tables that produce the <em>smallest</em> intermediate first, so every later operator handles fewer rows. The optimizer estimates each intermediate's row count from statistics and searches for the cheapest order.</li>
+  <li><strong>Join algorithm.</strong> A <strong>hash join</strong> builds an in-memory hash table on the smaller input then probes it with the larger — great when one side fits in memory. A <strong>sort-merge join</strong> sorts both sides and merges — better when inputs are already sorted or too big to hash. A <strong>nested-loop join</strong> is fine only for tiny inputs. The optimizer picks per join, from the estimated sizes.</li>
+</ul>
+
+<div class="callout warn"><div class="label">Statistics are the optimizer's eyes — and its blind spot</div>
+A cost-based optimizer is only as good as its statistics. If they are stale (the table grew 100&times; since the last refresh) or wrong (a column the optimizer thinks is uniform is actually skewed), it picks a bad join order or a hash join whose &ldquo;small&rdquo; side does not fit in memory and spills to disk. The single most common warehouse-performance bug is not a missing index — it is stale statistics on a table that recently changed shape. <code>ANALYZE</code> the table.</div>
+
+<p>The plan is a tree of operators. The remaining sections are about <em>how each operator is implemented</em> — because the same physical plan can run 10&times; to 100&times; faster depending on the execution model.</p>
+
+<h2>3 &middot; Why warehouses are fast I: vectorized execution</h2>
+
+<p>The classic execution model is <strong>Volcano</strong> (also called the iterator or row-at-a-time model): every operator exposes <code>next()</code>, which returns one row; an operator calls <code>next()</code> on its child to pull the next row, processes it, and returns it up. The whole plan is a chain of <code>next()</code> calls, and a query over a billion rows makes on the order of a billion calls <em>per operator</em>. It is elegant and composable — and slow, because of per-row overhead.</p>
+
+<p>Every <code>next()</code> call costs a (often virtual/indirect) function call; every operator does a branch (&ldquo;is this row null? does it pass the predicate?&rdquo;); and one row touches a few bytes, defeating the CPU cache and the SIMD units that want to chew through contiguous arrays. The actual work — comparing an integer, adding to a sum — is dwarfed by the bookkeeping around it.</p>
+
+<p><strong>Vectorized execution</strong> fixes this by changing the unit of work from one row to a <em>batch</em> — typically about 1,024 values of a single column. <code>next()</code> now returns a batch, and each operator runs a tight loop over that batch: a filter compares 1,024 integers in one cache-friendly pass, often using SIMD (one CPU instruction over 8 or 16 lanes at once). The function-call and dispatch overhead is paid once per 1,024 rows instead of once per row, and the inner loop is exactly the array-crunching shape modern CPUs are built for. This pairs naturally with columnar storage (lesson 04): a column <em>is</em> already a contiguous typed array, so a batch is just a slice of it.</p>
+
+<div class="callout"><div class="label">Worked number — overhead amortized over a 1,024-row batch</div>
+<p>Suppose the useful work to filter one row (load value, compare, decide) is ~1 ns, and the per-row <em>overhead</em> in the Volcano model — the virtual <code>next()</code> call, the branch misprediction, the cache miss from row-at-a-time access — is ~4 ns. Row-at-a-time cost per row:</p>
+<p><span class="math">1 ns work + 4 ns overhead = 5 ns/row</span></p>
+<p>Vectorized: the same ~4 ns of dispatch overhead is paid <em>once per batch</em> of 1,024 rows, and the per-value work drops too (tight loop, SIMD packs ~4 comparisons per step, call it ~0.3 ns/row):</p>
+<p><span class="math">0.3 ns work + (4 ns / 1,024) overhead &asymp; 0.3 ns + 0.004 ns &asymp; 0.30 ns/row</span></p>
+<p>That is roughly <span class="math">5 / 0.30 &asymp; 16&times;</span> faster on the filter, before any other trick. Over a billion rows: <span class="math">1,000,000,000 &times; 5 ns = 5 s</span> row-at-a-time versus <span class="math">1,000,000,000 &times; 0.30 ns &asymp; 0.3 s</span> vectorized. The plan is identical — only the operator implementation changed. This is why ClickHouse, DuckDB, and modern Spark/Photon are vectorized, and why a billion-row scan returns interactively rather than in minutes.</p>
+</div>
+
+<h2>4 &middot; Why warehouses are fast II: compilation, pushdown, and encoded operators</h2>
+
+<p>Vectorization is the biggest lever; three more compound it.</p>
+
+<p><strong>Query compilation (codegen).</strong> Even a vectorized engine spends cycles <em>interpreting</em> the plan — walking the operator tree, dispatching on operator type, branching on column types. <strong>Query compilation</strong> removes that layer: the engine generates source (or LLVM IR) <em>specialized to this exact query</em> — the filter constant, the column types, the aggregation function all baked in as literals — and compiles it to machine code, then runs that. There is no interpreter loop and no per-row type dispatch; the query becomes a purpose-built program. Systems like Spark's whole-stage codegen and HyPer/Umbra take this route. The trade is compilation latency (tens of milliseconds to build the code), which is negligible for a query that scans billions of rows but can dominate for tiny ones — so engines often compile only the heavy stages.</p>
+
+<p><strong>Predicate pushdown and late materialization.</strong> Two layout-aware tricks that cut bytes touched:</p>
+
+<ul>
+  <li><strong>Predicate pushdown</strong> — push the filter as close to the scan as possible, ideally <em>into</em> the storage layer. A Parquet file (lesson 04) stores per-block min/max stats; if a block's <code>quarter</code> range is entirely outside <code>'Q1'</code>, the engine skips the whole block without reading it. The filter that logically sits above the scan is evaluated <em>during</em> the scan, so disqualified data never enters the pipeline.</li>
+  <li><strong>Late materialization</strong> — when a query filters on one column and projects wide columns, do <em>not</em> stitch full rows up front. Run the filter on the narrow column first, carry only the surviving <em>row-ids</em>, and fetch the wide columns (<code>bio</code>, <code>payload</code>) <em>only</em> for the rows that passed. If a filter keeps 1% of rows, late materialization reads 1% of the wide column instead of 100% — the wide fetch shrinks by 100&times;.</li>
+</ul>
+
+<p><strong>Compression-aware execution.</strong> Lesson 04's run-length and dictionary encodings are not just for storage — operators can work on the <em>encoded</em> data directly. To count rows where <code>country = 'US'</code> in a run-length-encoded column stored as &ldquo;<code>US</code> &times; 4,000,&rdquo; the engine adds 4,000 in one step instead of comparing 4,000 values. A <code>GROUP BY country</code> can group on the small dictionary <em>codes</em> (1 byte) rather than the strings, and only decode to text for the final output. The operator never decompresses the bulk of the column — it computes on the compact form and decodes lazily, so compression saves CPU as well as I/O.</p>
+
+<div class="ascii">A vectorized scan -&gt; filter -&gt; project -&gt; aggregate pipeline
+(one column batch of ~1,024 values flows through each operator)
+
+  Parquet column chunks (compressed, with min/max stats)
+        |
+        v
+  [ SCAN ]  predicate pushdown: skip blocks whose min/max
+        |   can't match WHERE quarter='Q1'  (no I/O for them)
+        v
+  [ FILTER ]  vectorized: compare 1,024 'quarter' codes per call
+        |     output = surviving ROW-IDS only  (late materialization)
+        v
+  [ PROJECT ] fetch 'revenue' + 'category' ONLY for surviving row-ids
+        |     (wide columns never read for filtered-out rows)
+        v
+  [ AGGREGATE ] hash on dictionary CODE for 'category' (1 byte),
+        |        SUM(revenue) per group; decode codes to text at the end
+        v
+     result rows  (a few; the billion never left the scan loop)</div>
+
+<h2>5 &middot; Failure modes, the checklist, and where truth lives</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Stale statistics.</strong> The optimizer picks a bad join order or a hash join whose build side no longer fits memory and spills; a query that ran in seconds now runs in minutes. Refresh stats after big loads.</li>
+    <li><strong>Exploding intermediate joins.</strong> A bad join order materializes a billion-row intermediate before the filter that would have cut it. Usually a statistics or missing-filter problem; check the plan's estimated vs actual row counts.</li>
+    <li><strong>SELECT * defeats columnar.</strong> Projecting every column makes the scan read all columns of every row — the lesson-04 row-store cost, on a column store. Project only what you aggregate.</li>
+    <li><strong>Materialized aggregate drift.</strong> A precomputed cube reflects yesterday's facts; a dashboard shows stale numbers while raw-fact queries show fresh ones. The cube is a derived view (lesson 20) and needs a refresh path and a freshness budget.</li>
+    <li><strong>Tiny queries pay compilation tax.</strong> Codegen latency dominates a query that touches a few rows; compile only heavy stages, or fall back to a vectorized interpreter for small inputs.</li>
+    <li><strong>OLTP query on the warehouse.</strong> A point lookup of one row scans column chunks and reconstructs a row — slow. Point reads belong on the OLTP source (lesson 04), not the analytical copy.</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Decision checklist</h3><ul>
+    <li>Is the model a star schema — one denormalized fact table, dimensions around it? Snowflake only the large/shared dimensions.</li>
+    <li>Are the hot dashboard rollups served by materialized aggregates / a cube, with a defined freshness budget?</li>
+    <li>Are table statistics refreshed after each major load so the optimizer's join-order estimates are sound?</li>
+    <li>Is the engine vectorized (column batches) — and does the plan use predicate pushdown and late materialization (read the EXPLAIN)?</li>
+    <li>Does the query project only the columns it needs, never <code>SELECT *</code>?</li>
+    <li>Is the warehouse explicitly a derived view, with a rebuild path from the source/lake and reconciliation against it?</li>
+  </ul></div>
+</div>
+
+<div class="callout"><div class="label">Where is truth?</div>
+<strong>System of record:</strong> the OLTP source databases and the raw event log / data lake — the authoritative facts. <strong>Copies / derived views:</strong> the warehouse itself (fact + dimension tables) and every cube / materialized aggregate are <em>derived</em> — columnar copies rebuilt by batch/ETL jobs (lesson 18), never written to directly by users. <strong>Freshness budget:</strong> ETL lag — how far behind the source the warehouse is allowed to fall (e.g. hourly micro-batches &rArr; up to ~1 h stale); cubes add their own refresh lag on top. <strong>Owner:</strong> the data/analytics-engineering team that owns the ETL pipeline and the schema. <strong>Deletion path:</strong> a user deletion (lesson 25) must propagate from the source through the next ETL run into the warehouse and every cube — deletion is not done until the derived copies drop it too. <strong>Reconciliation / repair:</strong> rerun the batch job to rebuild a table or partition from the source — the whole point of &ldquo;derived&rdquo; (lesson 20). <strong>Evidence it is correct:</strong> row-count and aggregate reconciliation — sum a measure in the warehouse and compare to the same sum computed from the source/lake; a mismatch beyond the freshness window is a pipeline bug, not stale data. Storage for the underlying files is itself a subsystem (lesson 24).</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>
+<p>You run a recommender's analytics warehouse. The query is &ldquo;click-through rate by ad <code>category</code> for last week&rdquo; over a 2-billion-row <code>fact_impressions</code> table (80 columns) joined to a small <code>dim_ad</code> table. (1) Sketch the star schema and the logical plan. (2) The query touches 4 columns; estimate the bytes scanned versus a row store, and explain where predicate pushdown and late materialization help. (3) The query suddenly slows 20&times; one morning with no code change — give the two most likely causes and how you would confirm each from the query plan. (4) State which store is the source of truth and how you would prove the warehouse's CTR number is correct.</p></div>
+
+<h2>Where this points next</h2>
+<p>We can now explain why scanning a billion structured rows feels instant: a scan-friendly star schema, a columnar layout, an optimizer that orders the joins, and operators that crunch compressed column batches in compiled, vectorized loops. But a warehouse answers <em>&ldquo;sum revenue where category = electronics&rdquo;</em> — exact, structured predicates. It cannot answer <em>&ldquo;find documents <em>about</em> wireless earbuds&rdquo;</em> or <em>&ldquo;find the 10 product embeddings nearest this query vector.&rdquo;</em> Those need a different derived view with a different index. Lesson 22 builds it: <strong>search and vector indexes</strong> — inverted indexes for full-text, approximate-nearest-neighbor structures for embeddings, and how they power retrieval-augmented generation (RAG). Same &ldquo;derived view rebuilt from the source&rdquo; discipline, a fundamentally different access pattern.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+<p>A data warehouse is the biggest <strong>derived view</strong> a company runs — a columnar copy of its facts, rebuilt by batch ETL from the source of truth (lesson 18, 20). It is modeled as a <strong>star schema</strong> (one denormalized fact table of measures + dimension tables; the <strong>snowflake</strong> variant normalizes dimensions back into joins), often with <strong>data cubes / materialized aggregates</strong> that trade storage and flexibility for instant rollups. A query runs SQL &rarr; parse &rarr; logical plan &rarr; <strong>cost-based optimizer</strong> (which uses table statistics to pick join order and join algorithm) &rarr; physical plan. It feels fast because of the execution engine on top of lesson 04's columnar layout: <strong>vectorized execution</strong> processes ~1,024-value column batches per operator call (amortizing dispatch overhead for a ~16&times; win over the row-at-a-time Volcano model), <strong>query compilation</strong> removes interpreter overhead, and <strong>predicate pushdown, late materialization, and compression-aware operators</strong> ensure the engine reads and decodes only the bytes that survive the filter. Its correctness is provable by reconciling aggregates against the source.</p></div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>Contrast star and snowflake schemas; when do you snowflake a dimension? <em>(&sect;1 — star: one denormalized fact table of measures + foreign keys, dimensions radiating off; snowflake normalizes dimensions into sub-dimensions, saving storage but adding joins to the read path; keep the fact denormalized, snowflake only large/shared dimensions.)</em></li>
+  <li>What is a data cube / materialized aggregate, and what does it trade? <em>(&sect;1 — precomputed rollups across dimension combinations so a rollup is a lookup not a scan; trades storage and drill-down flexibility for instant queries on the precomputed grouping.)</em></li>
+  <li>Walk a SQL query through the execution pipeline; what does the optimizer decide? <em>(&sect;2 — parse &rarr; logical plan (what) &rarr; cost-based optimizer &rarr; physical plan (how); optimizer chooses join order and join algorithm (hash/sort-merge/nested-loop) using table statistics.)</em></li>
+  <li>Why is vectorized execution faster than row-at-a-time, and roughly how much? <em>(&sect;3 — Volcano makes one <code>next()</code> call + branch per row, so per-row overhead dominates the work; vectorized processes ~1,024-value column batches, amortizing dispatch once per batch and enabling SIMD — about a 16&times; win in the worked example, e.g. 5 s &rarr; 0.3 s over a billion rows.)</em></li>
+  <li>What does query compilation buy, and when is it a bad idea? <em>(&sect;4 — codegen specializes the plan to this query as machine code, removing interpreter/type-dispatch overhead; the compilation latency is wasted on tiny queries, so compile only heavy stages.)</em></li>
+  <li>Explain predicate pushdown and late materialization. <em>(&sect;4 — pushdown evaluates filters at/inside the scan using per-block min/max stats to skip blocks with no I/O; late materialization carries surviving row-ids and fetches wide columns only for rows that passed the filter, so a 1%-selective filter reads ~1% of the wide column.)</em></li>
+  <li>A warehouse query slows 20&times; overnight with no code change — diagnose. <em>(&sect;2, &sect;5 — most likely stale statistics after a big load causing a bad join order or a hash join that now spills; confirm by comparing the plan's estimated vs actual row counts and re-running <code>ANALYZE</code>.)</em></li>
+  <li>Is the warehouse a source of truth? How do you prove its numbers are right? <em>(&sect;5 — no; it is a derived view rebuilt by ETL from the OLTP source/lake, with freshness = ETL lag; prove correctness by reconciling row counts and aggregate sums against the source, and repair by rerunning the batch job.)</em></li>
+</ul>
+<footer class="lesson-nav">
+  <a href="20_derived_data_correctness.html"><span class="dir">&larr; Previous</span><span class="ttl">20 &middot; Derived Data: Keeping Views Correct</span></a>
+  <a class="next" href="22_search_vector_indexes_rag.html"><span class="dir">Next &rarr;</span><span class="ttl">22 &middot; Search, Vector Indexes, and RAG</span></a>
+</footer>
+</main>
+<!-- reviewed:v1 -->
+</body>
+</html>

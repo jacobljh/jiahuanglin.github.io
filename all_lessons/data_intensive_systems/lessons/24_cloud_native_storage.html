@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>24 &middot; Cloud-Native Storage as a Subsystem</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">data_intensive_systems</a><span class="crumb">/</span><span class="crumb">24 &middot; cloud storage</span><span class="step-pill">lesson 25 / 35 &middot; ~15 min</span></div></header>
+<main>
+<p class="kicker">Part 10 · Cloud / AI systems</p>
+<h1>Cloud-Native Storage as a Subsystem</h1>
+<p class="subtitle">Every mechanism so far — the write-ahead log, the LSM-tree's sequential writes, the leader shipping its replication log to followers — quietly assumed a <em>disk</em>: a block device attached to the machine, where a write lands in microseconds and you can overwrite a byte in place. In the cloud that assumption is gone. The disk is now a <em>network service</em>: storage lives on the far side of a network, compute is rented by the hour and may not survive the night, durability is a contract someone else signs, and moving a byte across a region boundary has a price tag. This lesson treats cloud storage not as "the same thing but managed", but as a subsystem with its own latency, failure, and cost model — and shows how that model reshapes choices you made in earlier lessons.</p>
+
+<div class="callout source-note">
+  <div class="label">Source grounding</div>
+  Original synthesis inspired by Martin Kleppmann, <em>Designing Data-Intensive Applications</em> — and specifically the 2nd-edition additions on the cloud era: the separation of storage and compute, object storage as the durable substrate, cloud data warehouses, and the operational delegation of managed databases. The mechanisms (durability, consistency, placement) are the same ones built earlier in this track; here we re-read them through a cloud lens. Built here, not reproduced.
+</div>
+
+<div class="callout">
+  <div class="label">Linear position</div>
+  <strong>Prerequisite:</strong> Lesson 04 (storage engines: the LSM-tree and columnar layout, and why sequential writes and immutable files matter) — you know that a storage engine is shaped by the cost of writes and the cost of overwriting in place. Lesson 08 (replication: leaders, followers, lag, failover) — you know copies are placed across machines for availability and that copies disagree across time.<br>
+  <strong>New capability:</strong> Reason about cloud storage as a subsystem with its own latency profile, durability contract, consistency model, failure boundaries (control-plane vs data-plane), and cost model (egress, per-op). Decide between an object store, a cloud warehouse, and a managed database for a given workload, and place data across regions and availability zones for latency and blast-radius isolation.
+</div>
+
+<div class="callout">
+  <div class="label">The plan</div>
+  Six moves. (1) Object stores (S3, GCS, Azure Blob) as the new durable substrate — what "the disk is a service" actually changes: storage/compute separation, the durability contract, consistency, and a latency profile so different from a local SSD that it reshapes storage-engine design (lesson 04). (2) Cloud warehouses (Snowflake, BigQuery) — compute that scales independently of stored bytes (lesson 21). (3) Managed databases (RDS, Aurora, Spanner, DynamoDB) as <em>operational delegation</em>: what you hand off and what you give up. (4) The constraints that are unique to running on someone else's cloud — egress cost, IAM, regions and availability zones (lesson 08). (5) The two failure boundaries — control plane vs data plane — and serverless / scale-to-zero. (6) A worked egress number, where truth lives, and the hand-off.
+</div>
+
+<h2>1 &middot; The disk is now a network service: object stores</h2>
+
+<p><em>What this is: S3 / GCS / Azure Blob as the durable substrate, and the four ways they differ from a local disk.</em></p>
+
+<p>An <strong>object store</strong> (Amazon S3, Google Cloud Storage, Azure Blob Storage) is a service that stores named <em>objects</em> — opaque blobs of bytes, from a few KB to terabytes — addressed by a key (<code>bucket/path/to/object</code>), reached over HTTP. It is not a filesystem and not a block device. You <code>PUT</code> a whole object and <code>GET</code> a whole object (or a byte range of one); you do not seek to offset 4096 and overwrite 64 bytes. That single restriction — <strong>objects are immutable; there is no in-place update</strong> — is the hinge the rest of this section turns on.</p>
+
+<p>The first and biggest consequence is <strong>the separation of storage and compute</strong>. On a classic database server, the disk is bolted to the CPU: if you want more storage you buy a bigger machine, and that same machine also does the computing. With an object store, the bytes live in a service that any number of compute nodes can read from over the network. Storage scales by writing more objects; compute scales by renting more (stateless) machines that read those objects. The two grow on independent axes. This is the architectural fact underneath cloud warehouses (&sect;2) and the lakehouse pattern, and it is why a query engine can spin up 100 workers for one minute, read a dataset none of them owns, and spin back down.</p>
+
+<div class="ascii">  CLASSIC SERVER (storage bolted to compute)        CLOUD (storage and compute separated)
+
+  ┌───────────────────────┐                         compute (stateless, ephemeral, rented)
+  │  CPU + RAM            │                          ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐
+  │  ───────────────     │                          │ node │ │ node │ │ node │ │ node │   ← scale this
+  │  local SSD (the disk)│                          └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘     by the hour
+  └───────────────────────┘                            │        │        │        │
+   grow storage = bigger box                           └────────┴───┬────┴────────┘
+   the box does everything                                     HTTP GET/PUT
+                                                                     │
+                                                        ┌────────────▼────────────┐
+                                                        │   OBJECT STORE (S3)     │   ← scale this
+                                                        │   immutable objects,    │     by writing
+                                                        │   replicated across AZs │     more objects
+                                                        └─────────────────────────┘</div>
+
+<p>The second consequence is the <strong>durability contract</strong>. The object store stores many replicas of each object across multiple <strong>availability zones</strong> (AZs — physically separate data centers within a region, with independent power and networking; introduced in &sect;4). Providers advertise figures like "eleven nines" of durability — <span class="math">99.999999999%</span> — meaning the modeled annual probability of losing a given object is around <span class="math">1 in 100 billion</span>. Treat that number as a marketing summary of "we keep enough geographically separated replicas and continuously repair them that you should not plan to lose objects", not as a guarantee you can verify. Durability here is <em>delegated</em>: you no longer run the replication and anti-entropy you built in lesson 08 — the provider does, behind the API. What you give up is the ability to inspect or prove it; what you gain is not having to.</p>
+
+<p>The third consequence is <strong>consistency</strong>. For years S3 was <em>eventually consistent</em>: <code>PUT</code> an object, immediately <code>GET</code> it, and you might get the old version or a 404, because the read hit a replica that hadn't caught up — exactly the replication-lag anomaly from lesson 08, now inside the storage service. As of 2020, S3 provides <strong>strong read-after-write consistency</strong>: after a successful <code>PUT</code> of a new object (or an overwrite), any subsequent <code>GET</code> or <code>LIST</code> sees that write. This removed a whole class of bugs (and the read-after-write workarounds people built), but note the boundary: it is read-after-write on a <em>single object</em>; it is <strong>not</strong> a multi-object transaction. You still cannot atomically swap two objects, which is why table formats (&sect; below) need their own commit protocols.</p>
+
+<p>The fourth consequence — the one that reshapes storage-engine design — is the <strong>latency and throughput profile</strong>. A local NVMe SSD answers a small read in roughly <span class="math">100 microseconds</span> (0.1 ms). An object-store <code>GET</code> is an HTTP request over the network: <strong>first-byte latency is tens of milliseconds</strong> — call it <span class="math">20–100 ms</span>, often ~50 ms. That is <strong>100&times; to 1000&times; slower per operation</strong>. But the <em>throughput</em> story is the opposite: you can run thousands of parallel <code>GET</code>s and pull many GB/s aggregate, far more bandwidth than one SSD. So the object store is a high-latency, high-bandwidth, immutable, whole-object device. That profile dictates how you store data on it:</p>
+
+<table>
+  <thead><tr><th>Local SSD assumes…</th><th>Object store forces…</th></tr></thead>
+  <tbody>
+    <tr><td>Cheap small random reads (~0.1 ms)</td><td>Few, large, sequential reads — amortize the ~50 ms per-op cost over many MB; read big byte ranges, not 4 KB pages</td></tr>
+    <tr><td>In-place overwrite of a page</td><td>Write new immutable objects; never overwrite — exactly the <strong>LSM-tree / append-only</strong> instinct from lesson 04</td></tr>
+    <tr><td>One process owns the disk</td><td>Many readers, no single owner; metadata/commit must live elsewhere</td></tr>
+  </tbody>
+</table>
+
+<p>This is why the modern data lake stores <strong>Parquet</strong> (the columnar format from lesson 04) as immutable objects, and why an LSM-tree on an object store flushes large immutable SSTables (which map perfectly onto immutable objects) rather than churning small pages. The append-only, "never overwrite, compact in the background" design you learned for write-heavy local engines turns out to be <em>exactly</em> what an object store wants — the immutability that was a clever optimization on a disk is a hard requirement in the cloud. And because no single process owns the bucket, the "which objects make up the current table" question can't live in a local index; it needs an external commit log. That is what table formats like Iceberg, Delta Lake, and Hudi provide: a small, atomically-updated manifest that points at the current set of immutable data objects — giving you snapshots and atomic table updates on top of a store that only guarantees single-object writes.</p>
+
+<h2>2 &middot; Cloud warehouses: compute scales apart from data</h2>
+
+<p><em>What this is: Snowflake / BigQuery built on storage-compute separation.</em></p>
+
+<p>A <strong>cloud data warehouse</strong> (Snowflake, Google BigQuery, Amazon Redshift in its modern form) takes &sect;1's separation and makes it the product. Your tables live as columnar objects in the object store. To run a query you provision a <em>compute cluster</em> (Snowflake calls it a "virtual warehouse"; BigQuery hides it as on-demand "slots") that reads those objects, executes the analytical query (the scan/join/aggregate machinery from lesson 21), and returns a result. The cluster is ephemeral and sized on demand.</p>
+
+<p>The payoff is that <strong>compute and stored data scale independently</strong>. You can store 500 TB and query it with a tiny cluster overnight and a huge one at 9am, paying only for the compute you spin up — the stored bytes cost the same regardless. Two teams can run heavy queries against the <em>same</em> data on two separate clusters without contending for each other's CPU, because they are different compute reading shared storage. This is the cloud-native answer to the OLTP/OLAP split from lesson 04 and the query-execution concerns of lesson 21: the warehouse is a query engine you rent by the second, sitting on top of the object store of &sect;1.</p>
+
+<h2>3 &middot; Managed databases: operational delegation</h2>
+
+<p><em>What this is: RDS / Aurora / Spanner / DynamoDB, and the trade you make by not running the database yourself.</em></p>
+
+<p>A <strong>managed database</strong> is a database the cloud provider operates for you: Amazon RDS (managed Postgres/MySQL), Aurora (a cloud-rearchitected MySQL/Postgres that puts the storage layer on a distributed, multi-AZ service), Google Spanner (a globally-distributed, strongly-consistent relational database), DynamoDB (a managed key-value/document store). You still design the schema and write the queries; you do not run the machine. The deal is <strong>operational delegation</strong> — and like any delegation, it is a trade, not a free win.</p>
+
+<table>
+  <thead><tr><th>You hand off (provider does it)</th><th>You give up</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Backups &amp; point-in-time recovery</strong> — automatic snapshots + log retention so you can restore to any second in a window</td><td><strong>Control</strong> — you can't touch the OS, pick arbitrary extensions/versions, or tune the storage layer below the provider's knobs</td></tr>
+    <tr><td><strong>Patching &amp; upgrades</strong> — security patches and minor-version upgrades applied in maintenance windows</td><td><strong>Portability</strong> — Aurora, Spanner, DynamoDB have proprietary surfaces; migrating off is a real project (a form of lock-in)</td></tr>
+    <tr><td><strong>Failover</strong> — multi-AZ standby promotion (the lesson-08 failover, run for you, often in under a minute)</td><td><strong>Cost</strong> — you pay a managed premium per hour, and at very large scale self-hosting can be markedly cheaper</td></tr>
+    <tr><td><strong>Replication &amp; scaling</strong> — read replicas, storage auto-grow, sharding (DynamoDB) behind the API</td><td><strong>Transparency</strong> — when it's slow or fails, you debug through the provider's metrics and a support ticket, not the box</td></tr>
+  </tbody>
+</table>
+
+<p>The decision is rarely "managed vs not" globally; it is per system. A small team running a product database almost always wins by delegating — failover and backups done right are hard, and that is exactly the lesson-08 machinery you don't want to operate at 3am. A team at scale with a hot, predictable, cost-sensitive workload may self-host to recover the managed premium and the control. Name the trade explicitly: what operational burden are you offloading, and what control / portability / cost are you paying for it?</p>
+
+<h2>4 &middot; Constraints unique to the cloud: egress, IAM, regions and AZs</h2>
+
+<p><em>What this is: three cloud realities that become hard architecture constraints — money, identity, and placement.</em></p>
+
+<p><strong>Egress cost.</strong> Reading and writing within a region is cheap or free; <em>moving data out</em> is not. <strong>Egress</strong> — data leaving a region or leaving the cloud entirely (to the internet, to another cloud, sometimes to another region) — is billed per GB, and it is one of the largest and most surprising lines on a cloud bill. This is not an accounting footnote; it is an <em>architecture constraint</em>. It is why you put compute in the same region as its data (so the bytes never cross a priced boundary), why cross-region replication has a real recurring cost, and why "just back up everything to another cloud" is expensive at scale. Egress quietly pushes architectures toward keeping data and the things that read it co-located. We put a number on this in &sect;6.</p>
+
+<p><strong>IAM (identity and access management).</strong> In the cloud, <em>identity is first-class infrastructure</em>. Every API call — a service reading an object, a function writing a row — is made by a principal (a user, a role, a service account) and is allowed or denied by an IAM policy. The discipline is <strong>least privilege</strong>: each principal gets exactly the permissions it needs and no more, so a compromised service can touch only its own bucket, not the whole account. This matters for data systems specifically because access control is no longer just rows-in-a-table permissions inside one database — it is who can read this bucket, who can decrypt this key, who can assume this role, enforced by the cloud before your code even runs. Misconfigured IAM (a public bucket, an over-broad role) is among the most common causes of real data breaches.</p>
+
+<p><strong>Regions and availability zones.</strong> A cloud is organized as <strong>regions</strong> (geographic areas — us-east-1, europe-west1) each containing several <strong>availability zones</strong> (AZs — physically separate data centers within the region, with independent power, cooling, and networking, connected by fast low-latency links). This is the cloud's placement vocabulary, and it serves the two goals from lesson 08:</p>
+<ul>
+  <li><strong>Latency.</strong> Put data and compute in a region near the user. A reader in Frankfurt hits europe-central, not a trans-Atlantic round-trip — the same local-read win as a regional read replica in lesson 08.</li>
+  <li><strong>Blast-radius isolation.</strong> Spread replicas across AZs so that one data center losing power doesn't take the data down — and spread critical systems across <em>regions</em> so that a whole-region outage isn't fatal. AZ-level replication is cheap (same region, low latency, no cross-region egress); region-level replication costs latency and egress but survives bigger failures. You are choosing how large a failure you must survive, and paying accordingly.</li>
+</ul>
+
+<div class="ascii">  REGION  us-east-1                                    REGION  eu-west-1
+  ┌─────────────────────────────────────┐             ┌──────────────────────────┐
+  │  AZ-a        AZ-b        AZ-c        │   async     │  AZ-a    AZ-b    AZ-c    │
+  │ ┌──────┐   ┌──────┐   ┌──────┐      │   replica   │ ┌──────┐ ┌──────┐        │
+  │ │replica│  │replica│  │replica│     │ ──────────▶ │ │replica│ │replica│       │
+  │ └──────┘   └──────┘   └──────┘      │  (egress $) │ └──────┘ └──────┘        │
+  │  synchronous across AZs (cheap,     │             │  disaster-recovery copy  │
+  │  low latency) → survive 1 AZ loss   │             │  → survive region loss   │
+  └─────────────────────────────────────┘             └──────────────────────────┘
+   within region: free/cheap, ~sub-ms        across region: priced egress + tens of ms latency</div>
+
+<h2>5 &middot; The two failure boundaries: control plane vs data plane, and serverless</h2>
+
+<p><em>What this is: the most important cloud failure distinction, plus scale-to-zero compute.</em></p>
+
+<p>Cloud services are split into two layers, and they fail independently:</p>
+<ul>
+  <li>The <strong>data plane</strong> is the path that serves your actual requests: the object <code>GET</code>/<code>PUT</code>, the database read/write, the running query. This is what your users touch.</li>
+  <li>The <strong>control plane</strong> is the management path: provisioning new resources, scaling a cluster up, the web console, creating IAM roles, launching new instances.</li>
+</ul>
+
+<p>The crucial property: <strong>the data plane can keep serving while the control plane is down</strong>. In several real large-scale cloud outages, already-running instances and existing objects kept serving reads and writes fine, but you could not launch new instances, scale up, or even reliably load the console. The architectural lesson is twofold. First, do not put control-plane operations on your critical request path — if serving a user request requires provisioning a resource or calling the management API, a control-plane outage takes you down even though the data plane is healthy. Second, your <em>recovery</em> plans often lean on the control plane (auto-scaling, launching replacement nodes, failing over to another region), so a control-plane outage can disable exactly the mechanism you were counting on to ride out a problem. Drill this failure explicitly (lesson 28): assume the console and provisioning are gone, and check that your already-running fleet still serves.</p>
+
+<p><strong>Serverless and scale-to-zero.</strong> The cloud's extreme of compute/storage separation is <strong>serverless</strong> compute (AWS Lambda, Cloud Functions, Cloud Run): you supply a stateless function, the platform runs it on demand, and when no requests arrive it <strong>scales to zero</strong> — you run (and pay for) nothing. Paired with serverless data (DynamoDB on-demand, Aurora Serverless, BigQuery), an entire system can idle at near-zero cost and scale up instantly under load. The costs are real and specific: (1) <strong>cold starts</strong> — the first request after idle pays the time to spin up a fresh execution environment (tens to hundreds of ms, more for heavy runtimes), so latency is bursty; (2) <strong>statelessness</strong> — a function keeps nothing between invocations, so <em>all</em> state must live in the external data plane (object store, managed DB), which makes the "where is truth?" question below even sharper; and (3) the per-request and per-op pricing rewards exactly the few-large-operations discipline &sect;1 already forced on you.</p>
+
+<h2>6 &middot; Worked number: the egress bill of a cross-region copy</h2>
+
+<p><em>What this is: turning the &sect;4 egress constraint into dollars and milliseconds.</em></p>
+
+<p>Suppose you keep a 40 TB training-data lake in <code>us-east-1</code> and a stakeholder asks you to also stand up a copy in <code>eu-west-1</code> for a European team — and to refresh 5 TB of new data into it every month. Cross-region egress is billed at roughly <span class="math">0.02 dollars per GB</span> (rates vary by provider and region pair; use this as an order-of-magnitude figure). Note <span class="math">40 TB = 40,000 GB</span>.</p>
+
+<div class="ascii">  Initial copy:    40,000 GB × 0.02 $/GB  = 800 $        (one time)
+  Monthly refresh:  5,000 GB × 0.02 $/GB  = 100 $/month  → 1,200 $/year
+  ─────────────────────────────────────────────────────────────────
+  Year-1 egress just to MOVE the bytes:   800 + 1,200    = 2,000 $
+  (this is ON TOP of paying to STORE the second 40 TB copy in eu-west-1)</div>
+
+<p>Two things to read off this. First, the <em>movement</em> is a recurring cost separate from <em>storage</em>: you pay to store the second copy <em>and</em> ~1,200 dollars/year just to keep it fresh — and if instead of replicating you let the EU team query <code>us-east-1</code> directly, every query result also crosses the priced boundary, so a chatty analytics workload can quietly out-cost the replica. Second, latency: a cross-region round-trip is tens of milliseconds versus sub-millisecond within a region, so even ignoring money, serving EU reads from <code>us-east-1</code> means every read pays a trans-continental hop. Egress cost and cross-region latency together are <em>why</em> you co-locate compute with data and treat a second-region copy as a deliberate, budgeted disaster-recovery / latency decision — not a default. Scale this to petabytes and a careless cross-region or cross-cloud data flow becomes a six-figure line item.</p>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Control-plane outage.</strong> Console and provisioning are down; you can't launch instances, scale, or fail over — even though the data plane still serves. If recovery depends on the control plane, you're stuck. Drill it (lesson 28).</li>
+    <li><strong>Treating the object store like a local disk.</strong> Small random <code>GET</code>s (4 KB at a time) at ~50 ms each murder throughput and rack up per-op charges; the fix is large sequential reads and immutable, append-only layout (lesson 04).</li>
+    <li><strong>Assuming multi-object atomicity.</strong> S3 is read-after-write per object, not transactional across objects; a naive "write two objects" table update can be seen half-done. Use a table format's commit manifest.</li>
+    <li><strong>Surprise egress bill.</strong> A cross-region or cross-cloud data flow (replication, chatty queries, a backup to another provider) silently bills per GB; it can dwarf storage cost.</li>
+    <li><strong>Over-broad IAM.</strong> A public bucket or an over-permissioned role turns one compromised service into a full-account breach; least privilege is not optional.</li>
+    <li><strong>Cold-start latency.</strong> Serverless idles to zero, so the first request after quiet pays the spin-up; latency-sensitive paths need warm capacity.</li>
+    <li><strong>Silent lock-in.</strong> Proprietary managed surfaces (Aurora, Spanner, DynamoDB) make migration a project; you discover the portability cost only when you try to leave.</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Decision checklist</h3><ul>
+    <li>Is the workload write-heavy ingestion, wide analytical scans, or transactional point reads? &rarr; object store + table format, cloud warehouse, or managed OLTP DB respectively.</li>
+    <li>Are storage and compute on independent scaling axes here, and have you co-located compute with its data to avoid egress?</li>
+    <li>What is the durability/consistency contract you actually need, and does the chosen service meet it (single-object read-after-write vs multi-object atomicity)?</li>
+    <li>What did you delegate (backups, patching, failover) and what did you give up (control, portability, cost)? Is that trade right for this system's scale?</li>
+    <li>How large a failure must this survive — one AZ (cheap, same-region) or a whole region (egress + latency cost)? Place replicas accordingly.</li>
+    <li>Does any critical request path depend on the control plane? If so, remove that dependency.</li>
+    <li>Is IAM least-privilege, with no public buckets and scoped roles per service?</li>
+    <li>Have you estimated egress for every cross-region / cross-cloud data flow before committing to it?</li>
+  </ul></div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout">
+  <div class="label">Try it</div>
+  You are designing storage for an ML platform on a single cloud. There are three data systems: (a) a <strong>training-data lake</strong> of 200 TB of event logs and images, scanned in bulk by training jobs; (b) a low-latency <strong>online feature store</strong> read at inference time by model servers in two regions; (c) an <strong>experiment-metadata database</strong> (runs, metrics, model lineage) with transactional reads/writes from a dashboard. For each: pick object store / cloud warehouse / managed DB, justify it from the latency-throughput and durability/consistency profiles in this lesson, and say what you delegate. Then: the model servers in region B currently read the feature store in region A — estimate the egress and latency cost of that and propose a fix. Finally: write one sentence on what breaks if the cloud's control plane goes down for an hour, and whether your design still serves inferences.
+</div>
+
+<h2>Where this points next</h2>
+<p>This lesson handed durability, replication, and even failover to a provider — and the moment you do that, <em>where your data physically lives</em> and <em>who is allowed to touch it</em> stop being purely technical choices. A region is also a legal jurisdiction; an object store's deletion semantics are also a compliance obligation; an IAM policy is also an audit boundary. Lesson 25 takes that thread up directly: <strong>law, regulation, and ethics as an architecture input</strong> — data residency, the right to be deleted, retention requirements, and consent — treating these not as paperwork bolted on at the end but as constraints that shape the system the same way latency budgets and egress costs do.</p>
+
+<div class="callout">
+  <div class="label">Where is truth?</div>
+  <strong>System of record:</strong> the object store (for the data lake) or the managed database (for transactional state) — the cloud service is now the authoritative copy. <strong>Copies / derived views:</strong> cross-AZ replicas (managed for you, invisible behind the API) and any cross-region disaster-recovery copy or warehouse-side cache. <strong>Freshness budget:</strong> single-object read-after-write is immediate; cross-region replicas lag by the async-replication budget (lesson 08); serverless reads always go to the live data plane. <strong>Owner:</strong> the team's cloud account, scoped by IAM least-privilege — identity is the access boundary. <strong>Deletion path:</strong> object lifecycle / retention policies and managed-DB retention windows — deletion is delegated to the provider's lifecycle rules, which is exactly where the lesson-25 compliance obligations attach. <strong>Reconciliation / repair:</strong> the provider's internal anti-entropy keeps the AZ replicas whole; you reconcile by re-running ingestion or restoring from a snapshot. <strong>Evidence it is correct:</strong> the durability contract (the eleven-nines model), point-in-time backups you can actually restore-test, and verified cross-AZ / cross-region replication — durability you can demonstrate by recovering, not just by trusting the number.
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  In the cloud the disk is a network service, and that one fact reshapes everything earlier lessons assumed. <strong>Object stores</strong> (S3/GCS/Blob) separate storage from compute, store immutable whole objects with delegated eleven-nines durability and (now) single-object read-after-write consistency, and have a high-latency (~50 ms/op), high-bandwidth profile that <em>forces</em> the append-only, large-sequential, never-overwrite design you learned for LSM-trees and Parquet in lesson 04. <strong>Cloud warehouses</strong> (Snowflake/BigQuery) make storage/compute separation a product: rent query compute by the second over shared columnar data (lesson 21). <strong>Managed databases</strong> (RDS/Aurora/Spanner/DynamoDB) are operational delegation — you hand off backups, patching, and failover (lesson 08), and give up control, portability, and some cost. Cloud-only constraints become real architecture: <strong>egress</strong> is a per-GB bill that pushes you to co-locate compute with data (40 TB cross-region costs hundreds to thousands of dollars just to move), <strong>IAM</strong> makes least-privilege identity the access boundary, and <strong>regions / AZs</strong> are how you place data for latency and blast-radius isolation. Critically, the <strong>data plane keeps serving while the control plane (provisioning, console, scaling) is down</strong> — so keep control-plane calls off the critical path and drill that outage. <strong>Serverless</strong> scales to zero at the cost of cold starts and forced statelessness. Truth now lives in a service you don't operate; durability is delegated and proven by restore tests, deletion runs through lifecycle policies — which is exactly where lesson 25's legal and ethical obligations attach.
+</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>What actually changes when "the disk" becomes an object store? <em>(&sect;1 — storage/compute separation, delegated eleven-nines durability, single-object read-after-write consistency, and a high-latency/high-bandwidth/immutable/whole-object profile; no in-place update and no single owner.)</em></li>
+  <li>How does the object-store latency profile change storage-engine design? <em>(&sect;1 — ~50 ms per op vs ~0.1 ms on SSD forces few large sequential reads and append-only immutable writes; this is exactly the LSM-tree/Parquet design from lesson 04, with immutability now a hard requirement and the table's current state tracked by an external commit manifest, e.g. Iceberg/Delta.)</em></li>
+  <li>S3 consistency — what guarantee, and what is it not? <em>(&sect;1 — strong read-after-write on a single object since 2020 (a GET after a successful PUT sees the write); it is NOT multi-object atomicity, so cross-object table updates need a table-format commit protocol.)</em></li>
+  <li>Why do cloud warehouses scale compute and storage independently, and why does that matter? <em>(&sect;2 — tables are columnar objects in the store; you rent ephemeral query clusters that read them, so 500 TB can be queried by a tiny cluster overnight and a huge one at 9am, and two teams query the same data without CPU contention.)</em></li>
+  <li>Managed database — what do you gain and give up? <em>(&sect;3 — gain: delegated backups/PITR, patching, failover, scaling; give up: control, portability (lock-in), cost premium, transparency. The right call is per-system and scale-dependent.)</em></li>
+  <li>Why is egress an architecture constraint, with a number? <em>(&sect;4, &sect;6 — out-of-region/out-of-cloud data is billed per GB (~0.02 $/GB); copying 40 TB cross-region is ~800 $ once plus ~1,200 $/yr to refresh, on top of storing the copy, and adds tens of ms latency — so you co-locate compute with data and budget any cross-region copy deliberately.)</em></li>
+  <li>Control plane vs data plane — why care? <em>(&sect;5 — the data plane (serving GETs/reads/queries) can stay up while the control plane (provisioning, console, scaling) is down; so keep control-plane calls off the critical request path and don't let recovery depend on the layer that's failing — and drill it, lesson 28.)</em></li>
+  <li>What does serverless buy and cost? <em>(&sect;5 — scale-to-zero (pay nothing idle, scale instantly) at the cost of cold-start latency on the first request and forced statelessness (all state in the external data plane).)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="23_feature_stores_ml_pipelines.html"><span class="dir">&larr; Previous</span><span class="ttl">23 &middot; Feature Stores and ML Data Pipelines</span></a>
+  <a class="next" href="25_law_regulation_ethics.html"><span class="dir">Next &rarr;</span><span class="ttl">25 &middot; Law, Regulation, and Ethics as Architecture Input</span></a>
+</footer>
+</main>
+<!-- reviewed:v1 -->
+</body>
+</html>

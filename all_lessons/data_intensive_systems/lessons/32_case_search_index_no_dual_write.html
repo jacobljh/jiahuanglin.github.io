@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>32 &middot; Interview Case: Search Index from Postgres without Dual Writes</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* Case template: the four-bucket answer rubric reuses the lesson-grid as a 2x2. */
+  .rubric-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .rubric-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .rubric-card h3 { margin-top: 0; }
+  .rubric-card.good { border-left: 4px solid var(--ok); }
+  .rubric-card.better { border-left: 4px solid var(--accent); }
+  .rubric-card.bad { border-left: 4px solid var(--bad); }
+  .rubric-card.followup { border-left: 4px solid var(--accent-2, #8b5cf6); }
+  @media (max-width: 720px) { .rubric-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">data_intensive_systems</a>
+    <span class="crumb">/</span>
+    <span class="crumb">32 &middot; case: no dual write</span>
+    <span class="step-pill">lesson 33 / 35 &middot; ~18 min</span>
+  </div>
+</header>
+
+<main>
+
+<p class="kicker">Part 12 · Applied & interviews</p>
+<h1>Interview Case: Search Index from Postgres without Dual Writes</h1>
+<p class="subtitle">The feature-store case (lesson 31) kept an online store and an offline store derived from one source of truth, and warned that the moment you maintain two copies of data the obvious-looking shortcut — have the application write both directly — is the single most common derived-data mistake there is. This case takes that trap head-on. You have a Postgres system of record and you need full-text / relevance search on top of it, served by Elasticsearch (or OpenSearch). The naive design writes the row to Postgres and indexes the document in Elasticsearch in the same request handler: a <strong>dual write</strong>. We will show exactly why that diverges, then build the correct design — drive the index from Postgres's change stream — and put real numbers on the lag budget and the reindex time.</p>
+
+<div class="callout source-note"><div class="label">DDIA source</div>Arc drawn from Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, Chapter 11 (Stream processing — change data capture) and Chapter 12 (The future of data systems — derived data, maintaining materialized views, the "system of record vs derived data" split). The dual-write divergence argument and the log-driven fix are the spine of Ch.12; CDC and the outbox pattern are from Ch.11. Original synthesis; the Postgres-to-Elasticsearch framing is ours.</div>
+
+<div class="callout"><div class="label">Linear position</div>
+<strong>Prerequisite:</strong> Lesson 19 (stream processing, CDC and the durable partitioned log), lesson 20 (derived data — dual-write divergence and the system-of-record vs derived-data split), lesson 14 (messaging, idempotency and the transaction boundary — the outbox pattern), lesson 13 (transactions — no atomicity across two systems), and the search/vector-index mechanisms in lesson 22. The case format follows lessons 29–31.<br>
+<strong>New capability:</strong> Diagnose why a dual write diverges (partial failure + races + no cross-system atomicity), and design a log-driven derived index — CDC or outbox &rarr; stream &rarr; idempotent indexer — with a quantified lag budget and a reindex/replay plan.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Six sections, following the shared case template. (1) The prompt, requirements, and the clarifying questions a strong candidate asks. (2) Back-of-envelope sizing: write QPS, CDC throughput, index lag budget, reindex time. (3) The design walk — first <em>why</em> the dual write diverges (the broken timeline), then the fix: change stream &rarr; log &rarr; idempotent upsert indexer, with the corrected timeline and an ASCII architecture diagram. (4) A concrete failure timeline for the log-driven design and its mitigation. (5) The four-bucket answer rubric. (6) Takeaway and interview prompts.</div>
+
+<h2>1 &middot; The prompt, requirements, and clarifying questions</h2>
+
+<p><strong>Prompt.</strong> "We store products (or documents, listings, messages — pick your domain) in Postgres, which is our system of record. Product managers want fast full-text and relevance search: typo tolerance, faceting, ranking. Postgres' built-in text search won't cut it at our scale, so we'll use Elasticsearch. Design how the search index stays in sync with Postgres. The data must never silently diverge."</p>
+
+<p>The phrase <em>system of record</em> is the whole game. Postgres holds the authoritative state; Elasticsearch is <strong>derived data</strong> — a denormalized, query-optimized copy that can always, in principle, be rebuilt from the source (lesson 20). Naming that split out loud is the first senior signal: it tells the interviewer you know the index is disposable and the database is not, which dictates every later decision.</p>
+
+<table>
+  <thead><tr><th>Functional</th><th>Non-functional</th></tr></thead>
+  <tbody>
+    <tr><td>Search returns results that reflect recent Postgres writes (create, update, delete).</td><td><strong>No silent divergence</strong> — every committed Postgres write eventually appears in the index, exactly once in effect.</td></tr>
+    <tr><td>Deletes and field edits propagate (a deleted product must disappear from search).</td><td><strong>Bounded staleness</strong> — the index trails the DB by a known, small lag (the lag budget).</td></tr>
+    <tr><td>Full reindex / backfill on demand (mapping change, new analyzer, corruption).</td><td>The sync path must survive indexer crashes, Elasticsearch downtime, and DB failover without losing or duplicating writes.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout"><div class="label">Clarifying questions a strong candidate asks first</div>
+<ul>
+<li><strong>How fresh must search be?</strong> Is a few seconds of staleness acceptable (almost always yes for search), or does the product require read-your-writes (you create a listing and must immediately find it)? This sets the lag budget and whether you also need a synchronous fallback for the author's own view.</li>
+<li><strong>Is Elasticsearch <em>ever</em> a source of truth?</strong> It must not be. Confirm it is purely derived — if anyone is treating search hits as authoritative state, that's a separate problem.</li>
+<li><strong>What is the write rate and the document size?</strong> Drives CDC throughput and reindex time (section 2).</li>
+<li><strong>What triggers a full reindex, and how often?</strong> Mapping/analyzer changes, schema evolution (lesson 05), or recovery. The replay design must make this routine, not heroic.</li>
+<li><strong>Can we add to the write path?</strong> Outbox needs an extra table write inside the app's transaction; logical-decoding CDC needs replication-slot access on the DB. Which is politically/operationally available?</li>
+</ul></div>
+
+<h2>2 &middot; Back-of-envelope sizing</h2>
+
+<p>Concrete numbers turn "it should be fast" into a defensible design. Assume a catalog of <span class="math">50,000,000</span> products, each indexed document <span class="math">~2 KB</span>, and a write rate that peaks at <span class="math">2,000</span> row changes per second (creates + updates + deletes).</p>
+
+<div class="callout"><div class="label">Worked numbers</div>
+<strong>(a) CDC throughput.</strong> Every committed row change becomes one change event. At <span class="math">2,000</span> changes/s and ~2 KB/doc, the change stream carries <span class="math">2,000 × 2 KB = 4 MB/s</span> &asymp; <span class="math">32 Mbps</span>. Trivial for Kafka (lesson 19) and for one indexer process; a single partition handles this, though we shard for headroom and parallelism.<br><br>
+<strong>(b) Index lag budget.</strong> Lag = time from Postgres COMMIT to the document being searchable. Decompose it:<br>
+&nbsp;&nbsp;&bull; logical decoding emits the event: ~tens of ms after commit.<br>
+&nbsp;&nbsp;&bull; Kafka produce + consumer poll: ~10–50 ms.<br>
+&nbsp;&nbsp;&bull; indexer batches + Elasticsearch <code>_bulk</code> + refresh interval: Elasticsearch is <strong>near-real-time</strong>, not real-time — a new doc is searchable only after a <em>refresh</em>, default every <span class="math">1 s</span>.<br>
+So a realistic steady-state budget is <strong>p50 &asymp; 0.5–1 s, p99 &asymp; 2–3 s</strong>. We will commit to an SLO of <strong>p99 lag &le; 5 s</strong> and alert when sustained lag exceeds it — that alert is how "no silent divergence" becomes observable.<br><br>
+<strong>(c) Reindex / backfill time.</strong> Full corpus = <span class="math">50,000,000 × 2 KB = 100 GB</span>. If one indexer sustains <span class="math">10,000</span> docs/s via <code>_bulk</code>, a single stream rebuilds in <span class="math">50,000,000 / 10,000 = 5,000 s &asymp; 1.4 h</span>. Run <span class="math">8</span> parallel indexers (one per partition) and it drops to <span class="math">~10 min</span>. This is the number that tells the interviewer a reindex is a routine operation, not a disaster.<br><br>
+<strong>(d) Replay / catch-up after an outage.</strong> If the indexer is down for <span class="math">10 min</span> at <span class="math">2,000</span> events/s, the backlog is <span class="math">1,200,000</span> events. Catch-up rate = consume rate &minus; produce rate. If the indexer drains at <span class="math">10,000</span>/s while new events arrive at <span class="math">2,000</span>/s, net drain = <span class="math">8,000</span>/s, so catch-up time = <span class="math">1,200,000 / 8,000 = 150 s &asymp; 2.5 min</span>. (This is the CDC-backlog drill from lesson 28.)</div>
+
+<h2>3 &middot; Design walk — why the dual write diverges, then the fix</h2>
+
+<h3>The trap: the application writes both systems directly</h3>
+
+<p>The design every junior reaches for: in one request handler, write the row to Postgres and then call the Elasticsearch index API. Two writes, two systems, one handler. It looks atomic in the code. It is not. There is <strong>no transaction that spans Postgres and Elasticsearch</strong> (lesson 13 — atomicity is a property of one system's commit; there is no cross-system two-phase commit here, and even if there were, it would block on either system's failure). So the pair of writes can fail independently, and the order in which concurrent writers hit the two systems is not coordinated. Three concrete ways it diverges:</p>
+
+<ul>
+<li><strong>Partial failure.</strong> Postgres commit succeeds, then the Elasticsearch call times out (or the app crashes between the two). The row exists; the document does not. Search permanently misses it — silent divergence (lesson 20).</li>
+<li><strong>Reverse partial failure.</strong> Elasticsearch indexes first, then the Postgres commit fails / rolls back. Now search returns a product that does not exist in the source of truth — a phantom hit.</li>
+<li><strong>Concurrent-write race.</strong> Two writers update the same row. Writer A wins in Postgres (A is the final DB state) but, because the two systems are unordered, writer B's document wins in Elasticsearch. The index now shows a value the database never settled on, and nothing will ever correct it.</li>
+</ul>
+
+<div class="ascii">DUAL WRITE (broken) — the application writes both systems directly
+
+  time ->
+  app      |  BEGIN; write row; COMMIT(ok) --X  index(doc) TIMEOUT
+  postgres |  ......... row v2 committed .........................   (row = v2)
+  elastic  |  ................................. (never updated) ...   (doc = v1)
+                                                  ^
+                                          partial failure: COMMIT ok,
+                                          index call lost. NO retry that
+                                          is safe, because the app already
+                                          returned. Result: DB=v2, index=v1
+                                          FOREVER. Divergence is silent.
+
+  Concurrent-write race (two writers W_A, W_B on the same row):
+  postgres |  W_A then W_B  ->  final row = v_B
+  elastic  |  W_B then W_A  ->  final doc = v_A     (orders differ! no
+                                                     cross-system ordering)
+  Result: DB says v_B, index says v_A. Permanent, undetectable skew.</div>
+
+<p>The root cause is not "we forgot a retry." Retries from the app can't fix it: a retry of the index call after the app already returned is best-effort and itself can fail; and a retry can't repair the race, because there is no agreed order. The real fix is to stop treating the two writes as peers. <strong>One system must be the source of truth, and the other must be derived from its change stream</strong> (lessons 19–20). Then there is exactly one ordered sequence of events — the database's commit log — and the index is a deterministic function of replaying that log.</p>
+
+<h3>The fix: drive the index from Postgres' change stream</h3>
+
+<p>Make Postgres the single writer the app talks to. Capture every committed change as an ordered event, put it on a durable log, and have an idempotent indexer apply it to Elasticsearch. Two equivalent ways to get the change stream:</p>
+
+<div class="topic-grid">
+  <div class="topic-card">
+    <div class="k">CDC via logical decoding</div>
+    <div class="v"><strong>Change data capture</strong> reads Postgres' write-ahead log (the WAL — the ordered durable log from lesson 03) through a <em>logical replication slot</em> and emits a row-level change event per commit (Debezium is the common connector). No app change; captures <em>every</em> write including ones outside your app. Needs replication-slot access and slot/retention care so the WAL isn't pruned before CDC reads it.</div>
+  </div>
+  <div class="topic-card">
+    <div class="k">Transactional outbox</div>
+    <div class="v">In the <em>same transaction</em> that writes the row, the app also inserts a row into an <code>outbox</code> table describing the change (the outbox pattern from lesson 14). Because it's one transaction, the outbox row commits if and only if the data row commits — atomicity restored, no dual write. A relay process then tails the outbox (often itself via CDC) onto the log. Needs an app-code change but no special DB privileges.</div>
+  </div>
+</div>
+
+<p>Both share the key property: the event is written <em>atomically with</em> the source-of-truth commit (it is the WAL itself, or a row in the same transaction), so there is no window where the DB committed but the event was lost. From there the pipeline is one direction only:</p>
+
+<div class="ascii">LOG-DRIVEN (correct) — index is a derived view of the DB's change stream
+
+   app  ──BEGIN; write row [+ outbox row]; COMMIT──►  ┌─────────────┐
+                                                       │  POSTGRES   │  system of record
+                                                       │  (WAL log)  │
+                                                       └──────┬──────┘
+                                  logical decoding /          │  one ordered
+                                  outbox relay (Debezium)     │  stream of commits
+                                                       ┌──────▼──────┐
+                                                       │  KAFKA      │  durable partitioned
+                                                       │  topic      │  log (lesson 19),
+                                                       │ key=row id  │  ordered per key
+                                                       └──────┬──────┘
+                                       at-least-once delivery │  consumer offset
+                                                       ┌──────▼──────┐
+                                                       │  INDEXER    │  idempotent:
+                                                       │  _bulk      │  UPSERT by doc id,
+                                                       │  upsert     │  drop stale versions
+                                                       └──────┬──────┘
+                                                       ┌──────▼──────┐
+                                                       │ ELASTICSEARCH│ derived index
+                                                       └─────────────┘  (rebuildable!)
+
+  Corrected timeline for the same partial failure:
+  postgres |  COMMIT row v2  → WAL event e_v2 durably recorded
+  kafka    |  e_v2 enqueued (survives indexer crash; offset not advanced)
+  indexer  |  CRASH before applying e_v2 ... restart ... re-reads e_v2
+  elastic  |  UPSERT doc=v2  (idempotent: applying e_v2 twice = once)
+  Result: DB=v2, index=v2. The crash delayed the index; it did not diverge it.</div>
+
+<p><strong>Why this removes all three divergences.</strong> (1) <em>Partial failure</em> is gone: the event is part of the commit, and Kafka holds it durably until the indexer acknowledges by advancing its offset — a crash just means re-delivery, never loss. (2) The <em>reverse</em> failure is gone: nothing is indexed unless the DB committed, because the event <em>is</em> the commit. (3) The <em>race</em> is gone: all changes to one row carry the same Kafka key, so they land in one partition and are delivered <strong>in commit order</strong> (lesson 19 — ordering is per-key within a partition); the indexer applies them in that order, and the index converges to the database's final state.</p>
+
+<h3>Idempotent upserts — the property that makes at-least-once safe</h3>
+
+<p>Kafka (and CDC) give <strong>at-least-once</strong> delivery: after a crash, the indexer may re-receive events it already applied. So apply must be <strong>idempotent</strong> — applying the same event twice has the same effect as once. Two mechanisms, used together:</p>
+<ul>
+<li><strong>Upsert by primary key.</strong> Index the document under a deterministic <code>_id</code> = the Postgres primary key. An upsert (index-or-replace) of the same id with the same content is a no-op the second time. A delete event becomes a delete-by-id, also idempotent (deleting an absent doc is a no-op).</li>
+<li><strong>Version guard against reordering / stale replays.</strong> Carry a monotonic version on each event — the Postgres LSN (log sequence number) or a row <code>updated_at</code>/version column — and use Elasticsearch external versioning (<code>version_type=external</code>) so an <em>older</em> event can never overwrite a newer document. This protects against a delayed redelivery landing after a newer write.</li>
+</ul>
+
+<h3>Reindex and backfill from the log</h3>
+
+<p>Because the index is a pure function of the change stream, rebuilding it is routine. To change the mapping/analyzer or recover from corruption: create a new index, replay from a snapshot/initial-load of the table (CDC connectors emit an initial snapshot, then stream the tail) into the new index while live events keep flowing, then atomically flip an Elasticsearch <strong>alias</strong> from the old index to the new one. No downtime, no dual write — the old index keeps serving reads until the flip. The sizing in section 2(c) said this is ~10 minutes with 8 parallel indexers on 100 GB; that is what makes "just reindex" an acceptable answer to almost any index-level problem.</p>
+
+<h2>4 &middot; Failure timeline for the log-driven design</h2>
+
+<p>The dual-write timeline is in section 3. Here is the failure that actually matters once you go log-driven — it is a <em>lag</em> problem, not a <em>divergence</em> problem, which is exactly the trade you wanted.</p>
+
+<div class="ascii">FAILURE: Elasticsearch cluster is down for 8 minutes; CDC keeps producing
+
+  t0      ES cluster unavailable (e.g. rolling restart gone wrong)
+  t0..t8m indexer's _bulk calls fail -> indexer does NOT advance its Kafka
+          offset (commit offset only after a successful bulk). Events pile
+          up in Kafka, which is durable and retains them. Backlog grows at
+          2,000 ev/s -> ~960,000 events buffered. NOTHING is lost.
+  t8m     ES recovers. Indexer resumes from its last committed offset.
+  t8m..   Drains backlog at 10,000/s while 2,000/s still arrive: net 8,000/s.
+          catch-up = 960,000 / 8,000 = 120 s = 2 min (lesson 28 drill).
+  t10m    Lag back under the 5 s SLO. Index is fully consistent with DB.
+
+  Root cause: a derived store was unavailable.
+  User-visible symptom: search results stale by up to ~10 min for affected
+    rows (NOT wrong — just behind). Reads still served from the old index.
+  Why it self-heals: the durable log decouples producer from consumer;
+    the offset is the only state, and it only moves on success.</div>
+
+<p>The mitigations that make this safe rather than scary: <strong>commit the Kafka offset only after a successful <code>_bulk</code></strong> (so a crash mid-batch re-delivers, never skips); <strong>retain Kafka long enough</strong> to cover your worst tolerated outage plus reindex margin (e.g. 7 days &rarr; days of buffer at this rate); <strong>guard the replication slot</strong> so Postgres doesn't recycle WAL the CDC reader still needs (an unbounded slot can fill the DB disk — monitor slot lag); and <strong>alert on sustained lag</strong> past the SLO, since lag is now your single, observable health signal — the thing dual writes could never give you.</p>
+
+<h2>5 &middot; Answer rubric</h2>
+
+<div class="rubric-grid">
+  <div class="rubric-card good"><h3>Good answer (baseline)</h3><ul>
+    <li>Names Postgres as system of record and Elasticsearch as <em>derived</em>, rebuildable data.</li>
+    <li>Identifies the dual write as the problem and explains it diverges on partial failure (one write succeeds, the other doesn't).</li>
+    <li>Proposes driving the index from a change stream (CDC) onto a log, with an indexer consuming it.</li>
+    <li>Knows search can be eventually consistent — a few seconds of lag is acceptable.</li>
+  </ul></div>
+  <div class="rubric-card better"><h3>Better answer (senior signal)</h3><ul>
+    <li>Explains <em>all three</em> divergence modes — partial failure both directions, and the unordered concurrent-write race — and ties them to "no cross-system atomicity" (lesson 13).</li>
+    <li>Contrasts CDC-via-logical-decoding vs the transactional outbox and picks based on DB access and app-change appetite.</li>
+    <li>Makes apply <strong>idempotent</strong>: upsert by primary key + external version guard (LSN/updated_at) so at-least-once and reordering are safe.</li>
+    <li>Quantifies the lag budget (refresh interval &rarr; p99 lag), reindex time, and backlog catch-up; commits to a lag SLO and alerts on it.</li>
+    <li>Reindex via snapshot + tail into a new index, flip an alias atomically — no downtime.</li>
+  </ul></div>
+  <div class="rubric-card bad"><h3>Red flags (what sinks a candidate)</h3><ul>
+    <li>"Just write to both in the same function" — no awareness it isn't atomic.</li>
+    <li>"Wrap both writes in a distributed transaction / 2PC across Postgres and ES" — ES has no such protocol, and 2PC blocks on failure anyway.</li>
+    <li>Retry the failed index call from the app and call it solved (ignores crashes and the race).</li>
+    <li>Treats Elasticsearch as a source of truth, or has no story for rebuilding the index.</li>
+    <li>No idempotency, so replays double-apply; or no ordering, so concurrent writes corrupt the index.</li>
+    <li>Polls Postgres with <code>SELECT ... WHERE updated_at &gt; last</code> and thinks it's equivalent — misses deletes, misses sub-second changes, and adds DB load.</li>
+  </ul></div>
+  <div class="rubric-card followup"><h3>Likely follow-ups (the interviewer's next probes)</h3><ul>
+    <li>"The author creates a listing and must see it in search immediately — but lag is 2 s. How?" (Read-your-writes: serve the author's own just-written doc from Postgres directly, or do a synchronous index for that one doc; relax for everyone else.)</li>
+    <li>"How do you reindex with a new analyzer without downtime?" (New index + alias flip; section 3.)</li>
+    <li>"CDC connector is down for an hour — what breaks first?" (Replication-slot WAL retention fills the DB disk; monitor slot lag, alert, cap retention vs. disk.)</li>
+    <li>"How do you know the index hasn't silently diverged?" (Lag SLO + periodic count/checksum reconciliation between DB and index; divergence triggers a targeted reindex.)</li>
+    <li>"One document references many rows (product + its reviews) — how does a review edit reindex the product?" (Denormalization on the stream: a join/enrichment step, or key both event types to the product id.)</li>
+  </ul></div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>You run the same pipeline for <strong>messages</strong> in a chat product: <span class="math">200,000,000</span> messages, ~1 KB each, peak write rate <span class="math">5,000</span> changes/s, served by OpenSearch. (a) Compute the CDC throughput and the full-reindex time with 1 vs 10 parallel indexers. (b) Edits and deletes (redactions) must vanish from search; show why a polling <code>updated_at</code> sync would miss a redaction and why CDC + delete-by-id does not. (c) The OpenSearch cluster is down for 20 minutes; compute the backlog and the catch-up time at a 12,000/s drain rate, and state the Kafka retention you'd set so nothing is lost. (d) A redaction event is redelivered after a later edit of the same message — explain how your version guard prevents the redaction from un-editing the message.</div>
+
+<h2>Where this points next</h2>
+<p>This case turned a search index into a derived view of an ordered change stream — the database stays the single source of truth, and the index is a deterministic, rebuildable function of its log. The next case (lesson 33, the model registry) inverts one assumption: there, the artifact store and metadata <em>are</em> the system of record, and the hard problem isn't keeping a derived copy fresh but making a single pointer — "which model is in production" — flip <strong>atomically and linearizably</strong> (lessons 16–17), with immutable versions and an audit trail behind it. Same family of ideas — logs, derived data, ordering — pointed at a write-once, promote-atomically workload instead of a continuously-synced one.</p>
+
+<div class="callout"><div class="label">Where is truth?</div>
+<strong>System of record:</strong> Postgres and its WAL — the authoritative, ordered sequence of every committed change. <strong>Copies / derived views:</strong> the Elasticsearch index (a denormalized, query-optimized materialized view) and the Kafka topic that carries the change stream between them. <strong>Freshness budget:</strong> p99 lag &le; 5 s from COMMIT to searchable, dominated by Elasticsearch's ~1 s refresh interval plus the log hops; this is the explicit, alertable SLO. <strong>Owner:</strong> the application/data team owns Postgres; the search-platform team owns the indexer and the index. <strong>Deletion path:</strong> a Postgres delete emits a delete event that the indexer applies as an idempotent delete-by-id, so a removed row reliably disappears from search (a polling sync would miss this — deletes leave no <code>updated_at</code> trail). <strong>Reconciliation/repair:</strong> the index is a pure function of the change stream, so any drift is repaired by snapshot-and-replay into a fresh index and an atomic alias flip (~10 min on 100 GB at 8-way parallelism); a CDC/indexer outage becomes recoverable lag, never loss, because the durable log retains events until the offset advances on success. <strong>Evidence of correctness:</strong> the lag SLO plus periodic count/checksum reconciliation between Postgres and the index turn "no silent divergence" from a hope into an observable, alertable property.</div>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+A search index over a Postgres system of record is <em>derived data</em>: keep it fresh by deriving it from the database's change stream, never by writing both systems from the application. The dual write diverges because there is no atomicity across two systems (lesson 13) — a partial failure leaves the index ahead or behind forever, and concurrent writers can land in different orders, so the two stores permanently disagree and you can't even see it. The fix is one ordered pipeline: capture every commit via <strong>CDC (logical decoding)</strong> or the <strong>transactional outbox</strong> so the event is atomic with the commit, put it on a durable per-key-ordered log (Kafka, lesson 19), and apply it with an <strong>idempotent upsert</strong> (primary-key id + external version guard) so at-least-once delivery and reordering are safe. The index now trails the DB by a small, <em>quantified, alertable</em> lag (p99 &le; a few seconds, gated by the refresh interval), reindex is a routine snapshot-and-replay with an alias flip (~10 min on 100 GB at 8-way parallelism), and an outage becomes recoverable lag — never silent divergence.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>Why does writing Postgres and Elasticsearch in the same handler diverge? <em>(§3 — no transaction spans two systems (lesson 13): a partial failure indexes ahead of or behind the DB permanently, and concurrent writers can hit the two systems in different orders, so the stores disagree with no way to notice.)</em></li>
+  <li>What is the correct architecture, in one line? <em>(§3 — Postgres as source of truth &rarr; CDC/outbox captures each commit &rarr; durable log (Kafka), keyed by row id for per-key ordering &rarr; idempotent upsert indexer &rarr; Elasticsearch as a rebuildable derived view.)</em></li>
+  <li>CDC via logical decoding vs the transactional outbox — when each? <em>(§3 — CDC needs replication-slot access but no app change and captures every write; outbox needs an app-code change (extra row in the same transaction) but no special DB privilege. Both make the event atomic with the commit.)</em></li>
+  <li>Why must the indexer be idempotent, and how? <em>(§3 — the log delivers at-least-once, so replays must be safe: upsert by the Postgres primary key (deletes = delete-by-id) plus an external version guard (LSN/updated_at) so a stale or reordered event can't overwrite a newer doc.)</em></li>
+  <li>What is the index lag budget and what dominates it? <em>(§2 — p50 ~0.5–1 s, p99 ~2–3 s; dominated by Elasticsearch's near-real-time refresh interval (default 1 s) plus log produce/consume hops. Commit to a p99 &le; 5 s SLO and alert on it.)</em></li>
+  <li>Elasticsearch is down for 8 minutes — what happens? <em>(§4 — the indexer stops advancing its offset, events buffer durably in Kafka (nothing lost), then drain at net 8,000/s for ~2 min after recovery. The outage becomes recoverable lag, not divergence.)</em></li>
+  <li>How do you reindex with a new mapping without downtime? <em>(§3 — snapshot/initial-load + tail the live stream into a new index while the old one serves reads, then atomically flip an alias; ~10 min on 100 GB with 8 parallel indexers from §2.)</em></li>
+  <li>How do you serve read-your-writes for the author of a just-created row when lag is 2 s? <em>(§5 — serve the author's own write from Postgres directly (or synchronously index that one doc) and let everyone else read the eventually-consistent index.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="31_case_feature_store.html"><span class="dir">&larr; Previous</span><span class="ttl">31 &middot; Case: ML Feature Store</span></a>
+  <a class="next" href="33_case_model_registry.html"><span class="dir">Next &rarr;</span><span class="ttl">33 &middot; Case: Model Registry</span></a>
+</footer>
+
+</main>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

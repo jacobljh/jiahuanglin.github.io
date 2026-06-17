@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>14 &middot; Messaging, Idempotency, and the Transaction Boundary</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">data_intensive_systems</a><span class="crumb">/</span><span class="crumb">14 &middot; messaging boundary</span><span class="step-pill">lesson 15 / 35 &middot; ~15 min</span></div></header>
+<main>
+<p class="kicker">Part 6 · Invariants under concurrency</p>
+<h1>Messaging, Idempotency, and the Transaction Boundary</h1>
+<p class="subtitle">Lesson 13 gave the application a clean fiction: wrap a set of reads and writes in a transaction and a chosen set of concurrency and crash faults simply do not happen — atomicity, isolation, and durability all hold <em>inside one database</em>. But a real operation rarely stays inside one database. "Place the order" writes an <code>orders</code> row <em>and</em> publishes an <code>order_placed</code> event to Kafka so the warehouse, the billing service, and the analytics pipeline can react. "Register the user" writes a <code>users</code> row <em>and</em> calls a remote email service. The instant an operation touches a database <em>and</em> a message broker <em>and</em> a second service, the ACID box no longer wraps the whole thing — there is no transaction that spans them. A crash between the two steps leaves an order with no event, or an event for an order that was rolled back. This lesson is about keeping invariants alive across that boundary, where ACID stops.</p>
+
+<div class="callout source-note"><div class="label">DDIA source</div>Arc drawn from Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, Chapter 7 (Transactions — and specifically why a single-system transaction cannot be stretched across a broker or a remote service) and Chapter 11 (Stream Processing — exactly-once / effectively-once message processing, idempotence, and the read-process-write boundary). Original synthesis; the outbox/inbox framing and the ML-infra examples are ours.</div>
+
+<div class="callout"><div class="label">Linear position</div>
+<strong>Prerequisite:</strong> Lesson 13 — a transaction is the unit that makes a bundle of reads and writes atomic, isolated, and durable <em>within one database</em>; you can name the anomalies and know that the C in ACID is the application's invariant. We reuse exactly that and ask the next question: what happens to the invariant when the operation also has to tell a <em>second</em> system?<br>
+<strong>New capability:</strong> Diagnose the dual-write / dual-system boundary problem, design the <strong>outbox pattern</strong> (one local transaction + an at-least-once relay) so a database write and a published message can never disagree, make a consumer safe to re-deliver with <strong>idempotency keys</strong> and an <strong>inbox</strong>, state precisely what "exactly-once" can and cannot mean (it is <em>effectively-once</em> = at-least-once delivery plus idempotent processing), and pick a <strong>saga</strong> or a <strong>durable workflow engine</strong> for multi-step cross-system operations that must survive a crash mid-flight.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Six moves. (1) Name the boundary problem precisely: there is no ACID transaction across a database and a broker, so "write the DB then publish" can fail in the gap and lose or phantom a message. (2) Say why the obvious fix — a distributed transaction / two-phase commit across both systems — is usually avoided (blocking, coupling), pointing forward to lesson 17 for the mechanics. (3) Build the <strong>outbox pattern</strong>: write the business row and an outbox event row in <em>one</em> local transaction, then a relay tails the outbox and publishes — turning two systems into one atomic local write plus an at-least-once relay. (4) Make the consumer safe with the <strong>inbox / dedup</strong> pattern and <strong>idempotency keys</strong>, with a worked duplicate-rate number. (5) Pin down <strong>exactly-once</strong> as a scoped guarantee — effectively-once — and link it to stream processing (lesson 19). (6) Stretch to multi-step operations: <strong>sagas</strong> with compensations and <strong>durable workflow engines</strong> that persist progress so a crash resumes rather than restarts. Then failure modes, the "Where is truth?" artifact, and the hand-off to partial failure and clocks.</div>
+
+<h2>1 · The boundary problem: there is no transaction across two systems</h2>
+
+<p><em>What this is: why "write the DB, then publish a message" is not atomic, and the two ways it breaks.</em></p>
+
+<p>A transaction (lesson 13) is a property of <em>one</em> resource manager — one database, with one commit log, one lock manager, one notion of abort. The moment your operation has to update a database <em>and</em> hand a message to Kafka (or call a second service over HTTP), you have two independent systems that commit independently, and nothing forces their two outcomes to agree. The naive code looks innocent:</p>
+
+<div class="ascii">the "dual write" — looks atomic, is not
+
+  def place_order(o):
+      db.begin()
+      db.insert(orders, o)            # step A: durable in the DB
+      db.commit()                     #   <-- COMMIT POINT of system 1
+      broker.publish("order_placed", o)   # step B: durable in the broker
+                                          #   <-- COMMIT POINT of system 2
+
+  there are TWO commit points and a GAP between them. A crash, a network
+  drop, or a broker timeout in the gap leaves the two systems disagreeing:
+
+    crash AFTER db.commit, BEFORE publish   -> order exists, NO event
+                                               (LOST message: warehouse never ships)
+    publish succeeds, then db.commit fails  -> event exists, NO order
+       (if you reorder the two)               (PHANTOM message: ship a rolled-back order)
+    publish times out, you retry, first one  -> order exists, TWO events
+       actually went through                  (DUPLICATE message)</div>
+
+<p>There is no ordering of the two steps that is safe. Publish-then-write risks a <strong>phantom</strong> message (an event for a row that never committed); write-then-publish risks a <strong>lost</strong> message (a committed row no one is told about); and any retry of a step whose acknowledgement you did not see risks a <strong>duplicate</strong>. This is the <strong>dual-write problem</strong>, and it is the central failure that this lesson exists to fix. The deep reason: the C in ACID — the invariant — was "an <code>order_placed</code> event exists for every committed order, and only for committed orders," and that invariant now spans two systems, so no single transaction can enforce it.</p>
+
+<div class="callout warn"><div class="label">Why you can't just "make publish reliable"</div>
+Engineers reach for retries: if <code>publish</code> fails, retry until it succeeds. But the crash can happen <em>between</em> <code>db.commit</code> and the line that even attempts the publish — there is no durable record that a publish is owed, so after a restart the process has no idea it still has to send the event. Reliability of the <em>publish call</em> does not help; the gap is in <em>remembering that a publish is required at all</em>. The fix has to make "a message is owed" part of the same durable transaction as the business write. That is the outbox (§3).</div>
+
+<h2>2 · Why not a distributed transaction (2PC) across both systems?</h2>
+
+<p><em>What this is: the textbook fix that exists, and why production usually refuses it.</em></p>
+
+<p>There <em>is</em> a classical answer to "make two systems commit atomically": a <strong>distributed transaction</strong> using <strong>two-phase commit (2PC)</strong>. A coordinator asks every participant (the DB, the broker) to <em>prepare</em> — durably promise it <em>can</em> commit — and once all vote yes, tells them all to <em>commit</em>. If any votes no, all abort. Done correctly it gives genuine atomicity across heterogeneous systems. So why is it rare in modern stacks? Three reasons, and we only sketch them here because the mechanism is the subject of lesson 17.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">It blocks on the coordinator</div><div class="v">Between "prepared" and "commit/abort", every participant holds locks and cannot release them. If the coordinator crashes after collecting votes but before deciding, participants are stuck <em>in doubt</em> — locks held, rows frozen — until it recovers. A single coordinator becomes a correctness-critical single point that can stall many systems at once.</div></div>
+  <div class="topic-card"><div class="k">It couples independent systems</div><div class="v">2PC requires every participant to speak the same protocol (XA, or equivalent) and to expose a durable prepare phase. Most message brokers and most microservice APIs do not, and you do not <em>want</em> your database's availability tied to a remote email vendor's. Heterogeneous systems with independent operators are exactly where 2PC is most painful.</div></div>
+  <div class="topic-card"><div class="k">It scales and fails poorly</div><div class="v">Throughput drops with the slowest participant; every distributed transaction is at least one extra round trip of prepare; and the failure modes (orphaned prepared transactions, coordinator log corruption) are operationally nasty. The industry verdict for DB-plus-broker has largely been: avoid it.</div></div>
+</div>
+
+<p>So instead of forcing two systems to commit atomically, the dominant pattern <em>collapses the problem to a single system</em>: make the only thing that must be atomic be a write to <em>one</em> database, and turn the second system into a downstream consumer of that database's durable log. That is the outbox.</p>
+
+<h2>3 · The outbox pattern: one local transaction, then an at-least-once relay</h2>
+
+<p><em>What this is: the workhorse fix — write the business row and the event in the same transaction, then relay.</em></p>
+
+<p>The <strong>outbox pattern</strong> (also "transactional outbox") removes the gap by refusing to have two commit points. In <em>one</em> local database transaction you write <em>both</em> the business row and a row into an <code>outbox</code> table describing the event you owe. Because both writes are in the same ACID transaction, they commit together or not at all — the invariant "an event is owed for exactly the committed orders" is now a single-database constraint, which lesson 13 already taught you how to keep. A separate <strong>relay</strong> (also called a message relay or dispatcher) then reads unpublished outbox rows and publishes them to the broker, marking each as sent.</p>
+
+<div class="ascii">OUTBOX + RELAY — two systems become one atomic local write + a relay
+
+  WRITE PATH (one ACID transaction, one commit point):
+    db.begin()
+      insert(orders,  o)                       # business row
+      insert(outbox,  {id, topic:"order_placed", payload:o, sent:false})
+    db.commit()        <-- BOTH rows or NEITHER. No gap, no dual write.
+
+  RELAY (a separate, restartable process — runs forever):
+    loop:
+      rows = select * from outbox where sent=false order by id limit N
+      for r in rows:
+          broker.publish(r.topic, r.payload, key=r.id)   # at-least-once
+          update outbox set sent=true where id=r.id
+      sleep(poll_interval)
+
+  crash anywhere in the relay -> on restart it re-reads sent=false rows and
+  re-publishes. A row may be published TWICE (publish ok, crash before the
+  update) but NEVER lost. The relay's guarantee is AT-LEAST-ONCE.</div>
+
+<p>The trade the outbox makes is precise and worth saying out loud: it converts an <em>unbounded correctness</em> problem (messages can be lost or phantom, with no bound) into a <em>bounded duplication + latency</em> problem (messages are never lost, may be duplicated, and arrive after a small relay delay). Duplication is recoverable on the consumer side (§4); loss is not. That asymmetry is the whole point.</p>
+
+<div class="callout"><div class="label">Polling relay vs CDC relay</div>
+The relay can learn about new outbox rows two ways. <strong>Polling</strong> (shown above) repeatedly queries <code>where sent=false</code> — dead simple, but it adds query load and its latency is the poll interval. <strong>Change data capture (CDC)</strong> tails the database's own write-ahead log (lesson 19) and streams every insert to the outbox table directly into the broker — no polling, lower latency, no <code>sent</code> column needed because the log <em>is</em> the source of truth. Tools like Debezium do exactly this. CDC is the same move taken to its limit: the database's durable log <em>is</em> the event stream. Lesson 32 builds an entire search-index pipeline on this idea precisely to avoid a dual write into the index.</div>
+
+<h4>Worked number: relay lag</h4>
+
+<p>Suppose the relay polls every <span class="math">200 ms</span>, fetches up to <span class="math">500</span> rows per poll, and each <code>publish</code> + mark-sent takes <span class="math">2 ms</span>. At steady state with an arrival rate of <span class="math">300</span> events/sec: each <span class="math">200 ms</span> window accumulates <span class="math">300 x 0.2 = 60</span> rows, well under the <span class="math">500</span>-row batch, so the relay drains each batch in <span class="math">60 x 2 = 120 ms</span> and keeps up. End-to-end lag from <code>db.commit</code> to broker is then bounded by poll wait + drain ≈ <span class="math">200 + 120 = 320 ms</span> worst case. Now a burst to <span class="math">3,000</span> events/sec: each window accumulates <span class="math">600</span> rows but the batch caps at <span class="math">500</span>, so the outbox <em>backlog grows</em> by <span class="math">100</span> rows per window — the relay is behind. The knobs: raise the batch limit, shorten the poll interval, or run multiple relay workers partitioned by <code>id</code> ranges. The lesson: outbox lag is real and measurable; size the relay for peak, not average, and alarm on outbox depth (<code>count where sent=false</code>) the way you alarm on a queue.</p>
+
+<h2>4 · The inbox and idempotency keys: making re-delivery safe</h2>
+
+<p><em>What this is: the consumer-side half — because the relay is at-least-once, the consumer must tolerate duplicates.</em></p>
+
+<p>The outbox guarantees <em>at-least-once</em> delivery, which means duplicates are not an edge case — they are guaranteed to happen eventually (relay restart, broker re-delivery on a missed ack, consumer crash after processing but before committing its offset). So the consumer must be built so that <strong>processing the same message twice has the same effect as processing it once</strong>. That property is <strong>idempotence</strong>, and there are two standard ways to get it.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Idempotency key + dedup ledger (inbox)</div><div class="v">Every message carries a stable, unique <strong>idempotency key</strong> (the outbox row id works perfectly — it is stable and unique per business event). The consumer keeps an <code>inbox</code> / <code>processed_keys</code> table. In <em>one</em> local transaction it checks "have I seen this key?", and if not, applies the effect <em>and</em> inserts the key. A duplicate finds the key already present and is dropped. The dedup record and the effect commit together, so the consumer can crash anywhere and stay correct.</div></div>
+  <div class="topic-card"><div class="k">Naturally idempotent effects</div><div class="v">Make the operation itself insensitive to repetition. An <strong>upsert</strong> keyed by a business id (<code>insert ... on conflict do update</code>) lands the same row no matter how many times it runs. Setting a value (<code>status = 'shipped'</code>) is idempotent; <em>incrementing</em> a counter (<code>count = count + 1</code>) is NOT — that is the lost-update shape from lesson 13 in reverse, and re-delivery double-counts. Prefer set-to-value over add-delta whenever the message could repeat.</div></div>
+</div>
+
+<div class="ascii">INBOX dedup — the consumer makes at-least-once look effectively-once
+
+  on message m (carries idempotency_key = outbox row id):
+    db.begin()
+      if exists(inbox where key = m.key):     # already processed
+          db.commit(); ack(m); return         #   drop the duplicate
+      apply_business_effect(m)                # e.g. mark order paid
+      insert(inbox, {key: m.key, at: now()})  # remember we did it
+    db.commit()        <-- effect + dedup record commit TOGETHER
+    ack(m)
+
+  crash before db.commit -> message redelivered, reprocessed cleanly (no effect yet)
+  crash after  db.commit, before ack -> redelivered, key found, dropped. SAFE.</div>
+
+<h4>Worked number: the duplicate rate you are signing up for</h4>
+
+<p>Say the broker re-delivers on a missed ack and your consumer crashes (or its ack is lost to a network blip) on <span class="math">0.5%</span> of messages, and the relay independently double-publishes on <span class="math">0.2%</span> of its rows. Then roughly <span class="math">0.005 + 0.002 = 0.007</span>, about <span class="math">1</span> in <span class="math">143</span> messages, arrives at the consumer more than once. At <span class="math">300</span> events/sec that is about <span class="math">2</span> duplicates every second — <span class="math">181,000</span> per day. <em>Without</em> idempotent processing, each one is a double-charge, a double-ship, or a corrupted counter. <em>With</em> the inbox, all <span class="math">181,000</span> are silently dropped and nothing downstream notices. This is why "we'll fix duplicates later" is never acceptable: the duplicate rate is not zero, it is a steady fraction of a percent, every day, forever.</p>
+
+<h2>5 · "Exactly-once" is effectively-once: a scoped guarantee, stated precisely</h2>
+
+<p><em>What this is: the most over-promised phrase in messaging — what it really means and what it cannot.</em></p>
+
+<p>Marketing says "exactly-once delivery." That phrase, taken literally, is impossible: a sender that does not receive an acknowledgement cannot know whether the message was lost <em>before</em> arrival or the <em>ack</em> was lost after, so it must either risk losing the message (at-most-once) or risk sending it again (at-least-once) — there is no third delivery option over an unreliable network. You cannot get exactly-once <em>delivery</em>.</p>
+
+<p>What you <em>can</em> get is <strong>effectively-once processing</strong>: <strong>at-least-once delivery plus idempotent processing</strong>. The message may arrive several times (delivery is at-least-once), but the <em>observable effect on state</em> happens exactly once (because the consumer dedups by idempotency key, §4). The trick is to be precise about <em>which</em> step is exactly-once:</p>
+
+<div class="ascii">what is and isn't guaranteed
+
+  at-most-once delivery   : send, never retry.  May LOSE. Effect <= 1 time.   (rarely ok)
+  at-least-once delivery  : retry until acked.   May DUPLICATE. Effect >= 1.   (the relay)
+  exactly-once DELIVERY   : impossible over an unreliable network.            (a myth)
+  effectively-once        : at-least-once delivery + idempotent processing.
+                            Delivery may repeat; STATE CHANGE happens once.   (the goal)</div>
+
+<p>This is the same guarantee a stream processor offers when it claims "exactly-once": frameworks like Kafka Streams or Flink achieve it by atomically committing the output write <em>and</em> the input offset together (an inbox by another name), so re-reading an un-acked offset reprocesses without double-applying. Lesson 19 builds that read-process-write loop in detail. The honest summary to give in an interview: <em>"There is no exactly-once delivery. We get effectively-once by combining at-least-once delivery with an idempotent, deduplicating consumer, and the guarantee is scoped to state changes inside systems we control — it does not extend to a third party's side effect we cannot dedup, like an email that was already sent."</em></p>
+
+<div class="callout warn"><div class="label">Where effectively-once leaks: non-idempotent external side effects</div>
+Idempotence is easy when the effect is a row in <em>your</em> database (dedup table, upsert). It is hard or impossible when the effect is <em>external and observable</em>: sending an email, charging a card, calling a partner API that itself is not idempotent. For those, push the idempotency key <em>to the external system</em> if it supports one (Stripe accepts an <code>Idempotency-Key</code> header and dedups on its side), or record "email for key K sent" in your inbox <em>before</em> the send and accept that a crash in the tiny window between send and record-commit can double-send. You cannot make a non-idempotent third party exactly-once; you can only shrink and document the window.</div>
+
+<h2>6 · Multi-step operations: sagas and durable workflows</h2>
+
+<p><em>What this is: when the operation is not one write but a chain of cross-system steps that must survive a crash mid-flight.</em></p>
+
+<p>The outbox handles "one local write, then tell others." But many operations are a <em>sequence</em> of cross-system steps, each of which can fail: reserve inventory → charge the card → allocate a shipping slot → send a confirmation. There is no single transaction over all four (different systems, §1–2), and a crash after step 2 must not leave the card charged with no shipment. Two patterns manage this.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Saga (with compensations)</div><div class="v">Model the operation as a sequence of <em>local</em> transactions, each in its own system, linked by events (often via outboxes). If a later step fails, run <strong>compensating</strong> transactions that semantically undo the earlier ones — refund the charge, release the reservation. A saga gives no isolation (other transactions can observe the half-done intermediate state) and no automatic rollback; <em>you</em> write the compensations and accept that the system is eventually-consistent across steps. It is the distributed analogue of "do, and if it goes wrong, do the opposite."</div></div>
+  <div class="topic-card"><div class="k">Durable workflow engine (Temporal-style)</div><div class="v">A <strong>workflow engine</strong> persists the <em>progress</em> of the operation — which steps have completed, with what results — to a durable store as it runs. If the worker crashes, the engine <strong>resumes</strong> the workflow from the last completed step rather than restarting from the top, replaying recorded results instead of re-executing them. Each step is still required to be idempotent (it may be retried), but the engine removes the burden of hand-rolling progress tracking, timers, and retries. This is "durable execution": the call stack itself becomes crash-resilient state.</div></div>
+</div>
+
+<p>The relationship to everything above: a saga is built <em>out of</em> outboxes and idempotent consumers — each step's event is published via an outbox and consumed idempotently. A durable workflow engine is the same guarantees packaged so the application writes ordinary-looking sequential code while the engine supplies the persistence, retries, and at-least-once-plus-idempotent semantics underneath. Both turn "a crash restarts the whole multi-step operation" into "a crash resumes it," which is the cross-system echo of the atomicity lesson 13 gave you inside one database.</p>
+
+<div class="callout"><div class="label">ML-infra tie — a training-job launch is a saga</div>
+"Launch fine-tuning run R" must: write a <code>runs</code> row (system of record), reserve a GPU pool (scheduler), copy the dataset snapshot (object store), and register the run in the experiment tracker. Four systems, no shared transaction. Do it as a dual write and a crash after the GPU reservation leaks 8 expensive GPUs with no run to bill them to. Do it as a <strong>saga driven by an outbox</strong>: write the <code>runs</code> row + an outbox event in one transaction; a relay drives the scheduler, store, and tracker, each step idempotent (keyed by run id) so retries are safe; if dataset copy fails, a compensating step releases the GPU reservation. Or run the whole launch inside a <strong>durable workflow</strong> so a controller restart resumes at "dataset copied" instead of re-reserving GPUs. Either way the invariant — "GPUs are reserved if and only if a run exists to use them" — survives the crash that a dual write would have broken.</div>
+
+<h2>Trade-offs</h2>
+<table>
+  <thead><tr><th>Choice</th><th>Buys</th><th>Costs / still allows</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Dual write (DB then publish)</strong></td><td>Nothing — it is the bug. Simple to type.</td><td>Lost / phantom / duplicate messages with no bound; invariant broken on any crash in the gap</td></tr>
+    <tr><td><strong>Distributed txn / 2PC</strong></td><td>True atomicity across heterogeneous systems</td><td>Blocking on coordinator (in-doubt locks), tight coupling, poor scale; broker/services rarely support it (lesson 17)</td></tr>
+    <tr><td><strong>Outbox + polling relay</strong></td><td>No dual write; at-least-once, never lost; trivial to operate</td><td>Poll-interval latency; extra query load; outbox table growth (needs pruning)</td></tr>
+    <tr><td><strong>Outbox + CDC relay</strong></td><td>Lowest latency; the DB log <em>is</em> the stream; no <code>sent</code> column</td><td>Operate a CDC pipeline (Debezium etc., lesson 19); log-format coupling</td></tr>
+    <tr><td><strong>Inbox / idempotency key</strong></td><td>Re-delivery is safe; effectively-once state change</td><td>Dedup table growth; must key every message stably; external side effects still leak (§5)</td></tr>
+    <tr><td><strong>Saga + compensations</strong></td><td>Multi-step cross-system ops with bounded recovery</td><td>No isolation (visible intermediate state); you hand-write every compensation; eventually consistent</td></tr>
+    <tr><td><strong>Durable workflow engine</strong></td><td>Crash resumes not restarts; retries/timers/progress handled for you</td><td>New infrastructure to run; steps still must be idempotent; lock-in to the engine's model</td></tr>
+  </tbody>
+</table>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>The dual write.</strong> "Write the DB, then publish" shipped as-is. Symptom: occasional orders with no downstream event (or events for rolled-back orders) that no single-service test reproduces, because the gap only opens on a crash between two commits.</li>
+    <li><strong>"Exactly-once" taken literally.</strong> A consumer written assuming each message arrives once. Symptom: double-charges and double-ships at a steady fraction-of-a-percent rate (§4 worked number) under normal operation, not just incidents.</li>
+    <li><strong>Non-idempotent effect on the consumer.</strong> The handler does <code>count = count + 1</code> or sends an un-keyed email. Symptom: counters drift high, customers get duplicate emails, only under retry/redelivery.</li>
+    <li><strong>Unbounded outbox / inbox table.</strong> Rows are never pruned; the table and its indexes bloat, the relay's <code>where sent=false</code> scan slows. Symptom: rising relay lag and storage with no corresponding traffic increase.</li>
+    <li><strong>Relay not sized for peak.</strong> Batch limit or single worker can't drain bursts; backlog grows (§3 worked number). Symptom: outbox depth climbs during traffic spikes, downstream sees stale events.</li>
+    <li><strong>Saga with no compensation for a step.</strong> A mid-saga failure leaves a side effect with nothing to undo it. Symptom: leaked reservations / charges with no matching final entity.</li>
+    <li><strong>Idempotency key that isn't stable.</strong> Keying on a timestamp or a per-attempt UUID instead of the business event id — every retry looks new, dedup never fires.</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Decision checklist</h3><ul>
+    <li>Does any code path write a database <em>and</em> publish / call a second system? If yes, it is a dual write — replace it with an outbox.</li>
+    <li>Are the business write and the outbox row in the <em>same</em> local transaction (one commit point)?</li>
+    <li>Is the relay at-least-once, and is outbox depth (<code>count where sent=false</code>) alarmed like a queue? Is the relay sized for peak, not average?</li>
+    <li>Does every message carry a <em>stable, unique</em> idempotency key (the outbox row id), and does the consumer dedup against an inbox <em>in the same transaction</em> as the effect?</li>
+    <li>Is every consumer effect idempotent — upsert / set-to-value, never blind increment, never un-keyed external side effect?</li>
+    <li>For external side effects (email, charge): does the third party accept an idempotency key, and is the unavoidable double-send window documented?</li>
+    <li>For multi-step operations: is it a saga with a compensation for <em>every</em> step, or a durable workflow that persists progress so a crash resumes? Have you decided you do NOT need 2PC (lesson 17)?</li>
+    <li>Are outbox and inbox rows pruned once safely past their retention horizon?</li>
+  </ul></div>
+</div>
+
+<div class="callout"><div class="label">Where is truth?</div>
+<strong>System of record:</strong> the business <em>row in the database</em> (the <code>orders</code> row), committed by one local ACID transaction — it is the only thing that is authoritatively true. <strong>Copies / derived views:</strong> the message in the broker is a <em>derived, at-least-once copy</em> of that fact, and every downstream consumer's state is a further derived view of the stream. <strong>Freshness budget:</strong> the relay lag (the §3 worst-case ≈ 320 ms, plus broker and consumer lag) — the window during which the broker has not yet been told a committed truth. <strong>Owner:</strong> the service that owns the database and its outbox owns the truth; consumers own their own derived views. <strong>Deletion path:</strong> deleting a fact means writing a tombstone/delete event through the same outbox so every derived view converges; you cannot reach into the broker and unsend. <strong>Reconciliation / repair:</strong> the consumer's idempotency-key dedup (inbox) is the reconciliation that absorbs duplicates and re-deliveries; for divergence, replay the stream and let idempotent processing converge. <strong>Evidence it is correct:</strong> the <em>idempotency-key ledger</em> — the inbox table of processed keys plus the outbox's <code>sent</code> flags — is the audit trail proving each committed fact was delivered and applied exactly once in effect, and lets you prove no order is missing an event and no event was applied twice.</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>Your service handles "confirm payment": it must write a <code>payments</code> row to its database, publish a <code>payment_confirmed</code> event so the fulfillment service ships, and send the customer a receipt email via a third-party API. (a) Show the naive dual-write code and enumerate every way a crash corrupts the invariant "fulfillment ships iff payment is confirmed." (b) Redesign it with an outbox: give the schema of the two tables, the single transaction, and the relay loop, and state the relay's delivery guarantee. (c) The fulfillment consumer might receive <code>payment_confirmed</code> twice; show the inbox-based handler that makes shipping idempotent, and name the stable idempotency key you'd use. (d) The receipt email is a non-idempotent external side effect — explain why you cannot make it strictly exactly-once and describe the smallest window in which a double-send can still occur and how you'd minimize it. (e) Now suppose confirm-payment also has to reserve a coupon and could need to refund — sketch whether you'd use a saga or a durable workflow and why.</div>
+
+<h2>Where this points next</h2>
+<p>The outbox, the inbox, and the relay all quietly assumed something: that a crashed process <em>stays</em> crashed, that a "missed ack" cleanly distinguishes a dead consumer from a slow one, and that when two relay workers split the outbox by id range, only one of them is really running. None of that is safe in a distributed system. A consumer you declared dead by timeout may be merely slow and is still processing; a relay you failed over may have a zombie predecessor still publishing; the clock you stamped the inbox row with may run backward relative to another node's. Lesson 15 confronts these <strong>partial failures</strong> directly: why you cannot trust timeouts or wall-clock time to tell live from dead, and how a <strong>fencing token</strong> — a monotonically increasing number issued with a lease — lets a system reject a write from a process that only <em>thinks</em> it still holds the lock. That is exactly the guarantee that keeps a failed-over relay's zombie from corrupting the very outbox this lesson built.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+A transaction protects an invariant inside one database, but real operations cross a broker and a second service, where ACID stops. "Write the DB then publish" is the <strong>dual-write</strong> bug: a crash in the gap loses or phantoms or duplicates the message, because the invariant now spans two systems with independent commit points. A distributed transaction (2PC, lesson 17) could make them atomic but blocks on its coordinator and couples heterogeneous systems, so it is usually avoided. The dominant fix is the <strong>outbox pattern</strong>: write the business row and an outbox event row in <em>one</em> local transaction, then a restartable <strong>relay</strong> (polling or CDC, lesson 19) publishes them — collapsing two systems into one atomic local write plus an <strong>at-least-once</strong> relay that may duplicate but never loses. The consumer closes the loop with an <strong>inbox</strong> and a stable <strong>idempotency key</strong>, deduping in the same transaction as the effect so re-delivery is safe. There is no exactly-once <em>delivery</em>; what you get is <strong>effectively-once</strong> = at-least-once delivery + idempotent processing, scoped to state changes in systems you control (external side effects still leak a small window). For multi-step cross-system operations, use a <strong>saga</strong> with compensations or a <strong>durable workflow engine</strong> that persists progress so a crash resumes rather than restarts. The system of record is the DB row; the broker carries a derived copy; the idempotency-key ledger is the evidence it all reconciles.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>Why is "write the database, then publish to Kafka" not safe, even with retries? <em>(§1 — two independent commit points with a gap; a crash between them loses the message, and reordering risks a phantom; there's no durable record that a publish is owed, so retrying the publish call doesn't help — the gap is in <em>remembering</em> a publish is required.)</em></li>
+  <li>You could use a distributed transaction across the DB and broker — why is that usually avoided? <em>(§2 — 2PC blocks on the coordinator with locks held in-doubt, couples heterogeneous systems that must all speak the protocol, and scales/fails poorly; most brokers and service APIs don't support it. Mechanics in lesson 17.)</em></li>
+  <li>Explain the outbox pattern and exactly what guarantee the relay provides. <em>(§3 — write the business row and an outbox event row in one local transaction so they commit atomically; a separate relay tails the outbox and publishes, marking rows sent. The relay is at-least-once: never lost, may duplicate on a crash between publish and mark-sent.)</em></li>
+  <li>Given at-least-once delivery, how do you make a consumer correct? <em>(§4 — idempotent processing: a stable idempotency key (the outbox row id) plus an inbox/dedup table checked-and-inserted in the same transaction as the effect, or naturally idempotent effects like upsert/set-to-value; never blind increment.)</em></li>
+  <li>Is exactly-once delivery achievable? What does "exactly-once" actually mean? <em>(§5 — no exactly-once <em>delivery</em>: a lost ack is indistinguishable from a lost message, so you choose at-most-once or at-least-once. What's real is <em>effectively-once</em> = at-least-once delivery + idempotent processing; the state change happens once even though delivery may repeat. Scoped to systems you control; external side effects leak a small window.)</em></li>
+  <li>Why is incrementing a counter in a message handler dangerous, and what do you do instead? <em>(§4 — re-delivery double-counts because add-delta isn't idempotent; use set-to-value or upsert keyed by the business id, or dedup the message by idempotency key before applying.)</em></li>
+  <li>A multi-step operation spans four systems and must survive a worker crash — saga or workflow engine? <em>(§6 — a saga chains local transactions linked by events (outboxes) with hand-written compensations and no isolation; a durable workflow engine persists progress and resumes from the last completed step on crash, with retries/timers handled for you but steps still idempotent. Both turn restart into resume.)</em></li>
+  <li>Where does the outbox/idempotency design break, and how would you catch it in production? <em>(§3–5 failure modes — unstable idempotency keys, non-idempotent external effects, unbounded outbox/inbox tables, a relay not sized for peak; catch via outbox-depth alarms, dedup-ledger audits proving every committed row was delivered once in effect, and pruning past retention.)</em></li>
+</ul>
+<footer class="lesson-nav">
+  <a href="13_transactions_isolation.html"><span class="dir">&larr; Previous</span><span class="ttl">13 &middot; Transactions and Isolation</span></a>
+  <a class="next" href="15_partial_failures_clocks_fencing.html"><span class="dir">Next &rarr;</span><span class="ttl">15 &middot; Partial Failure, Unreliable Clocks, and Fencing</span></a>
+</footer>
+</main>
+<!-- reviewed:v1 -->
+</body>
+</html>

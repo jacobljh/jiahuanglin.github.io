@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>33 &middot; Interview Case: Model Registry</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* Case-template helpers not in the shared stylesheet. */
+  .lesson-grid.rubric { grid-template-columns: repeat(2, minmax(0,1fr)); }
+  @media (max-width: 720px) { .lesson-grid.rubric { grid-template-columns: 1fr; } }
+  .rubric .lesson-card.good  { border-left: 3px solid var(--ok); }
+  .rubric .lesson-card.better{ border-left: 3px solid var(--accent); }
+  .rubric .lesson-card.bad   { border-left: 3px solid var(--bad); }
+  .rubric .lesson-card.next  { border-left: 3px solid var(--accent-2, #8b5cf6); }
+</style>
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">data_intensive_systems</a>
+    <span class="crumb">/</span>
+    <span class="crumb">33 &middot; case: model registry</span>
+    <span class="step-pill">lesson 34 / 35 &middot; ~18 min</span>
+  </div>
+</header>
+
+<main>
+
+<p class="kicker">Part 12 · Applied & interviews</p>
+<h1>Interview Case: Model Registry</h1>
+<p class="subtitle">Lesson 32 solved the dual-write trap: never write your source database and a derived search index in two separate steps — make one of them the log and let the other follow. This case applies that same discipline to a different artifact. A <strong>model registry</strong> is the system of record for trained ML models: the large immutable <em>weights</em> sitting in blob storage, the small critical <em>metadata</em> (version, metrics, lineage, stage) describing them, and — the part that bites in production — a single pointer that says <em>which version is live right now</em>. The crux is not storing files. It is making "promote version N to production" an atomic, linearizable flip that every serving replica agrees on, while keeping every artifact immutable so a rollback is just pointing back at a version that still exists, byte-for-byte.</p>
+
+<div class="callout source-note"><div class="label">DDIA source</div>Arc drawn from Martin Kleppmann, <em>Designing Data-Intensive Applications</em> — append-only logs and immutability (Ch.3, our <a href="03_storage_engines_logs_btrees.html">L03</a>), linearizability (Ch.9, <a href="16_consistency_causality_linearizability.html">L16</a>), consensus and coordination services like ZooKeeper/etcd (Ch.9, <a href="17_consensus_coordination_verification.html">L17</a>), and derived data / lineage (Ch.12, <a href="20_derived_data_correctness.html">L20</a>). The model-registry framing is ours; the mechanisms are general.</div>
+
+<div class="callout"><div class="label">Linear position</div>
+<strong>Prerequisite:</strong> append/log thinking and immutability (<a href="03_storage_engines_logs_btrees.html">L03</a>); linearizability — a register whose reads always see the latest committed write (<a href="16_consistency_causality_linearizability.html">L16</a>); consensus and a coordination service that holds an authoritative value with watches (<a href="17_consensus_coordination_verification.html">L17</a>); derived data and lineage (<a href="20_derived_data_correctness.html">L20</a>); the no-dual-write discipline (<a href="32_case_search_index_no_dual_write.html">L32</a>).<br>
+<strong>New capability:</strong> design a registry that separates a strongly-consistent metadata store from a durable blob store, makes artifacts content-addressed and immutable, exposes <em>one</em> linearizable production pointer per model so the whole serving fleet flips atomically, records enough lineage to answer "what produced this model", and rolls back safely in seconds.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Six moves, the shared case template. (1) The prompt, the functional/non-functional requirements, and the clarifying questions a strong candidate opens with. (2) Back-of-envelope sizing — model count, artifact size, promotion frequency, read QPS from the serving fleet. (3) The design walk, building the registry from the track's mechanisms with an ASCII architecture diagram. (4) One concrete failure timeline — a split-brain promotion — and its mitigation. (5) A four-bucket answer rubric: good, better, red flags, likely follow-ups. (6) Takeaway plus interview prompts with answers.</div>
+
+<h2>1 · The prompt and what to ask first</h2>
+
+<p><strong>Prompt.</strong> "Design a model registry. It is the system of record for our trained ML models. Teams push model versions; the registry stores the weights and the metadata about each version; and there is a notion of which version is currently serving production traffic. Make promotion and rollback safe, and make sure the whole serving fleet agrees on the live version."</p>
+
+<p>The weak candidate starts drawing an S3 bucket and a Postgres table. The strong candidate first separates the two halves of the problem — a <em>small but critical</em> metadata store and a <em>large but simple</em> artifact store — and then asks the questions that determine the consistency model.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Functional</div><div class="v">Register a new immutable version (weights + metadata). List/query versions and their metrics. Promote a version to a stage (staging, production). Roll back. Read "which version is production for model M" — the call the serving fleet makes. Read the artifact bytes for a given version. Record lineage: training data snapshot, code/commit, hyperparameters, parent version.</div></div>
+  <div class="topic-card"><div class="k">Non-functional</div><div class="v">Artifacts <strong>immutable</strong> — a version's bytes never change once registered. Promotion <strong>atomic and linearizable</strong> — no replica ever serves a half-applied flip; once promotion returns, every reader sees the new version. <strong>Durable</strong> artifacts (you can never lose a production model's weights). <strong>Auditable</strong> — who promoted what, when, from which lineage. Fast, high-QPS reads of the production pointer; promotion itself is rare.</div></div>
+  <div class="topic-card"><div class="k">Clarifying questions</div><div class="v">How big are artifacts — hundreds of MB or tens of GB? How many models and versions total? How often does a promotion happen — hourly or weekly? How many serving replicas read the pointer, and how do they react to a flip (poll, or get pushed)? Is a stale read of the production pointer for a few seconds acceptable, or must it be linearizable? Do we need point-in-time "what was production on date D" for audit?</div></div>
+  <div class="topic-card"><div class="k">The reframe</div><div class="v">This is two stores with opposite needs glued by one pointer. The blob store wants throughput and durability and does <em>not</em> need transactions. The metadata store wants strong consistency for a tiny amount of data. The pointer flip is the only operation that needs <strong>linearizability</strong> and <strong>consensus</strong>. Get those boundaries right and the rest is plumbing.</div></div>
+</div>
+
+<p>The single most important clarification is the one about the production pointer's consistency. If the answer is "a few seconds of staleness is fine" you can serve the pointer from an eventually-consistent cache. If the answer is "every replica must agree the instant promotion returns" — the usual answer for production model serving — you need a linearizable register backed by consensus, and that decision shapes the whole design.</p>
+
+<h2>2 · Back-of-envelope sizing</h2>
+
+<p>Numbers turn vague requirements into a concrete design. Take a mid-size ML org.</p>
+
+<div class="callout"><div class="label">Worked sizing</div>
+<strong>Inventory.</strong> Say <span class="math">500</span> models, each with <span class="math">~40</span> retained versions = <span class="math">20,000</span> artifacts. Average artifact <span class="math">2 GB</span> (a few are 30 GB LLMs, most are small trees and rankers). Artifact bytes ≈ <span class="math">20,000 × 2 GB = 40 TB</span> raw; at 3× replication for durability that is <span class="math">120 TB</span> in the blob store — large, but trivially within object-storage scale.<br><br>
+<strong>Metadata.</strong> Each version's metadata row (version, metrics, lineage refs, stage, checksums) is a few KB. <span class="math">20,000 × ~4 KB ≈ 80 MB</span>. The <em>entire</em> metadata store fits in RAM many times over. This is the key asymmetry: 40 TB of artifacts, 80 MB of metadata. They do not belong in the same engine.<br><br>
+<strong>Production pointers.</strong> One small record per model — "model M &rarr; version V" — so <span class="math">500</span> pointers, a few hundred bytes each. Tiny. This is the linearizable state, and it is essentially nothing in size.<br><br>
+<strong>Promotion frequency (write rate).</strong> Even a busy org promotes maybe <span class="math">50</span> times a day across all models — under <span class="math">0.001</span> writes/sec to the pointer set. Promotion is <em>rare</em>. Consensus is famously slow (a round-trip among a quorum, see <a href="17_consensus_coordination_verification.html">L17</a>), but at this write rate its cost is irrelevant.<br><br>
+<strong>Read QPS (the serving fleet).</strong> Here is the real load. Suppose <span class="math">2,000</span> serving replicas across all models. If each replica <em>polled</em> "what is production for my model" every <span class="math">5 s</span>, that is <span class="math">2,000 / 5 = 400</span> reads/sec on the pointer — modest, but it grows linearly with the fleet and adds up-to-5-second staleness. If instead each replica <strong>watches</strong> the pointer (a coordination service push on change), steady-state read load on the source of truth drops to near zero and a flip propagates in well under a second. The asymmetry — rare writes, fleet-scale reads, sub-second propagation wanted — points straight at a watched coordination register, not a polled database.<br><br>
+<strong>Artifact read bandwidth.</strong> A replica fetches weights only on cold start or a flip, not per request: <span class="math">2,000</span> replicas each pulling a <span class="math">2 GB</span> artifact during a fleet-wide promotion is <span class="math">4 TB</span> of egress in a burst. That is a real number — it argues for caching artifacts on the serving hosts and staggering the roll, not a thundering-herd pull from the blob store the instant the pointer flips.</div>
+
+<p>The sizing settles three design choices before any diagram: (a) artifacts and metadata get <em>separate</em> stores; (b) the production pointer is a tiny linearizable register with rare writes and is read via <em>watches</em>, not polling; (c) a flip triggers a bounded artifact-fetch burst that must be staggered.</p>
+
+<h2>3 · Design walk</h2>
+
+<p>Build it from the track's mechanisms. Four components, each with a job it is good at and a consistency need it must meet.</p>
+
+<h3>3.1 · Immutable, content-addressed artifacts (L03, L20)</h3>
+<p>Weights go in a blob/object store (S3, GCS) that gives durability and throughput but no transactions — and it does not need them. The discipline that makes the registry safe is <strong>immutability</strong>: a registered artifact's bytes never change. The cleanest way to enforce that is <strong>content addressing</strong> — name each artifact by the hash of its bytes (e.g. <code>sha256:9f86d0...</code>), exactly the append-only / immutable-log thinking from <a href="03_storage_engines_logs_btrees.html">L03</a>. The hash <em>is</em> the address, so the same bytes always land at the same key, a different model can never overwrite an existing one, and a download can be verified against its name. The version's metadata row stores that hash; "the weights for version V" is a content hash that resolves to bytes that cannot have drifted. This also gives free dedup (two versions with identical weights share storage) and makes lineage tamper-evident.</p>
+
+<h3>3.2 · Strongly-consistent metadata store (L13, L16)</h3>
+<p>Metadata — version number, metrics, the artifact hash, lineage refs, stage, checksums, who/when — lives in a small relational store (Postgres) that gives you transactions (<a href="13_transactions_isolation.html">L13</a>) and is easy to query ("best F1 among production-eligible versions of model M"). Registering a version is one transaction: write the metadata row referencing the already-uploaded, content-addressed artifact. Crucially, register the artifact <em>first</em> (upload bytes, get the hash), <em>then</em> commit the metadata row that points at it. That ordering — durable artifact before the row that references it — means the metadata never points at bytes that do not exist, the registry's version of "no dual write" (<a href="32_case_search_index_no_dual_write.html">L32</a>): one store is the follower of the other, never two independent writes that can half-fail.</p>
+
+<h3>3.3 · The linearizable production pointer (L16, L17)</h3>
+<p>This is the heart of the case. "Which version is live for model M" is a single mutable value that the whole fleet must agree on. The non-negotiable property is <strong>linearizability</strong> (<a href="16_consistency_causality_linearizability.html">L16</a>): the pointer behaves as one register, and the moment a promotion's write returns, every subsequent read — from any replica — sees the new version; there is never a window where two replicas serve different "production" versions because one read a stale copy. A normal asynchronously-replicated database (<a href="08_replication_leader_lag_failover.html">L08</a>) does <em>not</em> give you this: a follower can lag and hand a serving host the old version after the flip "succeeded".</p>
+<p>The right home for the pointer is a <strong>coordination service</strong> — etcd or ZooKeeper — which is a consensus system (<a href="17_consensus_coordination_verification.html">L17</a>) purpose-built for exactly this: a tiny amount of strongly-consistent state, linearizable writes via a quorum, atomic compare-and-set, and <strong>watches</strong> that push a notification to every interested client the instant the value changes. (Linearizable <em>reads</em> need a small care: etcd serves them through the Raft leader by default, while ZooKeeper reads can be served stale from a follower unless you issue a <code>sync</code> first — but the watch-driven flow below means replicas are pushed the new value rather than relying on a fresh read.) Promotion is a single linearizable compare-and-set: "set <code>/models/M/production</code> from version 41 to version 42, only if it is still 41." It succeeds atomically or fails — never half-applies. Watches mean the 2,000 replicas learn about the flip in sub-second time without polling (the sizing in §2). Because promotion is rare (§2), the cost of consensus is irrelevant; what you buy is that the fleet can never disagree about the live version.</p>
+
+<div class="ascii">                          MODEL REGISTRY
+
+  push version 42                                   promote 42 -> prod
+  (train job)                                       (release tool)
+       |                                                   |
+       v                                                   v
+  +----------------+   1. upload bytes            +--------------------+
+  |  ARTIFACT /    |&lt;------- (content hash) -------|  metadata write    |
+  |  BLOB STORE    |   sha256:9f86d0...            |  (register V42 row,|
+  |  (S3/GCS)      |                               |   refs the hash)   |
+  |  immutable,    |                               +---------+----------+
+  |  3x durable,   |                                         |
+  |  40 TB         |                                         v
+  +-------+--------+                               +--------------------+
+          ^                                        |  METADATA STORE    |
+          | 4. fetch weights                       |  (Postgres)        |
+          |    by hash (on flip /                  |  versions, metrics,|
+          |    cold start, staggered)              |  lineage, stage    |
+          |                                        |  ~80 MB, txns      |
+          |                                        +---------+----------+
+          |                                                  |
+          |                              2. compare-and-set  |
+          |                                 /models/M/prod    v
+          |                                 41 -> 42   +-------------------+
+          |                                 (atomic)   | COORDINATION SVC  |
+          |                                            | etcd / ZooKeeper  |
+          |                                            | LINEARIZABLE      |
+          |                                            | prod pointer,     |
+          |                                            | 500 tiny records  |
+          |                                            +---------+---------+
+          |                                                      |
+          |     3. WATCH push: "M is now V42"  (sub-second)      |
+          |   +--------------------------------------------------+
+          |   |              |              |              |
+          v   v              v              v              v
+   +--------+ +--------+ +--------+ +--------+ ...   SERVING FLEET
+   |replica | |replica | |replica | |replica |       (2,000 replicas)
+   |  M:V42 | |  M:V42 | |  M:V42 | |  M:V42 |       all agree on V42
+   +--------+ +--------+ +--------+ +--------+
+</div>
+
+<p>Read the flow as: artifact bytes are uploaded and addressed by hash (1); the metadata row is committed referencing that hash (2 on the write side); promotion is a single linearizable compare-and-set on the coordination service (2 on the pointer side); every replica is watching and is pushed the new version (3); each replica then fetches the new weights by hash from the blob store, staggered to avoid a stampede (4). The only linearizable operation in the whole system is the pointer flip; everything else is immutable bytes or rarely-changing metadata.</p>
+
+<h3>3.4 · Audit, lineage, and rollback (L20)</h3>
+<p><strong>Lineage</strong> answers "what produced this model" — which training-data snapshot, which code commit, which hyperparameters, which parent version. This is <strong>derived-data thinking</strong> (<a href="20_derived_data_correctness.html">L20</a>): a model is derived from data + code, and recording the inputs makes the derivation reproducible and the system auditable. Because artifacts are content-addressed (§3.1) and the data snapshot and code commit are themselves immutable references, the lineage is a tamper-evident chain — you can recompute the model from the recorded inputs and confirm you get the same hash.</p>
+<p><strong>Audit</strong> of promotions falls out almost for free: log every pointer change as an append-only record — <code>(model, from_version, to_version, who, when)</code>. That log is the answer to "what was production on date D" and "who promoted the bad model", and it is itself an immutable log (<a href="03_storage_engines_logs_btrees.html">L03</a>). <strong>Rollback</strong> is then trivial and safe: because every prior version's artifact is immutable and still present (never overwritten, never mutated), rolling back is just another compare-and-set flipping the pointer back to a version that still exists byte-for-byte. There is no "restore from backup" and no risk that the old weights drifted — immutability is what makes rollback a sub-second pointer flip rather than a recovery operation.</p>
+
+<table>
+  <thead><tr><th>Component</th><th>Job</th><th>Consistency need</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Artifact / blob store</strong></td><td>Hold large immutable weights, durably, at throughput</td><td>Durability + immutability (content-addressed); no transactions needed</td></tr>
+    <tr><td><strong>Metadata store</strong></td><td>Versions, metrics, lineage, stage; rich queries</td><td>Strong consistency / transactions; tiny data, registered after its artifact</td></tr>
+    <tr><td><strong>Production pointer</strong></td><td>The one live version per model the fleet reads</td><td><strong>Linearizable</strong>, consensus-backed, atomic compare-and-set + watches</td></tr>
+    <tr><td><strong>Audit / lineage log</strong></td><td>Who promoted what; what produced each model</td><td>Append-only / immutable; derived-data provenance</td></tr>
+  </tbody>
+</table>
+
+<h2>4 · Failure timeline — split-brain promotion</h2>
+
+<p>The failure that separates a good design from a fragile one: two promotions racing, or a stale-read replica, producing a fleet that disagrees about the live version.</p>
+
+<div class="ascii">  SCENARIO: two release tools promote model M at nearly the same time,
+            and the pointer lives in an async-replicated DB (the WRONG choice).
+
+  t0  pointer (leader) = V41. Followers = V41.
+  t1  Release tool A: "promote V42"  -> writes leader, leader = V42
+  t2  Release tool B: "promote V43"  -> also writes leader (last-writer-wins),
+                                        leader = V43.  A's promotion silently lost.
+  t3  Replica X reads a LAGGING FOLLOWER -> still sees V41 (stale, L08 lag)
+      Replica Y reads the leader         -> sees V43
+      Replica Z cached A's transient V42 -> serves V42
+  t4  SPLIT BRAIN: three different "production" versions serving at once.
+      No audit of who won. Rollback unclear: roll back to which version?
+  -------------------------------------------------------------------------
+  FIX with the linearizable pointer (L16/L17):
+  t1  Tool A: compare-and-set /models/M/prod  41 -> 42   ==> SUCCEEDS, now 42
+  t2  Tool B: compare-and-set /models/M/prod  41 -> 43   ==> FAILS (it is 42,
+                                        not 41). B is told it lost; it retries
+                                        from 42 or aborts. No lost update.
+  t3  WATCH pushes "M = V42" to ALL replicas; reads are linearizable, so no
+      replica can read a stale V41 after the set returned. Fleet converges.
+  t4  Audit log has exactly one record: (M, 41 -> 42, toolA, t1). One truth.
+</div>
+
+<p><strong>Root cause</strong> of the broken version: the pointer was treated as ordinary replicated data, so concurrent writes did last-writer-wins (a lost update) and lagging followers served stale reads. <strong>Mitigation:</strong> the pointer is a linearizable register with atomic compare-and-set on a coordination service — concurrent promotions are serialized (one wins, the other is told it lost and must retry against the new value), reads cannot go stale after a successful write, and watches push the single agreed value to the fleet. The conditional compare-and-set is the same fencing idea from <a href="15_partial_failures_clocks_fencing.html">L15</a>: an action that must not stomp a newer state checks the version it expects before it commits.</p>
+
+<h2>5 · Answer rubric</h2>
+
+<div class="lesson-grid rubric">
+  <div class="lesson-card good"><h3>Good answer (baseline)</h3><ul>
+    <li>Separates the <strong>large artifact store</strong> (blob, durable, throughput) from the <strong>small metadata store</strong> (strong consistency, queryable) — does not jam both into one engine.</li>
+    <li>Makes artifacts <strong>immutable</strong> and versioned; never overwrites a registered model's bytes.</li>
+    <li>Has an explicit <strong>production pointer</strong> per model and a promote operation distinct from registering a version.</li>
+    <li>Supports <strong>rollback</strong> by re-pointing at a prior version, and records who promoted what.</li>
+  </ul></div>
+  <div class="lesson-card better"><h3>Better answer (senior signal)</h3><ul>
+    <li>Names <strong>linearizability</strong> explicitly and puts the pointer in a <strong>consensus-backed coordination service</strong> (etcd/ZooKeeper), with <strong>atomic compare-and-set</strong> for promotion so concurrent flips can't lose updates.</li>
+    <li>Uses <strong>watches</strong> to push flips to the fleet sub-second and justifies it against polling with the read-QPS sizing.</li>
+    <li>Makes artifacts <strong>content-addressed</strong> (hash = name) for immutability, verification, and dedup; registers the artifact <em>before</em> the metadata row (no dual write).</li>
+    <li>Treats lineage as <strong>derived-data provenance</strong> (data snapshot + code commit + parent) and the promotion log as an <strong>append-only audit</strong>; rollback is a sub-second flip because prior bytes are immutable.</li>
+    <li>Quantifies: 40 TB artifacts vs 80 MB metadata; rare writes vs fleet-scale reads; staggers the post-flip artifact-fetch burst.</li>
+  </ul></div>
+  <div class="lesson-card bad"><h3>Red flags</h3><ul>
+    <li>Storing weights as a <code>BLOB</code> column in the metadata DB, or putting tiny critical metadata in the blob store — wrong store for each.</li>
+    <li>Mutable artifacts ("just re-upload to the same key") — destroys reproducibility and makes rollback unsafe.</li>
+    <li>Putting the production pointer in an <strong>async-replicated</strong> database and assuming reads are fresh — invites the split-brain timeline.</li>
+    <li>A non-atomic promote (delete-then-write, or two separate writes) that can leave the pointer in a half-applied state.</li>
+    <li>Polling the pointer at high frequency from thousands of replicas with no watch mechanism, or fetching artifacts in a thundering herd on flip.</li>
+    <li>No lineage / no audit log — cannot answer "what produced this" or "who promoted the bad model".</li>
+  </ul></div>
+  <div class="lesson-card next"><h3>Likely follow-ups</h3><ul>
+    <li>"How do you do a <strong>canary / gradual rollout</strong> instead of an instant flip?" (pointer holds a weighted map of versions, or per-shard pointers; still linearizable per key.)</li>
+    <li>"What if the coordination service is <strong>unavailable</strong>?" (reads served from each replica's last-known watched value — stay serving the current version; promotions block, which is the safe failure for a CP system.)</li>
+    <li>"How do you stop a <strong>2,000-replica fetch burst</strong> on flip?" (cache artifacts on hosts, pre-stage the new version before flipping, stagger/rate-limit the roll.)</li>
+    <li>"How do you guarantee a model is <strong>reproducible</strong> from lineage?" (content-addressed data snapshot + pinned code commit + recorded hyperparameters; recompute and compare hashes.)</li>
+    <li>"How do you handle <strong>multi-region</strong> serving?" (per-region pointer that follows a global one, or a globally linearizable pointer with the latency cost made explicit.)</li>
+  </ul></div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>You run a registry with <span class="math">300</span> models and <span class="math">1,500</span> serving replicas. (a) Sketch the four components and state, for each, its consistency need and roughly how much data it holds. (b) Write the exact promotion operation as a compare-and-set on the production pointer and explain why a plain "UPDATE pointer SET version=42" on an async-replicated database would let two replicas disagree. (c) A replica reads the pointer every 3 s today; compute the steady-state pointer read QPS, then explain how switching to watches changes both the QPS and the flip-propagation latency. (d) A bad model V42 is live; describe the rollback to V41 and state the single property of the artifact store that makes that rollback safe in one pointer flip. (e) The audit team asks "what was production for model M on 2026-03-01" — which structure answers it, and why is it an append-only log?</div>
+
+<h2>Where this points next</h2>
+<p>The registry is a <em>system of record</em> with a tiny linearizable core and a large immutable periphery — the consistency burden concentrated in one pointer. The next case inverts that profile. A <strong>metrics / observability dashboard</strong> has almost no strong-consistency requirement but enormous write fan-in: millions of high-cardinality time-series samples per second pouring in from the same serving fleet, stored columnar and rolled up, queried fresh-vs-historical with approximate aggregates. Lesson 34 builds that ingest-and-query path — where the hard problems are write throughput, downsampling, and hot-recent-vs-cold-historical storage rather than a single atomic flip.</p>
+
+<div class="callout"><div class="label">Where is truth?</div>
+<strong>System of record:</strong> three authoritative pieces — the content-addressed artifact bytes in the blob store, the metadata rows in Postgres, and the linearizable production pointer in the coordination service (etcd/ZooKeeper). The registry <em>is</em> the source of truth here; nothing downstream is more authoritative. <strong>Copies / derived views:</strong> each serving replica's locally cached weights and its last-watched copy of the pointer; the model itself is derived from its lineage (data snapshot + code + hyperparameters). <strong>Freshness budget:</strong> the pointer flip propagates to the fleet sub-second via watches (no stale window after the compare-and-set returns, because the pointer is linearizable); artifact bytes never change, so they have no freshness concern. <strong>Owner:</strong> the ML-platform team owns the registry; a release tool owns promotions. <strong>Deletion path:</strong> artifacts are immutable and retained so rollback targets always exist; "removing" a version means de-referencing it (it can never be production-pointed) and garbage-collecting only versions no pointer or retention policy still needs — never an in-place overwrite. <strong>Reconciliation/repair:</strong> a model is recomputable from its recorded lineage and verified by re-deriving the same content hash; a replica that missed a watch re-reads the linearizable pointer and re-fetches by hash. <strong>Evidence of correctness:</strong> content hashes prove the bytes never drifted (download verification, tamper-evident lineage); the append-only promotion log proves exactly who promoted what and when; the compare-and-set proves no concurrent flip was lost.</div>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+A model registry is two stores glued by one pointer. The <strong>artifact store</strong> holds large immutable weights — make them <strong>content-addressed</strong> (hash = name) so they can never drift, dedup for free, and verify on download (<a href="03_storage_engines_logs_btrees.html">L03</a>). The <strong>metadata store</strong> holds tiny strongly-consistent rows (versions, metrics, lineage, stage), registered <em>after</em> their artifact so the registry never dual-writes. The crux is the <strong>production pointer</strong>: "which version is live" must be <strong>linearizable</strong> (<a href="16_consistency_causality_linearizability.html">L16</a>) so the whole fleet agrees the instant a promotion returns, which means a <strong>consensus-backed coordination service</strong> (etcd/ZooKeeper) with an <strong>atomic compare-and-set</strong> promote and <strong>watches</strong> that push flips sub-second (<a href="17_consensus_coordination_verification.html">L17</a>) — rare writes, fleet-scale reads. <strong>Lineage</strong> (data snapshot + code commit + parent) is derived-data provenance and the promotion log is an append-only audit (<a href="20_derived_data_correctness.html">L20</a>). Because every artifact is immutable, <strong>rollback</strong> is just a compare-and-set back to a version that still exists byte-for-byte — a sub-second flip, not a recovery.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>Why split artifacts and metadata into two stores? <em>(§1, §2 — 40 TB of large immutable weights wants a durable high-throughput blob store with no transactions; 80 MB of critical metadata wants a strongly-consistent queryable engine. Opposite needs; one engine serves neither well.)</em></li>
+  <li>What property must the production pointer have, and where does it live? <em>(§3.3 — linearizability: the moment a promotion returns, every replica's read sees the new version. Put it in a consensus-backed coordination service (etcd/ZooKeeper), not an async-replicated DB whose followers lag.)</em></li>
+  <li>How is promotion made atomic against concurrent flips? <em>(§3.3, §4 — a single compare-and-set "set M from 41 to 42 only if still 41"; concurrent promotions are serialized, the loser is told it lost and retries — no lost update, no half-applied state.)</em></li>
+  <li>Why content-address the artifacts? <em>(§3.1 — naming by hash enforces immutability (same bytes, same key; no overwrite), gives download verification and free dedup, and makes lineage tamper-evident.)</em></li>
+  <li>How do 2,000 replicas learn about a flip without hammering the source of truth? <em>(§2, §3.3 — watches: the coordination service pushes the change to every watching client sub-second, so steady-state read load is near zero versus polling, which scales with the fleet and adds staleness.)</em></li>
+  <li>Why is rollback safe and fast here? <em>(§3.4 — artifacts are immutable, so every prior version still exists byte-for-byte; rollback is one compare-and-set back to it, not a restore — no risk the old weights drifted.)</em></li>
+  <li>What does lineage record and why? <em>(§3.4 — the training-data snapshot, code commit, hyperparameters, and parent version; it is derived-data provenance that makes a model reproducible and the registry auditable.)</em></li>
+  <li>What happens if the coordination service goes down? <em>(§5 — replicas keep serving their last watched version (reads from local cache); promotions block. Blocking writes while keeping reads is the safe failure mode for a CP coordination layer.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="32_case_search_index_no_dual_write.html"><span class="dir">&larr; Previous</span><span class="ttl">32 &middot; Case: Search Index Without Dual Writes</span></a>
+  <a class="next" href="34_case_metrics_dashboard.html"><span class="dir">Next &rarr;</span><span class="ttl">34 &middot; Case: Metrics / Observability Dashboard</span></a>
+</footer>
+
+</main>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

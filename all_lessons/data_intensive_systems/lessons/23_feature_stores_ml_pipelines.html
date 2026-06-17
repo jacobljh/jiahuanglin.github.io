@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>23 &middot; Feature Stores and ML Data Pipelines</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">data_intensive_systems</a><span class="crumb">/</span><span class="crumb">23 &middot; feature stores & ML</span><span class="step-pill">lesson 24 / 35 &middot; ~15 min</span></div></header>
+<main>
+<p class="kicker">Part 9 · Derived views</p>
+<h1>Feature Stores and ML Data Pipelines</h1>
+<p class="subtitle">Lesson 22 built the last <em>retrieval</em> view — a search and vector index that answers "what is relevant to this query." This lesson builds the last <em>family</em> of derived views in Part 9, and the one closest to the machine-learning product itself: the <strong>features</strong> a model reads as input, and the <strong>predictions</strong> it writes as output. Both are derived data. A feature is not a fact a user typed; it is a function computed over the raw event log — "this user's 7-day click rate," "this product's average rating." A prediction is a function of features and a model version. Treat them as derived views and the whole discipline of Part 9 applies: there is one source of truth (the raw event log and base tables), the views can go stale, and they can always be recomputed. Treat them carelessly and you get the two failures that ruin ML systems in production — <strong>label leakage</strong> (training on information that did not exist yet) and <strong>train-serve skew</strong> (the same feature computed two different ways offline and online). This lesson builds the machinery that prevents both: the DataFrame as the ML execution abstraction, point-in-time joins, and the offline/online feature store split.</p>
+
+<div class="callout source-note"><div class="label">DDIA source</div>Arc drawn from Martin Kleppmann, <em>Designing Data-Intensive Applications</em> — the batch-processing chapter (training-set materialization as a deterministic join, lesson <a href="18_batch_processing.html">18</a>) and the stream-processing chapter (event time, CDC, the stream-table join, lesson <a href="19_stream_processing.html">19</a>), with the 2nd-edition additions on DataFrames and dense numeric arrays as the analytics/ML execution model, and on ML training pipelines as derived-data systems. Original synthesis; the feature-store, point-in-time-join, and train-serve-skew framings are ours. The <em>worked interview case</em> for a feature store lives at <a href="31_case_feature_store.html">lesson 31</a>; this is the mechanism lesson behind it.</div>
+
+<div class="callout"><div class="label">Linear position</div>
+<strong>Prerequisite:</strong> Lesson <a href="18_batch_processing.html">18</a> (batch: building a training set <em>is</em> a deterministic join over an immutable input you can recompute), lesson <a href="19_stream_processing.html">19</a> (event time vs processing time, CDC keeping derived views in sync, the stream-table "as of event time" join), and lesson <a href="04_storage_engines_lsm_columnar.html">04</a> (columnar storage — why analytics and DataFrames scan columns, not rows). A hand-wave at encoding/schema (lesson <a href="05_encoding_schema_evolution.html">05</a>) helps, since a feature definition is a schema two systems must share.<br>
+<strong>New capability:</strong> Design an ML data pipeline and feature store as <em>correct derived data</em> — pick the DataFrame abstraction that fits your scale, materialize a training set with a point-in-time join that cannot leak labels, split offline (batch) from online (low-latency lookup) feature serving, and guarantee the two stay consistent so the model sees at inference exactly what it saw in training.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Six moves. (1) The <strong>DataFrame</strong> — named columns over partitioned rows — as the ML/analytics execution abstraction; lazy vs eager evaluation; distributed (Spark) vs single-node (pandas/Polars); and the dense matrices/arrays/tensors a model actually consumes. (2) The <strong>ML data pipeline</strong> stages: ingest → clean/validate → feature engineering → training-set materialization → serving, and the ETL/ELT framing. (3) <strong>Point-in-time (as-of) joins</strong> — the one join you must get right, with a tiny worked example, because the obvious join leaks labels. (4) <strong>Offline vs online</strong> feature stores — batch training-set generation vs single-row low-latency lookup at inference. (5) <strong>Train-serve skew</strong> — the same feature computed two ways diverges; the fix is one definition plus shared encoding (lesson 05). (6) <strong>Predictions as derived data</strong> — a model's output is a view you can recompute and backfill. Then the "Where is truth?" callout and the hand-off to cloud-native storage.</div>
+
+<h2>1 · The DataFrame: named columns over partitioned rows</h2>
+
+<p>Almost all analytics and ML data work happens through one abstraction: the <strong>DataFrame</strong>. A DataFrame is a table of <em>named, typed columns</em> over a set of rows — like a SQL table, but as a first-class value in a program you can pass around, transform, and chain operations on. The operations are the relational ones you already know plus a few ML-flavored extras: <code>filter</code> (drop rows), <code>select</code> (project columns), <code>join</code> (combine on a key), <code>groupBy ... agg</code> (aggregate), <code>withColumn</code> (derive a new column). The reason this shape dominates ML is that feature engineering <em>is</em> column algebra: you take raw columns and compute new ones — "encode this category as an integer," "compute the 7-day rolling click rate," "bucket this price into deciles." Each is a column-to-column transform.</p>
+
+<p>Two design axes separate the DataFrame libraries you will meet, and choosing wrong is a real production cost.</p>
+
+<p><strong>Eager vs lazy evaluation.</strong> An <em>eager</em> DataFrame (pandas) executes each operation the instant you write it — <code>df.filter(...)</code> immediately materializes a new filtered frame in memory. Simple to reason about and debug, but it cannot optimize across operations: if you filter <em>after</em> a join, pandas still built the full join first. A <em>lazy</em> DataFrame (Spark, Polars in lazy mode) does not execute as you go; it records your operations as a <strong>query plan</strong> (a directed graph of transforms) and runs nothing until you call an <em>action</em> that needs a result — <code>collect()</code>, <code>count()</code>, write-to-disk. Before executing, an optimizer rewrites the plan: it pushes the filter <em>down</em> below the join so fewer rows are ever joined (predicate pushdown), drops unread columns (projection pushdown), and picks join strategies — the very batch optimizations of lesson <a href="18_batch_processing.html">18</a>. Lazy buys whole-pipeline optimization at the cost of "nothing happened until the action," which surprises people debugging.</p>
+
+<p><strong>Single-node vs distributed.</strong> A single-node DataFrame (pandas, Polars) holds all the data in one machine's memory and is bounded by that machine's RAM — wonderful up to tens of GB, a wall beyond it. A distributed DataFrame (Spark) <strong>partitions</strong> the rows across many machines (partitioning, lesson <a href="18_batch_processing.html">18</a>) and runs each operation in parallel on every partition; a <code>join</code> or <code>groupBy</code> triggers a <em>shuffle</em> — the same all-to-all repartition-by-key from lesson 18 — which is again where the cost lives. The rule of thumb: if your data fits comfortably on one box, a single-node lazy frame (Polars) is faster and far simpler than a cluster; reach for Spark only when the data genuinely exceeds one machine, because the shuffle and coordination overhead is not free.</p>
+
+<table>
+  <thead><tr><th>Library</th><th>Evaluation</th><th>Scale</th><th>Use when</th></tr></thead>
+  <tbody>
+    <tr><td><strong>pandas</strong></td><td>Eager</td><td>Single node, in-RAM</td><td>Exploration, small/medium data, subsecond iteration</td></tr>
+    <tr><td><strong>Polars</strong></td><td>Lazy (and eager)</td><td>Single node, larger-than-pandas</td><td>One big machine, want the optimizer without a cluster</td></tr>
+    <tr><td><strong>Spark</strong></td><td>Lazy</td><td>Distributed, partitioned</td><td>Data exceeds one machine; cluster-scale joins/aggregates</td></tr>
+  </tbody>
+</table>
+
+<h3>From DataFrame to tensor: what the model actually eats</h3>
+<p>A DataFrame is the <em>preparation</em> surface, but a model does not consume named columns — it consumes <strong>dense numeric arrays</strong>. The last step of any ML pipeline converts the typed, named, often-categorical DataFrame into a <strong>matrix</strong> (a 2-D array of numbers: rows = examples, columns = numeric features) for classical models, or a <strong>tensor</strong> (an N-dimensional array — e.g. a batch of images is 4-D: batch × height × width × channels) for deep models. This conversion is exactly where categorical encodings (one-hot, integer, embedding lookups) and normalization happen, and it is why columnar storage (lesson <a href="04_storage_engines_lsm_columnar.html">04</a>) underpins ML: a feature is a column, models read whole columns at once, and a columnar layout lets you scan one feature across millions of rows without touching the others. The DataFrame is the bridge from <em>named, heterogeneous, human-meaningful</em> data to the <em>dense, homogeneous, numeric</em> form the linear algebra needs.</p>
+
+<h2>2 · The ML data pipeline as derived data</h2>
+
+<p>An ML system's data substrate is a pipeline of derived views, each computed from the one before, all ultimately derived from the raw event log and base tables. The stages:</p>
+
+<div class="mini-flow">
+<div class="step"><span class="n">1</span><strong>Ingest.</strong> Land raw data from sources — event logs (clicks, views), operational DB tables (via CDC, lesson <a href="19_stream_processing.html">19</a>), third-party feeds — into a lake or warehouse. This raw layer is the <em>system of record</em> for everything downstream.</div>
+<div class="step"><span class="n">2</span><strong>Clean / validate.</strong> Enforce schema, types, ranges; drop or quarantine malformed rows; deduplicate. A bad value here silently poisons every model trained on it, so validation is a gate, not a nicety.</div>
+<div class="step"><span class="n">3</span><strong>Feature engineering.</strong> The column algebra of §1: derive features from cleaned data — aggregations, rolling windows, encodings, joins across entities. The output is <em>feature tables</em> keyed by an entity id and a timestamp.</div>
+<div class="step"><span class="n">4</span><strong>Training-set materialization.</strong> Join labels (from the event log) to feature values to produce a flat training table. This is the join that must be <em>point-in-time</em> correct (§3) or the model learns from the future.</div>
+<div class="step"><span class="n">5</span><strong>Serving.</strong> At inference, fetch the current feature values for one entity, run the model, write the prediction back as a derived view (§6).</div>
+</div>
+
+<p>The framing you will hear is <strong>ETL vs ELT</strong>. <em>ETL</em> (extract, transform, load) transforms data <em>before</em> loading it into the warehouse — you decide the shape up front. <em>ELT</em> (extract, load, transform) loads raw data first and transforms it <em>inside</em> the warehouse with SQL/DataFrame jobs, so the raw layer is preserved and transforms can be re-run and revised. ELT is the modern default for ML precisely because of lesson 18's lesson: keep the immutable raw input, and recompute the derived layers when a feature definition changes. The feature tables, the training set, and the predictions are all <em>derived</em>; the raw event log is the only thing you cannot regenerate.</p>
+
+<h2>3 · The point-in-time join: the one you must get right</h2>
+
+<p>Here is the join at the center of every feature store, and the one that quietly destroys models. You have <strong>labels</strong> — each is an event with a timestamp: "user 42 was shown product 91 at 10:00 and clicked." You have <strong>features</strong> that change over time — "user 42's 7-day click rate," which was 0.10 last week and 0.30 today. To build a training row for that 10:00 label, you must attach the feature value <em>as it was at 10:00</em> — not its value now. Reading "whatever the feature table says today" is the same mistake as the stream-table join in lesson <a href="19_stream_processing.html">19</a>: you must read the feature <strong>as of the label's event time</strong>.</p>
+
+<p>Why it matters has a name: <strong>label leakage</strong>. If you join the 10:00 label to today's feature value (0.30), you have leaked information from <em>after</em> the prediction moment into the training row. The model learns a relationship that was not knowable at prediction time; offline metrics look fantastic, and the model fails in production because at serving time the future is, of course, unavailable. The fix is a <strong>point-in-time join</strong> (also called an <em>as-of join</em>): for each label, take the <em>most recent feature value whose timestamp is ≤ the label's event time</em>.</p>
+
+<div class="callout bad"><div class="label">Worked as-of join — leakage vs correct</div>
+A feature table records user 42's "7-day click rate" as it was recomputed over time, and we have two labels to build training rows for:
+<div class="ascii">feature history (user 42, "7d_click_rate"):
+   ts=09:00  value=0.10
+   ts=10:30  value=0.30      <- recomputed later in the day
+
+labels to join:
+   label A: shown@10:00  clicked=1
+   label B: shown@11:00  clicked=0
+
+WRONG ("join to current value", 0.30 for both):
+   label A -> feature 0.30   (LEAK: 0.30 did not exist until 10:30, after 10:00)
+   label B -> feature 0.30   (ok by luck)
+
+RIGHT (as-of join: latest feature ts <= label ts):
+   label A@10:00 -> latest ts <= 10:00 is 09:00 -> feature 0.10   (knowable at 10:00)
+   label B@11:00 -> latest ts <= 11:00 is 10:30 -> feature 0.30   (knowable at 11:00)</div>
+Label A is the tell: the naive join gives it 0.30, a value that was not computed until 10:30 — half an hour <em>after</em> the prediction it is supposed to inform. The as-of join gives it 0.10, the value that genuinely existed at 10:00. Get this wrong across a million rows and your offline AUC is a fiction.</div>
+
+<p>Mechanically, the point-in-time join is a join on <code>entity_id</code> plus an <em>inequality</em> on time (<code>feature.ts ≤ label.ts</code>), keeping the row with the maximum feature timestamp per label. It is more expensive than an equality join — engines implement it as a sort-merge on (entity, time) so it stays a sequential scan rather than a per-row lookup (lesson <a href="18_batch_processing.html">18</a>) — but it is the price of not leaking. Every serious feature store (Feast, Tecton, Databricks) makes the point-in-time join the primitive of training-set generation precisely because hand-rolled joins get it wrong.</p>
+
+<h2>4 · Offline vs online: two stores, two access patterns</h2>
+
+<p>The same logical features are read in two completely different ways, and a feature store is, at heart, the system that serves both from one definition.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Offline store (batch)</div><div class="v">Generates <strong>training sets</strong>. Access pattern: scan <em>millions of rows</em> across the whole history with point-in-time joins (§3). Lives in a columnar lake/warehouse (lesson <a href="04_storage_engines_lsm_columnar.html">04</a>) — Parquet on S3, BigQuery. Throughput-optimized; latency irrelevant; a job runs for minutes.</div></div>
+  <div class="topic-card"><div class="k">Online store (serving)</div><div class="v">Serves features at <strong>inference</strong>. Access pattern: fetch the <em>current</em> feature vector for <em>one entity</em> by key, in single-digit milliseconds, under request load. Lives in a low-latency key-value store — Redis, DynamoDB, Cassandra. Point-lookup-optimized; only the latest value per entity is kept.</div></div>
+</div>
+
+<p>The same feature ("7-day click rate") is therefore materialized into <em>two physical stores</em>: a wide columnar history for training, and a single hot row per entity for serving. A batch or streaming job computes the feature and writes it to <em>both</em> — and that dual materialization is exactly where the next failure mode lives.</p>
+
+<div class="ascii">one feature definition, two materializations, one model
+
+                    +-------------------------+
+   raw event log -->|  feature transform      |   (ONE definition; §5)
+   base tables   -->|  (e.g. 7d_click_rate)   |
+                    +-----------+-------------+
+                                |
+                +---------------+----------------+
+                v                                v
+      OFFLINE store (batch)             ONLINE store (serving)
+      columnar history, all ts          KV: latest value per entity
+      Parquet/BigQuery                  Redis/DynamoDB
+                |                                |
+        point-in-time join                  point lookup by key
+        over millions of rows              one entity, ~1-5 ms
+                v                                v
+        +---------------+                 +---------------+
+        | training set  |---> train ----> |   MODEL       | ---> prediction
+        +---------------+    (model v1)   +---------------+      (derived view, §6)
+                                                |
+                            same v1 reads the SAME features here as in training
+                            -> if offline and online disagree = TRAIN-SERVE SKEW</div>
+
+<p>Keeping the two consistent is the core feature-store problem. The clean pattern is the CDC/log approach of lesson <a href="19_stream_processing.html">19</a>: one feature-computation job writes to the offline columnar table, and the online store is kept in sync from that same computation (a <em>materialization</em> job pushes the latest value per entity into the KV store, or both subscribe to one feature stream). The freshness gap between them — how stale the online value is relative to the offline history — is the online store's <em>lag budget</em>, the streaming-vs-batch trade of lessons 18–19 applied to features.</p>
+
+<h2>5 · Train-serve skew: the same feature, computed twice</h2>
+
+<p><strong>Train-serve skew</strong> is the silent killer of deployed models: the feature value the model saw in <em>training</em> differs from the value it sees at <em>serving</em>, even for the identical entity and time, because the two were computed by two different code paths. The classic origin: the training feature is computed in a Spark/SQL batch job ("7-day click rate" as a windowed aggregate over the event log), while the serving feature is computed in application code in the request path ("count this user's clicks in the last 7 days" via a different query, a different time-zone handling, a different null policy). Each looks right in isolation; they disagree at the third decimal place; the model — which is exquisitely sensitive to its input distribution — degrades, and nothing in your tests catches it because each path passes its own unit tests.</p>
+
+<div class="callout warn"><div class="label">How skew sneaks in (and the worked tell)</div>
+Training (batch): <code>7d_click_rate = clicks_7d / impressions_7d</code> where the 7-day window is computed in UTC, and a user with <em>zero impressions</em> yields <code>NULL</code> (dropped). Serving (app code): the same ratio, but the window is computed in the server's <em>local</em> time zone, and zero impressions yields <code>0.0</code> (kept). For most users the two agree; for users near a day boundary or with sparse activity they diverge — say training says <code>0.25</code> and serving says <code>0.20</code> for the same user at the same instant. The model was fit assuming 0.25; it receives 0.20; predictions drift. The bug is invisible per-path: both "work." The only reliable detection is an <strong>offline/online parity audit</strong> — log the served feature vector alongside the prediction, recompute the same feature from the offline definition for those entities/times, and assert they match within tolerance.</div>
+
+<p>The fix is structural, not "be more careful": <strong>one feature definition, shared by both paths.</strong> You define the transform once — as a function, a SQL/DataFrame expression, or a feature-store-managed definition — and <em>both</em> the offline training-set job and the online serving path execute that <em>same</em> definition over the same inputs, with the <em>same encoding</em>. That shared encoding is exactly lesson <a href="05_encoding_schema_evolution.html">05</a>'s point: a feature is a schema (name, type, null policy, units, time zone) that two systems must agree on, and the way you keep two systems agreeing on a schema is to make the schema a single shared artifact, not two re-implementations. Feature stores enforce this by being the registry where a feature is defined once and both stores are populated from that one definition. When the definition changes, you bump its version and recompute — the derived-data discipline of lesson <a href="20_derived_data_correctness.html">20</a>.</p>
+
+<h2>6 · Predictions are derived data too</h2>
+
+<p>The final move closes the loop. A model's <strong>output</strong> — a score, a ranking, a class, an embedding — is itself a <em>derived view</em>: a deterministic function of (input features, model version). That reframing buys the same superpowers as every other derived view in Part 9. Predictions can be <strong>recomputed</strong>: ship model v2 and re-score the backlog. They can be <strong>backfilled</strong>: generate v2's predictions over all of history to compare against v1 before you roll out. They can be <strong>cached</strong> as a materialized view (precompute recommendations nightly) or computed on demand, the freshness-vs-cost trade of the whole part. And they are <strong>auditable</strong>: record the feature vector, the model version, and the timestamp alongside each prediction, and any output is reproducible — you can re-derive exactly what the model saw and said. The source of truth was never the prediction; it was the event log and the model artifact, and the prediction is a regenerable function of them.</p>
+
+<p>This is why a prediction log is not just a debugging convenience — it is the evidence layer. It is what powers the parity audit of §5 (compare served vs recomputed features), what lets you attribute a metric regression to a model version versus a data shift, and what makes "predictions as derived data" an operational reality rather than a slogan. The model registry (lesson <a href="31_case_feature_store.html">31</a>'s sibling case at lesson 33) is the catalog of model versions that makes this reproducibility complete.</p>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Label leakage.</strong> Joining a label to a feature value computed <em>after</em> the label's event time; offline metrics are inflated, production fails. Symptom: a model that is "too good" offline and disappoints live. Fix: point-in-time / as-of join (§3).</li>
+    <li><strong>Train-serve skew.</strong> The same feature computed by two code paths (batch vs request-path) diverges. Symptom: live performance below offline, no failing test. Fix: one shared definition + shared encoding (§5).</li>
+    <li><strong>Stale online store.</strong> The online KV value lags the offline definition past its budget; the model serves on old features. Symptom: features "frozen" after a pipeline stall. Fix: monitor materialization lag (§4).</li>
+    <li><strong>Eager frame OOM.</strong> A pandas join on data that no longer fits RAM. Symptom: the box swaps and dies. Fix: lazy + larger node (Polars) or distribute (Spark) (§1).</li>
+    <li><strong>Silent data corruption.</strong> A malformed value passes ingest unvalidated and poisons every downstream model. Symptom: gradual metric rot with no code change. Fix: validation gate at stage 2 (§2).</li>
+    <li><strong>Untracked feature version.</strong> Changing a feature definition in place so old training sets cannot be reproduced. Fix: version definitions, recompute (§5, lesson 20).</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Decision checklist</h3><ul>
+    <li>Does the data fit one machine? If yes, lazy single-node (Polars); if no, distributed (Spark) and watch the shuffle (§1).</li>
+    <li>Is every training-set join a point-in-time join on (entity, time ≤ label time)? Can you state, for each feature, that it was knowable at the label's event time? (§3)</li>
+    <li>Are offline and online features written from <em>one</em> definition, or two code paths? (§5)</li>
+    <li>Is there an offline/online parity audit logging served features and recomputing them? (§5, §6)</li>
+    <li>What is the online store's freshness budget, and do you monitor materialization lag against it? (§4)</li>
+    <li>Are feature definitions versioned so a training set is reproducible and recomputable after a change? (§2, §6)</li>
+    <li>Do you log (features, model version, timestamp) with every prediction so outputs are auditable and backfillable? (§6)</li>
+  </ul></div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>You are building the feature substrate for a click-prediction model. Features include <code>user_7d_click_rate</code> and <code>item_avg_rating</code>, both changing over time; labels are impression events with a timestamp and a clicked flag. (a) You have 4 billion impression events and a feature history far larger than one machine — pick the DataFrame engine and say what the expensive step in the training-set join will be. (b) Write, in words, the join condition that builds a leak-free training row for an impression at time <em>t</em>, and give a two-row worked example where the naive "current value" join would leak. (c) The model will serve at 5 ms p99 per request — describe the online store and how it is kept consistent with the offline store from <em>one</em> feature definition. (d) Three weeks in, live CTR is below the offline estimate but no test fails. Name the most likely cause and the one audit that would have caught it.</div>
+
+<div class="callout"><div class="label">Where is truth?</div>
+<strong>System of record:</strong> the raw event log and base tables (clicks, impressions, ratings, operational rows) — the only data you cannot regenerate. <strong>Copies / derived views:</strong> feature tables (offline columnar history + online KV latest-value), the materialized training set, and the model's predictions — all functions of the SoR plus a code/model version. <strong>Freshness budget:</strong> the online store's materialization lag behind the feature definition (CDC/batch lag, lessons 18–19); the offline history is as fresh as its last batch run. <strong>Owner:</strong> the feature definition is the single owned artifact (the feature-store registry), shared by both stores. <strong>Deletion path:</strong> delete from the SoR (the event log) and recompute the derived feature tables and predictions; per-user deletion propagates through the recompute. <strong>Reconciliation / repair:</strong> recompute features and re-materialize both stores from the raw log; re-score predictions with the current model version. <strong>Evidence it is correct:</strong> a <em>no-leakage check</em> (every feature timestamp ≤ its label's event time in the materialized training set) and an <em>offline/online parity audit</em> (served feature vectors logged with predictions and re-derived from the offline definition match within tolerance).</div>
+
+<h2>Where this points next</h2>
+<p>Part 9 has now built every family of derived view — materialized views and their correctness (lesson 20), analytics query execution (21), search and vector retrieval (22), and now features and predictions for ML. Every one of them — the columnar warehouse, the vector index, the offline feature store, the prediction log — lives on the same physical substrate: <em>cloud object storage</em>. The next lesson (lesson 24, <a href="24_cloud_native_storage.html">Cloud-Native Storage as a Subsystem</a>) opens that substrate up. It asks how a system like S3 actually delivers durability, elasticity, and the separation of storage from compute that lets a Spark cluster, a warehouse, and a feature store all read the same Parquet files — and what the data-intensive designer gives up (latency, strong consistency guarantees, per-request cost) in exchange. The feature store you just designed assumes that substrate exists; lesson 24 builds it.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+Features and predictions are the last family of <strong>derived views</strong>: a feature is a function of the raw event log, a prediction is a function of features and a model version, and the raw log is the only source of truth. The execution abstraction is the <strong>DataFrame</strong> — named columns over rows — with two axes: <em>eager</em> (pandas) vs <em>lazy</em> (Spark/Polars, which optimize the whole plan), and <em>single-node</em> (RAM-bound) vs <em>distributed</em> (partitioned, pays a shuffle); the final step converts the DataFrame into the dense <strong>matrices/tensors</strong> a model consumes, which is why columnar storage (lesson 04) underpins ML. The pipeline ingests → cleans → engineers features → materializes a training set → serves, in ETL/ELT form. The join at its center must be a <strong>point-in-time (as-of) join</strong> — attach each label the feature value <em>as of the label's event time</em> (lesson 19) — or you get <strong>label leakage</strong> and an offline metric that is a fiction. Features are served from two stores: an <strong>offline</strong> columnar history for batch training-set generation and an <strong>online</strong> KV store for millisecond point lookups at inference, kept consistent by computing from <em>one definition</em>. Computing a feature two ways (batch vs request-path) causes <strong>train-serve skew</strong>; the fix is one shared definition plus shared encoding (lesson 05), audited by an offline/online parity check. And because predictions are themselves a derived view, they can be recomputed, backfilled, cached, and audited — provided you log features, model version, and timestamp with every one.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>What is a DataFrame, and what do the eager/lazy and single-node/distributed axes buy you? <em>(§1 — named typed columns over rows; lazy (Spark/Polars) records a plan and optimizes the whole pipeline (pushdown, join choice) before any action, eager (pandas) runs each op immediately; single-node is RAM-bound and simple, distributed partitions rows and parallelizes but pays a shuffle on joins/aggregates. Fit one machine → Polars; exceed it → Spark.)</em></li>
+  <li>Why does ML ultimately need columnar storage and tensors, not just a DataFrame? <em>(§1 — a model consumes dense numeric matrices/tensors, not named columns; a feature is a column and models read whole columns across millions of rows, so columnar layout (lesson 04) lets you scan one feature without the others; the DataFrame is the bridge that encodes categoricals/normalizes into the dense array.)</em></li>
+  <li>What is a point-in-time / as-of join and why is it mandatory for training sets? <em>(§3 — join each label to the most recent feature value with timestamp ≤ the label's event time (a join on entity + a time inequality, lesson 19's "as of event time"); joining to the current value leaks future information (label leakage), inflating offline metrics while the model fails live.)</em></li>
+  <li>Contrast the offline and online feature stores. <em>(§4 — offline = columnar history (Parquet/warehouse), scans millions of rows with point-in-time joins to build training sets, throughput-optimized; online = low-latency KV (Redis/DynamoDB), point-lookup the latest vector for one entity in ~ms at inference; same feature materialized into both from one definition.)</em></li>
+  <li>What is train-serve skew, how does it arise, and what is the structural fix? <em>(§5 — the feature value in training differs from serving because two code paths (batch vs request-path) compute it differently (time zone, null policy, windowing); the fix is one shared definition + shared encoding (lesson 05), not "be careful," detected by an offline/online parity audit.)</em></li>
+  <li>In what sense is a model's prediction "derived data," and why care? <em>(§6 — a prediction is a deterministic function of (features, model version); so it can be recomputed, backfilled for a new model, cached as a materialized view, and audited — provided you log features + model version + timestamp; the SoR is the event log and model artifact, never the prediction.)</em></li>
+  <li>Your offline AUC is excellent but live performance is mediocre and no test fails — what are the two prime suspects and how do you tell them apart? <em>(§3, §5 — label leakage (a feature used a value not knowable at the label's event time → check every feature ts ≤ label ts with a no-leakage audit) and train-serve skew (offline and online features diverge → run an offline/online parity audit logging served vectors and recomputing them).)</em></li>
+</ul>
+<footer class="lesson-nav">
+  <a href="22_search_vector_indexes_rag.html"><span class="dir">&larr; Previous</span><span class="ttl">22 &middot; Search, Vector Indexes, and RAG</span></a>
+  <a class="next" href="24_cloud_native_storage.html"><span class="dir">Next &rarr;</span><span class="ttl">24 &middot; Cloud-Native Storage as a Subsystem</span></a>
+</footer>
+</main>
+<!-- reviewed:v1 -->
+</body>
+</html>

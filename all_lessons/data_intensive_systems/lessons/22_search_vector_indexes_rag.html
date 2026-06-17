@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>22 &middot; Search, Vector Indexes, and RAG</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">data_intensive_systems</a><span class="crumb">/</span><span class="crumb">22 &middot; search & vector</span><span class="step-pill">lesson 23 / 35 &middot; ~15 min</span></div></header>
+<main>
+<p class="kicker">Part 9 · Derived views</p>
+<h1>Search, Vector Indexes, and RAG</h1>
+<p class="subtitle">Lesson 21 took analytics seriously as <em>another</em> derived view: columnar tables and a query engine that scans, aggregates, and joins to answer "how much, grouped by what." But two enormous read patterns it cannot serve are "find the documents that <em>mention</em> these words" and "find the items that are <em>similar</em> to this one." Neither is an exact-key lookup and neither is an aggregate — they are <strong>relevance</strong> and <strong>similarity</strong> queries, and they need their own purpose-built indexes: the <strong>inverted index</strong> for full-text search and the <strong>approximate-nearest-neighbor (ANN) index</strong> for vector search. This lesson builds both, then wires them into a <strong>RAG</strong> pipeline — and the whole time it insists on the same discipline as lesson 20: these indexes are derived views over a system of record, kept fresh by replay and CDC, never the truth themselves.</p>
+
+<div class="callout source-note"><div class="label">DDIA source</div>Arc drawn from Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, Chapter 3 — the "full-text search and fuzzy indexes" section (inverted indexes, Lucene segments) — extended with the approximate-nearest-neighbor literature (HNSW, IVF, product quantization) that the DDIA 2nd edition adds as a first-class topic. Original synthesis; the inverted-index and ANN/RAG ASCII derivations and the worked exact-vs-ANN cost are ours.</div>
+
+<div class="callout"><div class="label">Linear position</div>
+<strong>Prerequisite:</strong> the <strong>LSM-tree</strong> of lesson 04 (immutable sorted segments reconciled by background compaction — the structural twin of how a search index ingests), and lesson 20's discipline of the <strong>derived view</strong> (a recomputable function of a system of record, with a source, an update path, a lag budget, and a rebuild path). Stream processing and CDC (lesson 19) supply the fresh-update mechanism.<br>
+<strong>New capability:</strong> design full-text and vector retrieval as a <em>fresh, rebuildable derived view</em> — choose an inverted index for relevance and an ANN index for similarity, reason about the recall-vs-latency-vs-memory trade, assemble a RAG pipeline, and give the whole thing a freshness budget and a reindex path rather than treating it as a source of truth.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Five moves. (1) Full-text search: build the <strong>inverted index</strong> from documents, define tokenization/analysis, and score relevance with TF-IDF then BM25. (2) Near-real-time indexing: Lucene's immutable <strong>segments</strong> merged in the background — structurally an LSM-tree (lesson 04) — and the refresh interval that makes search eventually consistent with the source. (3) Vector search: embeddings, similarity, why <em>exact</em> k-nearest-neighbor over millions of vectors is too slow, and the ANN families — HNSW, IVF, and product quantization — with the recall/latency/memory trade. (4) The <strong>RAG</strong> pipeline: embed query, ANN retrieve top-k, optional rerank, assemble LLM context — framed as a derived view kept fresh by CDC. (5) The honest caveat (these are not systems of record), the "Where is truth?" artifact, failure modes, and a checklist.</div>
+
+<h2>1 &middot; Full-text search: the inverted index, and how relevance is scored</h2>
+
+<p>Start with the read pattern. A user types <code>distributed consensus</code> into a search box and expects, in milliseconds, the most relevant documents out of millions — ranked, not just matched. A row store or even a columnar scan (lesson 21) cannot do this at speed: scanning every document for the words is linear in corpus size. The fix is to pay the cost <em>at write time</em> and build an index keyed by <em>word</em>, not by document. That index is the <strong>inverted index</strong>: a map from each <strong>term</strong> (a normalized word) to a <strong>posting list</strong> — the sorted list of document ids that contain it (often with positions and term frequencies).</p>
+
+<p>"Inverted" because the natural ("forward") layout is document &rarr; words; we invert it to word &rarr; documents, so a query for a word is a single lookup of a precomputed list instead of a scan. Getting from raw text to terms is <strong>analysis</strong> (or <strong>tokenization</strong>): split text into tokens, lowercase them, optionally drop stop-words (<code>the</code>, <code>a</code>), and reduce words to a root form by <strong>stemming</strong> (<code>running</code>, <code>runs</code> &rarr; <code>run</code>) so a query and a document match even when their surface forms differ. The <em>same</em> analyzer must run on documents at index time and on the query at search time, or they will never agree.</p>
+
+<div class="ascii">INVERTED INDEX  (term -> sorted posting list of doc ids)
+
+  documents                          analysis (tokenize, lowercase, stem)
+  ─────────                          ───────────────────────────────────
+  doc1: "Distributed consensus"  ->  [distribut, consensus]
+  doc2: "consensus is hard"      ->  [consensus, hard]
+  doc3: "a distributed log"      ->  [distribut, log]
+
+  INVERTED INDEX
+  ┌────────────┬──────────────────────────────┐
+  │ term       │ posting list (doc ids, tf)    │
+  ├────────────┼──────────────────────────────┤
+  │ consensus  │ doc1(1), doc2(1)              │
+  │ distribut  │ doc1(1), doc3(1)              │
+  │ hard       │ doc2(1)                       │
+  │ log        │ doc3(1)                       │
+  └────────────┴──────────────────────────────┘
+
+  query "distributed consensus" -> analyze -> [distribut, consensus]
+     intersect posting lists:  distribut={doc1,doc3} ∩ consensus={doc1,doc2}
+     candidate = {doc1}  -> then SCORE & rank, don't just match</div>
+
+<p>Matching is only half the job; the user wants the <em>best</em> documents first, so each candidate is <strong>scored</strong> for relevance. The classic intuition is <strong>TF-IDF</strong>: a term matters more in a document the more often it appears there (<strong>term frequency</strong>, TF) and the rarer it is across the whole corpus (<strong>inverse document frequency</strong>, IDF — a word in every document, like <code>the</code>, carries almost no signal; a word in three documents is highly discriminating). Multiply them: a document scores high when it uses a query term often <em>and</em> that term is globally rare.</p>
+
+<p>Modern engines use <strong>BM25</strong>, a refinement of TF-IDF that fixes two real problems. First, raw term frequency grows without bound, so a document stuffing a word 1,000 times would dominate; BM25 makes TF <em>saturate</em> — the tenth occurrence adds far less than the second. Second, long documents naturally contain more words, so they would win unfairly; BM25 applies <strong>length normalization</strong>, discounting matches in documents longer than average. The result is the de-facto relevance scorer in Lucene-based engines: same TF-IDF spirit, but bounded and length-fair. You do not need its formula for an interview — you need to be able to say <em>why</em> it beats raw TF-IDF: saturating term frequency and document-length normalization.</p>
+
+<h2>2 &middot; Near-real-time indexing: immutable segments are an LSM-tree</h2>
+
+<p>An inverted index would be miserable to update in place: inserting one document into the posting lists of all its terms means editing entries scattered across a huge structure on every write. Lucene — the engine inside Elasticsearch and OpenSearch — solves this the same way the LSM-tree of lesson 04 solved write-heavy ingestion: <em>never overwrite, write new immutable files and reconcile later.</em></p>
+
+<p>Newly indexed documents accumulate in an in-memory buffer; periodically (the <strong>refresh interval</strong>, e.g. one second) that buffer is flushed to disk as an immutable <strong>segment</strong> — a small, self-contained inverted index. A search queries <em>all</em> current segments and merges their results. A background <strong>merge</strong> process combines small segments into larger ones, dropping documents marked deleted (a delete is a tombstone bit, exactly like lesson 04 — you cannot edit an immutable file). Map it term-for-term onto the LSM-tree:</p>
+
+<div class="ascii">LUCENE SEGMENTS  ≅  LSM-TREE (lesson 04)
+
+  index buffer (in memory)        ≅   memtable
+        │ refresh (~1s)
+        ▼
+  segment_3  (immutable)          ≅   newest SSTable
+  segment_2  (immutable)          ≅   SSTable
+  segment_1  (immutable)          ≅   oldest SSTable
+        \________________/
+         background MERGE          ≅   compaction (drops deleted docs)
+
+  search: query every live segment, merge the per-segment results
+  delete: tombstone bit, physically removed at next merge</div>
+
+<p>The structural consequence is the one that matters for this track: because a document is searchable only <em>after</em> the next refresh, <strong>search is eventually consistent with the source</strong>. Index a document at <span class="math">t = 0</span> with a one-second refresh interval and it can be invisible to search for up to one second — by design. That is not a bug; it is the lag budget you bought to keep ingestion cheap, and it is the same eventual-consistency bargain lesson 20 named for every async derived view. Shrink the refresh interval for fresher search and you pay in more tiny segments and more merge work; lengthen it and you pay in staleness. The refresh interval is the search index's lag knob.</p>
+
+<h2>3 &middot; Vector search: similarity, and why exact kNN is too slow</h2>
+
+<p>Inverted indexes match <em>words</em>. But "find documents <em>about</em> the same thing" or "find images that <em>look</em> alike" is a semantic question that word-matching misses: <code>car</code> and <code>automobile</code> share no terms. The modern answer is the <strong>embedding</strong> — a learned model maps each piece of text or image to a dense vector of floats (say 768 or 1,536 dimensions) positioned so that semantically similar items land near each other in the space. Now "similar" becomes "close," and closeness is a number: <strong>cosine similarity</strong> (the angle between two vectors) or <strong>dot product</strong>.</p>
+
+<p>So retrieval becomes: embed the query, then find the <strong>k nearest neighbors</strong> (kNN) — the k stored vectors closest to it. The honest, exact way is <strong>brute force</strong>: compute the similarity to every stored vector and keep the top k. It is perfectly accurate and hopelessly slow at scale.</p>
+
+<div class="callout"><div class="label">Worked number — why exact kNN does not scale</div>
+<p>Suppose <span class="math">N = 10,000,000</span> stored vectors, each <span class="math">d = 768</span> dimensions. One similarity is a dot product: <span class="math">d</span> multiply-adds. One exact query touches every vector:</p>
+<p><span class="math">N &times; d = 10,000,000 &times; 768 = 7.68 &times; 10^9</span> multiply-adds per query.</p>
+<p>At a few billion such operations per second on one core, that is on the order of <strong>seconds</strong> per query — and it reads the whole vector set (<span class="math">10,000,000 &times; 768 &times; 4 bytes &asymp; 30 GB</span>) from memory every time. For a search box that must answer in <strong>~10 ms</strong>, exact kNN is off by two to three orders of magnitude. You cannot afford to look at every vector.</p></div>
+
+<p>The escape is to give up <em>exactness</em>: an <strong>approximate nearest neighbor</strong> (ANN) index returns <em>almost</em> the true top-k while looking at a tiny fraction of the vectors. <strong>Recall</strong> — the fraction of the true neighbors the index actually returns — drops slightly (say from 100% to 95%), and in exchange latency falls by 100&times; or more. For search and recommendations this is a great trade: the difference between the 5th and 6th most similar document rarely matters to a user, but the difference between 10 ms and 3 s matters enormously. Three index families make this trade, each differently:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">HNSW (graph)</div><div class="v"><strong>Hierarchical Navigable Small World.</strong> Build a multi-layer graph where each vector links to its near neighbors; search greedily walks the graph toward the query, descending from a coarse top layer to a dense bottom layer. Excellent recall and latency; high memory (it stores the graph edges) and slower to build.</div></div>
+  <div class="topic-card"><div class="k">IVF (clustering)</div><div class="v"><strong>Inverted File.</strong> Cluster the vectors into, say, 10,000 cells (centroids) up front. At query time, find the few nearest centroids and search only the vectors in those cells — an "inverted index over vector space." Tune how many cells you probe to trade recall for speed; cheaper memory than HNSW.</div></div>
+  <div class="topic-card"><div class="k">PQ (compression)</div><div class="v"><strong>Product Quantization.</strong> Not a search structure but a <em>compressor</em>: split each vector into sub-vectors and replace each with a small codebook id, shrinking a 768-float vector (~3 KB) to tens of bytes. Lets billions of vectors fit in RAM and speeds distance math, at some accuracy loss. Usually combined with IVF (IVF-PQ).</div></div>
+</div>
+
+<p>The governing trade is a triangle of <strong>recall vs latency vs memory</strong>. HNSW buys the best recall-at-latency but spends memory on graph edges; IVF spends less memory but you must probe enough cells to keep recall up; PQ buys huge memory savings (and faster math) at the cost of some recall because the compressed vectors are approximate. Every knob — HNSW's neighbor count, IVF's probe count, PQ's code length — moves you along this triangle. The interview-ready sentence: <em>ANN trades a small, bounded loss of recall for a one-to-two-order-of-magnitude win in latency and (with PQ) memory, which is exactly the right trade for relevance-style retrieval.</em></p>
+
+<h2>4 &middot; RAG: the vector index as a fresh derived view</h2>
+
+<p><strong>Retrieval-Augmented Generation (RAG)</strong> is the dominant pattern for grounding a language model in a private or current corpus the model was never trained on. The model does not "know" your company wiki; instead you <em>retrieve</em> the relevant passages at query time and paste them into the prompt as context, so the model answers from supplied evidence rather than its parametric memory. The retrieval engine is exactly the ANN index of section 3, fed by the embedding model of that section.</p>
+
+<div class="ascii">RAG PIPELINE  (read path, left→right)
+
+  user query
+     │  embed (same model used to index)
+     ▼
+  query vector ──▶ ┌──────────────┐  top-k candidates
+                   │  ANN INDEX    │ ───────────────▶ (optional) RERANK
+                   │  (HNSW/IVF)   │                   cross-encoder
+                   └──────────────┘                   re-scores k → best m
+                          ▲                                   │
+                          │ kept fresh                        ▼
+                          │                          assemble LLM context:
+  ╔════════════════════╗  │                          [query + top-m passages]
+  ║  SYSTEM OF RECORD  ║──┘  CDC / stream (lesson 19)         │
+  ║  document store    ║     embed new/changed docs,          ▼
+  ║  (chunks + text)   ║     upsert vectors into index    LLM generates answer
+  ╚════════════════════╝                                  grounded in passages</div>
+
+<p>Read it as five steps: <strong>embed</strong> the query with the same model used at index time; <strong>retrieve</strong> the top-k nearest passages from the ANN index; optionally <strong>rerank</strong> those k with a slower, more accurate cross-encoder that scores each (query, passage) pair jointly and keeps the best m (cheap because it only runs on k candidates, not the corpus); <strong>assemble</strong> the prompt from the query plus those passages; and <strong>generate</strong>. The retrieve-then-rerank shape mirrors a recommendation funnel: a cheap approximate stage narrows millions to k, an expensive precise stage orders the few.</p>
+
+<p>Here is where this lesson reconnects to the spine. The ANN index is <em>not</em> the source of truth for the documents — the <strong>document store</strong> is. The vector index is a <strong>derived view</strong> (lesson 20): a deterministic function of the documents and the embedding model. So it must be kept fresh the right way. When a document is created, edited, or deleted in the document store, a <strong>CDC / streaming</strong> pipeline (lesson 19) re-chunks and re-embeds it and upserts the new vectors into the ANN index — never a dual write from application code, for all the divergence reasons lesson 20 gave. A stale or missing document in the index is therefore not a mystery; it is a <strong>freshness-budget</strong> problem with a number: the CDC + embed + upsert lag, exactly the kind of lag budget lesson 20 insists every derived view must publish. And changing the embedding model invalidates <em>every</em> stored vector, so it is a full <strong>reindex</strong> — replay the document store through the new model — which is only safe because the index is recomputable. (The full no-dual-write design is its own interview case: <a href="32_case_search_index_no_dual_write.html">lesson 32</a>.)</p>
+
+<h2>5 &middot; The honest caveat: these indexes are not systems of record</h2>
+
+<p>The single most important thing to say about a search engine or vector database — and the thing interviews probe — is what it is <em>not</em>. Elasticsearch, OpenSearch, and vector stores like FAISS-backed services or pgvector indexes are <strong>not systems of record</strong>:</p>
+
+<ul>
+<li><strong>No strong consistency.</strong> Indexing is asynchronous (the refresh interval of section 2, the CDC lag of section 4), so a read can miss a just-written document. There is no read-your-writes guarantee across the index; cross-store reads are eventually consistent, never linearizable (lesson 16).</li>
+<li><strong>Lossy ranking.</strong> ANN deliberately returns approximate neighbors (recall &lt; 100%), and BM25/embedding relevance is a heuristic, not a fact. The "right" answer is a matter of degree, not a stored truth — you cannot enforce a uniqueness or referential constraint on it.</li>
+<li><strong>Rebuildable, therefore disposable.</strong> Precisely because it is a lossy, async derived view, you must be willing to throw it away and reindex from the document store. If you ever find yourself unable to rebuild it — because the only copy of some field lives in the index — you have accidentally made it authoritative, which lesson 20 named the cardinal sin.</li>
+</ul>
+
+<p>So write to the document store (the system of record), serve relevance and similarity from the derived index, publish the freshness budget, and keep the reindex button wired up. The search/vector index earns its place by answering queries no system of record can — relevance and similarity — and it stays safe by never pretending to be the truth.</p>
+
+<div class="callout"><div class="label">Where is truth?</div>
+<strong>System of record:</strong> the <em>document store</em> (the canonical chunks and their text, plus the embedding-model version). <strong>Copies / derived views:</strong> the inverted (full-text) index and the ANN (vector) index — both deterministic functions of the documents (and, for vectors, the embedding model). <strong>Freshness budget:</strong> the search refresh interval (section 2, e.g. ~1 s) plus the CDC + embed + upsert lag (section 4) — publish the number; a read inside that window may miss or return a stale doc. <strong>Owner:</strong> the team that owns the document store and the indexing pipeline. <strong>Deletion path:</strong> a delete in the document store flows via CDC to a tombstone in the segment (full-text) and a vector removal/upsert (ANN), provably propagated because the index is replayable. <strong>Reconciliation / repair:</strong> reindex — replay the document store through the analyzer / embedding model to rebuild the view; a new embedding model forces a full reindex. <strong>Evidence it is correct:</strong> doc-count parity between the source and the index (e.g. "source has 4,001,233 docs; index reports 4,001,180 — 53 missing"), recall spot-checks on known queries, and CDC lag dashboards.</div>
+
+<h2>6 &middot; Where this breaks, and a checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Analyzer mismatch.</strong> The query is tokenized/stemmed differently from the documents, so obvious matches return nothing. Symptom: searching the exact title of a known document finds it under one analyzer but not another (§1).</li>
+    <li><strong>Dual-write drift.</strong> Application code writes the document store and the index separately; a crash or reorder between the two leaves the index permanently out of sync with no record of the gap (§4, lesson 20). Use CDC, not dual writes.</li>
+    <li><strong>Hidden staleness.</strong> The refresh interval or CDC lag is real but unpublished, so a "search after save" path silently misses fresh docs and nobody has a number to reason about it (§2, §4).</li>
+    <li><strong>Recall collapse from over-tuning.</strong> Pushing IVF probe count or PQ code length too aggressively for speed drops recall so far that relevant results vanish — and because ranking is lossy by design, no error fires; quality just quietly degrades (§3).</li>
+    <li><strong>Forgotten reindex on model change.</strong> The embedding model is upgraded but old vectors are not rebuilt, so the index mixes incompatible vector spaces and similarity becomes meaningless (§4).</li>
+    <li><strong>Index treated as truth.</strong> A field exists only in the search index; when the index is rebuilt the field is lost. The derived view became authoritative by accident (§5, lesson 20).</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Design checklist</h3><ul>
+    <li>What is the <strong>system of record</strong> for the documents, and is the index a derived view with a named rebuild path (§5)?</li>
+    <li>Is the index fed by <strong>CDC / streaming</strong> from the source, never dual writes (§4, lesson 19/20)?</li>
+    <li>Is the <strong>freshness budget</strong> published — refresh interval plus CDC + embed lag — and is the rare "must see my own write" read routed to the source (§2, §4)?</li>
+    <li>Does the <strong>same analyzer / embedding model</strong> run at index time and query time (§1, §4)?</li>
+    <li>For vectors: which ANN family (HNSW / IVF / IVF-PQ), and what is your target on the <strong>recall vs latency vs memory</strong> triangle (§3)?</li>
+    <li>Is <strong>recall</strong> measured against a known-answer set, so over-tuning for speed is caught before users feel it (§3)?</li>
+    <li>Is there <strong>doc-count parity</strong> / drift auditing and a one-command <strong>reindex</strong>, including the full reindex an embedding-model change forces (§4, §5)?</li>
+  </ul></div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>Design retrieval for a help-center assistant over 5,000,000 support articles. (a) Name the system of record and the two derived indexes (full-text + vector); for each give source, update path, lag budget, and rebuild path. (b) Estimate the per-query cost of <em>exact</em> kNN at 768 dimensions and explain in one sentence why you must use ANN instead. (c) Pick an ANN family and justify it on the recall/latency/memory triangle, then name one knob and which way it moves recall. (d) Walk the RAG read path end to end, and say where a reranker helps and why it is cheap. (e) An article is deleted — trace exactly how the deletion reaches both indexes and state the worst-case window during which retrieval could still surface it. (f) Propose one audit that would catch the vector index silently missing 0.1% of articles.</div>
+
+<h2>Where this points next</h2>
+<p>Search and vector indexes were derived views shaped for <em>retrieval</em> — relevance and similarity. The next derived view is shaped for <em>machine-learning serving and training</em>: the <a href="23_feature_stores_ml_pipelines.html">feature store</a>. It takes everything here — a system of record fanned out by CDC, a freshness budget, online vs offline copies of the same data in opposite layouts (the row/KV vs columnar split of lesson 04), and the rebuild-by-replay discipline — and applies it to the values a model consumes, where the new hazards are <strong>online/offline skew</strong> (serving and training computing a feature differently) and <strong>label leakage</strong> (using future events to compute a past example's features). The embedding index you just built is itself a feature-store-shaped artifact, which is exactly why it comes next.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+Search and vector indexes are <strong>derived views</strong> built for queries a system of record cannot answer — <em>relevance</em> and <em>similarity</em>. Full-text search uses an <strong>inverted index</strong> (term &rarr; posting list), built after <strong>analysis</strong> (tokenize, lowercase, stem — the <em>same</em> analyzer at index and query time) and ranked by <strong>BM25</strong>, which beats raw TF-IDF by saturating term frequency and normalizing for document length. Lucene ingests via immutable <strong>segments</strong> merged in the background — structurally an <strong>LSM-tree</strong> (lesson 04) — so search is eventually consistent with the source, with the <strong>refresh interval</strong> as its lag knob. Vector search embeds text/images into dense vectors and ranks by cosine/dot; because <em>exact</em> kNN must touch every vector (~7.7 billion multiply-adds over 10M&times;768, seconds per query), it uses <strong>ANN</strong> — <strong>HNSW</strong> (graph), <strong>IVF</strong> (clustering), and <strong>product quantization</strong> (compression) — trading a small, bounded loss of <strong>recall</strong> for a 100&times; win in latency and memory. <strong>RAG</strong> wires this together: embed query &rarr; ANN retrieve top-k &rarr; optional rerank &rarr; assemble LLM context, with the vector index kept fresh from the document store by <strong>CDC</strong> (lesson 19), its staleness a published <strong>freshness budget</strong> (lesson 20). And the honest caveat throughout: these indexes are <strong>not systems of record</strong> — no strong consistency, lossy ranking — so you write to the document store, serve from the index, publish the lag, and keep the reindex button wired.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>What is an inverted index, and why is the same analyzer required at index and query time? <em>(§1 — a map from term to a sorted posting list of doc ids, so a word query is a precomputed-list lookup instead of a scan; the query must be tokenized/lowercased/stemmed exactly like the documents or matches silently fail.)</em></li>
+  <li>Why does BM25 beat raw TF-IDF? <em>(§1 — it saturates term frequency (the tenth occurrence of a word adds little) and normalizes for document length, so keyword-stuffed or merely long documents do not unfairly dominate, while keeping TF-IDF's "frequent here, rare globally" intuition.)</em></li>
+  <li>How is a Lucene index like an LSM-tree, and what does that imply for consistency? <em>(§2 — in-memory buffer ≅ memtable, immutable segments ≅ SSTables, background merge ≅ compaction, deletes are tombstones; documents become searchable only after the next refresh, so search is eventually consistent with the source and the refresh interval is the lag knob.)</em></li>
+  <li>Why can't you use exact kNN over millions of vectors, and what replaces it? <em>(§3 — exact kNN touches every vector (N&times;d multiply-adds, e.g. 10M&times;768 ≈ 7.7 billion per query, seconds and ~30 GB read), far too slow for a ~10 ms query; ANN indexes (HNSW/IVF/PQ) look at a fraction and trade a small recall loss for a 100&times; latency win.)</em></li>
+  <li>Contrast HNSW, IVF, and PQ on the recall/latency/memory triangle. <em>(§3 — HNSW is a navigable graph with best recall-at-latency but high memory for edges; IVF clusters into cells and probes a few, cheaper memory but recall depends on probe count; PQ compresses vectors into codebook ids for huge memory/math savings at some recall loss, usually combined as IVF-PQ.)</em></li>
+  <li>Walk the RAG pipeline and say where the vector index sits in the truth hierarchy. <em>(§4–5 — embed query &rarr; ANN retrieve top-k &rarr; optional cross-encoder rerank &rarr; assemble prompt &rarr; generate; the document store is the system of record and the vector index is a derived view kept fresh by CDC, never a dual write, with a published freshness budget.)</em></li>
+  <li>Why are search and vector indexes not systems of record, and how do you operate them safely? <em>(§5 — async indexing means no strong consistency / read-your-writes, and ANN + relevance scoring make ranking lossy; so write to the document store, serve relevance/similarity from the index, publish the lag budget, audit doc-count parity and recall, and keep a one-command reindex (full reindex on embedding-model change).)</em></li>
+</ul>
+
+<!-- where-next link target: 23_feature_stores_ml_pipelines.html -->
+<footer class="lesson-nav">
+  <a href="21_analytics_query_execution.html"><span class="dir">&larr; Previous</span><span class="ttl">21 &middot; Analytics and Query-Execution Internals</span></a>
+  <a class="next" href="23_feature_stores_ml_pipelines.html"><span class="dir">Next &rarr;</span><span class="ttl">23 &middot; Feature Stores and ML Data Pipelines</span></a>
+</footer>
+</main>
+<!-- reviewed:v1 -->
+</body>
+</html>

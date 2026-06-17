@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>10 &middot; Local-First and Offline Sync</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">data_intensive_systems</a><span class="crumb">/</span><span class="crumb">10 &middot; local-first</span><span class="step-pill">lesson 11 / 35 &middot; ~15 min</span></div></header>
+<main>
+<p class="kicker">Part 4 · Redundancy</p>
+<h1>Local-First and Offline Sync</h1>
+
+<p class="subtitle">Lesson 09 admitted more than one writer and we paid for it: two leaders could edit the same record with no agreed order, so we learned to <em>detect</em> concurrency with version vectors and resolve it without losing data. There the writers were still servers — fast machines on good networks, disconnected only briefly. Now push that to the extreme. The writer is your phone, a laptop on a plane, a notes app in a tunnel. Each device holds its own full replica, reads and writes it at memory speed, and reaches the network only <em>opportunistically</em> — connectivity is the exception, not the rule. With dozens of writers that spend most of their lives offline, "detect the conflict and ask someone to merge it" is no longer enough: you want a merge that <strong>cannot</strong> conflict, that converges no matter what order updates arrive in. This is the home of CRDTs.</p>
+
+<div class="callout source-note"><div class="label">DDIA source</div>Arc drawn from Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, Chapter 5 (Replication) — the multi-leader / offline-client and conflict-resolution material — extended with the CRDT literature (Shapiro et al. on Conflict-free Replicated Data Types) and the "local-first software" essay (Kleppmann, Wiggins, van Hardenberg, McGranaghan). Original synthesis; ML-infra and product framings are ours.</div>
+
+<div class="callout"><div class="label">Linear position</div>
+<strong>Prerequisite:</strong> Lesson 09 — multi-leader replication, write conflicts, why last-write-wins drops data, and version vectors as a <em>detector</em> of concurrency. We build on "two concurrent values exist for one key" and do not re-derive it.<br>
+<strong>New capability:</strong> Design an offline-capable sync layer where every device is a writer, choose data types whose merge is conflict-free and order-independent so all replicas provably converge, and reason about the metadata and tombstone cost that buys this.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Five moves. (1) The offline-first problem — what changes when the writer is a mostly-disconnected device, and why this is multi-leader replication at its limit. (2) Why last-write-wins is unacceptable here, and what "conflict-free" must mean instead. (3) CRDTs from first principles: the algebraic property that makes merge converge regardless of order, and state-based vs operation-based flavors. (4) Three worked CRDTs — a G-Counter, an OR-Set, and a sequence CRDT for collaborative text — with the merge shown step by step and an ASCII of two replicas diverging then reconverging. (5) Sync engines and local-first software in the wild (Automerge, Yjs, Figma, Riak), plus the bill: metadata overhead, tombstones, and garbage collection.</div>
+
+<h2>1 · The offline-first problem: the writer is your phone</h2>
+
+<p><em>What this is: every device owns a full replica, works offline, and syncs when it can.</em></p>
+
+<p>In server-side replication (lessons 08–09) the replicas are machines in datacenters: numerous, well-connected, and almost always reachable. A partition is a rare, alarming event. <strong>Local-first</strong> software inverts that picture. The primary copy of the data lives <em>on the device</em> — a phone, a tablet, a laptop — and the user reads and writes that local replica directly. The network is used only to <em>sync</em> with peers or a relay server, and it is assumed to be absent most of the time: airplane mode, a subway, a flaky café Wi-Fi, a phone in a pocket. Connectivity is the exception, not the rule.</p>
+
+<p>This is exactly the multi-leader pattern of lesson 09 (every replica accepts writes) but pushed to its limit on three axes at once:</p>
+
+<div class="mini-flow">
+<div class="step"><span class="n">→</span><strong>Many writers.</strong> Not two datacenters but potentially every user's every device — tens or hundreds of independent leaders for one shared document.</div>
+<div class="step"><span class="n">→</span><strong>Long offline windows.</strong> A server replica might lag by milliseconds; a phone in a tunnel diverges for <em>hours</em>, accumulating a long batch of local edits before it ever syncs.</div>
+<div class="step"><span class="n">→</span><strong>Arbitrary sync order.</strong> When devices reconnect they exchange edits peer-to-peer or through a relay in no fixed order. Two phones might sync to each other directly, then later both sync to the server. Updates can arrive duplicated, out of order, and after long delays.</div>
+</div>
+
+<p>The promise that makes this worth it is the <strong>local-first</strong> ideal, summarized as a few properties a user actually feels: <em>responsiveness</em> (every interaction is local, so there is no spinner waiting on a server), <em>offline</em> (the app fully works with no network), <em>collaboration</em> (multiple users and devices can edit the same data and it merges), and <em>ownership</em> (your data lives on your device and survives the vendor going away). Think of a collaborative notes app, a shared shopping list across a family's phones, a figure being edited in a design tool by three people at once, or — in ML-infra terms — an annotation tool where field reviewers label data on tablets offline and the labels merge when they dock.</p>
+
+<div class="callout warn"><div class="label">Why this breaks server-style reconciliation</div>
+On a server quorum (lesson 09) you can lean on read repair, anti-entropy, and "ask the application to merge two siblings on the next read." None of that fits a device that is offline for hours and then dumps a long batch of edits. There is no coordinator to call, no leader to serialize through, and the user will not tolerate "your edit conflicts, please resolve manually" forty times after a flight. The merge must be <strong>automatic</strong>, <strong>local</strong>, and <strong>order-independent</strong>. That requirement is what forces CRDTs.</div>
+
+<h2>2 · Why last-write-wins loses data here</h2>
+
+<p><em>What this is: the failure mode that ruled out LWW in lesson 09 becomes routine offline.</em></p>
+
+<p>Recall from lesson 09 that <strong>last-write-wins (LWW)</strong> attaches a timestamp to each write and, on conflict, keeps the larger timestamp and discards the rest. It always converges — and it silently drops the losing write, choosing the winner by <em>clock order</em>, which is not causal order. On a server with tight clock sync and millisecond divergence, LWW is merely risky. On offline devices it is a guarantee of data loss:</p>
+
+<div class="ascii">two phones edit a shared shopping list while both offline
+
+  phone A (offline 3h):  add "milk"   add "bread"
+  phone B (offline 1h):  add "eggs"
+
+  both reconnect, sync via the relay. LWW keeps whichever
+  whole-list write has the larger timestamp:
+
+     A's list = {milk, bread}     ts = 14:02
+     B's list = {eggs}            ts = 14:50   <- larger
+
+  LWW result = {eggs}     ->  milk AND bread vanish. no error.</div>
+
+<p>The user added three items across two phones and ended with one. Nothing told them anything was lost. And the device clocks were not even adversarial here — B simply made its edit later. Worse, a phone whose clock is set wrong (lesson 15 makes clock unreliability precise) can have its <em>older</em> edit win and clobber everyone. LWW collapses two genuinely concurrent, both-valid states into one by a coin-flip on wall-clock time.</p>
+
+<p>What we actually want is for the merged list to be <span class="math">{milk, bread, eggs}</span> — the union of what each device intended — and to reach that <em>same</em> answer no matter which phone synced first, whether B synced to A directly or both went through the relay, or whether an edit arrived twice. That is a strong, specific demand. It says: define a merge operation on the data that is <strong>commutative</strong> (order does not matter), <strong>associative</strong> (grouping does not matter), and <strong>idempotent</strong> (applying the same update twice is harmless). A merge with those three properties cannot conflict — every replica that has seen the same set of updates computes the identical value, no coordination required. Data types built around such a merge are CRDTs.</p>
+
+<h2>3 · CRDTs: a merge that cannot conflict</h2>
+
+<p><em>What this is: data types whose merge converges regardless of order, by construction.</em></p>
+
+<p>A <strong>CRDT</strong> (Conflict-free Replicated Data Type) is a data structure whose values live in every replica and whose <strong>merge</strong> function is, by mathematical construction, commutative, associative, and idempotent. The payoff is a theorem, not a hope: <strong>any two replicas that have received the same set of updates are in the same state</strong>, regardless of the order, grouping, or duplication in which those updates arrived. This property is called <em>strong eventual convergence</em>. Because the merge can never "conflict," there is no manual resolution step and no coordinator — exactly the automatic, local, order-independent merge §1 demanded.</p>
+
+<p>The reason this works algebraically: if you define replica states as a <strong>join-semilattice</strong> (a set with a "least upper bound" / merge operation that is commutative, associative, and idempotent) and require every update to only move a replica <em>upward</em> in that lattice, then merging two replicas just takes their least upper bound — and lattice merges always agree no matter the order. You do not need to follow the algebra to use CRDTs; you need to know that the data type's designer proved those three properties, so you inherit convergence for free.</p>
+
+<p>There are two ways to ship updates between replicas:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><h4>State-based (CvRDT)</h4><p>Each replica holds a full <em>state</em> and periodically sends its whole state to a peer; the peer <strong>merges</strong> (takes the least upper bound) it into its own. Robust to lost, duplicated, or reordered messages — merge is idempotent and commutative, so re-sending or re-merging is harmless. Cost: shipping the whole state is heavy for large objects (mitigated by <em>delta-state</em> CRDTs that send only the changed part).</p></div>
+  <div class="topic-card"><h4>Operation-based (CmRDT)</h4><p>Each replica broadcasts the <em>operations</em> it applied ("add milk", "increment by 1") rather than full state; peers apply each op locally. Messages are tiny, but the channel must deliver every op <strong>exactly once</strong> in <em>causal</em> order (lesson 16) — duplicate or out-of-causal-order delivery breaks it unless the op is itself made idempotent and commutative. Most real sync engines are op-based with a log that enforces causal, dedup'd delivery.</p></div>
+</div>
+
+<p>How does this relate to lesson 09's <strong>version vectors</strong>? A version vector <em>detects</em> that two writes are concurrent — it tells you a conflict exists but not what to do. A CRDT goes one step further and <em>defines the resolution</em> so there is nothing left to decide. In fact CRDTs lean on the same per-replica-counter machinery: each update is tagged with which replica produced it and a counter, so replicas can recognize updates they have already seen (idempotence) and reason about causality. CRDTs are version vectors plus a merge rule that is guaranteed safe. The causal ordering they rely on is exactly the happened-before relation lesson 16 formalizes.</p>
+
+<h2>4 · Three worked CRDTs, with the merge shown</h2>
+
+<h3>4.1 · G-Counter — a grow-only counter</h3>
+<p><em>What this is: the simplest CRDT — a counter that only goes up, used for likes, views, votes.</em></p>
+
+<p>A naive shared integer fails: if two replicas both read 5 and both increment to 6, merging by LWW keeps 6, losing one increment. The <strong>G-Counter</strong> (grow-only counter) fixes this by giving <em>each replica its own slot</em>. The state is a vector — one non-negative count per replica. A replica increments only its own slot. The counter's value is the <strong>sum</strong> of all slots; the merge of two states takes the element-wise <strong>max</strong> of the slots.</p>
+
+<div class="ascii">G-Counter over replicas A, B, C.  value = sum of slots.
+
+  start:        A=[0,0,0]   B=[0,0,0]   C=[0,0,0]
+
+  A increments twice  -> A=[2,0,0]
+  B increments once   -> B=[0,1,0]      (both offline, concurrent)
+
+  A and B sync. merge = element-wise MAX:
+     max([2,0,0],[0,1,0]) = [2,1,0]     value = 2+1 = 3   correct!
+
+  now C syncs with the OLD A=[2,0,0] too, then with merged [2,1,0]:
+     max([0,0,0],[2,0,0])   = [2,0,0]
+     max([2,0,0],[2,1,0])   = [2,1,0]   value = 3   same answer.</div>
+
+<p>Element-wise max is commutative, associative, and idempotent — so the order C synced in, and the fact it merged A's state twice, changed nothing. No increment is ever lost because each replica owns its slot and only ever raises it; max never lowers a slot. (To also <em>decrement</em>, use a PN-Counter: two G-Counters, one for increments and one for decrements, value = sum of P minus sum of N.)</p>
+
+<h3>4.2 · OR-Set — a set you can add to and remove from</h3>
+<p><em>What this is: a set with conflict-free add and remove — the shopping list, a tag set, group members.</em></p>
+
+<p>A grow-only set (G-Set) is trivial: merge is union, and you can never remove. The hard part is supporting <strong>remove</strong> while staying conflict-free, because "add X here" and "remove X there" are concurrent and you must not let a stale remove erase a fresh add. The <strong>OR-Set</strong> (Observed-Remove Set) solves it with <strong>unique tags</strong>: every <em>add</em> of an element attaches a fresh unique tag; a <em>remove</em> deletes only the tags it has actually <em>observed</em>. An element is "in the set" if it has at least one tag that has not been removed.</p>
+
+<div class="ascii">OR-Set on the shared shopping list. element "milk".
+
+  phone A (offline):  add milk   -> tag a1   set = { milk:{a1} }
+  phone B (offline):  add milk   -> tag b1   set = { milk:{b1} }
+  phone B:            remove milk           -> removes observed {b1}
+                                              set = { milk:{} }  (gone on B)
+
+  A and B sync. merge each element's live-tag set:
+     A's milk tags = {a1}      B's milk tags = {}  (b1 removed)
+     union of adds = {a1,b1};  removed = {b1}
+     live tags     = {a1,b1} - {b1} = {a1}   ->  milk IS still present!
+
+  B's remove only erased the add IT saw (b1). A's concurrent add (a1)
+  survives. "add wins" against a concurrent remove, by construction.</div>
+
+<p>This is the principled version of lesson 09's "keep siblings and union the cart," but the union is automatic and the remove is honest: it deletes exactly what it observed and nothing it didn't. The cost — visible above — is the per-add tag metadata, and the fact that removes leave behind <strong>tombstones</strong> (records that a tag was removed) so a late-arriving duplicate of an old add cannot resurrect a deleted element. Tombstones are the recurring tax of conflict-free deletion; §5 addresses paying it down.</p>
+
+<h3>4.3 · Sequence CRDTs — collaborative text</h3>
+<p><em>What this is: ordered text or lists where many people insert and delete concurrently.</em></p>
+
+<p>Text is the hardest case because position is relative: if you address characters by <em>index</em>, a concurrent insert upstream shifts everyone else's indices and two edits collide. <strong>Sequence CRDTs</strong> (RGA, Logoot/LSEQ, Yjs's YATA, Automerge's approach) give every inserted character a <strong>stable, globally unique identifier</strong> that encodes its position <em>between</em> its neighbors rather than at an absolute index. An insert says "this character goes between identifier P and identifier Q"; a delete tombstones a character's identifier rather than shifting anything. Because identifiers are unique and ordered, two concurrent inserts at the "same" spot get a deterministic, total order (ties broken by replica id), so every replica lays the characters out identically.</p>
+
+<div class="ascii">two editors, both starting from "HI", both offline.
+
+  identifiers shown as <id>; tombstones marked [x].
+
+  A inserts "!" after I:   H I <a:!>            -> "HI!"
+  B inserts "?" after I:   H I <b:?>            -> "HI?"
+
+  merge: both inserts are positioned "after I"; order the two new
+  ids deterministically (say a < b):
+
+     H  I  <a:!>  <b:?>      ->  "HI!?"   on BOTH replicas.
+
+  A then deletes I:  tombstone it, don't reindex:
+     H  [x:I]  <a:!>  <b:?>  ->  "H!?"    still converges.</div>
+
+<p>The user-visible text might surprise (<span class="math">!?</span> vs <span class="math">?!</span>), but it is <em>identical on every replica</em> and no character is lost — which is the contract. This is distinct from <strong>Operational Transformation (OT)</strong>, the older approach (used by Google Docs) that transforms each operation against concurrent ones to fix up indices; OT needs a central server to order operations, whereas sequence CRDTs converge peer-to-peer with no server, at the cost of carrying an identifier and a tombstone per character.</p>
+
+<h2>5 · Sync engines, local-first software, and the bill</h2>
+
+<p><em>What this is: the libraries and systems that ship CRDTs, and what they cost in practice.</em></p>
+
+<p>CRDTs are the convergence math; a <strong>sync engine</strong> is the surrounding machinery that stores the local replica, journals updates, and moves them between peers or through a relay. Real systems:</p>
+
+<table>
+  <thead><tr><th>System</th><th>What it is</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Automerge</strong></td><td>JSON-document CRDT library</td><td>State/op-based; full history; rich nested maps, lists, text. Heavier metadata, strong offline story.</td></tr>
+    <tr><td><strong>Yjs</strong></td><td>High-performance CRDT framework</td><td>Op-based, YATA sequence; powers many production collaborative editors; tuned to keep metadata small.</td></tr>
+    <tr><td><strong>Figma multiplayer</strong></td><td>Design-tool collaboration</td><td>Not pure CRDT — uses a central server with LWW per-property plus CRDT-like structures; pragmatic blend, server is the relay.</td></tr>
+    <tr><td><strong>Riak</strong></td><td>Distributed KV store</td><td>Server-side CRDTs ("Riak data types": counters, sets, maps) for conflict-free leaderless writes — the lesson 09 store, with CRDTs as the merge.</td></tr>
+  </tbody>
+</table>
+
+<p>Note the spectrum: Riak applies CRDTs <em>server-side</em> to dodge lesson 09's sibling-merge problem, while Automerge/Yjs apply them <em>client-side</em> for genuine offline-first apps. Figma shows the pragmatic middle — a central relay with CRDT-ish per-property merge, because their data has a natural authority and full peer-to-peer CRDTs were not worth the metadata.</p>
+
+<p>Which brings us to the bill. Conflict-free convergence is not free:</p>
+<ul>
+<li><strong>Metadata overhead.</strong> Every element carries identity (the OR-Set's tags, the sequence CRDT's per-character ids, per-replica counters). For a long document this metadata can dwarf the actual content; minimizing it is the entire game in engines like Yjs.</li>
+<li><strong>Tombstones.</strong> Conflict-free <em>deletion</em> requires remembering what was deleted (so a late duplicate cannot resurrect it). Tombstones accumulate forever unless reclaimed, so a heavily-edited document's storage grows with its <em>history</em>, not its current size.</li>
+<li><strong>Garbage collection.</strong> You can reclaim a tombstone only once you are sure <em>every</em> replica has seen the deletion — otherwise a still-offline phone could resurrect it. Determining that "everyone has seen it" requires knowing the causal frontier of all replicas (a version-vector watermark), which is hard when replicas may be offline indefinitely. Many systems GC conservatively, or only when a coordinator/relay can vouch for all peers.</li>
+</ul>
+
+<div class="callout"><div class="label">Worked numbers — the tombstone tax</div>
+A collaborative doc reaches a steady visible size of <strong>10,000 characters</strong>. Suppose each character carries an identifier of about <strong>16 bytes</strong> of CRDT metadata. Live content metadata: 10,000 × 16 = <strong>160 KB</strong> on top of the 10 KB of text — a 16× overhead already. Now suppose users have, over the document's life, inserted and deleted <strong>200,000</strong> characters total (lots of editing). Until GC runs, the deleted 190,000 also keep tombstones: 190,000 × 16 ≈ <strong>3.0 MB</strong> of dead metadata for a 10 KB document. The fix is GC once all replicas confirm the deletes — but if one phone has been offline for a month, you cannot reclaim until it returns. The trade is stark: <em>convergence with no coordinator</em> is paid for in storage that grows with edit history, not current state.</div>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>LWW on offline data.</strong> Whole-object last-write-wins silently discards a device's entire batch of offline edits. Symptom: edits "disappear" after a long offline stint, no error.</li>
+    <li><strong>Index-based positions.</strong> Editing ordered data by absolute index instead of stable ids — concurrent inserts collide and text scrambles. Symptom: characters interleave wrongly after merge.</li>
+    <li><strong>Op-based CRDT on a lossy channel.</strong> CmRDT ops delivered duplicated or out of causal order without dedup break convergence. Symptom: counters drift, removed items reappear.</li>
+    <li><strong>Tombstone / metadata blowup.</strong> No GC, or GC blocked by a perpetually-offline replica; storage grows without bound. Symptom: a tiny document is megabytes on disk and slow to sync.</li>
+    <li><strong>CRDT on data that needs a real invariant.</strong> A unique-username or non-negative-balance constraint cannot be a CRDT — automatic merge has no notion of "reject." Those need consensus (lesson 17), not convergence.</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Decision checklist</h3><ul>
+    <li>Is the writer genuinely mostly-offline, or a well-connected server? If servers, a quorum (lesson 09) may be simpler than client CRDTs.</li>
+    <li>Does the data have a conflict-free merge — counter (G/PN-Counter), set (OR-Set), ordered text (sequence CRDT), or nested map? If not, it is not a CRDT problem.</li>
+    <li>State-based or op-based? Op-based needs causal, exactly-once delivery; state/delta-based tolerates a lossy channel.</li>
+    <li>How is deletion handled, and how do tombstones get garbage-collected — and what happens if a replica is offline indefinitely?</li>
+    <li>What is the metadata budget per element, and does it dominate the payload for your sizes?</li>
+    <li>Does any field carry a hard invariant (uniqueness, balance &ge; 0)? Route that to a single authority / consensus, not a CRDT.</li>
+  </ul></div>
+</div>
+
+<div class="callout"><div class="label">Where is truth?</div>
+For local-first sync there is <strong>no single system of record</strong> — and that is the defining feature, not a bug. <strong>System of record:</strong> ambiguous on purpose; authority is distributed across all device replicas, none privileged (a relay server, if present, is just a convenient meeting point, not the truth). <strong>Copies / derived views:</strong> every device holds a full, equal replica. <strong>Freshness budget:</strong> unbounded — a replica may be hours or weeks stale while offline, by design. <strong>Owner:</strong> the user / each device owns its copy. <strong>Deletion path:</strong> tombstones — you record <em>that</em> something was removed (you cannot just drop it, or a late duplicate would resurrect it), and reclaim the tombstone only after every replica has observed it. <strong>Reconciliation / repair path:</strong> CRDT merge — commutative, associative, idempotent, so replicas converge automatically with no coordinator. <strong>Evidence it is correct:</strong> the convergence proof itself — replicas that have seen the same update set are provably in the same state (strong eventual convergence), checkable by comparing version vectors / state hashes.</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>You are building a collaborative to-do app: tasks can be added, removed, and reordered; each task has a "done" boolean; and devices are offline for long stretches. (a) Pick a CRDT for the set of tasks and a CRDT for the ordered list, and say what metadata each carries. (b) Two users concurrently — both offline — toggle the <em>same</em> task's "done" flag in opposite directions; propose a conflict-free rule and state what it does on merge. (c) A user deletes a task on phone A while phone B (offline two weeks) still has a pending "rename" op for it; trace the merge and say why a tombstone is required and when you could safely garbage-collect it. (d) The product wants "task IDs must be globally unique across the team" enforced — explain why that requirement does <em>not</em> belong in the CRDT layer and where it should live.</div>
+
+<h2>Where this points next</h2>
+<p>Replication — single-leader (08), multi-leader and leaderless (09), and now local-first to the limit (this lesson) — answered "how do we keep many <em>copies</em> of the same data agreeing?" But copying does nothing for a dataset too big for one machine or a write rate that swamps one node. The next move is orthogonal: <strong>partitioning</strong> (lesson 11) splits the data itself across machines so each node owns a slice. We will see the shard key as a performance contract, skew producing hot partitions, and rebalancing without downtime — and that real systems combine partitioning <em>and</em> replication, each partition being a small replica set running the very protocols of this part. And the causal ordering CRDTs quietly relied on gets made precise later in lesson 16.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+Local-first software is multi-leader replication at its extreme: every device is a writer that spends most of its time offline, reads and writes a full local replica at memory speed, and syncs opportunistically in arbitrary order. Last-write-wins is unacceptable here — it silently discards whole batches of offline edits by a clock comparison that is not causal order. The fix is a merge that <em>cannot</em> conflict: a CRDT, whose merge is commutative, associative, and idempotent, so any two replicas that have seen the same updates are provably in the same state regardless of order, grouping, or duplication. Build them from per-replica state — element-wise max for a G-Counter, unique add-tags with observed-removes for an OR-Set, stable between-neighbor identifiers for sequence/text — and ship them state-based (robust to lossy channels) or op-based (tiny messages, needs causal exactly-once delivery). CRDTs are version vectors plus a guaranteed-safe merge rule, so reconciliation needs no coordinator. The bill is metadata per element, tombstones for conflict-free deletion, and garbage collection that stalls until every replica has seen a delete — and any data with a hard invariant (uniqueness, non-negative balance) does not belong in a CRDT at all, because convergence has no way to say "no."</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>What makes local-first different from server-side multi-leader replication? <em>(§1 — the writer is a mostly-offline device holding a full local replica; many writers, long offline windows, arbitrary peer-to-peer sync order, and no coordinator to call for merges, which forces automatic local merge.)</em></li>
+  <li>Why is last-write-wins worse offline than on a server? <em>(§2 — offline devices diverge for hours and accumulate batches of edits; LWW keeps one timestamped write and silently discards the rest, by clock order which isn't causal, so a whole device's edits can vanish with no error.)</em></li>
+  <li>State the property that makes a CRDT converge, and why it removes the need for a coordinator. <em>(§3 — its merge is commutative, associative, and idempotent (a semilattice join), so replicas that received the same updates reach the same state regardless of order/grouping/duplication — strong eventual convergence, no coordination needed.)</em></li>
+  <li>State-based vs operation-based CRDTs — when does each fail? <em>(§3 — state-based ships whole state and tolerates lossy/duplicated/reordered delivery (heavy); op-based ships tiny ops but needs causal, exactly-once delivery or it drifts.)</em></li>
+  <li>How does an OR-Set support remove without losing concurrent adds? <em>(§4.2 — each add gets a unique tag; a remove deletes only the tags it observed, so a concurrent add's tag survives and the element stays present — "add wins," at the cost of tags and tombstones.)</em></li>
+  <li>Why can't collaborative text address characters by index, and what replaces it? <em>(§4.3 — concurrent inserts shift indices and collide; sequence CRDTs give each character a stable unique between-neighbor identifier and tombstone on delete, so all replicas order characters identically.)</em></li>
+  <li>What is the cost of CRDTs, and when should you NOT use one? <em>(§5 — per-element metadata, tombstones, and GC that stalls until every replica sees a delete; don't use a CRDT for data with a hard invariant like uniqueness or non-negative balance — that needs consensus, lesson 17, since merge has no "reject.")</em></li>
+  <li>How do CRDTs relate to version vectors? <em>(§3 — version vectors only detect that writes are concurrent; a CRDT adds a guaranteed-safe merge rule that defines the resolution, using the same per-replica counters to recognize already-seen updates and respect causality.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="09_replication_quorums_conflicts.html"><span class="dir">&larr; Previous</span><span class="ttl">09 &middot; Replication II: Quorums, Leaderless, and Conflicts</span></a>
+  <a class="next" href="11_partitioning_rebalancing.html"><span class="dir">Next &rarr;</span><span class="ttl">11 &middot; Partitioning, Hot Keys, and Rebalancing</span></a>
+</footer>
+</main>
+<!-- reviewed:v1 -->
+</body>
+</html>

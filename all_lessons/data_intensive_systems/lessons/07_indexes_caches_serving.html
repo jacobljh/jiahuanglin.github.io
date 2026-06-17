@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>07 &middot; Indexes, Caches, and Serving Under Demand</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">data_intensive_systems</a><span class="crumb">/</span><span class="crumb">07 &middot; indexes & caches</span><span class="step-pill">lesson 8 / 35 &middot; ~15 min</span></div></header>
+<main>
+<p class="kicker">Part 3 · Demand</p>
+<h1>Indexes, Caches, and Serving Under Demand</h1>
+<p class="subtitle">Lesson 06 gave us the yardstick: reliability, scalability, and a serving promise written as an SLO — a p99 latency target, not an average. It also showed why the <em>tail</em> is what users feel and why fan-out amplifies it. This lesson is the first move that actually <em>buys</em> that promise on the read path. The data already lives in a storage engine (lessons 03–04); the question now is how to answer reads <em>fast enough</em> and <em>often enough</em> under demand. Two tools dominate: an <strong>index</strong> trades write cost and space to turn a scan into a lookup, and a <strong>cache</strong> trades freshness to turn a slow lookup into a fast one. Both are derived copies of the truth, and both make you answer a question you cannot dodge: when the copy is stale, how wrong are you allowed to be, and for how long?</p>
+
+<div class="callout source-note"><div class="label">DDIA source</div>Arc drawn from Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, Chapter 1 (the latency / percentile framing) and Chapter 3 (indexes as access-path structures over a storage engine), combined with standard caching practice (cache-aside, write-through, stampede control, Little's Law). Original synthesis; the worked numbers, the ASCII read path, and the ML-serving framings are ours.</div>
+
+<div class="callout"><div class="label">Linear position</div>
+<strong>Prerequisite:</strong> Lessons 03–04 (storage engines and indexes — a B-tree or LSM lookup vs a full scan, and that every index must be maintained on write) and lesson 06 (SLOs, percentiles, tail-latency amplification under fan-out). We build on "an index is a secondary structure that costs writes to save reads" and "the promise is a p99, not a mean."<br>
+<strong>New capability:</strong> Design a serving / caching layer with an explicit <em>freshness budget</em> — pick a cache pattern and eviction policy, compute the effective latency a hit ratio buys you, defend the cache against a stampede on a hot key, and size concurrency to a latency target with Little's Law.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Five moves. (1) Recap the <strong>index</strong> as an access-path optimization — a read-speed-for-write-cost trade you already met in storage engines. (2) <strong>Caching</strong> — why it exists, the four placement patterns (cache-aside, read-through, write-through, write-behind), eviction (LRU/LFU/TTL), and the hit-ratio → effective-latency equation with a worked number. (3) <strong>Invalidation</strong> as a derived-view freshness problem — a cache is a derived copy of the system of record, and staleness is a budget you spend on purpose. (4) The <strong>cache stampede</strong> (thundering herd) when a hot key expires, and the four fixes that tame it. (5) <strong>SLO-driven serving</strong> — Little's Law to size concurrency, the latency budget across the read path, and CDN / edge caching, tying back to lesson 06's tail.</div>
+
+<h2>1 &middot; The index: an access-path optimization</h2>
+
+<p><em>What this is: a secondary structure that trades write cost and space for read speed.</em></p>
+
+<p>You already met indexes in the storage-engine lessons, so this is a recap with a sharper name for it. A table on disk is, at bottom, a pile of rows. To find "the user with email = x" without an index you must <strong>scan</strong> the whole pile — O(n) in the number of rows. An <strong>index</strong> is a separate, ordered structure (a B-tree in lessons 03, an LSM-tree or a hash index over the same data) that maps a search key to the location of the row, turning that O(n) scan into an O(log n) lookup. The index does not hold new truth; it is a <em>derived access path</em> over data that already exists. That single fact carries the whole trade-off:</p>
+
+<ul>
+<li><strong>It costs writes.</strong> Every index must be maintained on write. Insert one row into a table with four indexes and you do five writes, not one — the row plus an update to each index. This is exactly the read/write asymmetry you saw between B-trees and LSM-trees (lessons <a href="03_storage_engines_logs_btrees.html">03</a> and <a href="04_storage_engines_lsm_columnar.html">04</a>): the index makes reads cheap by making writes more expensive.</li>
+<li><strong>It costs space.</strong> The index is a second copy of the keys (and for a covering index, of some columns too).</li>
+<li><strong>It can go stale-by-construction only transiently.</strong> A synchronous index is updated in the same transaction as the row, so it is never stale; an <em>asynchronous</em> secondary index (common in search and analytics systems) is itself a derived view that lags — which is the same freshness problem the rest of this lesson is about.</li>
+</ul>
+
+<p>Hold that shape in mind, because a cache is the same trade pushed one layer out: <strong>an index trades write cost for read speed within the database; a cache trades freshness for read speed in front of it.</strong></p>
+
+<h2>2 &middot; Caching: why, the patterns, and the latency math</h2>
+
+<p><em>What this is: keep a fast copy of an answer so most reads never touch the slow source.</em></p>
+
+<p>A <strong>cache</strong> is a small, fast store that holds copies of recently or frequently used answers so that most reads are served from it instead of from the slower, more expensive system of record (the database, an object store, or an upstream service). Two reasons to want one: <strong>latency</strong> (an in-memory cache hit is ~0.1–1 ms; a database read that touches disk or crosses the network is tens of ms) and <strong>offload</strong> (every request the cache absorbs is one the database never sees, so the same backend serves far more traffic). In ML serving the canonical case is a <em>feature cache</em> in front of a feature store, or an embedding / inference-result cache in front of a model.</p>
+
+<p>The first design decision is <strong>where the cache sits relative to the reads and writes</strong>. Four patterns:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Cache-aside (lazy)</div><div class="v">The application owns the cache. On read: check cache; on a <em>miss</em>, read the DB, then write the value into the cache. On write: update the DB and <em>invalidate</em> (or update) the cache entry. Simplest and most common. Cost: every miss pays DB latency, and the invalidation logic lives in app code.</div></div>
+  <div class="topic-card"><div class="k">Read-through</div><div class="v">The cache itself knows how to fetch from the DB on a miss; the app only ever talks to the cache. Centralizes the load logic, but you depend on the cache layer's correctness and its miss behavior.</div></div>
+  <div class="topic-card"><div class="k">Write-through</div><div class="v">Writes go to the cache <em>and</em> the DB synchronously before acking. The cache is never stale relative to the DB, but every write pays both stores' latency. Good when reads dominate and you cannot tolerate staleness.</div></div>
+  <div class="topic-card"><div class="k">Write-behind (write-back)</div><div class="v">Writes go to the cache and ack immediately; the cache flushes to the DB asynchronously. Fastest writes, best absorption of write bursts — but the cache now holds <em>unflushed truth</em>, so a cache crash before flush loses data. The cache is briefly the system of record.</div></div>
+</div>
+
+<p>The second decision is <strong>eviction</strong>: a cache is bounded, so when it fills you must throw something out. <strong>LRU</strong> (least-recently-used) evicts the entry untouched for the longest — good for workloads with temporal locality. <strong>LFU</strong> (least-frequently-used) evicts the entry hit the fewest times — good when a stable hot set should never be displaced by a one-off scan. <strong>TTL</strong> (time-to-live) expires an entry after a fixed age regardless of use — this is your freshness lever, and it reappears in §3 and §4.</p>
+
+<div class="callout"><div class="label">Worked number — what a hit ratio actually buys</div>
+Effective latency is just the weighted average of the hit path and the miss path:
+<p style="text-align:center"><span class="math">latency = (hit_ratio &times; hit_latency) + (miss_ratio &times; miss_latency)</span></p>
+Take a hit at <span class="math">1 ms</span> and a miss (cache lookup + DB read) at <span class="math">40 ms</span>.<br>
+<strong>At a 95% hit ratio:</strong> <span class="math">0.95 &times; 1 + 0.05 &times; 40 = 0.95 + 2.0 = 2.95 ms</span> — call it ~3 ms.<br>
+<strong>At a 99% hit ratio:</strong> <span class="math">0.99 &times; 1 + 0.01 &times; 40 = 0.99 + 0.40 = 1.39 ms</span>.<br>
+<strong>At a 90% hit ratio:</strong> <span class="math">0.90 &times; 1 + 0.10 &times; 40 = 0.90 + 4.0 = 4.9 ms</span>.<br><br>
+Two things to notice. First, <strong>the misses dominate the average</strong>: at 95% hits the cache is hit 19 times for every miss, yet the misses contribute 2.0 of the 2.95 ms. Second, <strong>the last few percent of hit ratio are worth a lot</strong> — going 95% → 99% more than halves the average. And recall lesson 06: this is the <em>mean</em>; the user who misses still waits 40 ms, so your <strong>p99 is roughly the miss latency</strong>. A cache improves the average dramatically and the tail barely — which is why the stampede in §4 matters so much.</div>
+
+<h2>3 &middot; Invalidation is a derived-view freshness problem</h2>
+
+<p><em>What this is: the cache is a derived copy of the truth, so "is it stale?" is a budget, not an accident.</em></p>
+
+<p>"There are only two hard things in computer science: cache invalidation and naming things." The reason invalidation is hard is that <strong>a cache is a derived view of the system of record</strong> (the SoR — the database that holds the authoritative value). The moment the SoR changes, every cached copy of the old value is wrong. You have three honest ways to keep them aligned, and each is a point on a freshness/cost curve:</p>
+
+<ul>
+<li><strong>TTL expiry.</strong> Let the entry simply age out after, say, 60 s. Dead simple, no coupling to writes — but the cache can serve a value up to its TTL stale. The TTL <em>is</em> your freshness budget, made explicit: "users may see a value up to 60 s old."</li>
+<li><strong>Write-time invalidation.</strong> On a write to the SoR, delete (or overwrite) the cache entry. Tighter freshness, but now the write path must reliably reach the cache — and if the delete is lost (a dropped message, a crash between the two writes), you have a stale entry with no expiry to save you. This is a <em>dual-write</em> hazard, the same one lesson <a href="20_derived_data_correctness.html">20</a> dissects for all derived data.</li>
+<li><strong>Change-driven invalidation.</strong> Subscribe to a change feed from the SoR (a CDC stream or event log) and invalidate from it. This is the robust version — the change feed is an ordered durable log, so invalidations are not lost — and it is exactly the derived-data discipline lesson 20 argues for: keep the view correct by deriving it from the log rather than by hoping two writes both land.</li>
+</ul>
+
+<div class="callout warn"><div class="label">Staleness is a correctness budget, not a bug</div>
+A cache with a TTL is <em>deliberately wrong</em> for up to one TTL. That is fine for a product description, a follower count, or a recommendation list; it is not fine for a price at checkout or an access-control decision. The design question is never "is the cache ever stale?" (yes, always) but "<strong>how stale is allowed, on which data, and what reconciles it?</strong>" Write that budget down — it is the freshness line of this lesson's <em>Where is truth?</em> artifact below, and it foreshadows the whole derived-data treatment in lesson 20.</div>
+
+<h2>4 &middot; The cache stampede (thundering herd)</h2>
+
+<p><em>What this is: a hot key expires, every concurrent reader misses at once, and they all hit the DB together.</em></p>
+
+<p>Here is the failure the latency math in §2 hides. Suppose one key is extremely hot — a homepage feed, a popular product, a shared feature vector — served at <strong>10,000 requests/second</strong> from cache. Its TTL expires. Now, until <em>someone</em> repopulates it, every request is a miss, and if the recompute takes 50 ms, then <span class="math">10,000 &times; 0.05 = 500</span> requests pile onto the database simultaneously, all computing the <em>same</em> value. The database, sized for the steady miss trickle, falls over; latency spikes; more requests miss; the herd grows. This is a <strong>cache stampede</strong> (or thundering herd / dog-piling): a correlated miss storm triggered by a single expiry.</p>
+
+<div class="ascii">the read path, and where the stampede strikes
+
+  client ──▶ [ CDN / edge ] ──▶ [ app cache ] ──▶ [ database / SoR ]
+              ~5-30 ms RTT       ~0.5 ms hit         ~40 ms read
+              (§5, geo)          (§2)                (the slow source)
+
+  steady state (key cached):        hot-key TTL expiry (no guard):
+    99% served here ─┐                t0   key expires
+                     ▼                t0+  req#1 misses ─▶ DB (recompute 50ms)
+    [app cache] hit                   t0+  req#2..500 ALSO miss ─▶ DB
+        │ 1% miss                          (all recompute the SAME value)
+        ▼                             t0+  DB at 500x its miss load ─▶ ⚠ overload
+    [database] one read                    latency ↑ ─▶ more misses ─▶ herd grows</div>
+
+<p>Four fixes, often combined:</p>
+
+<ul>
+<li><strong>Request coalescing (single-flight).</strong> When a key is missing, let <em>only the first</em> request recompute it; concurrent requests for the same key wait for that one result and share it. The DB sees <strong>one</strong> recompute, not 500. This is the single biggest win and is cheap to implement (a per-key in-flight lock or promise).</li>
+<li><strong>Jittered TTL.</strong> Never give many keys the same expiry instant — add randomness, e.g. <span class="math">TTL = 60 s &plusmn; rand(0..10 s)</span>. This spreads expirations so a whole shelf of keys does not stampede together at the top of the minute.</li>
+<li><strong>Stale-while-revalidate.</strong> On expiry, keep serving the <em>stale</em> value to readers while a background task refreshes it. Readers never see a miss; they see a slightly old value for a moment. (Only legal within your freshness budget from §3.)</li>
+<li><strong>Early / probabilistic refresh.</strong> Refresh a hot key <em>before</em> it expires — either on a schedule, or probabilistically as it nears expiry (each read has a small, rising chance of triggering an async refresh), so the recompute happens off the critical path while the old value is still valid.</li>
+</ul>
+
+<div class="callout"><div class="label">Worked number — coalescing vs not</div>
+Hot key at 10,000 req/s, recompute 50 ms. <strong>Without a guard:</strong> the miss window is the recompute time, so ~<span class="math">10,000 &times; 0.05 = 500</span> concurrent DB recomputes of the identical value per expiry. <strong>With single-flight:</strong> exactly <strong>1</strong> recompute per expiry; the other ~499 readers block ~50 ms (or, with stale-while-revalidate, get the old value in ~0.5 ms and never block). The DB load from this key's misses drops by 500&times;. Add jittered TTL across the 1,000 hottest keys and you also stop them all expiring on the same tick.</div>
+
+<h2>5 &middot; SLO-driven serving: Little's Law, the budget, and the edge</h2>
+
+<p><em>What this is: connect the read path to the lesson-06 promise — size concurrency and spend a latency budget.</em></p>
+
+<p>Lesson 06 said the serving promise is an SLO: a p99 latency and a throughput. Two tools turn that promise into a sizing decision.</p>
+
+<p><strong>Little's Law</strong> relates the three quantities of any queueing system in steady state:</p>
+
+<p style="text-align:center"><span class="math">concurrency = throughput &times; latency</span> &nbsp; (L = &lambda; &times; W)</p>
+
+<p>The average number of requests <em>in flight</em> equals the arrival rate times the average time each spends in the system. It is an identity — always true in steady state — and it sizes your serving tier. If you must serve <strong>20,000 req/s</strong> at an average <strong>10 ms</strong> per request, then <span class="math">20,000 &times; 0.010 = 200</span> requests are in flight at any instant, so you need at least 200 concurrent slots (threads / connections / goroutines) just to keep up — fewer, and a queue forms and latency climbs without bound. Crucially, the law shows <strong>why a cache miss is doubly bad</strong>: if misses push average latency from 3 ms to 5 ms at the same 20,000 req/s, in-flight work jumps from 60 to 100 — a cache regression silently consumes 40 more concurrency slots, and if you have only 60, the system queues and falls over even though "the cache still mostly works."</p>
+
+<p><strong>The latency budget</strong> is the p99 SLO spent across the read path. Suppose the SLO is "p99 &lt; 50 ms" for a request that fans out (lesson 06) to an auth check, a feature lookup, and a model call:</p>
+
+<div class="ascii">  p99 budget: 50 ms total
+    edge / TLS + routing ........  5 ms
+    auth check (cached)  ........  2 ms
+    feature lookup       ........ 20 ms   ◀ cache this: target 90%+ hit
+    model inference      ........ 18 ms
+    serialization + slack .......  5 ms
+                                  ─────
+                                   50 ms
+
+  fan-out tail trap (lesson 06): if the request waits on N parallel
+  sub-calls, its latency is the SLOWEST of the N, so each sub-call's
+  p99 must be well under the budget — the tail is what you must cache against.</div>
+
+<p>Finally, <strong>CDN / edge caching</strong> pushes the cache geographically closer to the user. A <strong>CDN</strong> (content delivery network) is a fleet of caches in points of presence around the world; a read served from the nearest edge avoids the cross-region round trip entirely (saving the 100+ ms an ocean crossing costs, per lesson 06's fan-out math). It is the same cache-aside / TTL / invalidation machinery from §2–§4, just placed at the edge and best suited to data that is read far more than written and tolerates a freshness budget (static assets, public profiles, rendered pages). The freshness question does not go away at the edge — it gets <em>harder</em>, because now you have thousands of cache copies to invalidate, which is precisely why edge caches lean on TTLs and explicit purge APIs.</p>
+
+<h2>Trade-offs</h2>
+<table>
+  <thead><tr><th>Choice</th><th>Buys</th><th>Costs</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Add an index</strong></td><td>O(log n) lookups instead of O(n) scans</td><td>Extra write per index, more space; async indexes lag</td></tr>
+    <tr><td><strong>Cache-aside</strong></td><td>Simple, app controls it, only caches what's read</td><td>Every miss pays DB latency; invalidation logic in app</td></tr>
+    <tr><td><strong>Write-through</strong></td><td>Cache never stale vs DB</td><td>Every write pays both stores' latency</td></tr>
+    <tr><td><strong>Write-behind</strong></td><td>Fastest writes, absorbs bursts</td><td>Cache holds unflushed truth — crash loses data</td></tr>
+    <tr><td><strong>Longer TTL</strong></td><td>Higher hit ratio, less DB load</td><td>More staleness — spends more freshness budget</td></tr>
+    <tr><td><strong>Single-flight + stale-while-revalidate</strong></td><td>Kills the stampede; readers never block on a miss</td><td>Brief stale reads; per-key in-flight bookkeeping</td></tr>
+    <tr><td><strong>CDN / edge cache</strong></td><td>Cuts geo round-trip; massive offload</td><td>Thousands of copies to invalidate; hardest freshness</td></tr>
+  </tbody>
+</table>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Cache stampede.</strong> A hot key expires and N concurrent readers all recompute it at once, overloading the DB. Symptom: periodic DB latency spikes correlated with TTL boundaries.</li>
+    <li><strong>Stale-forever entry.</strong> Write-time invalidation is lost (dropped message, crash between writes) and there is no TTL, so a wrong value lives indefinitely. Symptom: one record is wrong long after it was updated.</li>
+    <li><strong>Hit ratio collapse.</strong> A scan or one-off traffic evicts the hot set under LRU; the average latency jumps toward the miss latency. Symptom: p50 climbs after a batch job or crawler runs.</li>
+    <li><strong>Concurrency exhaustion.</strong> Misses raise average latency, Little's Law raises in-flight count past the slot limit, a queue forms, latency runs away. Symptom: a small miss-rate rise causes a disproportionate latency cliff.</li>
+    <li><strong>Write-behind data loss.</strong> The cache crashes before flushing acked writes that never reached the DB.</li>
+    <li><strong>Edge invalidation lag.</strong> A purge doesn't reach every PoP; different regions serve different versions.</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Decision checklist</h3><ul>
+    <li>What is this data's <em>freshness budget</em> — how stale may a read be, and on which fields? Write it down.</li>
+    <li>Which pattern: cache-aside (default), write-through (no staleness allowed), or write-behind (write-burst absorption, accept crash-loss)?</li>
+    <li>Eviction: LRU (temporal locality), LFU (protect a stable hot set), or pure TTL (freshness-driven)? Set a TTL even if you also invalidate on write — it is your backstop.</li>
+    <li>Estimate the hit ratio and compute the effective latency and p99 (≈ miss latency). Does it meet the SLO?</li>
+    <li>Is there a hot key? If so, enable single-flight, jitter the TTLs, and consider stale-while-revalidate or early refresh.</li>
+    <li>How is the cache invalidated — TTL, write-time, or a CDC/change feed (preferred for correctness, see lesson 20)?</li>
+    <li>Use Little's Law to size concurrency slots for peak throughput at the expected latency, with headroom for a miss-rate rise.</li>
+    <li>Does geography justify a CDN/edge tier, and can you purge it reliably?</li>
+  </ul></div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>You serve an ML product home feed. The personalized feed for each user is expensive to compute (60 ms), read ~50,000 req/s total, and is acceptable up to 30 s stale. (a) Pick a cache pattern, an eviction policy, and a TTL, and justify each against the freshness budget. (b) Your cache hits at 92% with a 1 ms hit and a 60 ms miss — compute the effective average latency, and state your approximate p99 and why. (c) One celebrity's feed is requested 8,000 req/s; when its entry expires, what happens, and which two fixes do you apply? (d) At 50,000 req/s and your computed average latency, use Little's Law to size the minimum concurrency, and explain what happens to that number if the hit ratio drops to 85%.</div>
+
+<h2>Where this points next</h2>
+<p>A cache and an index both made the read path fast by keeping a <em>derived copy</em> of the truth — and both forced us to name a freshness budget for when that copy is stale. But notice what we quietly assumed: that there <em>is</em> a single authoritative system of record sitting behind the cache, one place the truth lives. The next pressure is what happens when that system of record itself must be copied — for durability and read scale — across more than one machine. Lesson <a href="08_replication_leader_lag_failover.html">08</a> introduces <strong>replication</strong>: a leader accepts writes and followers trail behind it, which means the SoR now has its <em>own</em> internal copies with their <em>own</em> lag and their own freshness budget (replication lag, read-your-writes). The cache's freshness problem you just met is about to repeat one layer deeper — and that recursion, "copies of copies, each with a budget," is the spine of the next several lessons.</p>
+
+<div class="callout"><div class="label">Where is truth?</div>
+<strong>System of record:</strong> the database / feature store / upstream service holding the authoritative value.<br>
+<strong>Copies / derived views:</strong> every cache entry (app cache, CDN edge copies) and every secondary index — all derived from the SoR, none authoritative.<br>
+<strong>Freshness budget:</strong> the TTL (plus any stale-while-revalidate window) — e.g. "a read may be up to 60 s old on this field." Make it explicit per data class; some fields (price at checkout, auth) get a budget of zero.<br>
+<strong>Owner:</strong> the service that owns the SoR also owns its cache's invalidation policy.<br>
+<strong>Deletion path:</strong> a delete in the SoR must purge or tombstone every copy — app cache <em>and</em> every CDN PoP — or the budget is violated indefinitely.<br>
+<strong>Reconciliation / repair path:</strong> TTL expiry (the backstop), write-time invalidation, or — best — a CDC/change-feed-driven invalidation that cannot lose events (lesson 20).<br>
+<strong>Evidence it is correct:</strong> hit-ratio and effective-latency metrics meeting the SLO, a bounded max staleness (age never exceeds TTL), and stampede protection (single-flight) keeping DB miss load flat across TTL boundaries.</div>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+An index trades write cost and space for read speed <em>inside</em> the database; a cache trades freshness for read speed <em>in front</em> of it — and both are derived copies of a system of record. Choose a cache pattern by where staleness is tolerable (cache-aside by default, write-through when none is, write-behind to absorb write bursts), and an eviction policy by your locality (LRU/LFU/TTL). The hit ratio sets the effective latency by a simple weighted average — but the misses dominate the average and roughly <em>are</em> the p99, so the tail barely improves. Treat invalidation as a derived-view freshness problem with an explicit budget, prefer a change-feed (CDC) invalidation that cannot lose events, and defend hot keys against stampedes with single-flight, jittered TTLs, stale-while-revalidate, and early refresh. Finally, hold the read path to its SLO with Little's Law (concurrency = throughput × latency) and a per-hop latency budget, pushing cache copies to the edge where geography and a freshness budget allow.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>Why does adding an index speed up reads but slow down writes? <em>(§1 — an index is a derived, ordered access path that turns an O(n) scan into an O(log n) lookup, but every write must also update every index, so one insert becomes several writes; it also costs space.)</em></li>
+  <li>Walk through the four cache placement patterns and when you'd pick each. <em>(§2 — cache-aside (lazy, app-managed, default); read-through (cache fetches on miss); write-through (sync to both, never stale, slow writes); write-behind (async flush, fast writes, crash-loss risk).)</em></li>
+  <li>Cache hits at 95% with a 1 ms hit and a 40 ms miss — what's the average latency, and what's your p99? <em>(§2 — 0.95×1 + 0.05×40 = 2.95 ms average; p99 ≈ the miss latency ~40 ms, because the misses are the slow tail and the cache barely helps the tail.)</em></li>
+  <li>Why is cache invalidation hard, and what's the most robust way to do it? <em>(§3 — a cache is a derived view of the SoR, so any SoR change makes copies wrong; TTL is simple but stale, write-time invalidation can be lost (dual-write hazard), and a CDC/change-feed invalidation is robust because the ordered log can't lose events — lesson 20.)</em></li>
+  <li>What is a cache stampede and how do you prevent it? <em>(§4 — a hot key expires and many concurrent readers all miss and recompute the same value at once, overloading the DB; fix with single-flight/request coalescing, jittered TTLs, stale-while-revalidate, and early/probabilistic refresh.)</em></li>
+  <li>State Little's Law and use it to size a serving tier. <em>(§5 — concurrency = throughput × latency; 20,000 req/s × 10 ms = 200 in-flight, so you need ≥200 concurrency slots; a miss-driven latency rise raises in-flight work and can exhaust slots, causing a queue and a latency cliff.)</em></li>
+  <li>How does a freshness budget connect a cache to the rest of the system? <em>(§3, §5 — it's the explicit "how stale may this be" line; it determines TTL and whether stale-while-revalidate is legal, varies by field (zero for price/auth), and it's the same derived-view discipline that governs replication lag (08) and all derived data (20).)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="06_reliability_scalability_slos.html"><span class="dir">&larr; Previous</span><span class="ttl">06 &middot; Reliability, Scalability, SLOs, and Tail Latency</span></a>
+  <a class="next" href="08_replication_leader_lag_failover.html"><span class="dir">Next &rarr;</span><span class="ttl">08 &middot; Replication I: Leaders, Followers, Lag, and Failover</span></a>
+</footer>
+</main>
+<!-- reviewed:v1 -->
+</body>
+</html>
