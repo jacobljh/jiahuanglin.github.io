@@ -1,113 +1,180 @@
 <!doctype html>
-        <html lang="en">
-        <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width,initial-scale=1">
-        <title>09 - Ray Data: Blocks, Streaming Execution, and ML Dataflow</title>
-        <link rel="stylesheet" href="style.css">
-        </head>
-        <body>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>09 · Ray Data: Blocks, Streaming Execution, and ML Dataflow | Ray, from first principles</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">ray</a><span class="crumb">/</span><span class="crumb">09</span><span class="step-pill">lesson 10 / 17</span></div></header>
+<main>
 
-        <header class="topnav">
-          <div class="inner">
-            <a class="crumb-link" href="../../index.html">all_lessons</a>
-            <span class="crumb">/</span>
-            <a class="crumb-link" href="index.html">ray</a>
-            <span class="crumb">/</span>
-            <span class="crumb">09</span>
-            <span class="step-pill">lesson 10 / 17</span>
-          </div>
-        </header>
+<p class="kicker">Part II - Applications and libraries</p>
+<h1>Ray Data: Blocks, Streaming Execution, and ML Dataflow</h1>
+<p class="subtitle">Lesson 08 made Ray Tune a control plane that runs many trials and kills the losers early — but every trial still needs <em>data</em>, and so does every training run in lesson 10. The map-shuffle-reduce shape you built by hand in lesson 05 is the right primitive, yet writing it raw means you decide block sizes, materialization, and GPU feeding yourself. Ray Data packages that shape into a dataset abstraction that streams data larger than cluster RAM through a chain of transforms and hands batches to a trainer without ever stalling the GPU — if you tune it right. This lesson is about what a dataset actually <em>is</em> underneath, and the two knobs (compute strategy, block size) that decide whether your expensive GPUs sit idle.</p>
 
-        <main>
-        <span class="part-label">Part II - Applications and libraries</span>
-        <h1>Ray Data: Blocks, Streaming Execution, and ML Dataflow</h1>
-        <p class="subtitle">Ray Data gives the rest of the Ray ML stack a common way to load, transform, repartition, stream, and hand data to batch inference or training.</p>
+<div class="callout source-note"><div class="label">Book source</div>Chapter 6, 'Data Processing with Ray' - Ray Datasets, transformations, streaming-style execution, external integrations with pandas/Dask/Spark-shaped data, and ML dataflow. Calibrated to current Ray: <code>ray.data.read_parquet</code>, <code>map_batches</code> with <code>compute=ActorPoolStrategy(...)</code>, and the streaming executor that pipelines blocks rather than bulk-materializing a dataset.</div>
 
-        <div class="callout">
-          <div class="label">Source map</div>
-          Book coverage: Chapter 6, 'Data Processing with Ray' - Ray Datasets, transformations, streaming-style execution, external integrations with pandas/Dask/Spark-shaped data, and ML dataflow.
-        </div>
+<div class="callout"><div class="label">Linear position</div><strong>Prerequisite:</strong> Lesson 05 (map-shuffle-reduce) — the fan-out/shuffle/reduce shape and why a driver-side reduce is a bottleneck; and lesson 04 (object store, spilling) — where blocks physically live.<br><strong>New capability:</strong> you can reason about a dataset as a stream of blocks, choose a tasks-vs-actors compute strategy for a transform, and size blocks so a CPU preprocessing pipeline keeps a GPU trainer saturated instead of starving it.</div>
 
-        <h2>The thesis</h2>
-        <p>Ray Data is the bridge between file-oriented data systems and Python ML workloads: it turns data into distributed blocks that can feed transforms, training, batch inference, and serving-adjacent workflows.</p>
+<div class="callout"><div class="label">The plan</div>Five moves. (1) Define a dataset as a sequence of <strong>blocks</strong> and say why blocks are the right unit. (2) Explain <strong>streaming execution</strong> — why a dataset bigger than cluster RAM still flows, versus "load it all then map." (3) <code>map_batches</code> and the <strong>compute-strategy</strong> choice: stateless tasks vs an <code>ActorPoolStrategy</code> that loads an expensive model once, with the amortization number. (4) The producer/consumer link into Ray Train — the GPU-starvation math and the fixes. (5) Block-size and CPU/GPU-balance trade-offs, the integration boundary, failure modes, and the hand-off to training.</div>
 
-        <h2>Linear path</h2>
-        <ol>
-  <li>Load data into blocks. Blocks are the physical units of distributed execution, locality, and backpressure.</li>
-  <li>Apply maps, filters, repartitions, group-bys, and streaming execution. Each transformation changes the execution graph and often the shuffle cost.</li>
-  <li>Hand data to ML consumers. The value is not just processing data; it is connecting preprocessing, training, and batch inference without changing substrate.</li>
-</ol>
+<h2>1 · A dataset is a sequence of blocks</h2>
 
-        <h2>The mechanism</h2>
-        <div class="concept-grid">
-<div class="concept"><strong>Dataset blocks</strong><div>Datasets are partitioned into blocks. Block size controls memory behavior, scheduling overhead, and parallelism.</div></div>
-<div class="concept"><strong>Lazy-ish execution</strong><div>Operations build an execution plan that Ray can optimize and execute across workers.</div></div>
-<div class="concept"><strong>Streaming execution</strong><div>Streaming blocks through operators can reduce memory pressure and overlap preprocessing with downstream consumers. Shuffle boundaries still force materialization.</div></div>
-<div class="concept"><strong>External interop</strong><div>Ray Data can interoperate with file formats, Python functions, pandas-style tables, Dask/Spark-shaped handoffs, tensor batches, and ML framework iterators.</div></div>
+<p>A Ray <strong>Dataset</strong> is not a single in-memory table. It is a logical sequence of <strong>blocks</strong>, where a <em>block</em> is a contiguous chunk of rows held as an Apache Arrow table (a columnar in-memory format) and stored as one immutable value in the object store (lesson 04). A 200 GB Parquet dataset read with default settings might become, say, 1,000 blocks of ~200 MB each, scattered across the object stores of every node in the cluster.</p>
+
+<p>Why blocks, and not rows or one big table? Two reasons, and they are the whole design.</p>
+
+<div class="lesson-flow">
+<div><strong>parallel unit</strong><span>A block is the granularity at which Ray Data schedules work. A transform over a 1,000-block dataset becomes up to 1,000 independent tasks (or actor calls) — the same fan-out you wrote by hand in lesson 05, now automatic. One row would be far too fine (scheduling overhead dominates, lesson 02); one giant table would be unparallelizable.</span></div>
+<div><strong>object-store residency</strong><span>Each block is an object-store value addressed by an ObjectRef. That means a block can live on the node that produced it, be read zero-copy by a same-node consumer, be spilled to disk under memory pressure (lesson 04), and be reconstructed from lineage if its node dies — none of which is possible for a value sitting in your driver's heap.</span></div>
 </div>
 
-        <h2>Decision surface</h2>
-        <table>
-  <thead><tr><th>Trade-off</th><th>How to reason about it</th></tr></thead>
-  <tbody>
-    <tr><td><strong>Ray Data vs Spark</strong></td><td>Ray Data fits Python-native ML dataflow and mixed CPU/GPU workloads. Spark remains stronger for mature SQL-heavy enterprise ETL.</td></tr>
-    <tr><td><strong>Materialize vs streaming execution</strong></td><td>Batch materialization is easier to inspect. Streaming execution can reduce memory and latency but is harder to debug.</td></tr>
-    <tr><td><strong>Map batches vs row functions</strong></td><td>Batch functions are faster and vectorizable. Row functions are simpler but often too slow at scale.</td></tr>
-  </tbody>
-</table>
+<p>So the block is doing the same job the partition does in Spark or the chunk does in Dask: it is the atom of parallelism <em>and</em> the atom of placement. Everything in this lesson is a consequence of choosing the right number and size of those atoms.</p>
 
-        <h2>Operational checklist</h2>
-        <ul>
-  <li>Pick block sizes deliberately; default behavior may not match your data distribution.</li>
-  <li>Use batch transforms for vectorized preprocessing and model inference.</li>
-  <li>Track shuffle stages separately from maps; shuffles usually dominate cost.</li>
-  <li>Treat external integrations as boundary contracts: schema, partitioning, ordering, and ownership must still be explicit.</li>
-  <li>Preserve schema and provenance when data will feed training or evaluation.</li>
-</ul>
+<h2>2 · Streaming execution — bigger than RAM still flows</h2>
 
-        <h2>Failure modes</h2>
-        <ul>
-  <li>Using Ray Data as a drop-in SQL warehouse replacement.</li>
-  <li>Mapping one Python call per row over millions of tiny rows.</li>
-  <li>Materializing every intermediate dataset when streaming execution would be enough.</li>
-</ul>
+<p>The naive mental model of a data pipeline is "load the dataset into memory, then map over it, then map again." That model breaks the moment the dataset is larger than cluster RAM: you cannot hold 2 TB of features in 512 GB of object-store memory, so a bulk-materialize-then-transform design either spills catastrophically (lesson 04's spill cliff) or crashes.</p>
 
-        <h2>Implementation sketch</h2>
-        <pre><code>import ray
+<p>Ray Data instead uses <strong>streaming execution</strong> (pipelined execution): it does <em>not</em> materialize the whole dataset between operators. Operators in the chain — read → map_batches → map_batches → consumer — run concurrently, and blocks flow through them one at a time. At any instant only a working set of blocks is resident; a block is read, transformed, consumed, and its memory freed while the next block is still being read. The dataset's <em>total</em> size can exceed cluster RAM because the cluster never holds all of it at once.</p>
 
-ds = ray.data.read_parquet(&quot;s3://bucket/events/&quot;)
+<div class="callout"><div class="label">Worked number — why streaming fits and bulk-load does not</div>
+Suppose 2 TB of training features, a cluster with 512 GB of object-store memory across nodes, and a pipeline <code>read → featurize → train</code>. <strong>Bulk-load:</strong> reading all 2 TB into the object store needs 2,000 GB but only 512 GB exists — the executor must spill 1,488 GB to local SSD. At a spill read-back of, say, ~1 GB/s per node that is minutes of pure I/O stall on top of the compute. <strong>Streaming:</strong> with a working set of, say, 32 blocks × 200 MB ≈ 6.4 GB resident at a time, the pipeline holds well under 512 GB and never spills — the 2 TB flows through in bounded memory. The dataset is 4× the size of cluster RAM and the job still runs.</div>
 
-def featurize(batch):
-    batch[&quot;text_len&quot;] = [len(x) for x in batch[&quot;text&quot;]]
+<p>The mechanism that keeps a streaming pipeline from blowing up is <strong>backpressure</strong>: a control signal that throttles a fast upstream operator when a slow downstream operator cannot keep up. If the reader is producing blocks faster than <code>featurize</code> can consume them, the resident blocks would pile up in the object store until it spills. Backpressure pauses the reader until the buffer drains, capping the working set. The consequence to internalize: in a streaming pipeline, the <em>slowest</em> operator sets the throughput of the whole chain, exactly like a factory line — which is why GPU starvation (§4) is a backpressure problem in disguise.</p>
+
+<h2>3 · map_batches and the compute-strategy choice</h2>
+
+<p>The workhorse transform is <code>map_batches(fn)</code>: it hands your function a <em>batch</em> — a slice of one block, as a dict of NumPy arrays or a pandas frame — and you return the transformed batch. Batching is what makes it fast: a vectorized NumPy or framework call over 1,024 rows is far cheaper than 1,024 per-row Python calls (lesson 02's granularity argument, applied to data). Prefer <code>map_batches</code> over a per-row <code>map</code> for anything that vectorizes.</p>
+
+<p>The decision that actually matters is the <strong>compute strategy</strong>: should each batch run as a stateless <em>task</em> or on a pool of stateful <em>actors</em>?</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Tasks (default)</div><div class="v">Each batch runs as a fresh stateless task on any free worker. Perfect for cheap, stateless transforms — parse a column, normalize, tokenize. No setup to amortize, maximum scheduling flexibility. This is the default and the right choice most of the time.</div></div>
+  <div class="topic-card"><div class="k">ActorPoolStrategy</div><div class="v">An <strong>ActorPoolStrategy</strong> is a compute strategy that runs the transform on a fixed pool of long-lived actor processes (lesson 03), each constructing your callable <em>once</em> and reusing it across many batches. The point is to pay an expensive one-time setup — loading a model onto a GPU — a handful of times instead of once per batch.</div></div>
+</div>
+
+<p>You select actors by passing a <em>class</em> (not a function) plus <code>compute=ray.data.ActorPoolStrategy(...)</code>. Ray Data builds the actors, calls <code>__init__</code> once each, then streams batches through their <code>__call__</code>. This is the batch-inference pattern: load the model once per actor, score many blocks.</p>
+
+<div class="callout"><div class="label">Worked number — init amortization</div>
+Say loading a vision model onto a GPU and warming it takes <strong>20 s</strong>, and scoring one batch of 1,024 images takes <strong>200 ms</strong>. The dataset is 1,000 blocks, one batch each. <strong>If init ran per batch</strong> (the trap of a task that loads the model inside <code>fn</code>): 1,000 × (20 s + 0.2 s) = 20,200 s ≈ 5.6 hours, of which 20,000 s is pure model loading. <strong>With an ActorPoolStrategy of 4 actors</strong>: init is paid 4 times = 4 × 20 s = 80 s total, and the 1,000 batches of scoring spread across 4 GPUs = (1,000 × 0.2 s) / 4 = 50 s. Total ≈ 130 s. The init cost collapsed from 20,000 s to 80 s — a <strong>~155×</strong> reduction on the whole job — purely by loading the model once per actor instead of once per batch. That single choice is the reason ActorPoolStrategy exists.</div>
+
+<pre><code>import ray
+from ray.data import ActorPoolStrategy
+
+ds = ray.data.read_parquet("s3://bucket/images/")   # → a Dataset of blocks
+
+# cheap, stateless: run as tasks (the default)
+def to_float(batch):                                 # batch = dict of np arrays
+    batch["image"] = batch["image"].astype("float32") / 255.0
     return batch
 
-features = (
-    ds.filter(lambda row: row[&quot;label&quot;] is not None)
-      .map_batches(featurize)
-      .repartition(128)
-)</code></pre>
+# expensive init: load the model ONCE per actor, reuse across batches
+class Classifier:
+    def __init__(self):
+        self.model = load_model().cuda()             # ~20 s — paid once per actor
 
-        <div class="callout ok">
-          <div class="label">Exercise</div>
-          You need to preprocess 20 TB of training examples, then train on GPUs. Which stages are CPU-bound, which are I/O-bound, which are GPU-bound, and where would you materialize a checkpoint?
-        </div>
+    def __call__(self, batch):
+        import torch
+        with torch.no_grad():
+            batch["pred"] = self.model(
+                torch.as_tensor(batch["image"]).cuda()).argmax(1).cpu().numpy()
+        return batch
 
-        <h2>Connective tissue</h2>
-        <p>This lesson is meant to connect Ray mechanics to the surrounding ML-systems library rather than live as an isolated API tour.</p>
-        <div class="link-grid"><a href="../../data_engineering/lessons/04_storage_formats.html">Data Engineering - storage formats</a><a href="../../data_engineering/lessons/05_transformation.html">Data Engineering - transformation</a></div>
+scored = (
+    ds.map_batches(to_float, batch_format="numpy")              # tasks
+      .map_batches(Classifier,                                   # actors:
+                   compute=ActorPoolStrategy(size=4),            # 4 long-lived workers
+                   num_gpus=1,                                    # one GPU each
+                   batch_size=1024)
+)
+</code></pre>
 
-        <footer class="lesson-nav">
-  <a href="08_ray_tune_hpo.html">
-    <span class="dir">&lt;- Previous</span>
-    <span class="ttl">08 - Ray Tune: Experiments and Hyperparameter Search</span>
-  </a>
-  <a class="next" href="10_ray_train_distributed_training.html">
-    <span class="dir">Next -&gt;</span>
-    <span class="ttl">10 - Ray Train: Distributed Training</span>
-  </a>
-</footer>
+<h2>4 · The producer/consumer link to Ray Train — don't starve the GPU</h2>
 
-        </main>
-        </body>
-        </html>
+<p>Ray Data exists largely to feed Ray Train (lesson 10). The relationship is producer/consumer: the data pipeline (CPU work — read, decode, augment) <em>produces</em> batches; the training loop (GPU work — forward/backward) <em>consumes</em> them. The hard rule of any such pipeline: <strong>the GPU can only run as fast as the slowest upstream operator can feed it.</strong> If preprocessing cannot deliver a batch in the time the GPU takes to consume one, the GPU idles — and an idle A100 is the most expensive idle resource in your system.</p>
+
+<div class="callout warn"><div class="label">GPU starvation — the utilization math</div>
+Say one training step (forward + backward on a batch) takes the GPU <strong>50 ms</strong>. To keep the GPU busy, preprocessing must supply a fresh batch every 50 ms — a producer throughput of 20 batches/s. Suppose your CPU preprocessing (decode + augment) takes <strong>80 ms</strong> per batch on a single preprocessing worker. Now each step is gated by data, not compute: the GPU does 50 ms of work then waits 30 ms for the next batch. GPU utilization = 50 / 80 = <strong>62.5%</strong> — you are paying for an A100 and using under two-thirds of it. <strong>Fix by adding producers:</strong> with 2 preprocessing workers, effective batch supply is 80 / 2 = 40 ms &lt; 50 ms, so data arrives before the GPU needs it and utilization returns to ~100%. The rule of thumb: provision CPU preprocessing parallelism so producer time-per-batch ÷ workers ≤ GPU time-per-batch.</div>
+
+<p>The fixes follow directly from the math, and all of them are knobs Ray Data gives you:</p>
+
+<div class="mini-flow">
+<div class="step"><span class="n">→</span><strong>More CPU preprocessing parallelism.</strong> Raise the number of tasks/actors doing decode and augment so aggregate producer throughput exceeds the GPU's consume rate (the 2-worker fix above). This is why heterogeneous clusters pair many CPU nodes with a few GPU nodes (lesson 00's resource-heterogeneity theme).</div>
+<div class="step"><span class="n">→</span><strong>Prefetch.</strong> Have the consumer pull the next few batches while the GPU is still chewing on the current one (<code>iter_batches(prefetch_batches=N)</code>). Prefetching hides producer latency behind compute as long as average producer throughput keeps up — it buys slack, it does not fix a chronically slow producer.</div>
+<div class="step"><span class="n">→</span><strong>Bigger blocks / larger batches.</strong> Fewer, larger units amortize per-batch overhead and feed GPUs that want big tensors — but watch the block-size trade-off in §5.</div>
+</div>
+
+<p>The handoff itself: in training you call <code>iter_batches</code> (or <code>iter_torch_batches</code>) on the dataset, and Ray streams shards to each training worker. Lesson 10 shows the sharded side — <code>train.get_dataset_shard</code> gives each DDP rank its slice; here the point is only that streaming + prefetch + enough producers is what keeps that shard's GPU fed.</p>
+
+<pre><code># consumer side — stream batches to the trainer, prefetching to hide latency
+for batch in scored.iter_torch_batches(batch_size=256, prefetch_batches=4):
+    loss = train_step(batch)          # 50 ms GPU; prefetch keeps the next batch ready
+</code></pre>
+
+<h2>5 · Block size, the CPU/GPU balance, and the integration boundary</h2>
+
+<p>Block size is the single tuning knob with the most leverage, and it is a genuine trade-off with a wrong answer on both ends.</p>
+
+<table class="trade-table">
+<thead><tr><th>Block size</th><th>What goes wrong</th></tr></thead>
+<tbody>
+<tr><td><strong>Too big</strong> (e.g. 8 GB blocks)</td><td>Stragglers — one slow block holds up the whole stage because work is coarse; memory pressure — a few resident giant blocks blow past the object-store limit and trigger spilling (lesson 04's spill cliff), turning an in-memory pipeline into a disk-bound one.</td></tr>
+<tr><td><strong>Too small</strong> (e.g. 1 MB blocks)</td><td>Per-block overhead dominates — every block is a scheduled task with metadata, ref-counting, and a function dispatch (lesson 02's granularity wall). A million 1 MB blocks spend more time in bookkeeping than in your transform.</td></tr>
+</tbody>
+</table>
+
+<div class="callout"><div class="label">Worked number — picking a block target</div>
+You have 200 GB of data and want blocks large enough that scheduling overhead is negligible but small enough to stay resident. Target ~128–256 MB per block. At 200 MB/block that is 1,000 blocks. With ~0.5 ms scheduling overhead per block (lesson 02), total overhead ≈ 1,000 × 0.5 ms = 0.5 s — trivial against minutes of real transform. Drop to 2 MB blocks and you have 100,000 blocks: 100,000 × 0.5 ms = 50 s of pure overhead, now a visible tax. Push to 8 GB blocks and you have 25 blocks: too few to spread across, say, 64 CPUs (most sit idle), and any one of them resident is a memory event. The 128–256 MB band is where overhead, parallelism, and residency all stay comfortable. Use <code>override_num_blocks</code> on read or <code>repartition(n)</code> to steer it.</div>
+
+<p>The other balance is <strong>CPU-preprocess vs GPU-train</strong>: spend too little on preprocessing parallelism and you starve the GPU (§4); spend too much and CPU nodes sit idle while the GPU is the bottleneck. The target is to provision just enough producers that the GPU is the bottleneck — because the GPU is what you are paying the most for, you <em>want</em> it to be the constraint, not the data path.</p>
+
+<p>Finally, the <strong>integration boundary</strong>. Ray Data reads and writes the formats your data already lives in — <code>read_parquet</code>, <code>read_csv</code>, <code>from_pandas</code>, <code>from_spark</code>, <code>from_huggingface</code> — and is the glue that moves data from those systems into Python ML transforms. It is explicitly <em>not</em> a Spark-SQL replacement: it has no mature query optimizer, no SQL engine, no decades of enterprise ETL hardening. The honest division of labor — do heavy SQL ETL in Spark/Snowflake, then hand the result to Ray Data for the last-mile ML preprocessing and GPU feeding — is the subject of lesson 15's ecosystem positioning. Treat each integration as a contract: schema, partitioning, and ordering must stay explicit across the boundary.</p>
+
+<h2>6 · Failure modes & checklist</h2>
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+<li><strong>Loading the model inside a task.</strong> Putting expensive init in a <code>map_batches</code> function (tasks) pays the 20 s load once per batch — the §3 trap. Use an actor class + ActorPoolStrategy so init is amortized.</li>
+<li><strong>Per-row map over millions of rows.</strong> A Python call per row drowns in interpreter and scheduling overhead. Vectorize with <code>map_batches</code>.</li>
+<li><strong>Bulk-materializing every intermediate.</strong> Calling <code>materialize()</code> between operators defeats streaming, forces the whole dataset into the object store, and triggers spilling. Stream unless you genuinely need to inspect or reuse a stage.</li>
+<li><strong>Starved GPU.</strong> Too few preprocessing producers leaves the GPU idle (the 62.5% case); the symptom is low GPU util with idle CPUs to spare. Add producers / prefetch.</li>
+<li><strong>Pathological block size.</strong> Defaults can produce blocks far from the 128–256 MB band on skewed or many-small-files data — stragglers or overhead follow. Set block count deliberately.</li>
+<li><strong>Treating Ray Data as a SQL warehouse.</strong> No query optimizer; heavy joins/aggregations belong in Spark (lesson 15).</li>
+</ul></div>
+  <div class="lesson-card"><h3>Implementation checklist</h3><ul>
+<li>Is this transform cheap+stateless (tasks) or does it have expensive one-time init (ActorPoolStrategy)?</li>
+<li>If actors: how many, and how many GPUs each — does the pool size match available accelerators?</li>
+<li>Is preprocessing parallelism enough that producer-time ÷ workers ≤ GPU-step time?</li>
+<li>Are blocks in the ~128–256 MB band — neither straggler-prone nor overhead-bound?</li>
+<li>Am I streaming end-to-end, or did a stray <code>materialize()</code> force the whole dataset resident?</li>
+<li>Is prefetch set on the trainer's <code>iter_batches</code> so the next batch is ready before the GPU asks?</li>
+<li>At each external boundary, are schema, partitioning, and ordering explicit?</li>
+</ul></div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>You have a <code>read_parquet → decode_and_augment → resnet_embed → train</code> pipeline. The GPU step is 40 ms/batch; <code>decode_and_augment</code> is 100 ms/batch on one CPU worker; loading the ResNet embedder costs 15 s. (a) How many CPU preprocessing workers do you need so the GPU is not starved? (b) Should <code>resnet_embed</code> run as tasks or an ActorPoolStrategy, and with how many actors if you have 2 GPUs? (c) Now the GPU step drops to 10 ms/batch (smaller model) — does your producer count from (a) still hold, and which resource is the bottleneck now? The "right answer" flips between (a) and (c): when the GPU got faster, the data path became the constraint and you need more producers, not more GPUs.</div>
+
+<h2>Where this points next</h2>
+<p>We can now keep a GPU fed; lesson 10 puts something on the other end of that pipe. Ray Train takes the streamed shards and runs N worker actors — one DDP rank per GPU — each holding a model replica and exchanging gradients via allreduce (the collective shape from lesson 05, and from the system_ml track). The open question this lesson leaves: once data feeding is solved, what bounds the speedup of adding more training workers, and what happens when the model itself no longer fits on one GPU? That is where data-parallel training meets the memory wall.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+A Ray Dataset is a sequence of <strong>blocks</strong> — Arrow tables living as object-store values — which are simultaneously the unit of parallelism and the unit of placement. <strong>Streaming execution</strong> pipelines blocks through the operator chain so a dataset larger than cluster RAM still flows in bounded memory, with <strong>backpressure</strong> capping the working set. <code>map_batches</code> vectorizes transforms; the <strong>compute strategy</strong> is the decision that matters — stateless tasks for cheap work, an <strong>ActorPoolStrategy</strong> for expensive one-time init (loading a model once per actor cut a worked job from ~5.6 h to ~130 s). The pipeline's job is to feed Ray Train without starving the GPU: provision producers so producer-time ÷ workers ≤ GPU-step time, prefetch to hide latency, and keep blocks in the 128–256 MB band to avoid both stragglers and overhead. Ray Data is the ML-dataflow glue, not a Spark-SQL replacement.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+<li>What is a block, and why is it the right unit? <em>(§1 — a chunk of rows as an Arrow table stored as one object-store value; it is both the atom of parallelism (one task per block) and the atom of placement (locality, spilling, lineage).)</em></li>
+<li>How does a dataset bigger than cluster RAM run at all? <em>(§2 — streaming execution pipelines blocks through operators concurrently; only a bounded working set is resident at once, so total size can exceed RAM; backpressure caps the buffer.)</em></li>
+<li>When do you use ActorPoolStrategy instead of the default tasks? <em>(§3 — when the transform has expensive one-time init, e.g. loading a model on a GPU; actors construct the callable once and reuse it, amortizing init across many batches (~155× on the worked job) instead of paying it per batch.)</em></li>
+<li>Your GPU sits at 60% utilization during training — why and how do you fix it? <em>(§4 — the data pipeline can't supply a batch within the GPU's step time, so the GPU idles between steps; add CPU preprocessing producers until producer-time ÷ workers ≤ GPU-step time, and prefetch to hide latency.)</em></li>
+<li>What goes wrong with blocks that are too big? Too small? <em>(§5 — too big: stragglers and memory pressure that triggers spilling; too small: per-block scheduling overhead dominates the actual transform. Target ~128–256 MB.)</em></li>
+<li>Should you do your heavy SQL joins in Ray Data? <em>(§5 — no; Ray Data has no query optimizer or SQL engine. Do heavy ETL in Spark/Snowflake and hand the result to Ray Data for last-mile ML preprocessing and GPU feeding, per lesson 15.)</em></li>
+<li>Why is calling materialize() between every operator an anti-pattern? <em>(§5 — it defeats streaming, forces the whole dataset into the object store, and triggers spilling; stream unless you must inspect or reuse a stage.)</em></li>
+</ul>
+
+<footer class="lesson-nav"><a href="08_ray_tune_hpo.html"><span class="dir">Previous</span><span class="ttl">08 · Ray Tune: Experiments and Hyperparameter Search</span></a><a class="next" href="10_ray_train_distributed_training.html"><span class="dir">Next</span><span class="ttl">10 · Ray Train: Distributed Training</span></a></footer>
+</main>
+<!-- reviewed:v1 -->
+</body>
+</html>

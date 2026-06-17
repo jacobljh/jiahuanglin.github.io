@@ -1,111 +1,310 @@
 <!doctype html>
-        <html lang="en">
-        <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width,initial-scale=1">
-        <title>14 - Debugging, Observability, and Failure Semantics</title>
-        <link rel="stylesheet" href="style.css">
-        </head>
-        <body>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>14 · Debugging, Observability, and Failure Semantics | Ray, from first principles</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">ray</a><span class="crumb">/</span><span class="crumb">14</span><span class="step-pill">lesson 15 / 17</span></div></header>
+<main>
 
-        <header class="topnav">
-          <div class="inner">
-            <a class="crumb-link" href="../../index.html">all_lessons</a>
-            <span class="crumb">/</span>
-            <a class="crumb-link" href="index.html">ray</a>
-            <span class="crumb">/</span>
-            <span class="crumb">14</span>
-            <span class="step-pill">lesson 15 / 17</span>
-          </div>
-        </header>
+<p class="kicker">Part III - Cluster and platform layer</p>
+<h1>Debugging, Observability, and Failure Semantics</h1>
+<p class="subtitle">Every lesson so far quietly assumed that when a task or actor dies, something sane happens. Lesson 12 promised the autoscaler would replace a lost node; lesson 10 promised training would resume from a checkpoint; lesson 13 promised a Checkpoint could flow from train to serve. This lesson cashes those promises. It builds the failure model the rest of the course leaned on — what Ray retries for free, what it reconstructs from lineage, and the precise places where both of those quietly stop working and leave you holding a corrupted result. Once you can name what is rebuildable and what is not, observability stops being dashboards-as-decoration and becomes the instrument that tells you which boundary just failed.</p>
 
-        <main>
-        <span class="part-label">Part III - Cluster and platform layer</span>
-        <h1>Debugging, Observability, and Failure Semantics</h1>
-        <p class="subtitle">A distributed Ray app needs a failure model: what retries, what is idempotent, what state can be rebuilt, and what metrics explain the slowdown.</p>
+<div class="callout source-note"><div class="label">Book source</div>Cross-cutting material from Chapters 2, 9, and 10 - runtime components, clusters, AIR failure model, memory management, and autoscaling behavior. Calibrated to current Ray: <code>@ray.remote(max_retries=, retry_exceptions=)</code> for tasks, <code>max_restarts</code>/<code>max_task_retries</code> for actors, the Ray dashboard, the timeline export, and <code>ray memory</code> for object-store introspection.</div>
 
-        <div class="callout">
-          <div class="label">Source map</div>
-          Book coverage: Cross-cutting material from Chapters 2, 9, and 10 - runtime components, clusters, AIR failure model, memory management, and autoscaling behavior.
-        </div>
+<div class="callout"><div class="label">Linear position</div><strong>Prerequisite:</strong> Lesson 04 (runtime, scheduling, object store) — you know the object store holds immutable values addressed by <code>ObjectRef</code>, that the <em>owner</em> of a ref is the worker that created it, and that the store spills to disk under pressure. Lesson 03 (actors) — actor state lives in one process and dies with it.<br><strong>New capability:</strong> a precise model of what Ray recovers automatically versus what you must make recoverable yourself, so you can decide where idempotency and checkpoints are mandatory rather than optional, and read the dashboard to localize a slowdown to a specific boundary.</div>
 
-        <h2>The thesis</h2>
-        <p>Ray failures are easiest to debug when you classify them by boundary: task, actor, object store, node, cluster, library control loop, or external system.</p>
+<div class="callout"><div class="label">The plan</div>
+Five moves. (1) Establish that Ray's recovery story is two mechanisms — task <em>retry</em> and lineage-based <em>reconstruction</em> — and define each. (2) Find the three cliffs where reconstruction silently fails: actor state, side effects, and a dead owner. (3) Derive the consequence: Ray gives you <em>at-least-once</em> execution, so your tasks must be <em>idempotent</em>, with a real side-effect bug and its fix. (4) Make the retry-vs-checkpoint trade-off quantitative with an expected-redo-work formula and a draggable knob. (5) Walk three concrete diagnoses on the dashboard — spilling, a straggler, a leaked ref — then the failure checklist.</div>
 
-        <h2>Linear path</h2>
-        <ol>
-  <li>Start with the symptom, but do not stop there. Slow jobs, failed tasks, actor deaths, object-store pressure, and autoscaler delays can look similar from the driver.</li>
-  <li>Find the ownership boundary. A task retry is different from an actor restart; an object spill is different from a training checkpoint; a Serve replica crash is different from an HTTP timeout.</li>
-  <li>Make operations part of the design. Idempotency, checkpoint cadence, metrics, logs, tracing, resource annotations, and dashboards are not polish. They are how the system explains itself.</li>
-</ol>
+<h2>1 · Two recovery mechanisms, defined</h2>
 
-        <h2>The mechanism</h2>
-        <div class="concept-grid">
-<div class="concept"><strong>Task retries</strong><div>Stateless tasks can often retry safely. Tasks with side effects need idempotency keys, transactional outputs, or explicit compensation.</div></div>
-<div class="concept"><strong>Actor recovery</strong><div>Actors own mutable state. Restarting an actor is easy only when that state can be reconstructed from a checkpoint or external source.</div></div>
-<div class="concept"><strong>Object-store pressure</strong><div>Large intermediates can spill, evict, or pin memory unexpectedly. Performance cliffs often start here rather than in user code.</div></div>
-<div class="concept"><strong>Library control loops</strong><div>Tune, Train, Serve, and RLlib each add their own retry, checkpoint, scheduling, and reporting behavior on top of Core.</div></div>
-<div class="concept"><strong>Cluster signals</strong><div>Autoscaler events, worker logs, dashboard metrics, pod status, and node pressure must be read together; one surface rarely tells the whole story.</div></div>
+<p>When a task fails — its worker crashed, its node was preempted, it raised — Ray has exactly two tools, and they are not the same tool.</p>
+
+<p><strong>Retry</strong> is the obvious one. A task marked <code>@ray.remote(max_retries=3)</code> that dies because its worker process crashed is simply resubmitted, up to three times, to (possibly) a different worker. By default Ray retries on <em>system</em> failures (worker/node death) but not on application exceptions your function raised; <code>retry_exceptions=True</code> opts into retrying those too. Retry is a coarse "run it again" — it assumes running it again will produce the same answer.</p>
+
+<p><strong>Reconstruction</strong> is the subtle one, and it is the payoff of the ownership/lineage model from lesson 04. <em>Lineage</em> is the record of how every object was produced: which task, with which input refs. When an object in the store is <em>lost</em> — evicted under memory pressure, or living on a node that died — and some still-running task now needs it, Ray does not error. It walks the lineage backward and <em>re-executes the task that produced the object</em>, recursively reconstructing any of <em>that</em> task's inputs that are also gone. The result is recomputed rather than retrieved. This is why a long chain of transformations can survive a node loss in the middle: Ray rebuilds the missing intermediate from its recipe.</p>
+
+<div class="lesson-flow">
+<div><strong>retry</strong><span>A failed task is resubmitted (up to <code>max_retries</code>). Used when the task itself died. Assumes re-running yields the same effect.</span></div>
+<div><strong>reconstruction</strong><span>A still-needed object was lost. Ray re-executes the producing task using lineage, recursively rebuilding lost inputs. The task did not fail — its <em>output</em> vanished.</span></div>
+<div><strong>lineage</strong><span>The dependency recipe Ray keeps for each object: producing task + input refs. The thing that makes reconstruction possible — and the thing that is gone when the owner dies.</span></div>
 </div>
 
-        <h2>Decision surface</h2>
-        <table>
-  <thead><tr><th>Trade-off</th><th>How to reason about it</th></tr></thead>
-  <tbody>
-    <tr><td><strong>Retry vs duplicate side effects</strong></td><td>Retries improve availability for pure work. They can duplicate writes, API calls, or environment actions unless outputs are idempotent.</td></tr>
-    <tr><td><strong>Checkpoint frequency vs throughput</strong></td><td>Frequent checkpoints reduce lost work. They also add I/O and can become the bottleneck.</td></tr>
-    <tr><td><strong>More metrics vs operator load</strong></td><td>Visibility is necessary, but noisy dashboards slow incident response. Keep golden signals and drilldown paths distinct.</td></tr>
-  </tbody>
-</table>
+<p>Both mechanisms share one assumption: <strong>re-executing a task is equivalent to executing it the first time.</strong> That holds for a pure function of its inputs — <code>def square(x): return x*x</code> recomputes the same value no matter how many times you run it. The entire rest of this lesson is about the cases where that assumption is false, because those are the cases that corrupt your data while every dashboard stays green.</p>
 
-        <h2>Operational checklist</h2>
-        <ul>
-  <li>Label every remote function as pure, idempotent, or side-effecting.</li>
-  <li>Define the recovery source for every actor: empty restart, checkpoint, durable external state, or fail-fast.</li>
-  <li>Track object-store memory, spilling, task backlog, worker CPU/GPU utilization, queue time, and retry counts.</li>
-  <li>For Serve, separate request queueing, model execution, replica startup, and downstream service latency.</li>
-  <li>For Train/Tune, verify checkpoints can actually restore before relying on them in production.</li>
-</ul>
+<h2>2 · The three cliffs where reconstruction fails</h2>
 
-        <h2>Failure modes</h2>
-        <ul>
-  <li>Solving every failure by increasing retries, which can amplify external side effects and cluster load.</li>
-  <li>Debugging only from the driver stack trace while the useful evidence lives in worker logs or autoscaler events.</li>
-  <li>Treating actor restart as equivalent to task retry even though actor state may have been the whole point.</li>
-</ul>
+<p>Reconstruction is powerful precisely because it is automatic, which is also why it is dangerous: it will happily re-run work that was <em>not</em> safe to re-run. There are three places the recipe-replay model breaks.</p>
 
-        <h2>Implementation sketch</h2>
-        <pre><code># A side-effecting task should make the side effect idempotent.
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Actor state</div><div class="v">An actor's value is <em>not</em> a pure function of its constructor inputs — it is the accumulation of every method call since. There is no lineage that reproduces "the counter is at 4,217" or "the optimizer has seen 12k batches." Restart the actor and you get a fresh object, not the lost state.</div></div>
+  <div class="topic-card"><div class="k">Side effects</div><div class="v">A task that writes to a database, sends an email, or charges a card changed the outside world. Re-executing it does it <em>again</em>. Lineage tracks the returned object, not the row it inserted — so reconstruction double-writes.</div></div>
+  <div class="topic-card"><div class="k">Dead owner</div><div class="v">Lineage is held by the <em>owner</em> of the ref (the worker that created it, lesson 04). If the owner dies, the recipe dies with it. Ray cannot reconstruct an object whose lineage is gone — you get an <code>OwnerDiedError</code>, not a silent rebuild.</div></div>
+</div>
+
+<p>The first cliff is why lesson 03 insisted actors are a single point of failure: their state is the whole point and it is exactly the thing reconstruction cannot rebuild. The third is the most surprising — it means the safety of <code>ray.put(big_array)</code> on the driver depends on the driver staying alive, and an object pinned far from its owner is a latent failure waiting for that owner's node to be preempted. The second cliff is the one that bites correctness rather than availability, so it gets its own section.</p>
+
+<div class="callout warn"><div class="label">The real contract</div>
+Ray's automatic recovery is <em>safe</em> only for pure tasks and for actor restarts where the state is reconstructable from a checkpoint or an external source. For everything else — side-effecting tasks and stateful actors — recovery is something <em>you</em> design, and Ray's automatic retry/reconstruction is then a hazard you must make idempotent rather than a feature you can lean on. The default <code>max_restarts=0</code> for actors is conservative on purpose: Ray would rather fail loudly than silently hand you a fresh actor where you expected the old state.</div>
+
+<h2>3 · At-least-once execution forces idempotency</h2>
+
+<p>Put retry and reconstruction together and you get the delivery guarantee Ray actually offers: <strong>at-least-once</strong> — a task that "succeeds" from your driver's point of view may have <em>run</em> its body more than once (a retry after a partial failure, a reconstruction of a lost output). It will never run <em>zero</em> times if you got a result, but it may run two or three. Contrast <em>at-most-once</em> (runs once or not at all, no duplicates, but you can lose work) and <em>exactly-once</em> (the expensive ideal almost no distributed system gives you for free).</p>
+
+<p>At-least-once is a fine guarantee for pure work and a correctness bomb for side effects. A task is <strong>idempotent</strong> when running it twice has the same observable effect as running it once. Pure functions are trivially idempotent. Side-effecting tasks are not, unless you engineer them to be. Here is the bug:</p>
+
+<pre><code># BUG: at-least-once + non-idempotent side effect = double charge.
+# A retry or a lineage reconstruction can run this body twice.
+@ray.remote(max_retries=3, retry_exceptions=True)
+def settle_order(order_id, amount):
+    db.insert("payments", {"order": order_id, "amount": amount})  # appends a row
+    return order_id
+# Run twice -> TWO payment rows for one order. Reconstruction never told you.</code></pre>
+
+<p>The fix is to make the write idempotent — keyed on something stable so a second run is a no-op, not a second effect. Two standard moves: a <strong>dedup key</strong> (a unique constraint or conditional insert keyed by <code>order_id</code>) or an <strong>idempotent upsert</strong> (write-if-absent to a deterministic location).</p>
+
+<pre><code># FIX: keyed so a second execution is a no-op, not a second charge.
+@ray.remote(max_retries=3, retry_exceptions=True)
+def settle_order(order_id, amount):
+    # upsert keyed by order_id: the unique key makes the 2nd write a no-op
+    db.upsert("payments", key=order_id, value={"amount": amount})
+    return order_id
+
+# Same shape for object/file outputs: write to a deterministic path,
+# commit atomically, and treat "already committed" as success.
 @ray.remote(max_retries=3)
 def write_partition(partition_id, rows):
-    output_path = f&quot;s3://bucket/job_42/partition={partition_id}/data.parquet&quot;
-    if already_committed(output_path):
-        return output_path
-    tmp_path = output_path + &quot;.tmp&quot;
-    write_parquet(tmp_path, rows)
-    commit_atomically(tmp_path, output_path)
-    return output_path</code></pre>
+    final = f"s3://bucket/job_42/part={partition_id}/data.parquet"
+    if already_committed(final):       # idempotency check first
+        return final
+    tmp = final + ".tmp"
+    write_parquet(tmp, rows)
+    commit_atomically(tmp, final)      # atomic rename = single visible effect
+    return final</code></pre>
 
-        <div class="callout ok">
-          <div class="label">Exercise</div>
-          Take one Ray workload from earlier lessons and write its failure table: task failure, actor death, node loss, object spill, checkpoint corruption, and autoscaler delay. What is retried, what is rebuilt, and what fails the job?
-        </div>
+<p>For actors, the equivalent of idempotency is <em>recoverable state</em>: allow restarts and make the state rebuildable.</p>
 
-        <h2>Connective tissue</h2>
-        <p>This lesson is meant to connect Ray mechanics to the surrounding ML-systems library rather than live as an isolated API tour.</p>
-        <div class="link-grid"><a href="../../interview_questions/system_design/13_fault_tolerance.html">System Design - fault tolerance</a><a href="../../interview_questions/system_design/16_observability.html">System Design - observability</a></div>
+<pre><code># Actor with restarts AND a checkpoint, so restart restores state.
+@ray.remote(max_restarts=2, max_task_retries=1)
+class Counter:
+    def __init__(self, ckpt="s3://bucket/counter.json"):
+        self.ckpt = ckpt
+        self.n = load_or_zero(ckpt)    # rebuild state on (re)construction
+    def incr(self):
+        self.n += 1
+        if self.n % 1000 == 0:
+            save(self.ckpt, self.n)    # periodic checkpoint, not every call
+        return self.n</code></pre>
 
-        <footer class="lesson-nav">
-  <a href="13_ml_platform_air_bridge.html">
-    <span class="dir">&lt;- Previous</span>
-    <span class="ttl">13 - The ML Platform Bridge</span>
-  </a>
-  <a class="next" href="15_ecosystem_integrations_alternatives.html">
-    <span class="dir">Next -&gt;</span>
-    <span class="ttl">15 - Ecosystem, Integrations, and Alternatives</span>
-  </a>
-</footer>
+<p>Note the tension <code>max_restarts</code> exposes: a restarted actor reruns <code>__init__</code>, so it recovers to the <em>last checkpoint</em>, not the last call. The 0–999 increments since the last save are gone. How often to save is the next question, and it has a number.</p>
 
-        </main>
-        </body>
-        </html>
+<h2>4 · Retry cost vs checkpoint cost</h2>
+
+<p>Checkpointing is not free, and not checkpointing is not free either — you are choosing where to pay. The lever is the interval between checkpoints (or, for a lineage chain, how much work sits between persisted boundaries). The expected work you must redo after a failure is:</p>
+
+<p class="math block">expected redo work ≈ failure_rate × work_since_last_checkpoint</p>
+
+<p>and the total overhead you are trying to minimize is the redo plus the checkpoint I/O itself:</p>
+
+<p class="math block">total ≈ (failures × work_lost_per_failure) + (num_checkpoints × checkpoint_cost)</p>
+
+<p><strong>Worked example — training loop.</strong> A training job runs 10 hours, with a per-hour node-failure probability of 2% (<span class="math">p = 0.02</span>). A checkpoint costs 30 s of I/O. If you checkpoint every 1 hour, you write 10 checkpoints (300 s of I/O ≈ 0.083 h) and on a failure you lose, on average, half an interval = 0.5 h of compute. Expected lost compute over the run ≈ <span class="math">10 × 0.02 × 0.5 h = 0.10 h</span>. Total overhead ≈ <span class="math">0.083 + 0.10 ≈ 0.18 h</span>. Now checkpoint every 6 minutes (0.1 h): 100 checkpoints = 3000 s ≈ 0.83 h of I/O, but expected loss drops to <span class="math">10 × 0.02 × 0.05 h = 0.01 h</span> — total ≈ 0.84 h, <em>worse</em>, because the I/O now dominates. The sweet spot is roughly where the two terms balance; the widget lets you find it.</p>
+
+<p><strong>Worked example — reconstruction vs checkpoint.</strong> A 12-stage Ray Data pipeline keeps intermediates only in the object store, relying on lineage. A node holding stage-7 output dies. Reconstruction re-runs stages 1–7 for the lost blocks — say 7 × 40 s = 280 s of recompute. If instead you had materialized stage-7 to durable storage at a one-time cost of 50 s, recovery would have been a 5 s reload. So if node loss is likely <em>and</em> the chain is long, a single mid-pipeline checkpoint (50 s) buys back 275 s on the (probable) failure. If node loss is rare, you skip the 50 s and let lineage handle the unlikely case — that is exactly the bet lineage is designed to win.</p>
+
+<div class="widget" id="ckpt-widget">
+  <div class="title">Checkpoint interval — redo work vs checkpoint I/O</div>
+  <div class="hint">A job of fixed <strong>length</strong> runs under a per-hour <strong>failure rate</strong>. Each checkpoint costs <strong>I/O time</strong>; on a failure you lose, on average, half a checkpoint interval of compute. Drag the <strong>interval</strong> and watch the two costs trade: long intervals → cheap I/O but big redo on failure; short intervals → tiny redo but I/O dominates. The minimum total is the interval you want.</div>
+
+  <canvas class="dist-canvas" id="ckpt-canvas" width="760" height="240" style="height:240px;"></canvas>
+
+  <div class="controls" style="margin-top: 12px;">
+    <label class="inline">checkpoint interval (h): <input type="range" id="ck-int" min="0.05" max="3" step="0.05" value="1"> <span class="val" id="ck-int-val">1.00</span></label>
+    <label class="inline">failure rate (/h): <input type="range" id="ck-fr" min="0.005" max="0.1" step="0.005" value="0.02"> <span class="val" id="ck-fr-val">0.020</span></label>
+    <label class="inline">checkpoint I/O (s): <input type="range" id="ck-io" min="5" max="120" step="5" value="30"> <span class="val" id="ck-io-val">30</span></label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">Checkpoints written</div><div class="v" id="ck-n">—</div></div>
+    <div class="kpi"><div class="k">Checkpoint I/O cost</div><div class="v" id="ck-iocost">—</div></div>
+    <div class="kpi"><div class="k">Expected redo work</div><div class="v" id="ck-redo">—</div></div>
+    <div class="kpi"><div class="k">Total overhead</div><div class="v" id="ck-total">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">Show the core JS</summary>
+<pre><code>// fixed-length job, interval I (hours), failure rate p (/h), io = checkpoint cost (s)
+const nCkpts   = jobLen / I;                 // how many checkpoints over the run
+const ioCost   = nCkpts * (io / 3600);       // total I/O, in hours
+const redoWork = jobLen * p * (I / 2);       // expected lost compute (half an interval)
+const total    = ioCost + redoWork;          // minimize this over I</code></pre>
+  </details>
+</div>
+
+<p>The shape is a classic U: total cost falls as you checkpoint more often (less redo), bottoms out, then rises as I/O takes over. The minimum moves <em>right</em> (checkpoint less often) when I/O is expensive, and <em>left</em> (checkpoint more often) when failures are frequent — which is the whole reason a 1000-GPU run checkpoints far more aggressively than a laptop job.</p>
+
+<h2>5 · Reading the dashboard: three diagnoses</h2>
+
+<p>The failure model tells you what <em>can</em> go wrong; observability tells you what <em>did</em>. Ray's instruments: the <strong>dashboard</strong> (live actors, tasks, per-node object-store memory, logs), the <strong>timeline</strong> (a Chrome-trace export you open in <code>chrome://tracing</code> to see every task as a bar — the way you spot stragglers and load skew), <code>ray memory</code> (a snapshot of every live <code>ObjectRef</code>, who owns it, and store occupancy), and <strong>metrics</strong> (pending tasks, object-store fill %, spill rate). Three concrete slowdowns, and how each shows up.</p>
+
+<div class="lesson-flow">
+<div><strong>(a) mystery slowdown</strong><span>A job that ran fine suddenly crawls. On the dashboard the object-store memory is pinned near 100% and the <em>spill rate</em> is non-zero — the store is full and Ray is writing objects to disk (lesson 04). Throughput collapsed because reads now hit disk, not shared memory. Fix: smaller blocks, <code>ray.put</code> fewer/larger objects, or free refs sooner so the store drains.</span></div>
+<div><strong>(b) straggler in a reduce</strong><span>A <em>straggler</em> is one task far slower than its siblings, holding up a barrier. In the timeline view, every map bar finishes at ~2 s except one that runs 40 s while the reduce waits idle. Cause is usually data skew — one partition is 20× larger. Fix: rebalance partitions, or split the hot key.</span></div>
+<div><strong>(c) leaked ObjectRef</strong><span>Object-store memory climbs monotonically across iterations and never drops. <code>ray memory</code> shows a growing list of refs owned by the driver — a Python list is holding every <code>ObjectRef</code> you ever created, so reference counting never frees them. Fix: drop refs you no longer need (<code>del</code> / let them go out of scope) so the store can evict.</span></div>
+</div>
+
+<p><strong>Worked number — the spill cliff.</strong> Say each node has a 30 GB object store and your pipeline holds 28 GB of live intermediates. Add one more 4 GB block and you are at 32 GB > 30 GB: Ray spills ~2 GB to disk. A shared-memory read of a block is effectively free (zero-copy, ~0 ms); a spilled read at, say, 500 MB/s costs <span class="math">2 GB / 0.5 GB/s = 4 s</span> per touch. If that block is read by 50 downstream tasks, that is <span class="math">50 × 4 s = 200 s</span> of pure disk latency that did not exist when everything fit in memory. This is why the slowdown is a <em>cliff</em>, not a slope: nothing degrades until you cross the store size, then a whole class of reads falls off the zero-copy path at once.</p>
+
+<p>Observability has a cost too — every metric scraped and every trace span recorded is overhead, and a noisy dashboard slows incident response as much as no dashboard. Keep a small set of golden signals (object-store fill %, spill rate, pending-task backlog, per-actor restart count, p99 latency for Serve) bright and on the front page; push the rest into drill-downs you open only when a golden signal moves.</p>
+
+<h2>6 · Failure modes &amp; checklist</h2>
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+<li><strong>Retries as a cure-all.</strong> Bumping <code>max_retries</code> to fix flakiness amplifies side effects (double writes) and cluster load on exactly the runs already in trouble. Fix the idempotency, not the retry count.</li>
+<li><strong>Actor restart treated as task retry.</strong> Setting <code>max_restarts</code> without checkpointing gives you a <em>fresh</em> actor where you needed the old state — the slowdown vanishes and your counter silently resets.</li>
+<li><strong>Dead-owner surprise.</strong> <code>ray.put</code> on a short-lived worker (or driver) whose node later dies: the object is unreconstructable because its lineage went with the owner.</li>
+<li><strong>Debugging only the driver trace.</strong> The driver shows a generic <code>RayTaskError</code>; the real cause (OOM kill, spill, node loss) is in worker logs or autoscaler events on the dashboard.</li>
+<li><strong>Leaked refs as a slow OOM.</strong> Holding every <code>ObjectRef</code> in a growing list pins the store; the job that worked at small scale OOMs the object store at large scale.</li>
+</ul></div>
+  <div class="lesson-card"><h3>Implementation checklist</h3><ul>
+<li>Is every remote function labeled <em>pure</em>, <em>idempotent</em>, or <em>side-effecting</em> — and do the side-effecting ones have a dedup key or atomic commit?</li>
+<li>For each actor: empty restart, checkpoint-restore, rebuild-from-external, or fail-fast? Is <code>max_restarts</code> set consistently with that choice?</li>
+<li>What is the checkpoint interval, and does the redo-vs-I/O math justify it for this failure rate?</li>
+<li>Have you actually <em>restored</em> from a checkpoint, not just written one?</li>
+<li>Which golden signals are on the dashboard front page: object-store fill %, spill rate, pending tasks, actor restarts, Serve p99?</li>
+<li>Could a long lineage chain be cut by one mid-pipeline materialization to bound reconstruction cost?</li>
+</ul></div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>Take one Ray workload from an earlier lesson (the Ray Data pipeline from 09, or the Train loop from 10) and write its failure table with a row per boundary: task failure, actor death, node loss, object spill, dead owner, checkpoint corruption, autoscaler delay. For each, state what is <em>retried</em>, what is <em>reconstructed</em>, and what <em>fails the job</em>. Then flip one assumption — raise the node-failure rate from 2%/h to 20%/h — and check which decisions change. (The checkpoint interval should shrink; a long lineage chain that was fine now needs a mid-pipeline materialization. If nothing in your design changes, you were not actually relying on the failure model.)</div>
+
+<h2>Where this points next</h2>
+<p>You now have the failure model the whole course assumed — and that model is the honest boundary of what Ray <em>is</em>. It gives you at-least-once tasks, lineage reconstruction, and actor restarts, and it explicitly does not give you exactly-once side effects or durable workflow state for free. That boundary is exactly the question lesson 15 takes up: where does Ray stop and another system begin? Knowing that reconstruction is gone when an owner dies, and that side effects need external idempotency, is what lets you reason about whether a workload belongs on Ray at all, or behind Spark, Temporal, or a Kubernetes-native stack.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+Ray recovers with two mechanisms: it <strong>retries</strong> failed tasks and <strong>reconstructs</strong> lost objects by re-executing their producing task from lineage. Both assume re-execution is harmless, which fails at three cliffs — actor state (no lineage reproduces it), side effects (re-running double-writes), and a dead owner (lineage is gone). The net guarantee is <strong>at-least-once</strong>, so side-effecting tasks must be made <strong>idempotent</strong> with a dedup key or atomic commit, and stateful actors need <code>max_restarts</code> <em>plus</em> a checkpoint. How often to checkpoint is a U-shaped trade-off: redo work ≈ failure_rate × work_since_last_checkpoint, balanced against checkpoint I/O. Observability turns this model into action — the dashboard's object-store fill and spill rate catch the spill cliff, the timeline catches stragglers, and <code>ray memory</code> catches leaked refs.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+<li>What are Ray's two recovery mechanisms, and how do they differ? <em>(§1 — retry resubmits a failed task; reconstruction re-executes the producing task from lineage to rebuild a lost <em>output</em>. Retry is for a dead task, reconstruction for a dead object.)</em></li>
+<li>Name the three cases where lineage reconstruction does not save you. <em>(§2 — actor state (not a pure function of inputs), side-effecting tasks (re-run double-writes), and a dead owner (lineage held by the owner is gone → OwnerDiedError).)</em></li>
+<li>What execution guarantee does Ray give, and what does it force on you? <em>(§3 — at-least-once; a body may run more than once via retry or reconstruction, so side-effecting tasks must be idempotent — dedup key or atomic write-if-absent.)</em></li>
+<li>Show a non-idempotent Ray task bug and fix it. <em>(§3 — an append-style DB insert double-writes on retry; fix with an upsert keyed by a stable id, or write-to-tmp + atomic commit + already-committed short-circuit.)</em></li>
+<li>How do you decide how often to checkpoint? <em>(§4 — minimize redo (≈ failure_rate × half-interval × job length) plus checkpoint I/O; the U-shaped total moves left (more often) as failure rate rises and right as I/O cost rises.)</em></li>
+<li>A job that ran fine suddenly crawls — how do you diagnose it? <em>(§5 — check object-store fill % and spill rate on the dashboard; near-100% with non-zero spill means reads fell off the zero-copy path to disk — the spill cliff. Then check the timeline for stragglers and <code>ray memory</code> for leaked refs.)</em></li>
+<li>Why is setting <code>max_restarts</code> on an actor not enough? <em>(§3 — a restarted actor reruns <code>__init__</code> and loses in-memory state; you must rebuild state from a checkpoint or external source, and you only recover to the last checkpoint, not the last call.)</em></li>
+</ul>
+
+<footer class="lesson-nav"><a href="13_ml_platform_air_bridge.html"><span class="dir">Previous</span><span class="ttl">13 · The ML Platform Bridge</span></a><a class="next" href="15_ecosystem_integrations_alternatives.html"><span class="dir">Next</span><span class="ttl">15 · Ecosystem, Integrations, and Alternatives</span></a></footer>
+</main>
+
+<script>
+(function(){
+  var canvas = document.getElementById('ckpt-canvas');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+
+  var intRng = document.getElementById('ck-int');
+  var frRng  = document.getElementById('ck-fr');
+  var ioRng  = document.getElementById('ck-io');
+  var intVal = document.getElementById('ck-int-val');
+  var frVal  = document.getElementById('ck-fr-val');
+  var ioVal  = document.getElementById('ck-io-val');
+  var kN     = document.getElementById('ck-n');
+  var kIo    = document.getElementById('ck-iocost');
+  var kRedo  = document.getElementById('ck-redo');
+  var kTot   = document.getElementById('ck-total');
+
+  var JOB = 10;   // fixed job length, hours
+
+  function cost(I, p, io){
+    var nCk   = JOB / I;
+    var ioH   = nCk * (io/3600);     // total checkpoint I/O, hours
+    var redo  = JOB * p * (I/2);     // expected lost compute, hours
+    return { nCk:nCk, ioH:ioH, redo:redo, total:ioH+redo };
+  }
+
+  function render(){
+    var I  = parseFloat(intRng.value);
+    var p  = parseFloat(frRng.value);
+    var io = parseFloat(ioRng.value);
+
+    var dpr = window.devicePixelRatio || 1;
+    var W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== Math.round(W*dpr)){ canvas.width = Math.round(W*dpr); canvas.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    var padX = 48, padTop = 22, padBot = 34;
+    var plotW = W - 2*padX, plotH = H - padTop - padBot;
+
+    // sweep interval to draw the total-cost curve and find its min
+    var Imin = 0.05, Imax = 3, steps = 240;
+    var maxC = 0, samples = [];
+    for (var i=0;i<=steps;i++){
+      var Ii = Imin + (Imax-Imin)*i/steps;
+      var c = cost(Ii, p, io).total;
+      samples.push({I:Ii, c:c});
+      if (c > maxC) maxC = c;
+    }
+    var minPt = samples[0];
+    for (var j=0;j<samples.length;j++) if (samples[j].c < minPt.c) minPt = samples[j];
+
+    function X(Iv){ return padX + (Iv-Imin)/(Imax-Imin)*plotW; }
+    function Y(c){ return padTop + plotH - (c/maxC)*plotH; }
+
+    // axes
+    ctx.strokeStyle = '#cbd5e1'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padX, padTop); ctx.lineTo(padX, H-padBot); ctx.lineTo(W-padX, H-padBot); ctx.stroke();
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('checkpoint interval (h)  →', padX, H-12);
+    ctx.save(); ctx.translate(14, padTop+plotH/2); ctx.rotate(-Math.PI/2);
+    ctx.fillText('total overhead (h)', -52, 0); ctx.restore();
+
+    // total-cost curve
+    ctx.strokeStyle = '#7c3aed'; ctx.lineWidth = 2; ctx.beginPath();
+    for (var k=0;k<samples.length;k++){
+      var x = X(samples[k].I), y = Y(samples[k].c);
+      if (k===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+
+    // minimum marker
+    ctx.fillStyle = '#16a34a';
+    ctx.beginPath(); ctx.arc(X(minPt.I), Y(minPt.c), 4, 0, 2*Math.PI); ctx.fill();
+    ctx.fillText('optimum ≈ ' + minPt.I.toFixed(2) + ' h', X(minPt.I)+8, Y(minPt.c)-6);
+
+    // current interval marker
+    var cur = cost(I, p, io);
+    var cx = X(I);
+    ctx.strokeStyle = '#dc2626'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(cx, padTop); ctx.lineTo(cx, H-padBot); ctx.stroke();
+    ctx.fillStyle = '#dc2626';
+    ctx.beginPath(); ctx.arc(cx, Y(cur.total), 4, 0, 2*Math.PI); ctx.fill();
+
+    intVal.textContent = I.toFixed(2);
+    frVal.textContent  = p.toFixed(3);
+    ioVal.textContent  = io.toFixed(0);
+    kN.textContent    = cur.nCk.toFixed(0);
+    kIo.textContent   = (cur.ioH*60).toFixed(1) + ' min';
+    kRedo.textContent = (cur.redo*60).toFixed(1) + ' min';
+    kTot.textContent  = (cur.total*60).toFixed(1) + ' min';
+  }
+
+  intRng.addEventListener('input', render);
+  frRng.addEventListener('input', render);
+  ioRng.addEventListener('input', render);
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

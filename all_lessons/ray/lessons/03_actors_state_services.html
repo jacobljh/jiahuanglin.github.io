@@ -1,110 +1,210 @@
 <!doctype html>
-        <html lang="en">
-        <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width,initial-scale=1">
-        <title>03 - Actors, State, and Services</title>
-        <link rel="stylesheet" href="style.css">
-        </head>
-        <body>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>03 · Actors, State, and Services | Ray, from first principles</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">ray</a><span class="crumb">/</span><span class="crumb">03</span><span class="step-pill">lesson 4 / 17</span></div></header>
+<main>
 
-        <header class="topnav">
-          <div class="inner">
-            <a class="crumb-link" href="../../index.html">all_lessons</a>
-            <span class="crumb">/</span>
-            <a class="crumb-link" href="index.html">ray</a>
-            <span class="crumb">/</span>
-            <span class="crumb">03</span>
-            <span class="step-pill">lesson 4 / 17</span>
-          </div>
-        </header>
+<p class="kicker">Part I - Core mental model</p>
+<h1>Actors, State, and Services</h1>
+<p class="subtitle">Lesson 02 gave you the stateless task: a function shipped to a worker, returning an <code>ObjectRef</code> immediately so the driver can fan out thousands of calls. But a task is born empty and dies with its return value — it cannot remember anything between calls, cannot hold a model that took 30 seconds to load, and cannot be a long-lived endpoint other code talks to. Some of the most common ML shapes — a parameter server, a model replica, a simulator, a connection pool — are <em>defined</em> by the state they carry. This lesson adds Ray's second primitive, the <strong>actor</strong>: a stateful worker that owns a Python object for its whole lifetime, and whose single-threaded execution model is both a correctness guarantee and the throughput ceiling you will spend the rest of the lesson designing around.</p>
 
-        <main>
-        <span class="part-label">Part I - Core mental model</span>
-        <h1>Actors, State, and Services</h1>
-        <p class="subtitle">When a function is not enough: actors let Ray keep state near the worker that owns it.</p>
+<div class="callout source-note"><div class="label">Book source</div>Chapter 2 Core API plus Chapter 3 distributed application design - stateful components and simulation workers. Calibrated to current Ray: <code>@ray.remote</code> on a class, <code>.remote()</code> method calls returning <code>ObjectRef</code>s, and the <code>max_restarts</code> / <code>max_concurrency</code> / async-actor options the modern API exposes for fault tolerance and concurrency.</div>
 
-        <div class="callout">
-          <div class="label">Source map</div>
-          Book coverage: Chapter 2 Core API plus Chapter 3 distributed application design - stateful components and simulation workers.
-        </div>
+<div class="callout"><div class="label">Linear position</div><strong>Prerequisite:</strong> Lesson 02 (Tasks, Objects, and Futures) — stateless <code>@ray.remote</code> functions, <code>.remote()</code> returning an <code>ObjectRef</code>, <code>ray.get</code>/<code>ray.put</code>, and the dependency graph that builds itself.<br><strong>New capability:</strong> decide when a workload needs <em>identity</em> rather than parallelism, build a stateful actor, reason quantitatively about its single-threaded throughput ceiling, and shard hot state across an actor pool instead of bottlenecking on one process.</div>
 
-        <h2>The thesis</h2>
-        <p>Tasks are for independent work. Actors are for identity: state, caches, environments, connections, model replicas, and long-lived services that should not be recreated for every call.</p>
+<div class="callout"><div class="label">The plan</div>
+Five moves. (1) Show the three things a task structurally cannot do, and define the actor as the fix. (2) Build a counter / parameter-server actor and a model-serving actor that loads weights once in <code>__init__</code>, naming "actor handle" and the method-call mechanics. (3) Make the concurrency model precise — one method at a time on one thread — and put a number on the throughput ceiling that creates. (4) Break that ceiling with an actor pool, shard state by key, and weigh async/threaded actors for I/O-bound work. (5) Confront the two costs you bought: an actor is a single point of failure and a serialization point — what <code>max_restarts</code> and checkpointing do and do not save.</div>
 
-        <h2>Linear path</h2>
-        <ol>
-  <li>Ask whether the work has memory. If every call is independent, use tasks. If calls must share state, use an actor.</li>
-  <li>Treat an actor as a remote Python object with a mailbox. Method calls are scheduled to the actor process and can mutate its local state.</li>
-  <li>Use actors to colocate expensive state with computation, but remember that a single actor can become a serial bottleneck unless you design around concurrency and sharding.</li>
-</ol>
+<h2>1 · What a task cannot do</h2>
 
-        <h2>The mechanism</h2>
-        <div class="concept-grid">
-<div class="concept"><strong>State ownership</strong><div>An actor owns Python state inside one worker process. That state can be a model, simulator, cache, database connection, or mutable counter.</div></div>
-<div class="concept"><strong>Method refs</strong><div>Actor methods also return object references. You can compose actor calls with task graphs, not just call them synchronously.</div></div>
-<div class="concept"><strong>Resource pinning</strong><div>An actor can reserve resources for its lifetime, such as one GPU for a model replica.</div></div>
-<div class="concept"><strong>Sharding</strong><div>Many small actors can partition state. One large actor centralizes correctness but often limits throughput.</div></div>
+<p>A task is a function: it receives arguments, runs, returns a value, and the worker that ran it is free to run anyone else's task next. That statelessness is exactly what makes tasks easy to parallelize and retry — Ray can re-run a failed task anywhere because it depends only on its inputs (lineage, lesson 04). But three real needs fall outside what a stateless function can express:</p>
+
+<div class="lesson-flow">
+<div><strong>mutable state</strong><span>A running counter, an accumulating set of gradients, an RL replay buffer that grows across calls. A task cannot hold a value that persists from one call to the next — every call starts from nothing.</span></div>
+<div><strong>expensive init</strong><span>A 13B-parameter model takes ~30 s to load from disk into GPU memory. If a task loads it on every call, you pay 30 s per inference. You want to load <em>once</em> and reuse the warm object across thousands of calls.</span></div>
+<div><strong>a service endpoint</strong><span>A long-lived addressable thing other code sends requests to — a feature server, a tokenizer, a connection pool to a database. Tasks have no identity; you cannot "call the same one again."</span></div>
 </div>
 
-        <h2>Decision surface</h2>
-        <table>
-  <thead><tr><th>Trade-off</th><th>How to reason about it</th></tr></thead>
-  <tbody>
-    <tr><td><strong>Actor vs task</strong></td><td>Actors avoid repeated setup and keep state local. Tasks are easier to parallelize and retry independently.</td></tr>
-    <tr><td><strong>One actor vs many actors</strong></td><td>One actor simplifies coordination. Many actors increase throughput but force you to design routing and aggregation.</td></tr>
-    <tr><td><strong>Mutable state vs reproducibility</strong></td><td>Mutable actors are convenient for services and simulations. They are harder to replay than deterministic task graphs.</td></tr>
-  </tbody>
-</table>
+<p>An <strong>actor</strong> is a class marked <code>@ray.remote</code>. Instantiating it (<code>Counter.remote()</code>) creates one long-lived worker process that constructs the object and holds it. That instance lives on <em>one</em> worker, owns a Python object, and survives between calls. Method calls — <code>counter.increment.remote()</code> — are shipped to that specific process and return <code>ObjectRef</code>s exactly like task calls, so actors compose into the same dependency graph tasks do. The reference you get back from <code>.remote()</code> on the class is an <strong>actor handle</strong>: a first-class value you can pass to other tasks and actors so they can call the same instance.</p>
 
-        <h2>Operational checklist</h2>
-        <ul>
-  <li>Use actors for model replicas, simulators, online learners, caches, queues, and external clients with connection state.</li>
-  <li>Make actor methods coarse enough to amortize RPC overhead.</li>
-  <li>Shard actors by natural key when throughput matters: user id, environment id, model id, partition id, or tenant.</li>
-  <li>Define what happens if an actor dies: rebuild from checkpoint, restart empty, or fail the job.</li>
-</ul>
+<p>The mental model: a task is a function call shipped to whatever worker is free; an actor is a remote object with a mailbox. Methods queue in that mailbox and run on the actor's process, one at a time, against state that lives there. Everything good and everything painful about actors follows from "one process owns the state."</p>
 
-        <h2>Failure modes</h2>
-        <ul>
-  <li>Putting all coordination in one actor and discovering it is the new global lock.</li>
-  <li>Using actors for pure stateless functions, which adds lifecycle complexity without benefit.</li>
-  <li>Forgetting that actor-local state is not magically durable.</li>
-</ul>
+<h2>2 · Two actors: a parameter server and a model replica</h2>
 
-        <h2>Implementation sketch</h2>
-        <pre><code>@ray.remote(num_gpus=1)
+<p>The smallest useful actor is a shared mutable counter — the seed of a parameter server. State lives in <code>self</code>; methods read and mutate it; the single-threaded execution model (next section) means the increments cannot race, so you get an atomic counter across the whole cluster for free:</p>
+
+<pre><code>import ray
+ray.init()
+
+@ray.remote
+class ParameterServer:
+    def __init__(self):
+        self.params = 0.0            # mutable state, owned by THIS process
+
+    def apply_gradient(self, grad):  # called concurrently by many workers
+        self.params -= 0.01 * grad   # cannot race: methods run one at a time
+        return self.params
+
+    def get(self):
+        return self.params
+
+ps = ParameterServer.remote()        # 'ps' is the ACTOR HANDLE
+refs = [ps.apply_gradient.remote(g) for g in gradients]  # queue many updates
+ray.get(refs)                        # each ran serially against shared state
+final = ray.get(ps.get.remote())     # read the converged value back</code></pre>
+
+<p>The second canonical actor solves the <em>expensive init</em> problem. The model is loaded once in <code>__init__</code> — which runs exactly once, when the actor is created — and every <code>predict</code> call reuses the warm, already-on-GPU object. <code>@ray.remote(num_gpus=1)</code> reserves one GPU for this actor's entire lifetime, so the weights stay resident:</p>
+
+<pre><code>@ray.remote(num_gpus=1)              # reserve a GPU for this actor's lifetime
 class ModelReplica:
     def __init__(self, weights_path):
-        self.model = load_model(weights_path)
+        self.model = load_model(weights_path)   # ~30 s, paid ONCE at creation
+        self.model.eval()
 
     def predict(self, batch):
-        return self.model(batch)
+        return self.model(batch)     # warm: no reload, just the forward pass
 
-replicas = [ModelReplica.remote(path) for _ in range(4)]
-refs = [replicas[i % 4].predict.remote(batch) for i, batch in enumerate(batches)]
-predictions = ray.get(refs)</code></pre>
+replica = ModelReplica.remote("s3://bucket/model.pt")
+# the 30 s load happens in the background while we prepare inputs
+preds = ray.get(replica.predict.remote(batch))</code></pre>
 
-        <div class="callout ok">
-          <div class="label">Exercise</div>
-          Pick a service you would normally deploy behind HTTP. Split it into stateless work and stateful ownership. Which parts are tasks? Which parts are actors? Which state must be checkpointed rather than merely kept warm?
-        </div>
+<div class="callout"><div class="label">Worked number — why init-once is the whole point</div>
+Say loading the model is 30 s and one inference is 40 ms. Scoring 10,000 batches with a <em>task</em> that loads the model each call costs <span class="math">10,000 × (30 s + 0.04 s) = 300,400 s ≈ 83.4 hours</span> — the load dominates by ~750×. With a <em>model-replica actor</em> that loads once, you pay <span class="math">30 s + 10,000 × 0.04 s = 30 s + 400 s = 430 s ≈ 7.2 minutes</span>. Same hardware, same model — the actor is ~700× faster purely by not throwing away the warm object. This is the structural reason model serving, simulators, and connection pools are actors, not tasks.</div>
 
-        <h2>Connective tissue</h2>
-        <p>This lesson is meant to connect Ray mechanics to the surrounding ML-systems library rather than live as an isolated API tour.</p>
-        <div class="link-grid"><a href="11_ray_serve_online_inference.html">Ray Serve lesson</a><a href="../../agentic_systems/lessons/10_memory.html">Agentic systems - memory</a></div>
+<h2>3 · The concurrency model is a single thread</h2>
 
-        <footer class="lesson-nav">
-  <a href="02_tasks_objects_refs.html">
-    <span class="dir">&lt;- Previous</span>
-    <span class="ttl">02 - Tasks, Objects, and Futures</span>
-  </a>
-  <a class="next" href="04_runtime_scheduling_object_store.html">
-    <span class="dir">Next -&gt;</span>
-    <span class="ttl">04 - Runtime, Scheduling, and the Object Store</span>
-  </a>
-</footer>
+<p>A plain actor processes <strong>one method call at a time, on a single thread</strong>. Calls arrive in the mailbox, run to completion in submission order per caller, and the next one starts only when the current one returns. This is the source of the consistency guarantee in §2 — no two <code>apply_gradient</code> calls interleave, so you never need a lock — but it is equally the source of a hard throughput ceiling.</p>
 
-        </main>
-        </body>
-        </html>
+<div class="callout warn"><div class="label">The real contract: one actor is one thread</div>
+An actor's throughput is bounded by <span class="math">1 / (per-call time)</span>, on one core, no matter how large the cluster. Adding 200 nodes does not make a single actor faster; it still runs its methods one after another on its one process. An actor is therefore simultaneously a <strong>serialization point</strong> (good for correctness) and a <strong>bottleneck</strong> (bad for scale). The job of the next section is to know when you have hit that ceiling and how to break past it.</div>
+
+<p>Put a number on it. If a method takes 20 ms, a single actor can serve at most <span class="math">1 / 0.020 s = 50 calls/s</span> — and that is the ceiling on a 1-node laptop and on a 500-node cluster alike. Suppose 40 worker tasks each want to push 100 gradients/s to one parameter server: that is <span class="math">40 × 100 = 4,000 calls/s</span> of demand against a 50 calls/s actor. The mailbox grows without bound, latency climbs, and the "fast" cluster is gated by one serialized process. You have rediscovered that a shared mutable object is a global lock.</p>
+
+<p>Two escape hatches exist <em>within</em> a single actor for the case where the method is <em>I/O-bound</em> (waiting on network/disk, not burning CPU):</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Async actor</div><div class="v">Define methods as <code>async def</code>; Ray runs an asyncio event loop in the actor. While one method <code>await</code>s a network reply, others run. Great for an actor that mostly waits on a database or remote API — concurrency without true parallelism (still one thread).</div></div>
+  <div class="topic-card"><div class="k">Threaded actor</div><div class="v"><code>@ray.remote(max_concurrency=N)</code> runs up to N methods on N threads. <strong>max_concurrency</strong> is the cap on simultaneously executing methods. Useful for blocking I/O, but the GIL still serializes CPU-bound Python — and you give up the free no-lock guarantee, so now you must protect shared state yourself.</div></div>
+  <div class="topic-card"><div class="k">Neither helps CPU work</div><div class="v">If the method is CPU-bound Python, the GIL means async and threads do <em>not</em> raise throughput. The only real fix for CPU-bound demand is more processes — i.e. more actors. That is the pool pattern, §4.</div></div>
+</div>
+
+<h2>4 · Break the ceiling: pools and sharded state</h2>
+
+<p>When one actor cannot keep up with CPU-bound demand, run a fixed pool of N actors and spread calls across them. Each actor is its own process on its own core, so N actors give you roughly N× the throughput — turning the 50 calls/s ceiling into ≈ N × 50 calls/s. The simplest pool is round-robin over a list of handles:</p>
+
+<pre><code># N independent model-replica actors, each on its own GPU/core
+N = 8
+pool = [ModelReplica.remote("s3://bucket/model.pt") for _ in range(N)]
+
+# round-robin: call i goes to actor i % N — work spreads across N processes
+refs = [pool[i % N].predict.remote(b) for i, b in enumerate(batches)]
+preds = ray.get(refs)</code></pre>
+
+<p>Ray also ships <code>ray.util.ActorPool</code>, which load-balances by handing each new task to whichever actor is free rather than blind round-robin — better when call durations vary, since a slow actor does not stall its share of the queue:</p>
+
+<pre><code>from ray.util import ActorPool
+pool = ActorPool([ModelReplica.remote(path) for _ in range(N)])
+# map_unordered assigns each input to the next AVAILABLE actor
+results = list(pool.map_unordered(lambda a, b: a.predict.remote(b), batches))</code></pre>
+
+<div class="callout"><div class="label">Worked number — single actor vs pool, and where it still breaks</div>
+Back to the 20 ms method (50 calls/s per actor) against 4,000 calls/s of demand. One actor: 50 calls/s served, the rest queues — utterly bottlenecked. A pool of <span class="math">N = 8</span>: <span class="math">8 × 50 = 400 calls/s</span> — still short. <span class="math">N = 80</span>: <span class="math">80 × 50 = 4,000 calls/s</span> — now you match demand, at the cost of 80 processes (and 80 GPUs if each holds a replica). The pool only helps because the work <em>shards cleanly</em>: each <code>predict</code> is independent. The thing that does <em>not</em> shard is the single mutable counter in §2 — if every call must update one shared total, a pool cannot help, because the state itself is the serialization point.</div>
+
+<p>That last point is the design pivot. When the bottleneck is <em>state</em>, you do not pool identical actors; you <strong>shard the state by a natural key</strong> so that each actor owns a disjoint slice and calls for different keys run in parallel. A single global counter becomes K counter shards keyed by, say, <code>user_id % K</code>:</p>
+
+<pre><code>K = 16
+shards = [ParameterServer.remote() for _ in range(K)]
+
+def update(user_id, grad):
+    shard = shards[hash(user_id) % K]     # this user's state lives on ONE shard
+    return shard.apply_gradient.remote(grad)
+# distinct users hit distinct shards → up to K× the single-actor throughput,
+# while each user's own updates stay serialized (still race-free per key)</code></pre>
+
+<p>Sharding buys throughput but costs you global atomicity: a sum across all shards is now a fan-in (read all K, add them), and you can no longer take a single lock across the whole state. That is the recurring actor trade-off — centralize for correctness, shard for scale, and you cannot have both for the same piece of state.</p>
+
+<table class="trade-table">
+<thead><tr><th>Situation</th><th>Use</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Pure parallel compute, no shared state</td><td><strong>Task</strong></td><td>Trivially parallel, retried anywhere by lineage, no lifecycle to manage.</td></tr>
+<tr><td>Expensive init reused across calls (model, connection)</td><td><strong>Actor</strong></td><td>Load/connect once in <code>__init__</code>, keep the warm object resident.</td></tr>
+<tr><td>Mutable state that must stay consistent</td><td><strong>One actor</strong></td><td>Single-thread execution serializes mutations — no locks needed.</td></tr>
+<tr><td>One actor can't keep up, work shards cleanly</td><td><strong>Actor pool</strong> / <code>ActorPool</code></td><td>N processes ≈ N× throughput for independent calls.</td></tr>
+<tr><td>Hot shared state is the bottleneck</td><td><strong>Sharded actors</strong></td><td>Partition state by key; disjoint keys run in parallel.</td></tr>
+<tr><td>Method waits on I/O, not CPU</td><td><strong>Async / threaded actor</strong></td><td><code>max_concurrency</code> overlaps waiting; GIL still blocks CPU work.</td></tr>
+</tbody>
+</table>
+
+<h2>5 · The two costs: a single point of failure and a serialization point</h2>
+
+<p>You bought capabilities in §1; here is the bill. An actor concentrates state in one process, which means two things break in ways tasks do not.</p>
+
+<p><strong>State dies with the process.</strong> A task's output can be reconstructed by re-running it (lineage). An actor's accumulated state — the replay buffer, the converged parameters, the warmed cache — cannot, because re-running <code>__init__</code> gives you a fresh empty object, not the state you had. If the node holding the actor dies, that state is gone. <strong>max_restarts</strong> tells Ray how many times to restart a crashed actor (e.g. <code>@ray.remote(max_restarts=3)</code>), but a restart re-runs <code>__init__</code> and starts empty unless <em>you</em> persist and reload state. Durability is your job:</p>
+
+<pre><code>@ray.remote(max_restarts=3)          # Ray will recreate the actor up to 3 times
+class ReplayBuffer:
+    def __init__(self, ckpt="s3://b/buf.pkl"):
+        self.ckpt = ckpt
+        self.data = load_if_exists(ckpt) or []   # reload on restart, else empty
+
+    def add(self, item):
+        self.data.append(item)
+
+    def checkpoint(self):                # call periodically from the driver
+        save(self.ckpt, self.data)       # durability is YOUR responsibility</code></pre>
+
+<div class="callout"><div class="label">Worked number — checkpoint interval is a real trade-off</div>
+Suppose a learner actor accumulates 5,000 experiences/min and checkpointing the buffer costs 2 s of stalled work. Checkpoint every 1 min and you lose at most 5,000 experiences on a crash, paying <span class="math">2 s / 60 s ≈ 3.3%</span> overhead. Checkpoint every 10 min and overhead drops to <span class="math">2 s / 600 s ≈ 0.33%</span>, but a crash now loses up to 50,000 experiences (~10 min of work). The interval trades steady-state overhead against worst-case loss — there is no free durability, only a knob, and §14 (failure semantics) makes the cluster-wide version of this argument.</div>
+
+<p><strong>It is still a serialization point.</strong> Even fault-tolerant, one actor is one thread (§3). The two costs compound: the actor you made durable with checkpointing is the same actor whose 50 calls/s ceiling you must respect. Production designs therefore reach for a <em>pool of restartable, periodically-checkpointed actors sharded by key</em> — fault tolerance and throughput at once — which is precisely the shape Ray Serve (lesson 11) and RLlib (lesson 07) package so you do not assemble it by hand each time.</p>
+
+<h2>Failure modes & checklist</h2>
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+<li><strong>The accidental global lock.</strong> Routing all coordination through one actor turns a 50 calls/s method into the cluster's bottleneck. Measure mailbox depth; shard or pool before it saturates.</li>
+<li><strong>Actors for stateless work.</strong> Wrapping a pure function in an actor adds lifecycle, placement, and failure-handling complexity for zero benefit — use a task.</li>
+<li><strong>Assuming durability.</strong> Actor-local state is <em>not</em> persisted. A node failure with no checkpoint loses every gradient, every buffered experience, every cache entry.</li>
+<li><strong>Threaded actor without locks.</strong> Setting <code>max_concurrency&gt;1</code> revokes the free no-race guarantee; shared <code>self</code> state now needs explicit locking, and CPU work still won't speed up under the GIL.</li>
+<li><strong>Too-fine methods.</strong> A 100 µs method pays more in per-call RPC than it computes — same granularity trap as tasks (lesson 02). Batch work per call.</li>
+</ul></div>
+  <div class="lesson-card"><h3>Implementation checklist</h3><ul>
+<li>Does this work have <em>memory</em> (state, expensive init, or an endpoint)? If not, it is a task.</li>
+<li>What is one method's latency, and therefore this actor's <span class="math">1 / t</span> throughput ceiling?</li>
+<li>Does the work shard cleanly (→ pool) or is the shared state itself the bottleneck (→ shard by key)?</li>
+<li>Is the bottleneck CPU (needs more actors) or I/O (async / <code>max_concurrency</code>)?</li>
+<li>If this actor dies, what happens — rebuild from checkpoint, restart empty, or fail the job? Is <code>max_restarts</code> set?</li>
+<li>What is the checkpoint interval, and what worst-case loss does it imply?</li>
+</ul></div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>You serve a model whose <code>predict</code> takes 20 ms and you must handle 1,200 requests/s at p99 &lt; 100 ms. Compute the minimum pool size from the single-actor ceiling (50 calls/s → 24 actors just to match throughput; add headroom for queueing and you land near 30+). Now flip one assumption: the method drops to 5 ms because you added request batching. Recompute — the ceiling becomes 200 calls/s, so 6 actors match throughput. The "right answer" (pool size) moved 4× from one knob (per-call time), which is exactly why §11's dynamic batching exists. Then add a per-user feature cache: does it live in the replica actors (fast but duplicated K×, lost on restart) or one sharded cache actor (consistent but a new bottleneck)? Justify which, and where the checkpoint goes.</div>
+
+<h2>Where this points next</h2>
+<p>You now have both primitives — stateless task, stateful actor — and the handle that lets them call each other. But we have been hand-waving the machinery underneath: when you fire <code>predict.remote(batch)</code>, <em>which</em> node runs it, how does the 4 MB batch get there without copying it through the driver, where does the model replica's GPU reservation actually come from, and what reconstructs a lost object? Lesson 04 opens the runtime: the driver/worker/raylet/GCS layout, the resource-and-locality-aware scheduler that placed your actors, and the plasma object store whose ownership and lineage model is what made <code>ObjectRef</code> work in the first place.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+An actor is Ray's answer to everything a stateless task structurally can't be: a class marked <code>@ray.remote</code> whose instance lives on one worker, owns mutable Python state, and serves method calls that return <code>ObjectRef</code>s like tasks do — the actor handle is a passable, callable reference to that one instance. Its single-threaded execution is a double-edged contract: it serializes method calls so shared state stays race-free <em>without locks</em>, but it caps throughput at <span class="math">1 / (per-call time)</span> on one core regardless of cluster size. You break that ceiling with a pool of N actors (≈ N× throughput when work shards cleanly) or by sharding hot state by key (disjoint keys run in parallel, at the cost of global atomicity); for I/O-bound methods, async / <code>max_concurrency</code> overlaps the waiting. The price of concentrating state is that an actor is a single point of failure whose state dies with the process — <code>max_restarts</code> recreates it but re-runs <code>__init__</code> empty, so durability means <em>you</em> checkpoint, trading steady-state overhead against worst-case loss. Decide by the one question: does the work have memory? If yes, actor; if no, task.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+<li>What can an actor do that a task cannot, and what does it cost you? <em>(§1, §5 — hold mutable state, reuse expensive init, be a service endpoint; in exchange it's a single point of failure whose state isn't durable and a single-threaded serialization point.)</em></li>
+<li>An actor method takes 20 ms — what's the max throughput of one actor on a 500-node cluster? <em>(§3 — 1/0.020 = 50 calls/s; cluster size is irrelevant because one actor runs methods serially on one process.)</em></li>
+<li>When does an actor pool help and when does it not? <em>(§4 — N actors give ≈ N× throughput when calls are independent; it does NOT help when the bottleneck is one shared mutable state, which stays serialized — then shard the state by key instead.)</em></li>
+<li>Why doesn't a plain actor need a lock around shared state? <em>(§2, §3 — single-threaded execution runs one method at a time, so mutations can't interleave; this guarantee is lost the moment you set max_concurrency&gt;1.)</em></li>
+<li>What does <code>max_restarts</code> actually recover, and what does it not? <em>(§5 — it recreates a crashed actor up to N times, but re-runs <code>__init__</code> from scratch; accumulated state is lost unless you checkpoint and reload it yourself.)</em></li>
+<li>Async actor vs threaded actor vs more actors — when each? <em>(§3, §4 — async/threaded (max_concurrency) overlap I/O-bound waiting on one process but the GIL blocks CPU work; CPU-bound demand needs more actor processes, i.e. a pool.)</em></li>
+<li>How do you choose a checkpoint interval for a stateful learner? <em>(§5 — trade steady-state overhead (checkpoint cost / interval) against worst-case loss (work done since last checkpoint); shorter = safer but slower, longer = cheaper but loses more on a crash.)</em></li>
+</ul>
+
+<footer class="lesson-nav"><a href="02_tasks_objects_refs.html"><span class="dir">Previous</span><span class="ttl">02 · Tasks, Objects, and Futures</span></a><a class="next" href="04_runtime_scheduling_object_store.html"><span class="dir">Next</span><span class="ttl">04 · Runtime, Scheduling, and the Object Store</span></a></footer>
+</main>
+<!-- reviewed:v1 -->
+</body>
+</html>

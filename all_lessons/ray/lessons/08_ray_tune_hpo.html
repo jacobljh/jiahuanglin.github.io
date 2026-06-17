@@ -1,112 +1,298 @@
 <!doctype html>
-        <html lang="en">
-        <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width,initial-scale=1">
-        <title>08 - Ray Tune: Experiments and Hyperparameter Search</title>
-        <link rel="stylesheet" href="style.css">
-        </head>
-        <body>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>08 · Ray Tune: Experiments and Hyperparameter Search | Ray, from first principles</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">ray</a><span class="crumb">/</span><span class="crumb">08</span><span class="step-pill">lesson 9 / 17</span></div></header>
+<main>
 
-        <header class="topnav">
-          <div class="inner">
-            <a class="crumb-link" href="../../index.html">all_lessons</a>
-            <span class="crumb">/</span>
-            <a class="crumb-link" href="index.html">ray</a>
-            <span class="crumb">/</span>
-            <span class="crumb">08</span>
-            <span class="step-pill">lesson 9 / 17</span>
-          </div>
-        </header>
+<p class="kicker">Part II - Applications and libraries</p>
+<h1>Ray Tune: Experiments and Hyperparameter Search</h1>
+<p class="subtitle">Lesson 07 gave you RLlib: many cheap rollout actors feeding a few expensive learners, one training run at a time. But which learning rate? Which network width, which batch size, which discount factor? A single training run answers none of that — you need to run <em>dozens</em> of configurations and let the good ones survive. Ray Tune is that layer. The trap is to read it as "random search, but on more machines." It is something sharper: a <strong>control plane over a population of experiments</strong> that decides, while they run, which configs deserve more compute and which to kill. This lesson builds that control plane from the problem up, and makes the central engineering claim — that <em>early stopping</em>, not parallelism, is where the compute savings live — quantitative.</p>
 
-        <main>
-        <span class="part-label">Part II - Applications and libraries</span>
-        <h1>Ray Tune: Experiments and Hyperparameter Search</h1>
-        <p class="subtitle">Tune is not just random search on more machines. It is a control plane for trials, resources, schedulers, checkpoints, and early stopping.</p>
+<div class="callout source-note"><div class="label">Book source</div>Chapter 5, "Hyperparameter Optimization with Ray Tune" - random search, why HPO is hard, Tune architecture, configuration, RLlib, and Keras examples. API wording is calibrated to current Ray: <code>Tuner</code> / <code>TuneConfig</code> / <code>tune.report</code> / <code>tune.with_resources</code> / <code>ASHAScheduler</code>.</div>
 
-        <div class="callout">
-          <div class="label">Source map</div>
-          Book coverage: Chapter 5, 'Hyperparameter Optimization with Ray Tune' - random search, why HPO is hard, Tune architecture, configuration, RLlib, and Keras examples.
-        </div>
+<div class="callout"><div class="label">Linear position</div><strong>Prerequisite:</strong> Lesson 07 (RLlib) — one configured training run as a task/actor graph, with metrics reported per iteration. Also the task/actor/object-store model from Part I.<br><strong>New capability:</strong> launch and govern a <em>population</em> of training runs, propose configs intelligently, and reallocate cluster compute away from doomed trials toward promising ones — turning "train it 50 times by hand" into one resource-aware experiment.</div>
 
-        <h2>The thesis</h2>
-        <p>Hyperparameter optimization is distributed systems under uncertainty: many trials compete for resources, partial signals arrive at different times, and the scheduler must decide what deserves more compute.</p>
+<div class="callout"><div class="label">The plan</div>
+Five moves. (1) Establish why hyperparameter optimization (HPO) is genuinely hard — high-dimensional, expensive, black-box, no gradient — so you see why throwing machines at it is not the answer. (2) Decompose Tune into three separated concerns: the <strong>trial</strong>, the <strong>search algorithm</strong> (explore the space), and the <strong>scheduler</strong> (reallocate compute over time). (3) Make ASHA's successive halving quantitative with a worked epoch budget — the multiple-× saving that is the whole point. (4) Resource-aware concurrency and checkpointing — how Tune packs trials onto the cluster and pauses/resumes them. (5) Failure modes, the late-bloomer risk, and the hand-off to Ray Train.</div>
 
-        <h2>Linear path</h2>
-        <ol>
-  <li>Represent each experiment as a trainable with a config, metric, resource request, and checkpoint behavior.</li>
-  <li>Define a search space and search algorithm. Random search is a baseline; Bayesian and evolutionary methods use observations to choose future trials.</li>
-  <li>Add a trial scheduler. ASHA, HyperBand, and PBT change allocation over time so weak trials stop early and promising trials receive more budget.</li>
-</ol>
+<h2>1 · Why HPO is hard (and why machines alone don't fix it)</h2>
 
-        <h2>The mechanism</h2>
-        <div class="concept-grid">
-<div class="concept"><strong>Trainable</strong><div>The function or class that performs one trial. It reports metrics and checkpoints state so Tune can monitor and resume it.</div></div>
-<div class="concept"><strong>Search algorithm</strong><div>Chooses the next config to try. It is about exploration of parameter space.</div></div>
-<div class="concept"><strong>Scheduler</strong><div>Allocates time and resources among active trials. It is about exploitation, early stopping, and promotion.</div></div>
-<div class="concept"><strong>Storage</strong><div>Metrics and checkpoints are the experiment record. Without durable storage, distributed tuning becomes expensive guesswork.</div></div>
+<p>Stochastic gradient descent tunes a model's <em>weights</em> because the loss is differentiable in the weights — you have a gradient pointing downhill. Hyperparameters are different. Learning rate, batch size, network depth, dropout, weight decay — these sit <em>outside</em> the differentiable graph. You cannot take the gradient of "final validation accuracy" with respect to "learning rate," because evaluating that relationship requires <em>training a whole model</em>. HPO is therefore the optimization of a function with four hostile properties:</p>
+
+<div class="lesson-flow">
+<div><strong>black-box</strong><span>You only learn the value of a config by running it end to end. No analytic form, no gradient — you observe, you cannot differentiate.</span></div>
+<div><strong>expensive</strong><span>One evaluation is one full (or partial) training run: minutes to days of GPU time. You get few samples for the money, so each one must count.</span></div>
+<div><strong>high-dimensional</strong><span>Five hyperparameters with ten plausible values each is 10⁵ = 100,000 combinations. Grid search is exponential in dimensions; exhaustive coverage is hopeless.</span></div>
+<div><strong>noisy</strong><span>Re-run the same config with a new random seed and the metric moves. You are optimizing through a haze, so a 0.2% "improvement" may be noise.</span></div>
 </div>
 
-        <h2>Decision surface</h2>
-        <table>
-  <thead><tr><th>Trade-off</th><th>How to reason about it</th></tr></thead>
-  <tbody>
-    <tr><td><strong>Random search vs adaptive search</strong></td><td>Random search is robust and parallel. Adaptive search can be sample-efficient but may bottleneck on sequential decisions.</td></tr>
-    <tr><td><strong>Aggressive early stopping vs patience</strong></td><td>Early stopping saves compute. It can also kill slow-starting configurations that would have won later.</td></tr>
-    <tr><td><strong>Trial parallelism vs per-trial scale</strong></td><td>Many small trials explore broadly. Fewer distributed trials evaluate large configurations realistically.</td></tr>
-  </tbody>
-</table>
+<p>Now the key insight that separates Tune from a job scheduler. Because evaluation is expensive and the budget is fixed, the question is never "can I run all the configs in parallel?" — you usually cannot afford to. The question is <strong>"given a fixed pile of GPU-hours, how do I spend them to find the best config?"</strong> That reframes HPO as a <em>resource-allocation problem under uncertainty</em>: partial results arrive at different times, and something must continuously decide which running experiments are worth feeding. That "something" is the control plane Tune provides. Parallelism is table stakes; allocation is the value.</p>
 
-        <h2>Operational checklist</h2>
-        <ul>
-  <li>Choose the metric and optimization direction before launching trials.</li>
-  <li>Make checkpointing cheap enough to run often, but complete enough to resume faithfully.</li>
-  <li>Specify per-trial resources so Tune can pack the cluster intentionally.</li>
-  <li>Keep a simple baseline search in the experiment plan; clever search without a baseline is hard to trust.</li>
-</ul>
+<div class="callout warn"><div class="label">The control-plane framing</div>
+"Random search on more machines" buys you a linear speedup: 8 machines, 8× the configs in the same wall-clock. Useful, but bounded by your hardware budget. The Tune framing buys you something parallelism cannot: it spends <em>less compute per config</em> by abandoning losers early, so the <em>same</em> GPU budget explores far more of the space. Section 3 shows this is often a 5–10× effective speedup on top of whatever parallelism you have — and it comes from a scheduler, not from more nodes.</div>
 
-        <h2>Failure modes</h2>
-        <ul>
-  <li>Tuning on a noisy validation metric without repeated seeds or confidence intervals.</li>
-  <li>Letting the search algorithm compare trials that ran for very different budgets without a scheduler-aware metric.</li>
-  <li>Storing checkpoints on local disk and losing them when trials move or nodes die.</li>
-</ul>
+<h2>2 · Three separated concerns: trial, search, scheduler</h2>
 
-        <h2>Implementation sketch</h2>
-        <pre><code>from ray import tune
+<p>Tune's design cleanly splits three jobs that beginners tend to conflate. Define each at first use:</p>
 
-def trainable(config):
-    model = build_model(config)
-    for epoch in range(20):
-        loss, acc = train_one_epoch(model, config)
-        tune.report({&quot;loss&quot;: loss, &quot;accuracy&quot;: acc})
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Trial</div><div class="v">One hyperparameter config, trained as a Ray task or actor. A <strong>trial</strong> owns its config, reports a metric over time via <code>tune.report(...)</code>, and writes <strong>checkpoints</strong> (saved model+optimizer state) so it can pause and resume. It is the unit of parallelism here — exactly the "tuning trial" named in lesson 00.</div></div>
+  <div class="topic-card"><div class="k">Search algorithm</div><div class="v">Proposes the <em>next config to try</em> — this is <strong>exploration</strong> of the parameter space. Grid and random are stateless baselines; Bayesian methods (via Optuna or HyperOpt) build a model of the space from past trials and propose where the expected payoff is highest — <strong>exploitation</strong> of what was learned.</div></div>
+  <div class="topic-card"><div class="k">Scheduler</div><div class="v">Decides, among <em>already-running</em> trials, which to <strong>stop early</strong> and which to keep funding — this is allocation of compute over time. ASHA, median-stopping, and PBT live here. The scheduler is where the GPU-hours are actually saved.</div></div>
+</div>
+
+<p>The separation matters because the two decisions answer different questions and can be mixed and matched. The search algorithm answers <em>"where in the space should I look next?"</em> The scheduler answers <em>"of the trials I am already running, which are wasting my compute right now?"</em> You can pair random search (cheap, embarrassingly parallel) with an aggressive scheduler, or Bayesian search (sample-efficient but sequential — it must see results before proposing) with a gentle one. The book's chapter walks random search first precisely because it is the robust baseline against which any clever search must justify itself.</p>
+
+<p><strong>Exploration vs exploitation, concretely.</strong> Pure random search is all exploration: it never uses what it learned, so it wastes samples re-checking obviously-bad regions, but it parallelizes perfectly and never gets stuck. Bayesian search exploits: after 20 trials it has a surrogate model and concentrates samples near the best region — far fewer trials to a good answer, but each proposal waits on prior results (a serial dependency, recall the Amdahl ceiling from lesson 00), and it can tunnel into a local optimum. The practical answer is usually random/grid for breadth plus a scheduler for the savings, escalating to Bayesian only when each trial is so expensive that sample-efficiency dominates.</p>
+
+<h2>3 · Successive halving: where the compute is actually saved</h2>
+
+<p>This is the heart of the lesson. ASHA — Asynchronous Successive Halving Algorithm — is the default scheduler worth understanding in full, because its arithmetic is the entire argument for using Tune over a loop.</p>
+
+<p>The idea: do not train every config to completion to find out it was bad. A config that is in the bottom third after <em>1 epoch</em> is very unlikely to be the winner after 27. So organize training into <strong>rungs</strong> — checkpoints at increasing budgets — and at each rung <em>promote</em> only the top fraction, killing the rest. A <strong>rung</strong> is a budget milestone (e.g. "1 epoch trained"); successive halving is the repeated cull at each rung. The <strong>grace period</strong> is the minimum budget every trial gets before it is eligible to be killed — your protection against murdering a config before it has had a fair chance.</p>
+
+<div class="callout"><div class="label">Worked number — 81 configs, reduction factor 3</div>
+Take <strong>81</strong> configs, a reduction factor η = 3 (keep the top 1/3 at each rung), a grace period of 1 epoch, and a max of 27 epochs. Rungs sit at 1, 3, 9, 27 epochs.<br><br>
+<strong>Full training (no scheduler):</strong> 81 configs × 27 epochs = <strong>2,187 epoch-units</strong>.<br><br>
+<strong>ASHA successive halving:</strong>
+<div class="mini-flow" style="margin:10px 0;">
+<div class="step"><span class="n">rung 0</span>run all <strong>81</strong> configs for <strong>1</strong> epoch → 81 epoch-units. Keep top 27.</div>
+<div class="step"><span class="n">rung 1</span>run the surviving <strong>27</strong> for <strong>3</strong> epochs (2 more each) → 54 epoch-units. Keep top 9.</div>
+<div class="step"><span class="n">rung 2</span>run the surviving <strong>9</strong> for <strong>9</strong> epochs (6 more each) → 54 epoch-units. Keep top 3.</div>
+<div class="step"><span class="n">rung 3</span>run the surviving <strong>3</strong> for <strong>27</strong> epochs (18 more each) → 54 epoch-units. One winner.</div>
+</div>
+Total ≈ 81 + 54 + 54 + 54 = <strong>243 epoch-units</strong>. That is <span class="math">2,187 / 243 = 9×</span> less compute than training everything to the end — and crucially, the winner still got its full 27 epochs. The savings come entirely from the 54 configs you killed at rung 0 after a single epoch, and the 18 you killed at rung 1. <strong>Stack this on top of parallelism:</strong> 8 GPUs running ASHA find the same winner roughly 9× cheaper than 8 GPUs running every config full-length — that is the 5–10× from §1, made of arithmetic, not hardware.</div>
+
+<p>The "A" in ASHA — <em>asynchronous</em> — matters on a real cluster. Classic Hyperband waits for an entire rung to finish before promoting, so one straggler stalls the whole population (a synchronization barrier; recall the shuffle bottleneck of lesson 05). ASHA promotes a trial the moment enough peers have reported at its rung, so GPUs never sit idle waiting for the slowest trial. That is why it is the cluster default.</p>
+
+<div class="callout warn"><div class="label">The late-bloomer risk is real</div>
+Successive halving assumes early performance predicts late performance. Sometimes it does not: a config with a low warm-up learning rate, or one needing a long schedule, can sit in the bottom third at epoch 1 and overtake everyone by epoch 27 — but ASHA already killed it. This is the genuine downside of aggressive early stopping, and the lever against it is the <strong>grace period</strong>: raise it (e.g. 5 epochs before any culling) and you protect slow starters at the cost of spending more compute on eventual losers. Grace period is the exploration-budget knob, and there is no free setting — it trades wasted compute on doomed trials against the risk of killing a winner.</div>
+
+<h2>4 · Resource-aware concurrency and checkpointing</h2>
+
+<p>A scheduler that kills trials is only useful if the freed compute is immediately reused. Tune is <strong>resource-aware</strong>: each trial declares what it needs (CPUs, GPUs, fractional GPUs), and Tune packs trials onto the cluster honoring those reservations — the same placement logic from lesson 04, applied to a trial population.</p>
+
+<div class="callout"><div class="label">Worked number — packing 4 GPUs</div>
+You have a 4-GPU node and 40 configs to explore. If each trial needs a whole GPU, Tune runs <strong>4 at a time</strong> (max concurrency = 4) and queues the other 36; as ASHA kills a trial, the next dequeues onto the freed GPU. If your model is small and a trial only needs <strong>0.5 GPU</strong> (declared via <code>tune.with_resources(train_fn, {"gpu": 0.5})</code>), Tune packs <strong>8 trials</strong> onto the same 4 GPUs — doubling exploration throughput at the cost of two trials sharing each GPU's memory and compute. The trade-off: too-fine fractions cause GPU memory thrash and noisy timings; whole-GPU trials waste capacity on small models. <code>max_concurrent_trials</code> additionally caps concurrency when a Bayesian search needs results to flow back before proposing more.</div>
+
+<p><strong>Checkpointing is what makes pause/resume possible.</strong> When ASHA stops a trial at a rung, it does not always discard it — with pause-and-resume schedulers it saves the trial's state to durable storage so it can be reloaded later. More importantly, checkpoints are how Tune survives node failure: a preempted spot instance or a dead worker loses a trial's process, but the trial resumes from its last checkpoint instead of restarting from epoch 0. The rule from the old skeleton holds — checkpoint <em>often enough</em> to lose little work, but <em>cheaply enough</em> not to dominate runtime, and write to <strong>shared/durable storage</strong> (S3, NFS) not local disk, because trials migrate between nodes.</p>
+
+<p>One scheduler deserves a special note because it blurs the search/scheduler line: <strong>Population Based Training (PBT)</strong>. PBT runs a population, periodically copies the weights of top performers onto poor ones, and then <em>mutates their hyperparameters live</em> — so the config is not fixed for a trial's lifetime, it evolves. This is uniquely powerful for things like learning-rate schedules (it discovers a schedule, not just a constant), at the cost of more bookkeeping and the requirement that trials checkpoint frequently so weights can be cloned mid-flight.</p>
+
+<h2>5 · The real code</h2>
+
+<p>Putting the three concerns together. The train function is an ordinary loop that calls <code>tune.report</code> each epoch; the <code>Tuner</code> wires up the search space, the search algorithm, and the scheduler:</p>
+
+<pre><code>from ray import tune, train
+from ray.tune.schedulers import ASHAScheduler
+from ray.tune.search.optuna import OptunaSearch
+
+def train_fn(config):                         # ONE trial
+    model = build_model(width=config["width"])
+    opt = make_optimizer(lr=config["lr"])
+    for epoch in range(27):                    # up to the ASHA max
+        loss, acc = train_one_epoch(model, opt)
+        # report the metric AND a checkpoint so Tune can rank + resume
+        tune.report({"accuracy": acc, "loss": loss})
 
 tuner = tune.Tuner(
-    trainable,
-    param_space={&quot;lr&quot;: tune.loguniform(1e-5, 1e-1), &quot;width&quot;: tune.choice([64, 128, 256])},
+    tune.with_resources(train_fn, {"gpu": 0.5}),   # resource-aware: 2 trials / GPU
+    param_space={                                  # the search space
+        "lr":    tune.loguniform(1e-5, 1e-1),      # continuous, log scale
+        "width": tune.choice([64, 128, 256]),      # categorical
+    },
+    tune_config=tune.TuneConfig(
+        metric="accuracy", mode="max",
+        search_alg=OptunaSearch(),                 # Bayesian exploration
+        scheduler=ASHAScheduler(                    # successive halving
+            max_t=27, grace_period=1, reduction_factor=3),
+        num_samples=81,                            # 81 configs to draw
+    ),
 )
-results = tuner.fit()</code></pre>
+results = tuner.fit()
+best = results.get_best_result(metric="accuracy", mode="max")
+print(best.config, best.metrics["accuracy"])</code></pre>
 
-        <div class="callout ok">
-          <div class="label">Exercise</div>
-          You have 64 GPUs and two options: 64 one-GPU trials or 8 eight-GPU trials. What changes if your final model will train on 8 GPUs? What changes if the search is over data augmentation rather than model size?
-        </div>
+<p>Read the separation in the code: <code>param_space</code> is the <em>space</em>, <code>search_alg</code> proposes <em>within</em> it (exploration), <code>scheduler</code> reallocates compute across the running trials (the savings), and <code>tune.with_resources</code> governs packing. Swap <code>OptunaSearch()</code> for the default random search, or <code>ASHAScheduler</code> for <code>None</code>, and you can isolate exactly how much each contributes — which is precisely the baseline discipline the book insists on.</p>
 
-        <h2>Connective tissue</h2>
-        <p>This lesson is meant to connect Ray mechanics to the surrounding ML-systems library rather than live as an isolated API tour.</p>
-        <div class="link-grid"><a href="../../ml_system_design/lessons/10_evaluation_and_feedback.html">ML Systems Design - evaluation</a><a href="../../interview_questions/system_design/14_optimization.html">System Design - optimization</a></div>
+<h2>6 · Make ASHA's budget tangible</h2>
 
-        <footer class="lesson-nav">
-  <a href="07_rllib_reinforcement_learning.html">
-    <span class="dir">&lt;- Previous</span>
-    <span class="ttl">07 - RLlib: Scalable Reinforcement Learning</span>
-  </a>
-  <a class="next" href="09_ray_data_processing.html">
-    <span class="dir">Next -&gt;</span>
-    <span class="ttl">09 - Ray Data: Blocks, Streaming Execution, and ML Dataflow</span>
-  </a>
-</footer>
+<p>Drag the knobs to see how the number of configs and the reduction factor trade off against compute. The bars compare full training (every config to the max) against ASHA's successive halving over the same population.</p>
 
-        </main>
-        </body>
-        </html>
+<div class="widget" id="asha-widget">
+  <div class="title">ASHA budget — compute saved by early stopping</div>
+  <div class="hint">Pick how many configs you explore (<strong>N</strong>), how aggressively each rung culls (<strong>reduction factor η</strong> — keep the top 1/η), and the <strong>max epochs</strong> a survivor trains. The widget builds rungs at 1, η, η², … epochs, keeps the top 1/η at each, and totals the epoch-units. Compare the green ASHA bar against the grey full-training bar — the gap is the GPU-hours early stopping buys you.</div>
+
+  <canvas class="dist-canvas" id="asha-canvas" width="760" height="200" style="height:200px;"></canvas>
+
+  <div class="controls" style="margin-top: 12px;">
+    <label class="inline">configs N: <input type="range" id="ah-n" min="9" max="256" step="1" value="81"> <span class="val" id="ah-n-val">81</span></label>
+    <label class="inline">reduction factor η: <input type="range" id="ah-eta" min="2" max="5" step="1" value="3"> <span class="val" id="ah-eta-val">3</span></label>
+    <label class="inline">max epochs: <input type="range" id="ah-max" min="9" max="81" step="1" value="27"> <span class="val" id="ah-max-val">27</span></label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">Full training (epoch-units)</div><div class="v" id="ah-k-full">—</div></div>
+    <div class="kpi"><div class="k">ASHA (epoch-units)</div><div class="v" id="ah-k-asha">—</div></div>
+    <div class="kpi"><div class="k">Speedup</div><div class="v" id="ah-k-speed">—</div></div>
+    <div class="kpi"><div class="k">Rungs</div><div class="v" id="ah-k-rungs">—</div></div>
+  </div>
+
+  <details>
+    <summary style="cursor: pointer; color: var(--text-mute); font-size: 13px;">Show the core JS</summary>
+<pre><code>// rungs at budgets 1, eta, eta^2, ... up to maxEpochs; keep top 1/eta survivors each.
+let survivors = N, prevBudget = 0, asha = 0, budget = 1;
+while (true) {
+  asha += survivors * (budget - prevBudget);   // incremental epochs this rung
+  if (budget &gt;= maxEpochs || survivors &lt;= 1) break;
+  survivors = Math.max(1, Math.floor(survivors / eta));
+  prevBudget = budget;
+  budget = Math.min(maxEpochs, budget * eta);
+}
+const full = N * maxEpochs;                      // train everything to the end
+const speedup = full / asha;                     // the early-stopping win</code></pre>
+  </details>
+</div>
+
+<h2>7 · Failure modes & checklist</h2>
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+<li><strong>Killing a late bloomer.</strong> Grace period too short, so ASHA culls a slow-starting config that would have won. Raise the grace period for schedules with warm-ups; sanity-check against a no-scheduler baseline on a small N.</li>
+<li><strong>Tuning on noise.</strong> A single-seed validation metric wiggles run-to-run; the scheduler then promotes on luck. Average a few seeds or use a less noisy metric before trusting a 0.2% gap.</li>
+<li><strong>Comparing unequal budgets.</strong> Letting a search algorithm rank a 1-epoch trial against a 27-epoch one without a scheduler-aware metric. The scheduler must compare like with like — at the same rung.</li>
+<li><strong>Local-disk checkpoints.</strong> Trials migrate between nodes; a checkpoint on the worker's local disk vanishes when the trial moves or the node dies. Write to shared/durable storage.</li>
+<li><strong>Sequential search starving the cluster.</strong> A purely Bayesian search proposes one config at a time, so 32 GPUs sit idle waiting for results. Allow concurrent proposals or pair with random seeding.</li>
+</ul>
+  </div>
+  <div class="lesson-card"><h3>Implementation checklist</h3><ul>
+<li>Did you set <code>metric</code> and <code>mode</code> (max/min) explicitly before launching?</li>
+<li>Is there a random/grid baseline to justify any clever search algorithm?</li>
+<li>What is the grace period, and is it long enough for your slowest-starting plausible config?</li>
+<li>Does each trial declare its per-trial resources so Tune can pack the cluster intentionally?</li>
+<li>Are checkpoints frequent enough to lose little, cheap enough not to dominate, and on durable storage?</li>
+<li>Is the search algorithm allowed enough concurrency to keep the cluster busy?</li>
+</ul>
+  </div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>You have 64 GPUs and a model that trains in 27 epochs. Plan an ASHA experiment over 5 hyperparameters: choose N (configs), η, and the grace period, and estimate the epoch-unit budget vs full training using §3's arithmetic. Now flip an assumption: your best config is known to use a long warm-up that looks bad for the first 6 epochs. What must change — and what does it cost? (The grace period must rise to at least ~6, which shrinks the early-stopping saving; the "right" plan changes the moment late-blooming becomes plausible.)</div>
+
+<h2>Where this points next</h2>
+<p>Tune governs a population of trials, but it has been treating each trial as a black-box train function. What if one trial is itself too big for a single GPU and must be data-parallel across many workers? That is the recurring distributed-training shape — and Tune composes directly with it: a trial can <em>be</em> a Ray Train run, and the data feeding it comes from Ray Data (lesson 09). Lesson 10 builds Ray Train's N-worker, gradient-exchanging machinery, after which a single Tune trial can itself span a multi-GPU cluster. The control plane you just built sits one layer above the training engine you are about to meet.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+Ray Tune is a control plane over a population of experiments, not random search on more machines. HPO is hard because it is black-box, expensive, high-dimensional, and noisy, which reframes it as resource allocation under uncertainty. Tune separates three concerns: a <strong>trial</strong> (one config as a task/actor reporting a metric and checkpointing), a <strong>search algorithm</strong> (explore the space — random/grid baselines vs Bayesian exploitation via Optuna/HyperOpt), and a <strong>scheduler</strong> (reallocate compute over time). The real savings live in the scheduler: ASHA's successive halving trains 81 configs to a winner for ~243 epoch-units instead of 2,187 — a 9× win on top of parallelism — by killing the bottom 1/η at each rung. Its cost is the late-bloomer risk, tuned by the grace period; its enablers are resource-aware packing (<code>tune.with_resources</code>, fractional GPUs, <code>max_concurrent_trials</code>) and durable checkpointing for pause/resume and fault tolerance. Tune composes with Train (10) and RLlib (07) — it sits one layer above the engine that runs each trial.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+<li>Why can't you use gradient descent to tune hyperparameters? <em>(§1 — hyperparameters sit outside the differentiable graph; evaluating one requires a full training run, so HPO is a black-box, gradient-free optimization.)</em></li>
+<li>What distinguishes Tune from "random search on more machines"? <em>(§1, §3 — parallelism gives a linear, hardware-bounded speedup; Tune's scheduler spends less compute per config by early-stopping losers, a 5–10× effective win from arithmetic, not nodes.)</em></li>
+<li>Separate the roles of the search algorithm and the scheduler. <em>(§2 — search proposes the next config (exploration of the space); scheduler decides which running trials to kill/keep (allocation of compute over time). They are independent and composable.)</em></li>
+<li>Walk through ASHA's budget for 81 configs, η=3, max 27 epochs. <em>(§3 — rungs at 1/3/9/27 keeping top 1/3 each: 81+54+54+54 ≈ 243 vs 81×27 = 2,187 epoch-units, a 9× saving, winner still trains full length.)</em></li>
+<li>What is the grace period and what does it trade off? <em>(§3, §4 — the minimum budget before a trial can be killed; raising it protects late-blooming configs at the cost of more compute spent on eventual losers.)</em></li>
+<li>Why is ASHA asynchronous rather than synchronous Hyperband? <em>(§3 — synchronous promotion waits for a whole rung (a barrier a straggler stalls); async promotes as soon as enough peers report, keeping GPUs busy on a real cluster.)</em></li>
+<li>How does Tune pack trials onto a cluster, and what does a fractional GPU buy/cost? <em>(§4 — each trial declares resources via tune.with_resources; 0.5-GPU trials double exploration throughput but share memory/compute, risking thrash and noisy timings.)</em></li>
+<li>Why must checkpoints go to durable shared storage? <em>(§4 — trials migrate between nodes and nodes die; a local-disk checkpoint is lost on migration or failure, breaking pause/resume and fault tolerance.)</em></li>
+</ul>
+
+<footer class="lesson-nav"><a href="07_rllib_reinforcement_learning.html"><span class="dir">Previous</span><span class="ttl">07 · RLlib: Scalable Reinforcement Learning</span></a><a class="next" href="09_ray_data_processing.html"><span class="dir">Next</span><span class="ttl">09 · Ray Data: Blocks, Streaming Execution, and ML Dataflow</span></a></footer>
+
+</main>
+
+<script>
+(function(){
+  var canvas = document.getElementById('asha-canvas');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+
+  var nRng   = document.getElementById('ah-n');
+  var etaRng = document.getElementById('ah-eta');
+  var maxRng = document.getElementById('ah-max');
+  var nVal   = document.getElementById('ah-n-val');
+  var etaVal = document.getElementById('ah-eta-val');
+  var maxVal = document.getElementById('ah-max-val');
+  var kFull  = document.getElementById('ah-k-full');
+  var kAsha  = document.getElementById('ah-k-asha');
+  var kSpeed = document.getElementById('ah-k-speed');
+  var kRungs = document.getElementById('ah-k-rungs');
+
+  function computeAsha(N, eta, maxEpochs){
+    var survivors = N, prevBudget = 0, asha = 0, budget = 1, rungs = 0;
+    while (true){
+      asha += survivors * (budget - prevBudget);
+      rungs++;
+      if (budget >= maxEpochs || survivors <= 1) break;
+      survivors = Math.max(1, Math.floor(survivors / eta));
+      prevBudget = budget;
+      budget = Math.min(maxEpochs, budget * eta);
+    }
+    return { asha: asha, rungs: rungs };
+  }
+
+  function render(){
+    var N   = parseInt(nRng.value, 10);
+    var eta = parseInt(etaRng.value, 10);
+    var maxE = parseInt(maxRng.value, 10);
+
+    var r = computeAsha(N, eta, maxE);
+    var full = N * maxE;
+    var speedup = full / r.asha;
+
+    var dpr = window.devicePixelRatio || 1;
+    var W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== Math.round(W*dpr)){ canvas.width = Math.round(W*dpr); canvas.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    var padL = 130, padR = 70, padTop = 28, padBot = 28;
+    var plotW = W - padL - padR;
+    var barH = 34, gap = 30;
+    var maxVbar = full;
+
+    function bar(y, value, color, label){
+      var w = (value / maxVbar) * plotW;
+      ctx.fillStyle = color;
+      ctx.fillRect(padL, y, w, barH);
+      ctx.fillStyle = '#5b6573';
+      ctx.font = '12px monospace';
+      ctx.textAlign = 'right';
+      ctx.fillText(label, padL - 10, y + barH/2 + 4);
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#334155';
+      ctx.fillText(value.toLocaleString() + ' epoch-units', padL + w + 8, y + barH/2 + 4);
+    }
+
+    ctx.fillStyle = '#334155';
+    ctx.font = '13px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('same population, two budgets', padL, padTop - 10);
+
+    bar(padTop + 6, full, '#94a3b8', 'full training');
+    bar(padTop + 6 + barH + gap, r.asha, '#16a34a', 'ASHA');
+
+    nVal.textContent   = N;
+    etaVal.textContent = eta;
+    maxVal.textContent = maxE;
+    kFull.textContent  = full.toLocaleString();
+    kAsha.textContent  = r.asha.toLocaleString();
+    kSpeed.textContent = speedup.toFixed(1) + '×';
+    kRungs.textContent = r.rungs;
+  }
+
+  nRng.addEventListener('input', render);
+  etaRng.addEventListener('input', render);
+  maxRng.addEventListener('input', render);
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+<!-- reviewed:v1 -->
+</body>
+</html>

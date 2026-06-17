@@ -1,118 +1,185 @@
 <!doctype html>
-        <html lang="en">
-        <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width,initial-scale=1">
-        <title>10 - Ray Train: Distributed Training</title>
-        <link rel="stylesheet" href="style.css">
-        </head>
-        <body>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>10 · Ray Train: Distributed Training | Ray, from first principles</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">ray</a><span class="crumb">/</span><span class="crumb">10</span><span class="step-pill">lesson 11 / 17</span></div></header>
+<main>
 
-        <header class="topnav">
-          <div class="inner">
-            <a class="crumb-link" href="../../index.html">all_lessons</a>
-            <span class="crumb">/</span>
-            <a class="crumb-link" href="index.html">ray</a>
-            <span class="crumb">/</span>
-            <span class="crumb">10</span>
-            <span class="step-pill">lesson 11 / 17</span>
-          </div>
-        </header>
+<p class="kicker">Part II - Applications and libraries</p>
+<h1>Ray Train: Distributed Training</h1>
+<p class="subtitle">Lesson 09 built a streaming data pipeline whose whole job was to keep a GPU fed — and it ended on an open question: once the pipeline is fast enough, what consumes the batches? This lesson answers it. Ray Train takes the one distributed-training shape that recurs across PyTorch, the orientation table, and lesson 05's tree-reduce — N processes, each holding a full model replica, each chewing a different data shard, all agreeing on one gradient every step — and packages it as a job harness. The work here is to understand that shape precisely enough to predict when adding a GPU stops helping, and to see exactly where Ray Data hands its shards across to Train.</p>
 
-        <main>
-        <span class="part-label">Part II - Applications and libraries</span>
-        <h1>Ray Train: Distributed Training</h1>
-        <p class="subtitle">Ray Train wraps the recurring shape of distributed ML: workers, data shards, framework launch, checkpoints, metrics, and scale-out.</p>
+<div class="callout source-note"><div class="label">Book source</div>Chapter 7, "Distributed Training with Ray Train" - training basics, example pipeline, trainers, migration, scaling, preprocessing, Tune integration, and callbacks. Calibrated to current Ray: <code>ray.train.torch.TorchTrainer</code>, <code>ScalingConfig</code>, <code>ray.train.report(...)</code> with a <code>Checkpoint</code>, and <code>ray.train.get_dataset_shard()</code>.</div>
 
-        <div class="callout">
-          <div class="label">Source map</div>
-          Book coverage: Chapter 7, 'Distributed Training with Ray Train' - training basics, example pipeline, trainers, migration, scaling, preprocessing, Tune integration, and callbacks.
-        </div>
+<div class="callout"><div class="label">Linear position</div><strong>Prerequisite:</strong> Lesson 09 (Ray Data) — a dataset is a stream of blocks, pipelined so it can outrun cluster RAM, and the failure to keep up is GPU starvation. Also lesson 05's tree/all-to-all reduce, and actors (lesson 03) as long-lived stateful workers.<br><strong>New capability:</strong> launch a multi-GPU data-parallel training job, reason quantitatively about its scaling efficiency from interconnect bandwidth and model size, and know precisely when data parallelism stops working and tensor/pipeline parallelism must take over.</div>
 
-        <h2>The thesis</h2>
-        <p>Distributed training is not merely running the same script on more GPUs. It is coordinating data shards, model replicas, gradients, checkpoints, metrics, and failure recovery as one job.</p>
+<div class="callout"><div class="label">The plan</div>Five moves. (1) Name the recurring data-parallel shape — replica per GPU, shard per replica, allreduce per step — and define every term in it. (2) Show how Ray Train wraps that shape: <code>TorchTrainer</code> + <code>ScalingConfig</code>, <code>prepare_model</code>, <code>report</code>, and the Ray Data → Train shard handoff. (3) The central trade-off, with worked numbers: scaling efficiency as compute/(compute+comm), and why interconnect bandwidth sets the knee. (4) The memory wall — what data parallelism cannot do, and the forward reference to tensor/pipeline parallelism. (5) Checkpoint frequency vs overhead as its own worked cost balance, then failure modes and a checklist.</div>
 
-        <h2>Linear path</h2>
-        <ol>
-  <li>Start from the scaling reason: model too large, data too large, training too slow, or experiment iteration too expensive.</li>
-  <li>Choose the training topology. Data parallelism, framework-specific distributed strategies, and external libraries such as DeepSpeed each imply different communication patterns.</li>
-  <li>Use Ray Train as the job harness: launch workers, provide datasets, report metrics, save checkpoints, and integrate with Tune when the training job becomes one trial among many.</li>
-</ol>
+<h2>1 · The shape: one replica per GPU, one shard per replica, one gradient per step</h2>
 
-        <h2>The mechanism</h2>
-        <div class="concept-grid">
-<div class="concept"><strong>Trainer</strong><div>The trainer owns the distributed job configuration and launches worker processes with the selected framework integration.</div></div>
-<div class="concept"><strong>Scaling config</strong><div>Number of workers, GPU usage, and resources define the physical shape of the job.</div></div>
-<div class="concept"><strong>Datasets and iterators</strong><div>Ray Data can feed workers with sharded batches, which reduces glue code between preprocessing and training.</div></div>
-<div class="concept"><strong>Checkpointing</strong><div>Checkpoints are the recovery boundary and the handoff point to tuning, batch prediction, or serving.</div></div>
+<p>Distributed training is not "run the script on more GPUs." It is a specific, tightly synchronized dance, and the most common form of it — the one Ray Train defaults to — is <strong>data parallelism</strong>. Hold this picture: you have N worker processes, each pinned to its own GPU. Every worker holds a <strong>complete copy of the model</strong> — same architecture, same weights, identical at the start of every step. We call each such process a <strong>rank</strong> (rank 0, rank 1, … rank N−1 — the integer identity PyTorch's distributed layer assigns each worker). PyTorch's <strong>DistributedDataParallel</strong> (DDP) is the machinery that keeps those replicas identical; a Ray Train worker is, mechanically, one DDP rank running inside a Ray actor.</p>
+
+<p>Within one training step, each rank does the following, in lockstep with all the others:</p>
+
+<div class="mini-flow">
+<div class="step"><span class="n">1</span><strong>Different data.</strong> Each rank pulls its <em>own</em> shard of the batch — rank 0 sees examples the others never touch. The effective batch is N times the per-GPU batch.</div>
+<div class="step"><span class="n">2</span><strong>Same forward + backward.</strong> Each rank runs forward and backward on its shard and computes a <em>local</em> gradient. Because the shards differ, the N local gradients differ.</div>
+<div class="step"><span class="n">3</span><strong>Allreduce the gradients.</strong> The ranks exchange gradients so that every rank ends the step holding the <em>same</em> summed-then-averaged gradient — as if one machine had seen the whole big batch.</div>
+<div class="step"><span class="n">4</span><strong>Identical update.</strong> Each rank applies that shared averaged gradient with its optimizer. Because the gradient was identical, the weights stay identical. Replicas never drift.</div>
 </div>
 
-        <h2>Decision surface</h2>
-        <table>
-  <thead><tr><th>Trade-off</th><th>How to reason about it</th></tr></thead>
-  <tbody>
-    <tr><td><strong>Minimal migration vs full integration</strong></td><td>Wrapping an existing training loop is fast. Deep integration with Ray Data, callbacks, and checkpointing gives better operability.</td></tr>
-    <tr><td><strong>More workers vs communication tax</strong></td><td>More GPUs increase compute, but gradient synchronization and input pipeline pressure can erase gains.</td></tr>
-    <tr><td><strong>Report cadence vs synchronization cost</strong></td><td><code>train.report</code> is a worker synchronization point. Frequent reports improve visibility and checkpoint freshness, but every worker must reach the same reporting steps.</td></tr>
-    <tr><td><strong>Train alone vs Train plus Tune</strong></td><td>A single production training job needs stability. A research sweep needs trial orchestration and early stopping.</td></tr>
-  </tbody>
-</table>
+<p><strong>Allreduce</strong> is the load-bearing word, so define it exactly. An allreduce is a collective operation in which every participant contributes a vector (here, its local gradient) and every participant ends up with the element-wise reduction (here, the sum, which is then divided by N to average) of all contributions. The naive way — send everything to rank 0, sum, broadcast back — makes rank 0 a bottleneck that moves N×model_bytes. The standard implementation is <strong>ring-allreduce</strong>: arrange the N ranks in a ring, split each gradient into N chunks, and pass chunks around the ring in two passes (a reduce-scatter then an all-gather). Its bandwidth cost per rank is</p>
 
-        <h2>Operational checklist</h2>
-        <ul>
-  <li>Measure data-loader throughput before blaming distributed training.</li>
-  <li>Save checkpoints to durable shared storage, not worker-local scratch.</li>
-  <li>Report metrics at a cadence that is useful for monitoring but not so frequent it becomes overhead.</li>
-  <li>Make sure every worker calls <code>train.report</code> the same number of times.</li>
-  <li>Make the single-worker version deterministic enough to debug before scaling.</li>
-</ul>
+<p style="text-align:center;"><span class="math">comm_bytes ≈ 2 × (N − 1) / N × model_bytes</span></p>
 
-        <h2>Failure modes</h2>
-        <ul>
-  <li>Scaling workers while the input pipeline still starves the GPUs.</li>
-  <li>Checkpointing only model weights and forgetting optimizer, scheduler, tokenizer, or preprocessing state.</li>
-  <li>Reporting or checkpointing from only one worker while the others skip the barrier.</li>
-  <li>Ignoring cluster placement and putting workers across slow links when communication is frequent.</li>
-</ul>
+<p>which approaches <span class="math">2 × model_bytes</span> as N grows — crucially, <em>independent of N</em> for large N. That bandwidth-optimality is exactly why ring-allreduce, not the naive star reduce of lesson 05, is what production training uses. The deep mechanics of collectives and the wires they run over are the subject of the system_ml track — see <a href="../../system_ml/lessons/02_collectives.html">collectives</a> and <a href="../../system_ml/lessons/03_interconnect.html">interconnect</a>, and <a href="../../system_ml/lessons/04_ddp.html">DDP</a> for the full data-parallel treatment. Ray Train is the orchestration layer that launches those ranks and hands them their data; it does not reinvent the collective.</p>
 
-        <h2>Implementation sketch</h2>
-        <pre><code>from ray import train
+<h2>2 · How Ray Train wraps the shape</h2>
+
+<p>Ray Train's contract is small on purpose. You write a function that trains on <em>one</em> worker — exactly the loop you already know — and Ray Train runs N copies of it as actors, sets up the DDP process group, and feeds each its shard. You hand it a <code>TorchTrainer</code> with a <code>ScalingConfig(num_workers=N, use_gpu=True)</code> describing the physical shape, then call <code>.fit()</code>.</p>
+
+<pre><code>import ray.train.torch
+from ray.train import ScalingConfig, Checkpoint, RunConfig
 from ray.train.torch import TorchTrainer
-from ray.train import ScalingConfig
+import tempfile, os, torch
 
 def train_loop_per_worker(config):
+    # Ray Train has already set up the DDP process group and assigned this rank a GPU.
     model = build_model(config)
-    train_loader = get_data_iterator()
-    for batch in train_loader:
-        loss = step(model, batch)
-        train.report({&quot;loss&quot;: loss})
+    model = ray.train.torch.prepare_model(model)   # wraps in DDP + moves to this rank's GPU
+    opt = torch.optim.Adam(model.parameters(), lr=config["lr"])
+
+    # Ray Data → Train handoff: this rank gets ITS shard, no one else's (see lesson 09).
+    shard = ray.train.get_dataset_shard("train")
+
+    for epoch in range(config["epochs"]):
+        for batch in shard.iter_torch_batches(batch_size=config["bs"]):
+            loss = step(model, opt, batch)         # forward/backward; DDP allreduces the grad here
+        # report metrics AND a checkpoint at the epoch barrier (all ranks must call this)
+        with tempfile.TemporaryDirectory() as d:
+            if ray.train.get_context().get_world_rank() == 0:   # rank 0 writes weights once
+                torch.save(model.module.state_dict(), os.path.join(d, "model.pt"))
+            ray.train.report({"loss": loss.item(), "epoch": epoch},
+                             checkpoint=Checkpoint.from_directory(d))
 
 trainer = TorchTrainer(
     train_loop_per_worker,
-    scaling_config=ScalingConfig(num_workers=4, use_gpu=True),
+    train_loop_config={"lr": 1e-3, "epochs": 10, "bs": 256},
+    scaling_config=ScalingConfig(num_workers=4, use_gpu=True),   # 4 GPUs, 4 DDP ranks
+    datasets={"train": ray_dataset},                             # from lesson 09
+    run_config=RunConfig(storage_path="s3://my-bucket/runs"),    # durable, shared checkpoint store
 )
-result = trainer.fit()</code></pre>
+result = trainer.fit()
+best = result.checkpoint                                          # handoff to Tune/Serve</code></pre>
 
-        <div class="callout ok">
-          <div class="label">Exercise</div>
-          A four-GPU job is only 1.6x faster than one GPU. List the suspects in order: data input, gradient synchronization, batch size, checkpoint frequency, Python overhead, placement. What would you measure first?
-        </div>
+<p>Three pieces do all the work, and each maps onto something from earlier lessons:</p>
 
-        <h2>Connective tissue</h2>
-        <p>This lesson is meant to connect Ray mechanics to the surrounding ML-systems library rather than live as an isolated API tour.</p>
-        <div class="link-grid"><a href="../../system_ml/lessons/04_ddp.html">System ML - DDP</a><a href="../../system_ml/lessons/26_checkpointing_fault_tolerance.html">System ML - checkpointing</a></div>
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">prepare_model</div><div class="v">Moves the model to this rank's GPU and wraps it in DDP, which registers the backward hook that fires the allreduce. After this line, <code>loss.backward()</code> silently synchronizes gradients across all ranks. This is the only line that turns a single-GPU loop into a data-parallel one.</div></div>
+  <div class="topic-card"><div class="k">get_dataset_shard</div><div class="v">The Ray Data → Train handoff. The dataset from lesson 09 is split so each rank streams a disjoint shard. This is where lesson 09's starvation point lands: if the pipeline can't fill a rank's shard fast enough, that rank's GPU idles, and because of the step-4 barrier, <em>every</em> rank waits for it.</div></div>
+  <div class="topic-card"><div class="k">report + Checkpoint</div><div class="v"><code>ray.train.report({...}, checkpoint=...)</code> publishes metrics for monitoring/Tune and persists a checkpoint to the shared <code>storage_path</code>. It is a synchronization point: all ranks must call it the same number of times, or the ones that skipped it deadlock the barrier.</div></div>
+</div>
 
-        <footer class="lesson-nav">
-  <a href="09_ray_data_processing.html">
-    <span class="dir">&lt;- Previous</span>
-    <span class="ttl">09 - Ray Data: Blocks, Streaming Execution, and ML Dataflow</span>
-  </a>
-  <a class="next" href="11_ray_serve_online_inference.html">
-    <span class="dir">Next -&gt;</span>
-    <span class="ttl">11 - Ray Serve: Online Inference</span>
-  </a>
-</footer>
+<p><strong>Fault tolerance</strong> falls out of the checkpoint. A <strong>checkpoint</strong> is a serialized snapshot of everything needed to resume — model weights, optimizer state, scheduler state, epoch counter — written to durable shared storage (S3, NFS), never worker-local scratch (a dead worker takes its scratch with it). If a worker actor dies mid-run, Ray Train tears down the process group, requests a fresh worker from the cluster, and restarts every rank from the last reported checkpoint. The blast radius of a single GPU failure is therefore "redo the work since the last checkpoint," not "lose the whole run" — which is precisely why checkpoint <em>frequency</em> becomes a tunable cost in §5.</p>
 
-        </main>
-        </body>
-        </html>
+<h2>3 · The central trade-off: scaling efficiency and the interconnect knee</h2>
+
+<p>The promise of data parallelism is linear speedup: 4 GPUs train 4× faster. It is never quite true, because step 3 — the allreduce — is pure overhead that grows with the cluster. The right mental model is that each step costs <span class="math">compute + comm</span>, where compute is the forward/backward on one shard and comm is the allreduce. Define <strong>scaling efficiency</strong> as the fraction of wall-clock spent doing useful compute:</p>
+
+<p style="text-align:center;"><span class="math">efficiency = compute / (compute + comm)</span></p>
+
+<p>Work it with numbers. Take a model with 1 GB of gradients (a ~250M-parameter model in fp32, or a ~500M-param model in fp16). Per-rank allreduce volume is <span class="math">≈ 2 × model_bytes = 2 GB</span> moved across the interconnect each step. Suppose the per-GPU forward+backward takes <strong>compute = 200 ms</strong>.</p>
+
+<div class="callout"><div class="label">Worked number — the interconnect decides the knee</div>
+The allreduce time is <span class="math">2 GB ÷ bandwidth</span>. Two fabrics, same job:
+<br><br>
+<strong>NVLink / NVSwitch (≈ 300 GB/s effective):</strong> comm = 2 GB ÷ 300 GB/s ≈ <strong>6.7 ms</strong>. Efficiency = 200 / (200 + 6.7) ≈ <strong>97%</strong>. Eight GPUs give you ≈ 7.7× — nearly linear.
+<br><br>
+<strong>10 GbE Ethernet (≈ 1.25 GB/s effective):</strong> comm = 2 GB ÷ 1.25 GB/s ≈ <strong>1600 ms</strong>. Efficiency = 200 / (200 + 1600) ≈ <strong>11%</strong>. Eight GPUs give you ≈ 0.9× — you have <em>spent</em> seven GPUs to go nowhere, because every step is 89% waiting on the wire.
+<br><br>
+Same model, same compute, same N — only the fabric changed, and it moved efficiency from 97% to 11%. This is the single most important fact about data-parallel scaling: <strong>the interconnect, not the GPU, sets the knee.</strong></div>
+
+<p>Note that ring-allreduce's comm volume is roughly constant in N (it stays ≈ 2× model_bytes per rank), so on a fast fabric efficiency degrades gently. The real damage comes from <em>crossing a slow boundary</em>: 8 GPUs inside one NVLink-connected node stay at 97%, but spreading those same 8 ranks across two nodes joined by 10 GbE forces the slow link into the ring and collapses efficiency. This is why placement matters and why Ray Train's <code>ScalingConfig</code> should keep a job's workers on well-connected nodes — a lesson that connects directly to placement groups (lesson 04) and to cluster topology (lesson 12). The fix when the wire is the wall is either a faster fabric, or larger per-GPU batches so compute grows relative to the fixed comm (raise compute to 800 ms on 10 GbE and efficiency climbs from 11% to 33% — still poor, but it shows the lever).</p>
+
+<table class="trade-table">
+<thead><tr><th>Lever</th><th>Effect on efficiency = compute/(compute+comm)</th><th>Cost it brings</th></tr></thead>
+<tbody>
+<tr><td><strong>Faster interconnect (NVLink &gt; IB &gt; Ethernet)</strong></td><td>Shrinks comm directly; the dominant lever. 10 GbE → NVLink took our example 11% → 97%.</td><td>Hardware/placement constraint; can't always get it.</td></tr>
+<tr><td><strong>Larger per-GPU batch</strong></td><td>Raises compute while comm stays fixed, so the ratio improves.</td><td>Memory pressure; very large effective batch can hurt convergence (needs LR warmup).</td></tr>
+<tr><td><strong>Gradient compression / fp16 grads</strong></td><td>Halves or more the model_bytes moved, so comm drops.</td><td>Numerical care; not free accuracy-wise.</td></tr>
+<tr><td><strong>More workers (N)</strong></td><td>On a fast fabric, near-linear; on a slow one, near-zero return.</td><td>Only worth it once efficiency is high — otherwise pure waste.</td></tr>
+</tbody>
+</table>
+
+<h2>4 · The memory wall: where data parallelism simply cannot help</h2>
+
+<p>Everything above assumes one thing: the model <em>fits on one GPU</em>. Data parallelism replicates the <strong>entire</strong> model — weights, gradients, and optimizer state — on every rank. Adding workers adds throughput, never capacity. So when the model itself is too big for a single accelerator, data parallelism does nothing at all; you cannot even start.</p>
+
+<div class="callout warn"><div class="label">The wall, with numbers</div>
+Take a 70B-parameter model trained with Adam. Per parameter you need, roughly: 2 bytes weights (fp16) + 2 bytes gradient + 4 + 4 + 4 bytes of fp32 optimizer state (master copy, momentum, variance) ≈ <strong>16 bytes/param</strong>. That is 70e9 × 16 ≈ <strong>1.1 TB</strong> — versus a single 80 GB H100. The model is ~14× too large for one GPU before a single activation is stored. No number of data-parallel replicas changes this: each replica still needs the whole 1.1 TB on its own device. Data parallelism scales <em>compute</em>, not <em>capacity</em>.</div>
+
+<p>This is the boundary where you must switch strategies. <strong>Tensor parallelism</strong> splits each layer's matrices across GPUs so one layer lives on several devices; <strong>pipeline parallelism</strong> splits the model by depth so different GPUs hold different layers and micro-batches flow through like an assembly line. These are not Ray Train concepts — they are model-partitioning strategies you bring (via DeepSpeed, FSDP, Megatron), and Ray Train then orchestrates the resulting workers. The full treatment is in system_ml: <a href="../../system_ml/lessons/06_tensor_parallel.html">tensor parallelism</a> and <a href="../../system_ml/lessons/07_pipeline_parallel.html">pipeline parallelism</a>. The practical decision rule: <em>data parallel until the model stops fitting, then partition the model, and usually combine both</em> (data-parallel groups of model-parallel shards). Knowing which wall you are on — the throughput wall (use more data-parallel ranks) or the memory wall (partition the model) — is the whole judgment of this lesson.</p>
+
+<h2>5 · Checkpoint frequency: a cost balance, not a habit</h2>
+
+<p>Checkpointing trades a known, recurring cost (the time to write a snapshot, during which all ranks barrier) against an unknown, occasional cost (the work you redo when a worker dies and you restart from the last checkpoint). Checkpoint too rarely and a failure late in an epoch throws away hours; too often and you spend the run writing to S3 instead of training.</p>
+
+<div class="callout"><div class="label">Worked number — the optimal interval</div>
+Suppose one checkpoint costs <span class="math">C = 30 s</span> to write (serialize + push ~10 GB to shared storage), a step takes 1 s, and the expected failure rate is one worker failure every <span class="math">MTBF = 4 hours = 14,400 s</span>. If you checkpoint every <span class="math">T</span> seconds, then over an interval you pay, on average:
+<br>• <strong>checkpoint overhead</strong> = <span class="math">C / T</span> fraction of time (30 s every T s), and
+<br>• <strong>expected recompute on failure</strong> ≈ on average half an interval lost per failure = <span class="math">(T / 2) / MTBF</span> fraction.
+<br><br>
+Total overhead ≈ <span class="math">C/T + T/(2 × MTBF)</span>. Minimizing over T gives <span class="math">T* = √(2 × C × MTBF) = √(2 × 30 × 14,400) ≈ 930 s ≈ 15.5 min</span>. At that interval each cost is ≈ <span class="math">30/930 ≈ 3.2%</span>, for ≈ 6.4% total overhead. Checkpoint every 60 s instead and overhead balloons to <span class="math">30/60 = 50%</span> — you spend half the run checkpointing. Checkpoint once an hour (3600 s) and a failure costs an expected <span class="math">1800 s ≈ 30 min</span> of redo. The square-root rule is the lesson: <strong>checkpoint interval should scale with √(checkpoint_cost × MTBF)</strong>, not "every epoch" by reflex.</div>
+
+<p>Two refinements. Cheaper checkpoints (async writes, sharded/incremental snapshots) lower C and so let you checkpoint more often for the same overhead. And MTBF gets <em>worse</em> as you add workers — more GPUs means more things to fail — so a 512-GPU run on commodity hardware genuinely needs frequent checkpoints, while an 8-GPU run on reliable hardware barely needs them. The deeper failure-tolerance machinery (lineage, reconstruction, idempotency) is lesson 14 and system_ml's <a href="../../system_ml/lessons/26_checkpointing_fault_tolerance.html">checkpointing &amp; fault tolerance</a>.</p>
+
+<h2>6 · Failure modes &amp; checklist</h2>
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+<li><strong>Scaling into a starved pipeline.</strong> Adding GPUs while Ray Data can't fill them: every rank waits at the step barrier for the slowest-fed one, so 8 GPUs run at the speed of the data loader. Measure loader throughput (lesson 09) before adding workers.</li>
+<li><strong>The interconnect wall, unnoticed.</strong> A run that's "only 1.6× faster on 4 GPUs" is usually allreduce-bound on a slow fabric — efficiency is 40%, not the 95% you assumed. Compute compute/(compute+comm) before blaming the code.</li>
+<li><strong>Barrier mismatch.</strong> One rank calls <code>report</code>/checkpoint a different number of times than the others (e.g. a per-rank early-stop), so the others hang forever at a barrier no one will reach.</li>
+<li><strong>Partial checkpoints.</strong> Saving weights but not optimizer/scheduler/epoch state — resume restarts the optimizer cold, and the loss curve visibly jumps.</li>
+<li><strong>Worker-local checkpoints.</strong> Writing to <code>/tmp</code> on the worker; the one resource you lose when a worker dies is exactly its local disk.</li>
+<li><strong>Reaching for model parallelism too early.</strong> Splitting a model that fits fine on one GPU adds communication for no capacity gain. Partition only when you've hit the memory wall.</li>
+</ul></div>
+  <div class="lesson-card"><h3>Implementation checklist</h3><ul>
+<li>Which wall am I on — throughput (more data-parallel ranks) or memory (the model doesn't fit, so partition it)?</li>
+<li>What is the per-step compute, and the allreduce time at my model size and interconnect — i.e. what is my scaling efficiency, really?</li>
+<li>Are all my workers on a fast, well-connected set of nodes, or is a slow link in the ring?</li>
+<li>Does every rank call <code>report</code> the same number of times?</li>
+<li>Does the checkpoint capture weights + optimizer + scheduler + epoch, on durable shared storage?</li>
+<li>Is my checkpoint interval near <span class="math">√(2 × C × MTBF)</span>, given my failure rate and snapshot cost?</li>
+<li>Did I make the single-worker version correct and deterministic before scaling to N?</li>
+</ul></div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>You have a 1.3B-parameter model (fp16: ~2.6 GB weights, ~2.6 GB gradients) and 8 GPUs. Per-GPU forward+backward is 150 ms. (a) Compute scaling efficiency on NVLink (300 GB/s) and on 10 GbE (1.25 GB/s) — note the allreduce volume is ≈ 2 × gradient_bytes. (b) Now the model grows to 40B parameters: does it still fit on one 80 GB GPU with Adam optimizer state? Recompute the ~16 bytes/param budget — and watch the right answer flip from "add more data-parallel workers" to "partition the model." (c) Failures now hit once every 30 minutes (you moved to spot instances); with a 20 s checkpoint cost, what interval minimizes overhead, and how does it differ from the 4-hour-MTBF case?</div>
+
+<h2>Where this points next</h2>
+<p>Training produces a checkpoint; the checkpoint's whole reason to exist is to be served. Lesson 11 picks up exactly there: the trained weights now have to answer live requests under a latency SLO, which is a completely different shape from the synchronized lockstep of training. Where Train fans out replicas to <em>agree on one gradient</em>, Serve fans out replicas to <em>handle independent requests</em>, and the central knob flips from "allreduce overhead" to "how long do I wait to batch requests before the GPU is full." The handoff object is the same <code>Checkpoint</code> you just produced.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>Data-parallel training is one tight shape: N ranks, each a full model replica on its own GPU, each on a different data shard, synchronizing gradients every step via ring-allreduce (cost ≈ 2 × model_bytes per rank, near-constant in N). Ray Train wraps it — <code>TorchTrainer</code> + <code>ScalingConfig</code> launch the ranks, <code>prepare_model</code> wires DDP, <code>get_dataset_shard</code> is the Ray Data → Train handoff, and <code>report(..., checkpoint=...)</code> gives metrics plus the snapshot that makes worker failure recoverable. The governing trade-off is scaling efficiency = compute/(compute+comm), and the <em>interconnect</em> sets the knee: the same job runs at 97% on NVLink and 11% on 10 GbE. Data parallelism scales throughput, never capacity — when the model itself doesn't fit (a 70B model needs ~1.1 TB), you hit the memory wall and must partition with tensor/pipeline parallelism. And checkpoint frequency is a real cost balance, optimal near √(2 × cost × MTBF), not "every epoch" by habit.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+<li>Walk through one data-parallel training step and define rank, replica, and allreduce. <em>(§1 — each rank holds a full replica, processes its own shard, computes a local gradient; allreduce makes every rank end with the same summed/averaged gradient so replicas apply an identical update and never drift.)</em></li>
+<li>Why ring-allreduce instead of sending everything to rank 0? <em>(§1 — the star reduce moves N×model_bytes through one bottleneck; ring-allreduce costs ≈ 2×(N−1)/N × model_bytes per rank, bandwidth-optimal and near-constant in N.)</em></li>
+<li>Your 4-GPU job is only 1.6× faster than 1 GPU. How do you diagnose it? <em>(§3 — compute scaling efficiency = compute/(compute+comm); a slow interconnect makes allreduce dominate. Check data-loader throughput (§6, lesson 09) and the fabric before the code.)</em></li>
+<li>Same model, NVLink vs 10 GbE — what happens to efficiency and why? <em>(§3 — comm = 2×model_bytes ÷ bandwidth; a 1 GB-gradient model goes from ~7 ms (97%) on NVLink to ~1600 ms (11%) on 10 GbE. The interconnect sets the knee.)</em></li>
+<li>You have a 70B model and 100 GPUs. Does data parallelism solve it? <em>(§4 — no; data parallelism replicates the whole model per GPU (~1.1 TB with Adam state), so it scales throughput not capacity. You hit the memory wall and must use tensor/pipeline parallelism.)</em></li>
+<li>How does Ray Data hand data to Ray Train, and where does GPU starvation bite? <em>(§2 — <code>get_dataset_shard()</code> gives each rank a disjoint shard; if the pipeline can't fill a rank, that rank's GPU idles and the step barrier makes every rank wait for it.)</em></li>
+<li>How often should you checkpoint? <em>(§5 — minimize C/T + T/(2·MTBF) → optimal interval ≈ √(2 × checkpoint_cost × MTBF); checkpoint more often as MTBF drops with more workers or cheaper snapshots, not "every epoch" by reflex.)</em></li>
+</ul>
+
+<footer class="lesson-nav"><a href="09_ray_data_processing.html"><span class="dir">Previous</span><span class="ttl">09 · Ray Data: Blocks, Streaming Execution, and ML Dataflow</span></a><a class="next" href="11_ray_serve_online_inference.html"><span class="dir">Next</span><span class="ttl">11 · Ray Serve: Online Inference</span></a></footer>
+</main>
+<!-- reviewed:v1 -->
+</body>
+</html>

@@ -1,108 +1,187 @@
 <!doctype html>
-        <html lang="en">
-        <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width,initial-scale=1">
-        <title>04 - Runtime, Scheduling, and the Object Store</title>
-        <link rel="stylesheet" href="style.css">
-        </head>
-        <body>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>04 · Runtime, Scheduling, and the Object Store | Ray, from first principles</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">ray</a><span class="crumb">/</span><span class="crumb">04</span><span class="step-pill">lesson 5 / 17</span></div></header>
+<main>
 
-        <header class="topnav">
-          <div class="inner">
-            <a class="crumb-link" href="../../index.html">all_lessons</a>
-            <span class="crumb">/</span>
-            <a class="crumb-link" href="index.html">ray</a>
-            <span class="crumb">/</span>
-            <span class="crumb">04</span>
-            <span class="step-pill">lesson 5 / 17</span>
-          </div>
-        </header>
+<p class="kicker">Part I - Core mental model</p>
+<h1>Runtime, Scheduling, and the Object Store</h1>
+<p class="subtitle">Lessons 02 and 03 gave you the two primitives — stateless tasks returning <code>ObjectRef</code> futures, and stateful actors — and told you the object store "carries values between them." That was a promise made on faith. This lesson opens the box: the processes that actually run on each node, the scheduler that decides <em>where</em> a task lands, and the shared-memory object store that lets a 4&nbsp;GB array sit in one place while ten workers read it. Once you can name where work is placed, where its bytes live, and what is actually scarce, almost every Ray performance question becomes a calculation rather than a mystery.</p>
 
-        <main>
-        <span class="part-label">Part I - Core mental model</span>
-        <h1>Runtime, Scheduling, and the Object Store</h1>
-        <p class="subtitle">The invisible machinery: head node metadata, worker processes, local object stores, resources, locality, and what happens when bytes move.</p>
+<div class="callout source-note"><div class="label">Book source</div>Chapter 2, 'Understanding Ray System Components' — scheduling and executing work on a node, the head node, and distributed scheduling. Calibrated to current Ray, where the per-node agent is the <strong>raylet</strong>, cluster metadata lives in the <strong>GCS</strong> on the head node, and the object store is the Plasma shared-memory store with distributed reference counting and the ownership model.</div>
 
-        <div class="callout">
-          <div class="label">Source map</div>
-          Book coverage: Chapter 2, 'Understanding Ray System Components' - scheduling and executing work on a node, the head node, and distributed scheduling.
-        </div>
+<div class="callout"><div class="label">Linear position</div><strong>Prerequisite:</strong> Lesson 02 (tasks, <code>ObjectRef</code>, <code>ray.put</code>) and Lesson 03 (actors as long-lived stateful workers) — you can already submit work and share values, but you treat the runtime as a black box.<br><strong>New capability:</strong> reason quantitatively about placement (move the task to the data or the data to the task?), object-store sizing and spill, and the failure consequence of the ownership model — and reserve co-located resources with placement groups.</div>
 
-        <h2>The thesis</h2>
-        <p>Most Ray performance questions reduce to three runtime questions: where is the work placed, where are its input objects, and what resource is actually scarce?</p>
+<div class="callout"><div class="label">The plan</div>
+Five moves. (1) Name the four runtime processes — driver, workers, raylet, GCS — and what each owns. (2) Walk the distributed scheduler: resources as a contract, locality-aware placement, and spillback when a node is full. (3) Open the Plasma object store: zero-copy shared-memory reads, immutability, reference counting, and the ownership model that decides what can be rebuilt. (4) Make spilling and object-store sizing quantitative — the latency cliff when intermediate results exceed the budget. (5) Placement groups for gang-scheduled bundles, then failure modes, a checklist, and the hand-off to map-shuffle-reduce.</div>
 
-        <h2>Linear path</h2>
-        <ol>
-  <li>Stop thinking of a cluster as a bigger laptop. It is a set of nodes with separate CPU, GPU, memory, disk, and network boundaries.</li>
-  <li>The scheduler must place tasks near resources and, when possible, near data. Every placement is a compromise between locality, fairness, and utilization.</li>
-  <li>The object store makes intermediate values shareable across workers, but it also introduces a memory budget. When the object store spills, performance can change suddenly.</li>
-</ol>
+<h2>1 · Four processes, four responsibilities</h2>
 
-        <h2>The mechanism</h2>
-        <div class="concept-grid">
-<div class="concept"><strong>Head node</strong><div>The head coordinates cluster metadata and exposes control-plane services. It is not where all useful work should happen.</div></div>
-<div class="concept"><strong>Local schedulers</strong><div>Work is placed across nodes based on resources, dependencies, and availability. Resource annotations are part of the program contract.</div></div>
-<div class="concept"><strong>Plasma-style object store</strong><div>Large immutable objects can be shared by processes on a node without every worker holding its own Python copy.</div></div>
-<div class="concept"><strong>Spilling and locality</strong><div>If objects exceed memory, they may spill to disk or remote storage. If a task runs far from its inputs, network transfer becomes part of task latency.</div></div>
+<p>Stop picturing a cluster as one big laptop. It is a set of <strong>nodes</strong> — separate machines (or pods) with their own CPU, GPU, RAM, disk, and a network between them. On every node Ray runs a small set of processes, and knowing which one owns what is the difference between guessing and debugging.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Driver</div><div class="v">The process running your <code>main()</code> / the script that called <code>ray.init()</code>. It submits tasks, creates actors, and calls <code>ray.get</code> to pull results back. There is one driver per program; it owns top-level control flow and is the first thing you accidentally turn into a serial bottleneck (lesson 00).</div></div>
+  <div class="topic-card"><div class="k">Worker</div><div class="v">An ordinary Python process that Ray manages on a node and uses to <em>run</em> a task or host an actor. A node has a pool of workers (one per CPU slot by default). A stateless task runs on any free worker; an actor pins one worker for its whole lifetime.</div></div>
+  <div class="topic-card"><div class="k">Raylet (per node)</div><div class="v">The C++ agent on each node — the local control plane. It is two things fused: a <strong>local scheduler</strong> that decides which of this node's workers runs a queued task, and an <strong>object manager</strong> that owns this node's slice of the shared object store and fetches remote objects over the network when a local task needs them.</div></div>
+  <div class="topic-card"><div class="k">GCS (head node)</div><div class="v">The <strong>Global Control Store</strong> — a key-value service on the head node holding cluster-wide metadata: which nodes exist and their resources, the actor registry (where each actor lives), placement-group state, and ObjectRef ownership records. It is the cluster's source of truth, and historically its single point of failure (lesson 12 covers GCS fault tolerance).</div></div>
 </div>
 
-        <h2>Decision surface</h2>
-        <table>
-  <thead><tr><th>Trade-off</th><th>How to reason about it</th></tr></thead>
-  <tbody>
-    <tr><td><strong>Locality vs utilization</strong></td><td>Waiting for data-local resources can reduce network movement. Running anywhere can keep CPUs busy but move bytes.</td></tr>
-    <tr><td><strong>Resource reservation vs flexibility</strong></td><td>Declaring resources prevents overcommit. Over-declaring resources leaves cluster capacity idle.</td></tr>
-    <tr><td><strong>Object store vs external storage</strong></td><td>The object store is excellent for intermediate results. Durable datasets and checkpoints belong in external storage with explicit lifecycle.</td></tr>
-  </tbody>
+<p>The split matters because it tells you who to suspect. A task that won't schedule is a <em>raylet/GCS resource</em> question — no node advertises the resources you asked for. A program that mysteriously stalls is usually the <em>driver</em> blocking on <code>ray.get</code>. An "actor not found" is the <em>GCS</em> actor registry. And bytes that won't move are the <em>object manager</em> half of a raylet. Most of this lesson lives inside the raylet.</p>
+
+<h2>2 · How the scheduler decides where work lands</h2>
+
+<p>When you call <code>f.remote(x)</code>, the task does not run immediately — it is queued, and the scheduler must choose a worker on some node. Three ideas drive that choice.</p>
+
+<p><strong>Resources are a contract, not enforcement.</strong> A task declares what it needs: <code>@ray.remote(num_cpus=2, num_gpus=1)</code>. Ray treats <code>num_cpus</code>, <code>num_gpus</code>, and any <code>resources={"...": n}</code> as <em>logical</em> resources — a bookkeeping budget the scheduler will not overcommit. It is crucial to internalize that these are a <em>promise about scarcity</em>, not a sandbox. Declaring <code>num_cpus=2</code> does not pin your task to two cores or stop it spawning thirty threads; it only means the scheduler will subtract 2 from that node's CPU budget and refuse to co-place more tasks than the node advertises. Under-declare and you oversubscribe the hardware (your "2-CPU" tasks each secretly use 8 and the node thrashes); over-declare and the node sits half-idle because the budget says "full" while the cores are not. Resources are how <em>you</em> tell Ray what is scarce.</p>
+
+<p><strong>Locality-aware placement.</strong> Among nodes that satisfy the resource contract, the scheduler prefers a node that <em>already holds the bytes</em> of the task's arguments in its local object store — because then the task reads them with no network transfer. If <code>preprocess.remote(block_ref)</code> can run on the node where <code>block_ref</code>'s value already lives, that is strictly cheaper than copying the block across the network first.</p>
+
+<p><strong>Spillback.</strong> When the preferred (local, or resource-rich) node is full — no free worker matching the resource request — the local scheduler does not queue indefinitely. It <em>spills back</em>: hands the task to the GCS / another raylet to place on a different node that has capacity. Spillback is what keeps the cluster busy instead of letting one hot node become a queue, at the cost of giving up locality for that task.</p>
+
+<div class="callout warn"><div class="label">The real contract: locality is a preference, not a guarantee</div>
+The scheduler optimizes locality <em>when it is cheap to honor</em>. The moment honoring it would mean idling a node while a busy one drains, spillback wins and your task runs away from its data. So you cannot <em>assume</em> a task ran data-local; you can only make it <em>likely</em> (by where you put the inputs) and measure it. This is exactly the locality-vs-utilization trade-off, and the next box gives it a number.</div>
+
+<div class="callout"><div class="label">Worked number — move the task to the data, or the data to the task?</div>
+Take a task whose input is a <strong>4&nbsp;GB</strong> block, on a cluster wired with <strong>10&nbsp;GbE</strong> (≈ 1.25&nbsp;GB/s usable). Moving the block to a non-local worker costs roughly <span class="math">4 GB ÷ 1.25 GB/s = 3.2 s</span> of transfer.<br><br>
+<strong>Case A — short compute (5&nbsp;s).</strong> Run data-local: total ≈ 5&nbsp;s. Run remote: <span class="math">3.2 + 5 = 8.2 s</span> — a <strong>64% slowdown</strong>. Here locality clearly matters; you want the task on the node holding the block.<br><br>
+<strong>Case B — long compute (10&nbsp;min = 600&nbsp;s).</strong> The same 3.2&nbsp;s transfer is <span class="math">3.2 / 600 ≈ 0.5%</span> of the job. Now insisting on locality is silly — if the data-local node is busy, the 3.2&nbsp;s of network is noise and you should let spillback place the task anywhere a worker is free, to keep utilization high.<br><br>
+The break-even is where transfer time is a meaningful fraction of compute: roughly <em>compute &lt; ~10× transfer → favor locality; compute ≫ transfer → favor utilization.</em> The residual trade-off never disappears — you are trading saved network against idle workers, and the right answer flips with the compute-to-bytes ratio.</div>
+
+<h2>3 · The Plasma object store: shared memory, immutability, ownership</h2>
+
+<p>Every task result and every <code>ray.put(value)</code> lands in the node's <strong>object store</strong> — Ray's implementation is called <strong>Plasma</strong>, an in-memory store backed by shared memory. Three properties make it the load-bearing component of the whole runtime.</p>
+
+<p><strong>Zero-copy reads on the same node.</strong> "Zero-copy" means exactly what it says: a large object is written once into a shared-memory segment, and every worker process on that node <em>maps</em> the same physical pages (via <code>mmap</code>) into its own address space rather than receiving a private copy. Ten workers reading a 4&nbsp;GB array consume 4&nbsp;GB of RAM total, not 40&nbsp;GB, and the "read" is a pointer remap that takes microseconds — no deserialization, no memcpy of the payload. This is precisely why you <code>ray.put</code> a big shared value once and pass its ref instead of passing the value into each task (the serialization trap from lesson 00).</p>
+
+<p><strong>Objects are immutable.</strong> Once written, an object's bytes never change. Immutability is what makes zero-copy <em>safe</em> — many readers can share the same pages because no one can mutate them out from under another — and it is what makes a value cacheable and reconstructible. To "change" a value you produce a new object with a new ref.</p>
+
+<p><strong>Distributed reference counting and the ownership model.</strong> Ray tracks how many references exist to each object across the whole cluster; when the count hits zero, the object is evicted. But counting needs an authority, and that authority is the <strong>owner</strong>: the worker that <em>created</em> the ref — by submitting the task that returns it, or by calling <code>ray.put</code> — owns that object's metadata and its <strong>lineage</strong> (the task and arguments that produced it). The owner, not the GCS, holds the reference count and the recipe.</p>
+
+<div class="callout warn"><div class="label">The sharp edge of ownership: if the owner dies, the object is gone</div>
+Because lineage and the reference count live with the owner, an object is only as durable as the worker that created it. If that worker (often your <strong>driver</strong>, for <code>ray.put</code> values) dies, the object cannot be reconstructed and any task still waiting on it fails with an <em>owner died</em> error — even if the bytes are physically still sitting in some node's Plasma store. Practical consequence: do not <code>ray.put</code> a shared table from the driver and then expect long-lived actors to depend on it across a driver restart; give long-lived shared state an owner that lives as long as its readers (lesson 14 returns to this under failure semantics).</div>
+
+<p><strong>Lineage-based reconstruction.</strong> Here is what ownership <em>buys</em> you. Because the owner remembers the task and inputs that produced an object, a <em>lost</em> object (its node crashed, evicting the bytes) can be rebuilt by simply <strong>re-executing the task that produced it</strong> — recursively, if its inputs were lost too. You did not have to checkpoint the intermediate value; the task graph <em>is</em> the recovery plan. This is automatic for task results whose inputs are still reproducible, and it is the foundation of Ray's task fault tolerance — the full failure model, including where reconstruction <em>cannot</em> help (actor state, side effects, <code>ray.put</code> objects whose owner died), is lesson 14.</p>
+
+<pre><code>import ray
+ray.init()
+
+# A large, read-only lookup table the whole job shares.
+# ray.put writes it into Plasma ONCE; we pass the ref, not the bytes.
+lookup_ref = ray.put(load_lookup_table())   # e.g. a 4 GB embedding table
+
+@ray.remote(num_cpus=2, num_gpus=1)          # the resource CONTRACT
+def score(block, table):
+    # Ray auto-dereferences a top-level ObjectRef arg before the task runs,
+    # so `table` is the actual object — read zero-copy on this node.
+    return model_score(block, table)
+
+# Pass the SAME ref to every task. On a node holding `lookup_ref`'s bytes,
+# all workers mmap the one copy (4 GB total), not one copy per task.
+refs = [score.remote(b, lookup_ref) for b in blocks]
+results = ray.get(refs)                       # block once, here</code></pre>
+
+<h2>4 · Spilling, and why object-store memory is its own budget</h2>
+
+<p>The object store has a fixed size — by default Ray reserves about <strong>30% of a node's RAM</strong> for Plasma, separate from the Python heap your task code allocates. This separation is the first thing to internalize: <em>object-store memory ≠ process heap</em>. A node with 64&nbsp;GB RAM gives Plasma ≈ 19&nbsp;GB; the rest is for your workers' own allocations. You can blow the heap (a worker OOMs) while the object store is empty, or fill Plasma while the heap is fine — they are tracked and exhausted independently.</p>
+
+<p><strong>Spilling</strong> is what happens when the object store fills: rather than failing, Ray writes least-recently-used objects out to disk (or remote storage) to make room — and reads them back when a task needs them. This keeps the job correct, but it introduces a <strong>latency cliff</strong>, because disk is orders of magnitude slower than the shared-memory read it replaced.</p>
+
+<div class="callout"><div class="label">Worked number — the spill cliff</div>
+Node: 64&nbsp;GB RAM → Plasma budget ≈ <span class="math">0.30 × 64 = 19.2 GB</span>. A map stage emits intermediate blocks of 0.5&nbsp;GB each; you have <strong>50 in flight</strong> before the reduce consumes them → <span class="math">50 × 0.5 = 25 GB</span> of live objects.<br><br>
+That is 25&nbsp;GB chasing a 19.2&nbsp;GB store, so ≈ <strong>5.8&nbsp;GB must spill</strong>. Reading a 0.5&nbsp;GB block back from a local NVMe SSD at ~1&nbsp;GB/s costs <span class="math">0.5 s</span> per block; from a network/cloud disk at ~200&nbsp;MB/s it is <span class="math">~2.5 s</span> per block. Versus a shared-memory read measured in <em>microseconds</em>, that is a 10,000–100,000× jump for every spilled block touched — a true cliff, not a gentle slope. The fix is rarely "buy more RAM"; it is to <strong>reduce live objects</strong>: smaller blocks, stream the reduce so producers and consumers overlap (lesson 05), or stop fanning out faster than you fan back in.</div>
+
+<table class="trade-table">
+<thead><tr><th>Trade-off</th><th>How to reason about it</th></tr></thead>
+<tbody>
+<tr><td><strong>Locality vs utilization</strong></td><td>Prefer the node holding an arg's bytes when transfer is a real fraction of compute (Case A); let spillback keep workers busy when compute dwarfs transfer (Case B). The break-even is the compute-to-bytes ratio, not a fixed rule.</td></tr>
+<tr><td><strong>Reservation vs flexibility</strong></td><td>Accurate <code>num_cpus</code>/<code>num_gpus</code> declarations prevent oversubscription and thrash; over-declaring leaves capacity idle. The contract is only as good as your honesty about real usage.</td></tr>
+<tr><td><strong>Object store vs external storage</strong></td><td>Plasma is ideal for short-lived intermediate results (fast, reconstructible). Durable datasets and checkpoints belong in external storage (S3, a filesystem) with explicit lifecycle — they outlive any owner and must survive a full cluster restart.</td></tr>
+</tbody>
 </table>
 
-        <h2>Operational checklist</h2>
-        <ul>
-  <li>Annotate GPUs and custom resources explicitly; do not rely on accidental placement.</li>
-  <li>Watch object-store memory separately from Python heap memory.</li>
-  <li>Use chunk sizes large enough for efficient transfer but small enough for load balancing and retry.</li>
-  <li>Design for spill behavior before production: where do objects spill, how fast is the disk, and what happens under backpressure?</li>
+<h2>5 · Placement groups: gang-scheduling a bundle of resources</h2>
+
+<p>Sometimes independent placement is wrong. If you need four GPU workers that must be <em>co-located</em> — say tensor-parallel ranks of one model that exchange activations over the fast intra-node link — you cannot let the scheduler scatter them across nodes and hope. A <strong>placement group</strong> reserves a set of resource <strong>bundles</strong> atomically (gang scheduling: either all bundles are placed or none are) and lets you control their spread.</p>
+
+<pre><code>from ray.util.placement_group import placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+# Four bundles, each 1 GPU + 2 CPUs, all PACKed onto as few nodes as
+# possible (STRICT_PACK would force a single node) — co-locate TP workers
+# so their activations cross the intra-node link, not the slow network.
+pg = placement_group([{"GPU": 1, "CPU": 2}] * 4, strategy="PACK")
+ray.get(pg.ready())                              # gang: all 4 or none
+
+@ray.remote(num_gpus=1, num_cpus=2)
+class TPWorker:
+    def step(self, shard): ...
+
+workers = [
+    TPWorker.options(
+        scheduling_strategy=PlacementGroupSchedulingStrategy(
+            placement_group=pg, placement_group_bundle_index=i)
+    ).remote()
+    for i in range(4)
+]</code></pre>
+
+<p>The strategies trace the locality-vs-utilization tension again: <code>PACK</code> (and <code>STRICT_PACK</code>) maximize co-location for fast communication but can fail to schedule if no node is empty enough; <code>SPREAD</code> distributes bundles for fault isolation and balanced load at the cost of inter-node communication. Placement groups are how Ray Train and RLlib reserve co-located GPU workers under the hood (lessons 07, 10).</p>
+
+<h2>6 · Failure modes & checklist</h2>
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+<li><strong>Optimizing compute while transfer is the bottleneck.</strong> You profile and tune the function body while the real cost is a 4&nbsp;GB arg copied to a non-local worker. Check object-store traffic and locality before micro-optimizing code.</li>
+<li><strong>Treating Plasma as infinite shared RAM.</strong> The object store is ~30% of node RAM, separate from the heap. Fan out faster than you reduce and you spill — a sudden latency cliff that looks like the job "randomly slowing down."</li>
+<li><strong>Owner death.</strong> A <code>ray.put</code> from the driver, depended on by long-lived actors, becomes unreconstructible the moment the driver exits — even though the bytes may still be in Plasma. Give shared state an owner that outlives its readers.</li>
+<li><strong>Under-declaring resources.</strong> Tasks that secretly use 8 cores declared as <code>num_cpus=1</code> let the scheduler pack 8× too many onto a node, which then thrashes. The contract only protects you if it is honest.</li>
+<li><strong>Letting the head node run heavy work.</strong> Application tasks landing on the head compete with the GCS for CPU/RAM and can destabilize the cluster's control plane.</li>
+</ul></div>
+  <div class="lesson-card"><h3>Implementation checklist</h3><ul>
+<li>For each task: where do its large input bytes live, and is the task likely to run there?</li>
+<li>Did you <code>ray.put</code> shared read-only data <em>once</em> and pass the ref, instead of passing the value per task?</li>
+<li>Are <code>num_cpus</code>/<code>num_gpus</code>/custom resources declared to match <em>real</em> usage, not wishfully?</li>
+<li>What is the object-store budget per node, and how many live objects will the heaviest stage hold at once — will it spill?</li>
+<li>Who <em>owns</em> each long-lived shared object, and does that owner outlive every task that depends on it?</li>
+<li>Do any tasks/actors need co-location? If so, are they in a placement group with the right PACK/SPREAD strategy?</li>
+<li>Is durable state (datasets, checkpoints) in external storage rather than relying on the object store?</li>
+</ul></div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>A task reads a <strong>4&nbsp;GB</strong> input over <strong>10&nbsp;GbE</strong> and then computes for <strong>5&nbsp;seconds</strong>. Decide: move the task to the data, or the data to the task? Now change the compute to <strong>10&nbsp;minutes</strong> and redo the arithmetic — the right answer should flip. Then size it: on a 64&nbsp;GB node (≈19&nbsp;GB Plasma), how many 4&nbsp;GB inputs can be live before you spill, and what does the first spilled read cost off NVMe vs cloud disk? Finally, state which of these tasks you would put in a <code>STRICT_PACK</code> placement group and why.</div>
+
+<h2>Where this points next</h2>
+<p>You now know how one task is placed, how its bytes are shared, and what happens when the store fills. But real workloads are not one task — they are <em>thousands</em>, arranged in a shape: fan out a map, exchange data in a shuffle, and fold results back in a reduce. That shape stresses every mechanism in this lesson at once — locality during the map, the object store during the shuffle, and the spill cliff if the reduce can't keep up. Lesson 05 builds map-shuffle-reduce on top of this runtime, shows why naively <code>ray.get</code>-ing everything onto the driver is an anti-pattern, and gives the tree-reduce that shrinks the serial fraction Amdahl punished you for in lesson 00.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+A Ray cluster is four kinds of process: a <strong>driver</strong> (your control flow), <strong>workers</strong> (where tasks/actors run), a per-node <strong>raylet</strong> (local scheduler + object manager), and the head-node <strong>GCS</strong> (cluster metadata). The scheduler places work by a resource <em>contract</em> (logical, not enforced), prefers data-locality but spills back to keep nodes busy — and the locality-vs-utilization choice is decided by the compute-to-bytes ratio, not a rule. The <strong>Plasma</strong> object store shares immutable values zero-copy via <code>mmap</code> on a node, reference-counts them across the cluster, and pins each object's lineage to its <strong>owner</strong> — so lost objects are rebuilt by re-running their task, but an object dies with its owner. Object-store memory is a separate ~30% budget; exceed it and you hit the disk-spill latency cliff. Co-located bundles go in a <strong>placement group</strong>. Name where work runs, where the bytes are, and what is scarce, and Ray performance becomes arithmetic.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+<li>Name Ray's four runtime processes and what each owns. <em>(§1 — driver: control flow; worker: runs a task or hosts an actor; raylet: per-node local scheduler + object manager; GCS: cluster metadata on the head node.)</em></li>
+<li>Does <code>num_cpus=2</code> stop a task using more than two cores? <em>(§2 — no; logical resources are a scheduling contract preventing overcommit, not a sandbox. Under-declaring oversubscribes the hardware; over-declaring idles capacity.)</em></li>
+<li>4&nbsp;GB input over 10&nbsp;GbE: when do you move the task to the data vs the data to the task? <em>(§2 — transfer ≈ 3.2&nbsp;s; with 5&nbsp;s compute that's a 64% penalty so favor locality; with 600&nbsp;s compute it's ~0.5% noise so favor utilization and let spillback place it.)</em></li>
+<li>What does "zero-copy" mean in the object store, and why is immutability required for it? <em>(§3 — workers <code>mmap</code> the same shared-memory pages instead of each getting a private copy; immutability makes shared readers safe and the object reconstructible.)</em></li>
+<li>What is the ownership model and what breaks when an owner dies? <em>(§3 — the worker that created a ref owns its reference count and lineage; if it dies the object is unreconstructible even if the bytes still exist, and dependents fail with owner-died.)</em></li>
+<li>How does Ray recover a lost (evicted) task result without checkpointing it? <em>(§3 — lineage-based reconstruction: re-execute the task that produced it, recursively, since the owner remembers the recipe; sets up the lesson 14 failure model.)</em></li>
+<li>Your job suddenly slows down mid-run with no code change. What runtime cause do you check first? <em>(§4 — object-store spill: live objects exceeded the ~30%-of-RAM Plasma budget and are now read from disk, a 10,000×+ latency cliff. Reduce live objects / block size, overlap producer-consumer.)</em></li>
+<li>Why would you use a placement group, and what's the PACK vs SPREAD trade-off? <em>(§5 — to gang-schedule co-located bundles, e.g. TP GPU workers on the fast intra-node link; PACK maximizes co-location (may fail to schedule), SPREAD gives fault isolation at inter-node communication cost.)</em></li>
 </ul>
 
-        <h2>Failure modes</h2>
-        <ul>
-  <li>Optimizing function code while the real bottleneck is object transfer.</li>
-  <li>Forgetting that one node's object store is not infinite shared RAM.</li>
-  <li>Letting the head node run application-heavy work by accident.</li>
-</ul>
+<h2>Connective tissue</h2>
+<p>The object store is a shared-memory <em>cache</em> with eviction and a disk-spill tier — the same storage-engine ideas (write-once immutable values, LRU eviction, spilling to a slower tier) that databases formalize. And the locality-vs-transfer math is the cluster interconnect from the systems-ML view: 10&nbsp;GbE vs NVLink changes every break-even in this lesson.</p>
+<div class="lesson-flow">
+<div><strong>Storage engines</strong><span>Write-once immutable values, LRU eviction, and spill-to-a-slower-tier are the same ideas a database formalizes — see <a href="../../data_intensive_systems/lessons/05_storage_engines_logs_btrees.html">data-intensive systems · storage engines</a>.</span></div>
+<div><strong>Interconnect</strong><span>Every locality-vs-transfer break-even in this lesson is set by the wire: 10&nbsp;GbE vs NVLink changes the numbers — see <a href="../../system_ml/lessons/03_interconnect.html">system_ml · interconnect</a>.</span></div>
+</div>
 
-        <h2>Implementation sketch</h2>
-        <pre><code>@ray.remote(num_cpus=2, resources={&quot;ssd&quot;: 1})
-def preprocess(block):
-    # If caller passes an ObjectRef as this top-level argument,
-    # Ray dereferences it before preprocess runs.
-    return transform(block)
-
-# Put a large immutable lookup table once, then pass its ref.
-lookup_ref = ray.put(load_lookup_table())
-refs = [preprocess.remote(block) for block in blocks]</code></pre>
-
-        <div class="callout ok">
-          <div class="label">Exercise</div>
-          For a task that reads 4 GB and computes for 5 seconds, decide whether you would rather move the task to the data or the data to the task. Now change compute time to 10 minutes. The right answer should change.
-        </div>
-
-        <h2>Connective tissue</h2>
-        <p>This lesson is meant to connect Ray mechanics to the surrounding ML-systems library rather than live as an isolated API tour.</p>
-        <div class="link-grid"><a href="../../data_intensive_systems/lessons/05_storage_engines_logs_btrees.html">Data-intensive systems - storage engines</a><a href="../../system_ml/lessons/03_interconnect.html">System ML - interconnect</a></div>
-
-        <footer class="lesson-nav">
-  <a href="03_actors_state_services.html">
-    <span class="dir">&lt;- Previous</span>
-    <span class="ttl">03 - Actors, State, and Services</span>
-  </a>
-  <a class="next" href="05_mapreduce_patterns.html">
-    <span class="dir">Next -&gt;</span>
-    <span class="ttl">05 - Distributed Patterns: Map, Shuffle, Reduce</span>
-  </a>
-</footer>
-
-        </main>
-        </body>
-        </html>
+<footer class="lesson-nav"><a href="03_actors_state_services.html"><span class="dir">Previous</span><span class="ttl">03 · Actors, State, and Services</span></a><a class="next" href="05_mapreduce_patterns.html"><span class="dir">Next</span><span class="ttl">05 · Distributed Patterns: Map, Shuffle, Reduce</span></a></footer>
+</main>
+<!-- reviewed:v1 -->
+</body>
+</html>
