@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>30 · Fused optimizers &amp; the training step</title><link rel="stylesheet" href="../reinforcement_learning/lessons/style.css"><style>main{overflow-wrap:break-word}table{table-layout:fixed}th,td{overflow-wrap:anywhere}input[type="range"]{max-width:min(200px,44vw)}label.inline{flex-wrap:wrap;max-width:100%}</style></head>
+<body><header class="topnav"><div class="inner"><a class="crumb-link" href="../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">gpu_kernels</a><span class="crumb">/</span><span class="crumb">30 · fused optimizers &amp; the training step</span><span class="step-pill">lesson 30 / 33</span></div></header><main>
+
+<h1>Fused optimizers &amp; the training step</h1>
+<p class="subtitle">Every gradient kernel in this Part produces one thing — gradients — and the optimizer consumes all of them. The optimizer is pure bandwidth, the launch-overhead problem at its worst, and the home of the mixed-precision dtype dance. This closing lesson builds the fused optimizer kernel, adds loss scaling and fp32 master weights, brings in recomputation as the last memory lever, and assembles the full training step back to lesson 25's peak.</p>
+
+<div class="callout">
+  <div class="label">Builds on</div>
+  Consumes the gradients from lessons 26–29. Reuses the launch-overhead tax (lesson 18), the bandwidth roofline (lesson 10), and the recompute-for-memory trade introduced in lesson 25 and used in 27–29. This is the synthesis lesson of Part IV.
+</div>
+
+<h2>The question this lesson answers</h2>
+<p>You profile a training step and the optimizer — a few elementwise multiply-adds — eats a startling slice of the time, and the model barely fits in memory despite the weights being small. Why is the cheapest math in the model a performance problem, and where did all the memory go?</p>
+
+<h2>The optimizer is pure bandwidth</h2>
+<p>AdamW, per parameter, given gradient <span class="math">g</span>:</p>
+<div class="math block">m ← β₁·m + (1−β₁)·g        v ← β₂·v + (1−β₂)·g²
+p ← p − lr·( m̂ / (√v̂ + ε) ) − lr·wd·p</div>
+<p>Count the memory: to update one parameter you <strong>read</strong> p, g, m, v and <strong>write</strong> p, m, v — seven parameter-sized tensor touches for a handful of FLOPs. Arithmetic intensity is ~1 FLOP/byte: deeply memory-bound (lesson 10's roofline puts it far left of the ridge). There is no matmul to make fast and no reduction to tile; the <em>only</em> levers are "move fewer bytes" and "launch fewer kernels." That reframes the optimizer as a bandwidth kernel, not a math kernel.</p>
+
+<h2>The launch-overhead trap: thousands of tiny tensors</h2>
+<p>A transformer has thousands of separate parameter tensors (every weight matrix, norm scale, bias). A textbook optimizer loops in Python and launches <em>one kernel per tensor</em>. Each launch pays the 10–30 µs CPU-side dispatch tax from lesson 18, and each kernel moves so few bytes it finishes before the next is even queued — the GPU sits idle between launches.</p>
+<table><thead><tr><th>Implementation</th><th>Launches</th><th>What dominates</th></tr></thead><tbody>
+<tr><td>Per-tensor (loop in Python)</td><td>~thousands</td><td><strong>launch overhead</strong> — GPU starved between kernels</td></tr>
+<tr><td><code>foreach</code> / multi-tensor-apply</td><td>~tens (batched by dtype/shape group)</td><td>bandwidth — the right bottleneck</td></tr>
+<tr><td>Fused (one kernel, whole Adam math)</td><td>~tens</td><td>bandwidth, minimal intermediates</td></tr>
+</tbody></table>
+<p><strong>Multi-tensor-apply</strong> (the <code>foreach</code> path) packs a list of tensors into one kernel launch: a metadata array of pointers+sizes lets a single grid stride across all tensors, so thousands of launches collapse to a handful. The <strong>fused</strong> optimizer goes further — it does the entire m/v/p update in one pass per element instead of several <code>_foreach</code> ops, so m and v never round-trip to HBM between sub-steps. Both turn a launch-bound kernel back into a clean bandwidth-bound one. This is the exact same "stop launching tiny kernels, fuse the elementwise chain" lesson as fused activation (lesson 19) — applied to the optimizer.</p>
+
+<h2>Mixed precision: the dtype dance</h2>
+<p>Matmuls want bf16/fp16 for tensor-core throughput (lesson 09), but the optimizer update is a <em>tiny</em> number added to a <em>large</em> weight. In bf16 (8-bit mantissa) a small <span class="math">lr·update</span> added to a big <span class="math">p</span> rounds away entirely — "swamping." So mixed-precision training keeps an <strong>fp32 master copy</strong> of the weights and fp32 optimizer states; the optimizer updates the fp32 master, then casts to bf16 for the next forward.</p>
+<svg viewBox="0 0 820 200" class="diagram" role="img" aria-label="Mixed precision loop: bf16 compute, fp32 master weights and optimizer states, cast each step">
+  <defs><marker id="o30" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <g font-size="11" fill="var(--text-mute)">
+    <rect class="node-bg" x="20"  y="40" width="150" height="54" rx="6"/><text x="95"  y="62" text-anchor="middle" font-weight="700" fill="var(--text)">fwd + bwd (bf16)</text><text x="95"  y="80" text-anchor="middle">tensor cores</text>
+    <rect class="node-bg" x="210" y="40" width="150" height="54" rx="6"/><text x="285" y="62" text-anchor="middle" font-weight="700" fill="var(--text)">bf16 grads</text><text x="285" y="80" text-anchor="middle">× loss-scale (fp16)</text>
+    <rect class="node-bg" x="400" y="40" width="170" height="54" rx="6"/><text x="485" y="58" text-anchor="middle" font-weight="700" fill="var(--text)">fused Adam (fp32)</text><text x="485" y="76" text-anchor="middle">m,v,master all fp32</text>
+    <rect class="node-bg" x="610" y="40" width="180" height="54" rx="6"/><text x="700" y="58" text-anchor="middle" font-weight="700" fill="var(--text)">cast master → bf16</text><text x="700" y="76" text-anchor="middle">weights for next fwd</text>
+  </g>
+  <path class="edge" d="M170 67 L210 67" marker-end="url(#o30)"/>
+  <path class="edge" d="M360 67 L400 67" marker-end="url(#o30)"/>
+  <path class="edge" d="M570 67 L610 67" marker-end="url(#o30)"/>
+  <path class="edge" d="M700 94 C700 140 95 140 95 94" marker-end="url(#o30)"/>
+  <text x="380" y="132" font-size="11" fill="var(--text-mute)">loop</text>
+</svg>
+
+<h3>Loss scaling — and why bf16 mostly skips it</h3>
+<p>fp16 has a narrow exponent range; small gradients underflow to zero in its tail and the model stops learning. The fix is <strong>loss scaling</strong>: multiply the loss by <span class="math">S</span> before backward so every gradient is scaled up by <span class="math">S</span> into fp16's representable range, then <em>unscale</em> (divide by <span class="math">S</span>) before the optimizer step. Dynamic loss scaling raises <span class="math">S</span> until it sees an inf/NaN, then backs off. <strong>bf16</strong> shares fp32's 8-bit exponent (same range, fewer mantissa bits), so it rarely underflows and usually needs no loss scaling — the single biggest practical reason modern training prefers bf16 over fp16.</p>
+
+<h2>Where all the memory went: the 16-bytes-per-parameter floor</h2>
+<p>Now close lesson 25's table. Mixed-precision Adam holds, per parameter:</p>
+<table><thead><tr><th>Buffer</th><th>dtype</th><th>bytes/param</th></tr></thead><tbody>
+<tr><td>weight (compute copy)</td><td>bf16</td><td>2</td></tr>
+<tr><td>gradient</td><td>bf16 (or fp32)</td><td>2 (–4)</td></tr>
+<tr><td>fp32 master weight</td><td>fp32</td><td>4</td></tr>
+<tr><td>Adam m</td><td>fp32</td><td>4</td></tr>
+<tr><td>Adam v</td><td>fp32</td><td>4</td></tr>
+<tr><td colspan="2"><strong>total (the famous floor)</strong></td><td><strong>16 (–18)</strong></td></tr>
+</tbody></table>
+<p>So a 7B model needs ~112 GB <em>before a single activation</em> — which is why it doesn't fit on one 80 GB H100 and why optimizer-state sharding (ZeRO/FSDP) exists. The weights you can name are a quarter of the real footprint; the optimizer states are the rest. This is the fixed term in lesson 25's widget.</p>
+
+<h2>The last lever: activation recomputation (gradient checkpointing)</h2>
+<p>The fixed 16P is sharded away across GPUs; the <em>activation</em> term is what a single GPU still chokes on, and it's the term you control with kernels. FlashAttention already recomputes its scores (lesson 29); <strong>gradient checkpointing</strong> generalizes that to whole transformer blocks: on the forward, store only each block's <em>input</em> (the boundary), discard everything inside; on the backward, recompute the block's forward to regenerate its internal activations, then run the block's backward. The trade:</p>
+<ul>
+  <li><strong>Memory</strong>: activations drop from "every layer's internals" to "one block's worth at a time" — for L layers checkpointed at block boundaries, roughly an L-fold cut in stored activations.</li>
+  <li><strong>Compute</strong>: one extra forward per checkpointed block ≈ <strong>+33% step FLOPs</strong> (recall the 6N rule: forward is ~1/3 of fwd+bwd; recomputing it adds that third).</li>
+</ul>
+<p>It's the same compute-for-memory bargain as every other kernel in Part IV, now at the granularity of a whole block. You reach for it exactly when lesson 25's widget says you're activation-bound.</p>
+
+<h2>The full training step, assembled</h2>
+<p>Putting Part IV together, one step is:</p>
+<ol>
+  <li><strong>Forward</strong> (Parts I–II kernels) — save what each op needs (lesson 25), recompute the rest.</li>
+  <li><strong>Loss</strong> — fused cross-entropy keeps the giant logits off HBM (lesson 27).</li>
+  <li><strong>Backward</strong> — matmul's two GEMMs (26), norm/activation gradients with cross-token reductions (28), FlashAttention backward's recompute (29); all accumulating gradients in fp32; recompute checkpointed blocks here.</li>
+  <li><strong>Optimizer</strong> — one fused multi-tensor Adam pass over fp32 master + states, loss-scale unscale, cast to bf16 (this lesson).</li>
+</ol>
+<p>Peak memory = (16P optimizer floor, shardable) + (activations, controllable by fusion + recompute). Every kernel in this Part attacks one of those terms. That is the engineering line of thinking the whole track has been building toward: you don't memorize kernels, you locate the bottleneck term and apply the kernel that shrinks it.</p>
+
+<h2>Interactive · optimizer time and the memory floor</h2>
+<p>Set parameter count, the number of separate tensors, and the per-launch overhead. The widget compares per-tensor vs fused-foreach optimizer time (launch-bound vs bandwidth-bound) and shows the 16P memory floor that fusion does <em>not</em> change.</p>
+
+<div class="widget"><div class="title">Optimizer: launches vs bandwidth, and the 16P floor</div><p class="hint">Per-tensor: time ≈ #tensors·overhead + bytes/BW. Fused: time ≈ fewLaunches·overhead + bytes/BW. Adam moves ~7·P·4 bytes (fp32 states). Memory floor = 16·P bytes.</p><div class="controls">
+<label class="inline">params (B) <input id="op-P" type="range" min="0.5" max="70" step="0.5" value="7"><span class="val" id="op-P-v">7</span></label>
+<label class="inline">#param tensors <input id="op-n" type="range" min="50" max="8000" step="50" value="1500"><span class="val" id="op-n-v">1500</span></label>
+<label class="inline">launch µs <input id="op-l" type="range" min="2" max="30" step="1" value="12"><span class="val" id="op-l-v">12</span></label>
+<label class="inline">HBM TB/s <input id="op-bw" type="range" min="0.8" max="8" step="0.05" value="3.35"><span class="val" id="op-bw-v">3.35</span></label>
+</div><canvas id="op-canvas" class="dist-canvas" height="220"></canvas><p class="hint" id="op-note"></p></div>
+
+<h2>Where this leaves you</h2>
+<p>That closes Part IV: you can read or write the gradient kernel of every op in a transformer, predict its bottleneck (bandwidth, reduction, recompute, or launch), and assemble a training step that fits. Part V (lessons 31–33) drills the Part I CUDA primitives under interview conditions — the declarations, the optimized snippets, and the algorithm-and-data-structure thinking you reach for on a whiteboard.</p>
+
+<script>
+(function(){
+  const ids=['P','n','l','bw'];
+  const e=Object.fromEntries(ids.map(k=>[k,document.getElementById('op-'+k)]));
+  const c=document.getElementById('op-canvas'),ctx=c.getContext('2d'),note=document.getElementById('op-note');
+  function draw(){
+    ids.forEach(k=>document.getElementById('op-'+k+'-v').textContent=e[k].value);
+    c.width=c.clientWidth*devicePixelRatio;c.height=220*devicePixelRatio;ctx.setTransform(1,0,0,1,0,0);ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.clearRect(0,0,c.clientWidth,220);
+    const P=+e.P.value*1e9,n=+e.n.value,l=+e.l.value,bw=+e.bw.value;
+    const bytes=7*P*4;                       // ~7 fp32 touches of param-sized states
+    const bwTime=bytes/(bw*1e12)*1000;       // ms
+    const perTensor=n*l/1000 + bwTime;       // ms
+    const fused=Math.ceil(n/500)*l/1000 + bwTime; // batched launches
+    const rows=[
+      ['per-tensor (launch-bound)', perTensor, '#dc2626'],
+      ['fused foreach (bandwidth-bound)', fused, '#16a34a'],
+    ];
+    const max=Math.max(perTensor,fused,0.001)*1.05;
+    rows.forEach(([nm,v,col],i)=>{
+      const y=26+i*44,w=(c.clientWidth-300)*v/max;
+      ctx.fillStyle='#eef1f5';ctx.fillRect(290,y,c.clientWidth-300,26);
+      ctx.fillStyle=col;ctx.fillRect(290,y,w,26);
+      ctx.fillStyle='#1f2430';ctx.font='12px sans-serif';ctx.fillText(nm,12,y+17);
+      ctx.fillStyle='#1f2430';ctx.fillText(v.toFixed(2)+' ms',296+w+4,y+17);
+    });
+    const floor=16*P/1e9;
+    ctx.fillStyle='#1f2430';ctx.font='12px sans-serif';
+    ctx.fillText('speedup from fusion: '+(perTensor/fused).toFixed(1)+'×   (bandwidth floor '+bwTime.toFixed(2)+' ms is the same for both)',12,140);
+    ctx.fillStyle='#2563eb';
+    ctx.fillText('mixed-precision Adam memory floor: 16 × '+(+e.P.value)+'B params = '+floor.toFixed(0)+' GB  (before activations, shardable via ZeRO/FSDP)',12,166);
+    ctx.fillStyle='#5b6573';
+    ctx.fillText('Fusion removes launch overhead; it cannot remove the 16P floor — that needs sharding.',12,190);
+    note.textContent='Per-tensor launches '+n+' kernels at '+l+' µs each = '+(n*l/1000).toFixed(2)+' ms of pure overhead on top of a '+bwTime.toFixed(2)+' ms bandwidth floor. Fusing collapses that overhead; the optimizer becomes bandwidth-bound, as it should be.';
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+<footer class="lesson-nav"><a href="29_flash_attention_backward.html"><span class="dir">Previous</span><span class="ttl">29 · FlashAttention backward</span></a><a class="next" href="31_cuda_common_operations.html"><span class="dir">Next</span><span class="ttl">31 · CUDA common operations</span></a></footer>
+<!-- reviewed:v1 -->
+</main></body></html>

@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>29 · FlashAttention backward</title><link rel="stylesheet" href="../reinforcement_learning/lessons/style.css"><style>main{overflow-wrap:break-word}table{table-layout:fixed}th,td{overflow-wrap:anywhere}input[type="range"]{max-width:min(200px,44vw)}label.inline{flex-wrap:wrap;max-width:100%}</style></head>
+<body><header class="topnav"><div class="inner"><a class="crumb-link" href="../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">gpu_kernels</a><span class="crumb">/</span><span class="crumb">29 · FlashAttention backward</span><span class="step-pill">lesson 29 / 33</span></div></header><main>
+
+<h1>FlashAttention backward</h1>
+<p class="subtitle">The flagship of the training Part. The forward (lesson 12) never materialized the N² attention matrix — so the backward has to <em>recompute</em> it, block by block, while carrying a single per-row correction scalar and running the two-GEMM rule inside a streaming loop. It composes every idea in Part IV: recompute-don't-store, the online softmax statistic, cross-block gradient accumulation, and fp32 reductions.</p>
+
+<div class="callout">
+  <div class="label">Builds on</div>
+  Forward FlashAttention &amp; online softmax (lesson 12 / 10); the two-GEMM rule (26); recompute-the-stat and cross-block accumulation (28). If lesson 12 was the forward flagship of the serving track, this is its mirror.
+</div>
+
+<h2>The question this lesson answers</h2>
+<p>FlashAttention forward earned its speedup by <em>not</em> storing the N² scores. That looks like it should make the backward impossible — gradients need the attention weights. How do you compute <span class="math">dQ, dK, dV</span> when the thing you'd differentiate was thrown away?</p>
+
+<h2>What the forward left behind</h2>
+<p>Recall the forward output for one query row: <span class="math">O = softmax(QKᵀ/√d)·V</span>, computed with the online recurrence so that the only things written to HBM are:</p>
+<ul>
+  <li><span class="math">O</span> — the output, shape <span class="math">N×d</span> (you needed it anyway), and</li>
+  <li><span class="math">L</span> — the per-row log-sum-exp <span class="math">L<sub>i</sub> = m<sub>i</sub> + log ℓ<sub>i</sub></span>, shape <span class="math">N</span> (one scalar per query).</li>
+</ul>
+<p>That's <span class="math">O(N·d)</span> of saved state, not <span class="math">O(N²)</span>. The N² probability matrix <span class="math">P = softmax(S)</span> is gone. The backward's whole trick is that <span class="math">L</span> is exactly enough to <strong>regenerate</strong> any block of <span class="math">P</span> on demand: <span class="math">P<sub>ij</sub> = exp(S<sub>ij</sub> − L<sub>i</sub>)</span>, where <span class="math">S<sub>ij</sub> = (Q<sub>i</sub>·K<sub>j</sub>)/√d</span> is recomputed from Q and K. No global softmax pass needed — <span class="math">L</span> already folded in the row max and normalizer.</p>
+
+<h2>The gradients, and the one scalar that makes them local</h2>
+<p>Given <span class="math">dO</span>, the attention backward is:</p>
+<div class="math block">dV = Pᵀ · dO
+dP = dO · Vᵀ
+dS = P ∘ (dP − D),   where D<sub>i</sub> = Σ<sub>j</sub> dO<sub>ij</sub>·O<sub>ij</sub>   (one scalar per row)
+dQ = (dS · K)/√d
+dK = (dSᵀ · Q)/√d</div>
+<p>The pivotal term is <span class="math">D<sub>i</sub> = rowsum(dO ∘ O)</span>. It comes from the softmax Jacobian: differentiating <span class="math">softmax</span> gives <span class="math">dS = P∘(dP − (P·dP)·𝟙)</span>, and the inner product <span class="math">P·dP</span> per row equals <span class="math">rowsum(dO∘O)</span> — a quantity you can compute in <strong>one cheap pass over dO and O</strong> before the main loop. Precomputing <span class="math">D</span> (shape N, like L) means each block of <span class="math">dS</span> is computable <em>locally</em> from that block's <span class="math">P</span>, <span class="math">dP</span>, and the row scalar <span class="math">D<sub>i</sub></span> — no second global reduction inside the loop. This is the same "hoist the per-row correction out of the loop" move as the online softmax, now on the backward side.</p>
+
+<h2>The loop structure: who accumulates cleanly, who needs atomics</h2>
+<p>Look at the reduction axes. <span class="math">dK<sub>j</sub></span> and <span class="math">dV<sub>j</sub></span> for a key/value block <span class="math">j</span> sum over <em>all query rows i</em>. <span class="math">dQ<sub>i</sub></span> for a query block <span class="math">i</span> sums over <em>all key blocks j</em>. You can't make both the clean inner-loop accumulation at once. FlashAttention-2's backward chooses the outer loop over <strong>K/V blocks</strong>:</p>
+<ul>
+  <li><strong>Outer loop j over K/V blocks; inner loop i over Q blocks.</strong> Inside, <span class="math">dK<sub>j</sub>, dV<sub>j</sub></span> accumulate in registers across all i and write once at the end of the j-iteration — clean, no atomics, fp32 accumulator.</li>
+  <li><strong>dQ is the awkward one</strong>: each (i, j) contributes to <span class="math">dQ<sub>i</sub></span>, so across outer iterations the same <span class="math">dQ<sub>i</sub></span> gets many contributions. Two production choices: (a) <code>atomicAdd</code> the partial <span class="math">dQ<sub>i</sub></span> into HBM each iteration (simple, non-deterministic), or (b) a <em>separate</em> dQ kernel that loops the other way (outer over Q, inner over K) so dQ accumulates cleanly too — the two-kernel split most libraries ship, trading a second recompute of S for determinism.</li>
+</ul>
+
+<svg viewBox="0 0 840 250" class="diagram" role="img" aria-label="Backward loops over K/V blocks accumulating dK,dV cleanly while dQ takes a contribution each iteration">
+  <defs><marker id="fa29" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <text x="20" y="22" font-size="12" font-weight="700" fill="var(--text-mute)">precompute D = rowsum(dO∘O)  →  one pass, shape N (like L)</text>
+  <rect class="node-bg" x="20" y="34" width="800" height="28" rx="6"/><text x="420" y="53" text-anchor="middle" font-size="11" font-weight="700">D[i] and L[i]: the two per-row scalars that make every block local</text>
+  <text x="20" y="92" font-size="12" font-weight="700" fill="var(--text-mute)">outer loop: K/V block j</text>
+  <g font-size="10" fill="var(--text-mute)">
+    <rect class="node-bg" x="20"  y="104" width="180" height="78" rx="6"/>
+    <text x="110" y="124" text-anchor="middle" font-weight="700" fill="var(--text)">inner loop: Q block i</text>
+    <text x="110" y="142" text-anchor="middle">recompute S=QᵢKⱼᵀ/√d</text>
+    <text x="110" y="158" text-anchor="middle">P=exp(S−Lᵢ)  (regenerate)</text>
+    <text x="110" y="174" text-anchor="middle">dS=P∘(dOᵢVⱼᵀ − Dᵢ)</text>
+  </g>
+  <rect class="node-bg" x="230" y="104" width="180" height="78" rx="6"/><text x="320" y="134" text-anchor="middle" font-weight="700" font-size="11" fill="#15803d">dKⱼ,dVⱼ += …</text><text x="320" y="152" text-anchor="middle" font-size="10" fill="var(--text-mute)">accumulate in registers</text><text x="320" y="168" text-anchor="middle" font-size="10" fill="var(--text-mute)">write once per j ✓ clean</text>
+  <rect class="node-bg" x="440" y="104" width="190" height="78" rx="6"/><text x="535" y="134" text-anchor="middle" font-weight="700" font-size="11" fill="#b45309">dQᵢ += dS·Kⱼ/√d</text><text x="535" y="152" text-anchor="middle" font-size="10" fill="var(--text-mute)">contributed every j →</text><text x="535" y="168" text-anchor="middle" font-size="10" fill="var(--text-mute)">atomics OR separate dQ kernel</text>
+  <path class="edge" d="M200 143 L230 143" marker-end="url(#fa29)"/>
+  <path class="edge" d="M410 143 L440 143" marker-end="url(#fa29)"/>
+  <text x="650" y="138" font-size="10" fill="var(--text-mute)">never materialize</text><text x="650" y="152" font-size="10" fill="var(--text-mute)">the N×N P matrix —</text><text x="650" y="166" font-size="10" fill="var(--text-mute)">one block at a time</text>
+  <text x="20" y="214" font-size="11" fill="var(--text-mute)">Memory: saved state is O(N·d) [O, L, D], never O(N²). Compute: backward recomputes S, so it is ~2–2.5× the forward FLOPs.</text>
+  <text x="20" y="234" font-size="11" fill="var(--text-mute)">This is the recompute-for-memory trade (lesson 25) at its most valuable: at N=8192 the avoided P matrix is gigabytes.</text>
+</svg>
+
+<h2>The trade in one line</h2>
+<p>FlashAttention backward spends <strong>extra FLOPs</strong> (recomputing S and P) to avoid <strong>O(N²) memory</strong>. Because attention is bandwidth/memory-bound at long context and the saved matrix grows quadratically while the recompute grows only with the work you were already doing, the trade is overwhelmingly worth it — and it's the only way attention training fits at long sequence at all.</p>
+
+<h2>Worked numbers: why O(N²) was never an option</h2>
+<p>One head, head-dim d = 128, bf16. The materialized probability matrix is <span class="math">N²·2</span> bytes <em>per head per layer</em>:</p>
+<table><thead><tr><th>Seq length N</th><th>Materialized P (per head)</th><th>FlashAttn saved state O+L+D (per head)</th><th>Ratio</th></tr></thead><tbody>
+<tr><td>2,048</td><td>2048²·2 = 8.4 MB</td><td>2048·128·2 + 2048·4·2 ≈ 0.54 MB</td><td>~16×</td></tr>
+<tr><td>8,192</td><td>8192²·2 = 134 MB</td><td>≈ 2.1 MB</td><td>~64×</td></tr>
+<tr><td>32,768</td><td>32768²·2 = 2.1 GB</td><td>≈ 8.5 MB</td><td>~256×</td></tr>
+</tbody></table>
+<p>Multiply by heads × layers and the materialized path is impossible past a few thousand tokens; the FlashAttention path scales linearly. The price is FLOPs: the backward's recompute of S makes attention backward ≈ 2.5× the forward attention FLOPs — paid gladly, because the alternative doesn't fit.</p>
+
+<h2>The traps</h2>
+<table><thead><tr><th>Trap</th><th>Symptom</th><th>Fix</th></tr></thead><tbody>
+<tr><td>Forgetting to precompute D</td><td>a global reduction sneaks into the inner loop; slow / wrong dS</td><td>compute D = rowsum(dO∘O) in a pass before the main loop</td></tr>
+<tr><td>Recomputing P without L</td><td>numerically unstable exp; NaNs</td><td>P = exp(S − L); L already carries the row max</td></tr>
+<tr><td>dQ accumulation race</td><td>non-deterministic grads or wrong dQ</td><td>atomics (accept non-determinism) or the separate dQ-major kernel</td></tr>
+<tr><td>bf16 dK/dV/dQ accumulators</td><td>grad drift at long context</td><td>fp32 accumulators, downcast on store (lesson 26)</td></tr>
+<tr><td>Causal mask handling in backward</td><td>gradient leaks across the causal boundary</td><td>skip fully-masked (i,j) blocks; mask the diagonal block</td></tr>
+</tbody></table>
+
+<h2>Interactive · the N² you don't pay, the FLOPs you do</h2>
+<p>Sweep sequence length. The widget contrasts the materialized P matrix (quadratic) with FlashAttention's saved state (linear), and shows the recompute FLOP overhead you pay for it — the recompute-for-memory trade made visual.</p>
+
+<div class="widget"><div class="title">FlashAttention backward: memory saved vs FLOPs spent</div><p class="hint">Materialized P per head = N²·2 bytes. FA saved state = N·d·2 (O) + N·4·2 (L,D). Backward FLOPs ≈ 2.5× forward attention (extra recompute of S).</p><div class="controls">
+<label class="inline">seq length N <input id="fa-N" type="range" min="1024" max="65536" step="1024" value="8192"><span class="val" id="fa-N-v">8192</span></label>
+<label class="inline">head dim d <input id="fa-d" type="range" min="64" max="256" step="8" value="128"><span class="val" id="fa-d-v">128</span></label>
+<label class="inline">heads·layers <input id="fa-h" type="range" min="1" max="2048" step="1" value="1024"><span class="val" id="fa-h-v">1024</span></label>
+</div><canvas id="fa-canvas" class="dist-canvas" height="220"></canvas><p class="hint" id="fa-note"></p></div>
+
+<h2>What this sets up</h2>
+<p>You've now built the gradient of the hardest forward kernel by composing every Part IV idea. All these kernels produce one thing: gradients. The last lesson consumes them — the optimizer kernel — and closes the training step back to lesson 25's memory peak, with mixed precision and recomputation as the final levers.</p>
+
+<script>
+(function(){
+  const ids=['N','d','h'];
+  const e=Object.fromEntries(ids.map(k=>[k,document.getElementById('fa-'+k)]));
+  const c=document.getElementById('fa-canvas'),ctx=c.getContext('2d'),note=document.getElementById('fa-note');
+  function draw(){
+    ids.forEach(k=>document.getElementById('fa-'+k+'-v').textContent=e[k].value);
+    c.width=c.clientWidth*devicePixelRatio;c.height=220*devicePixelRatio;ctx.setTransform(1,0,0,1,0,0);ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.clearRect(0,0,c.clientWidth,220);
+    const N=+e.N.value,d=+e.d.value,h=+e.h.value;
+    const matP=N*N*2*h/1e9;          // GB
+    const saved=(N*d*2 + N*4*2)*h/1e9; // GB
+    const rows=[
+      ['materialized P  (N²·heads·layers)', matP, '#dc2626', matP.toFixed(2)+' GB'],
+      ['FlashAttn saved state  (N·d linear)', saved, '#16a34a', (saved*1000).toFixed(1)+' MB'],
+    ];
+    const max=Math.max(matP,saved,0.001)*1.05;
+    rows.forEach(([n,v,col,lbl],i)=>{
+      const y=30+i*48,w=(c.clientWidth-340)*v/max;
+      ctx.fillStyle='#eef1f5';ctx.fillRect(330,y,c.clientWidth-340,26);
+      ctx.fillStyle=col;ctx.fillRect(330,y,Math.max(w,1),26);
+      ctx.fillStyle='#1f2430';ctx.font='12px sans-serif';ctx.fillText(n,12,y+17);
+      ctx.fillStyle='#1f2430';ctx.fillText(lbl,336+Math.max(w,1)+4,y+17);
+    });
+    const ratio=matP/saved;
+    ctx.fillStyle='#5b6573';ctx.font='12px sans-serif';
+    ctx.fillText('memory ratio: '+ratio.toFixed(0)+'× smaller   ·   backward FLOPs ≈ 2.5× forward attention (recompute cost)',12,150);
+    ctx.fillText('The quadratic bar is the wall you hit without recompute; the linear bar is why long-context training exists.',12,172);
+    note.textContent='At N='+N+', materializing P would cost '+matP.toFixed(2)+' GB across heads·layers — '+ratio.toFixed(0)+'× the FlashAttention saved state. You pay ~2.5× forward FLOPs to recompute S in the backward and the memory stays linear in N.';
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+<footer class="lesson-nav"><a href="28_norm_activation_backward.html"><span class="dir">Previous</span><span class="ttl">28 · Norm &amp; activation backward</span></a><a class="next" href="30_fused_optimizers_training_step.html"><span class="dir">Next</span><span class="ttl">30 · Fused optimizers &amp; the training step</span></a></footer>
+<!-- reviewed:v1 -->
+</main></body></html>
