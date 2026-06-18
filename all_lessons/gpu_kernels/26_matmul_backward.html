@@ -28,12 +28,11 @@ db = Σ<sub>rows</sub> dY  (shape N, a column reduction — if there's a bias)</
 </tbody></table>
 <p>Same FLOP count three times (2·T·K·N) — that's the 2× of lesson 25. But the two backward GEMMs are <em>not</em> interchangeable, and the difference is the contraction dimension.</p>
 
-<h2>Why dW is the troublemaker: it contracts over the batch</h2>
-<p>The contraction (reduction) dimension is the one you sum over. Forward and <span class="math">dX</span> contract over a feature dimension (K or N) — typically a few thousand. But <span class="math">dW = Xᵀ·dY</span> contracts over <strong>T = batch·tokens</strong>, which at training scale is tens of thousands to millions. Three consequences:</p>
+<h2>Why dW is the special one: it contracts over the batch</h2>
+<p>The contraction (reduction) dimension is the one you sum over. Forward and <span class="math">dX</span> contract over a feature dimension (K or N) — typically a few thousand. But <span class="math">dW = Xᵀ·dY</span> contracts over <strong>T = batch·tokens</strong>, which at training scale is tens of thousands to millions. Two consequences follow, and the first is unconditional:</p>
 <ol>
-  <li><strong>It's a long, thin reduction.</strong> The output <span class="math">dW</span> is small (K×N, the weight shape) but each entry sums T products. Each weight gradient is "this weight's contribution summed over every token in the batch" — a giant reduction along the dimension you most want to parallelize over.</li>
-  <li><strong>You want to split the contraction (split-K), which forces a cross-block reduction.</strong> To use all the SMs you tile <span class="math">dW</span>'s small output across few blocks — too few to fill the GPU. The fix is <strong>split-K</strong>: partition the T-contraction across blocks, each computing a partial <span class="math">dW</span>, then sum the partials. That sum is a cross-block reduction → either atomics (fast, <em>non-deterministic</em>) or a second reduction kernel over a workspace buffer (deterministic, one extra pass). Lesson 30 explains why determinism matters for training.</li>
-  <li><strong>fp32 accumulation is mandatory.</strong> Summing tens of thousands of bf16 products in bf16 loses the low bits exactly where it hurts — the same trap as lesson 19's sum-of-squares. Accumulate <span class="math">dW</span> (and <span class="math">db</span>) in fp32 even when X, dY, and the stored gradient are bf16.</li>
+  <li><strong>fp32 accumulation is mandatory.</strong> Each entry of <span class="math">dW</span> sums <em>T</em> products — "this weight's contribution from every token in the batch." Summing tens of thousands of bf16 products in bf16 loses the low bits exactly where it hurts — the same trap as lesson 19's sum-of-squares. Accumulate <span class="math">dW</span> (and <span class="math">db</span>) in fp32 even when X, dY, and the stored gradient are bf16. This bites at <em>every</em> weight shape, because T is always large.</li>
+  <li><strong>When the weight is small, dW under-fills the GPU and wants split-K.</strong> A GEMM is tiled over its <em>output</em>, and dW's output is the weight, K×N. For a fat MLP weight (4096×14336 → thousands of 128×128 tiles) that fills the SMs fine. But for a <em>small</em> output projection — a gate, a low-rank head, an attention out-proj at modest d — K×N tiles into fewer blocks than there are SMs, and the GPU starves while a huge T-reduction runs inside each. The fix is <strong>split-K</strong>: partition the T-contraction across blocks, each computing a partial <span class="math">dW</span>, then sum the partials. That sum is a cross-block reduction → either atomics (fast, <em>non-deterministic</em>) or a second reduction kernel over a workspace buffer (deterministic, one extra pass). Lesson 30 explains why determinism matters for training. Note that split-K helps only because the output is small — growing T makes the reduction longer, not the occupancy worse.</li>
 </ol>
 
 <svg viewBox="0 0 860 250" class="diagram" role="img" aria-label="Three GEMMs: forward contracts K, dX contracts N, dW contracts the batch dim T and needs split-K">
@@ -59,7 +58,7 @@ db = Σ<sub>rows</sub> dY  (shape N, a column reduction — if there's a bias)</
     <rect class="node-bg" x="20" y="228" width="80" height="20" rx="4"/><text x="60" y="242" text-anchor="middle" font-weight="700">Xᵀ K×T</text>
     <rect class="node-bg" x="120" y="228" width="80" height="20" rx="4"/><text x="160" y="242" text-anchor="middle" font-weight="700">dY T×N</text>
     <rect class="node-bg" x="222" y="228" width="80" height="20" rx="4"/><text x="262" y="242" text-anchor="middle" font-weight="700">dW K×N</text>
-    <text x="340" y="242" fill="#b91c1c">contract T (batch·tokens!) — tiny output, huge reduction → split-K + fp32</text>
+    <text x="340" y="242" fill="#b91c1c">contract T (batch·tokens!) — fp32 always; split-K when the K×N output is small</text>
   </g>
 </svg>
 
@@ -80,9 +79,9 @@ db = Σ<sub>rows</sub> dY  (shape N, a column reduction — if there's a bias)</
 <table><thead><tr><th>Kernel</th><th>FLOPs</th><th>HBM traffic (bytes moved)</th><th>Bound</th></tr></thead><tbody>
 <tr><td>forward <span class="math">Y=XW</span></td><td>2·8192·4096·14336 ≈ 0.96 TFLOP</td><td>X 0.067 GB + W 0.117 GB + Y 0.235 GB</td><td>compute (tensor cores)</td></tr>
 <tr><td><span class="math">dX = dY·Wᵀ</span></td><td>0.96 TFLOP</td><td>dY 0.235 + W 0.117 + dX 0.067 GB</td><td>compute</td></tr>
-<tr><td><span class="math">dW = Xᵀ·dY</span></td><td>0.96 TFLOP</td><td>X 0.067 + dY 0.235 + dW (fp32) 0.235 GB</td><td>compute, but under-occupied → split-K</td></tr>
+<tr><td><span class="math">dW = Xᵀ·dY</span></td><td>0.96 TFLOP</td><td>X 0.067 + dY 0.235 + dW (fp32) 0.235 GB</td><td>compute; healthy here (large output)</td></tr>
 </tbody></table>
-<p>Three ~0.96 TFLOP GEMMs ≈ 2.9 TFLOP per layer per step. At ~490 TFLOP/s sustained that is ~5.9 ms/layer of GEMM — and the backward two-thirds of it is the reason a training step is ~3× an inference step on the same shape. The <span class="math">dW</span> GEMM, despite identical FLOPs, often clocks slowest because its small K×N output (0.235 GB fp32) under-fills the GPU until split-K spreads the T-contraction across SMs.</p>
+<p>Three ~0.96 TFLOP GEMMs ≈ 2.9 TFLOP per layer per step. At ~490 TFLOP/s sustained that is ~5.9 ms/layer of GEMM (versus ~2.0 ms for the forward GEMM alone) — the backward's two extra GEMMs are the reason the per-layer GEMM cost roughly triples from inference to training. At <em>this</em> fat MLP shape the <span class="math">dW</span> output (4096×14336) tiles into thousands of blocks and fills the GPU fine — split-K isn't needed. It's the small output projections (the widget below lets you shrink the weight to find them) where <span class="math">dW</span>'s K×N output starves the SMs and split-K over the T-contraction pays off. The fp32 accumulation, by contrast, you need at every shape.</p>
 
 <h2>The traps, collected</h2>
 <table><thead><tr><th>Trap</th><th>Symptom</th><th>Fix</th></tr></thead><tbody>
@@ -141,7 +140,7 @@ db = Σ<sub>rows</sub> dY  (shape N, a column reduction — if there's a bias)</
     ctx.fillText('suggested split-K factor over T: '+splitK+' (each adds a partial dW to reduce in fp32)',16,212);
     note.textContent = dwTiles<SMS
       ? 'dW under-fills the GPU: its tiny K×N output makes only '+dwTiles+' tiles for '+SMS+' SMs. Split the T-contraction '+splitK+' ways so every SM has work — then reduce the partials in fp32. This is why dW is the slow GEMM despite matching forward FLOPs.'
-      : 'dW output is large enough to fill the SMs here; split-K is unnecessary. Shrink the weight (K, N) or grow the batch (T) to see dW starve.';
+      : 'dW output is large enough to fill the SMs here; split-K is unnecessary. Shrink the weight (K, N) — a small output projection — to make dW starve. (Growing T lengthens the reduction but does NOT change the tile count, so it never fixes occupancy — only split-K does.)';
   }
   Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
 })();

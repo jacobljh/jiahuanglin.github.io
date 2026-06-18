@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>21 · Norm backward in Triton</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">Triton kernels / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">21 · norm backward</span>
+    <span class="step-pill">lesson 21 / 21</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Norm backward in Triton — the dγ/dβ reduction</h1>
+<p class="subtitle">The forward RMSNorm of lesson 11 was a clean row-per-program job. Its backward splits into two kernels with opposite personalities: <strong>dx is per-row</strong> (one program per row, easy — you just recompute the row statistic) and <strong>dγ/dβ is a reduction over every token in the batch</strong> (the hard cross-row sum). This lesson is the Triton code for both halves, including the classic lock / grouped-partial reduction the official layernorm tutorial uses.</p>
+
+<h2>The question this lesson answers</h2>
+<p>Forward norm parallelizes perfectly: every row is independent, no program talks to another. So why is the backward the kernel people get wrong, and where exactly does the cross-program coordination sneak back in?</p>
+
+<div class="callout">
+  <div class="label">Builds on</div>
+  Lesson 11 built the fused RMSNorm forward — the per-row mean-square reduction you now run in reverse. The <strong>concept</strong> (recompute the stat instead of storing x̂; the atomics-vs-two-pass table; activation backward in the epilogue) is derived in <a class="crumb-link" href="../../gpu_kernels/28_norm_activation_backward.html">gpu_kernels lesson 28</a> — read that for the math and the trade-off reasoning. Here we focus on the Triton mechanics: the @triton.jit kernels, the masked fp32 reductions, and the grouped workspace.
+</div>
+
+<h2>The gradients (the half-page you reverse)</h2>
+<p>For LayerNorm, per row <span class="math">x ∈ ℝ<sup>d</sup></span> with <span class="math">μ = mean(x)</span>, <span class="math">σ = sqrt(var(x)+ε)</span>, <span class="math">x̂ = (x−μ)/σ</span>, output <span class="math">y = γ·x̂ + β</span>. Given <span class="math">dy</span>, write <span class="math">dŷ = dy·γ</span>. Then:</p>
+
+<pre class="math block">dx = (1/σ)·[ dŷ − mean(dŷ) − x̂·mean(dŷ·x̂) ]      (per-row, two in-row reductions)
+dγ = Σ over all tokens  dy·x̂                       (per-feature, cross-row)
+dβ = Σ over all tokens  dy                          (per-feature, cross-row)</pre>
+
+<p>RMSNorm drops the mean: <span class="math">x̂ = x/σ</span> with <span class="math">σ = sqrt(mean(x²)+ε)</span>, so its dx loses the <span class="math">mean(dŷ)</span> term and keeps <span class="math">mean(dŷ·x̂)</span>. The shape of the problem is identical. The two in-row reductions are why a normalized output's gradient depends on the <em>whole</em> row — but each row stays independent, so dx is still row-per-program. The dγ/dβ lines are the trouble: their reduction axis is the <strong>token axis</strong>, the very axis dx parallelized over.</p>
+
+<h2>The dx kernel — recompute the stat, don't store x̂</h2>
+<p>The forward saved one scalar per row (<span class="math">rstd = 1/σ</span>) — same as lesson 11's wrapper. The backward reads <span class="math">x</span> and <span class="math">dy</span>, recomputes <span class="math">x̂</span> in registers, and never touches a stored normalized row. Real Triton:</p>
+
+<pre><code>@triton.jit
+def layernorm_bwd_dx_kernel(
+    dy_ptr, x_ptr, w_ptr, rstd_ptr, mean_ptr,
+    dx_ptr,
+    dw_partial_ptr, db_partial_ptr,        # [GROUPS, d] workspace
+    stride_row, N, GROUPS,
+    BLOCK: tl.constexpr,
+):
+    row  = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs &lt; N
+
+    x_row  = x_ptr  + row * stride_row
+    dy_row = dy_ptr + row * stride_row
+
+    # masked loads, promote to fp32 immediately
+    x    = tl.load(x_row  + offs, mask=mask, other=0.0).to(tl.float32)
+    dy   = tl.load(dy_row + offs, mask=mask, other=0.0).to(tl.float32)
+    w    = tl.load(w_ptr  + offs, mask=mask, other=0.0).to(tl.float32)
+
+    # recompute the row stat (one extra reduction over x — already in regs)
+    mean = tl.load(mean_ptr + row)           # LayerNorm; RMSNorm skips this
+    rstd = tl.load(rstd_ptr + row)
+    xhat = (x - mean) * rstd                  # RMSNorm: xhat = x * rstd
+
+    # dy_hat = dy * gamma, then the two IN-ROW reductions in fp32
+    dyhat = dy * w
+    c1 = tl.sum(dyhat,        axis=0) / N      # mean(dy_hat)
+    c2 = tl.sum(dyhat * xhat, axis=0) / N      # mean(dy_hat * xhat)
+    dx = (dyhat - c1 - xhat * c2) * rstd       # RMSNorm: drop the c1 term
+
+    tl.store(dx_ptr + row * stride_row + offs, dx.to(tl.bfloat16), mask=mask)
+
+    # accumulate this row's contribution into the group's partial dw/db
+    g = row % GROUPS
+    tl.atomic_add(dw_partial_ptr + g * N + offs, (dy * xhat), mask=mask)
+    tl.atomic_add(db_partial_ptr + g * N + offs, dy,          mask=mask)</code></pre>
+
+<p>The two <code>tl.sum</code> calls are the in-row reductions — warp shuffle plus SMEM, exactly the reduction primitive of lesson 06, run twice. <code>mask</code> guards the <span class="math">N</span>-vs-<span class="math">BLOCK</span> tail so <code>other=0.0</code> lanes contribute nothing. Everything that feeds a reduction is fp32; only the <code>dx</code> store casts back to bf16.</p>
+
+<div class="callout warn">
+  <div class="label">Trap · the bf16 grad accumulator</div>
+  The partial <code>dw</code>/<code>db</code> workspace MUST be fp32. Each feature slot accumulates a sum over thousands of tokens; in bf16 (only 7 mantissa bits) the running sum stops growing once it dwarfs the addend — you silently lose the tail of the batch. This is the gradient version of lesson 11's "compute the stat in fp32" rule, and it bites harder because the sum is over B·T terms, not d.
+</div>
+
+<h2>The hard half: dγ/dβ across the whole batch</h2>
+<p>Look at the last three lines of the dx kernel. Each program owns one row, but it writes into a <span class="math">[GROUPS, d]</span> buffer shared with other programs — the cross-program communication that forward norm never needed. There are three ways to combine the per-row partials, and they are the same three from lesson 28's table; here is what each looks like in Triton.</p>
+
+<h3>1 · tl.atomic_add straight to a [d] buffer</h3>
+<pre><code># every row atomically adds into the SAME d slots
+tl.atomic_add(dw_ptr + offs, dy * xhat, mask=mask)
+tl.atomic_add(db_ptr + offs, dy,        mask=mask)</code></pre>
+<p>Simplest to write, no second kernel. But with B·T programs hammering <span class="math">d</span> slots, contention is brutal on hot features, and — fatally — the <em>order</em> of fp32 atomic adds is nondeterministic, so two identical runs produce bitwise-different gradients. That is a debugging nightmare in training (lesson 28 / the CUDA track's reproducibility argument).</p>
+
+<h3>2 · grouped partial buffers + a tiny reduce kernel</h3>
+<p>This is what the kernel above does. Instead of B·T writers per slot, you fix <span class="math">GROUPS</span> (say 256) partial rows; row <span class="math">r</span> accumulates into group <span class="math">r mod GROUPS</span>. Now at most <span class="math">GROUPS</span> programs touch a slot, not B·T. Then a second, trivially small kernel sums the groups:</p>
+
+<pre><code>@triton.jit
+def dw_reduce_kernel(dw_partial_ptr, db_partial_ptr, dw_ptr, db_ptr,
+                     GROUPS, N, BLOCK_N: tl.constexpr, BLOCK_G: tl.constexpr):
+    col   = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    cmask = col &lt; N
+    accw = tl.zeros((BLOCK_N,), tl.float32)
+    accb = tl.zeros((BLOCK_N,), tl.float32)
+    for g0 in range(0, GROUPS, BLOCK_G):       # walk the GROUPS axis in tiles
+        rows = g0 + tl.arange(0, BLOCK_G)
+        rmask = rows &lt; GROUPS
+        m = rmask[:, None] &amp; cmask[None, :]
+        accw += tl.sum(tl.load(dw_partial_ptr + rows[:, None]*N + col[None, :],
+                               mask=m, other=0.0), axis=0)
+        accb += tl.sum(tl.load(db_partial_ptr + rows[:, None]*N + col[None, :],
+                               mask=m, other=0.0), axis=0)
+    tl.store(dw_ptr + col, accw.to(tl.bfloat16), mask=cmask)
+    tl.store(db_ptr + col, accb.to(tl.bfloat16), mask=cmask)</code></pre>
+
+<p>This cuts contention from B·T writers per slot to at most <span class="math">GROUPS</span>, and the reduce kernel sums groups in a <em>fixed</em> order. But note the subtlety: the partial rows above are still built with <code>atomic_add</code>, and multiple rows map to the same group (<code>row mod GROUPS</code>), so the order in which they accumulate is <em>not</em> fixed — the partials are not bitwise-reproducible even though the reduce step is. For full determinism you remove the atomics entirely: give each program a <strong>disjoint contiguous block of rows</strong>, accumulate that block's partial <em>in registers</em> (it owns those rows, no one else writes the slot), and store one partial row per block. Then both the partial accumulation and the fixed-order reduce are deterministic. That disjoint-block variant — not the grouped-<code>atomic_add</code> one — is what PyTorch's native layernorm, Apex, and Liger ship. The workspace is small (a few MB; see the worked numbers) and the second pass is sub-microsecond.</p>
+
+<h3>3 · the historical lock + partial buffer (the official Triton tutorial)</h3>
+<p>Before grouped buffers became the norm, Triton's own layernorm tutorial used a <strong>lock</strong>: a small <span class="math">[GROUPS]</span> integer array of spin-locks plus a <span class="math">[GROUPS, d]</span> partial buffer. A program spins on <code>tl.atomic_cas</code> to acquire its group's lock, does a read-modify-write of that partial row, then releases:</p>
+
+<pre><code># acquire: spin until the lock for this group is free
+lock = lock_ptr + g
+while tl.atomic_cas(lock, 0, 1) == 1:
+    pass
+count = count_ptr + g
+n = tl.load(count)
+if n == 0:                      # first writer initializes
+    tl.atomic_xchg(count, 1)
+else:                           # later writers accumulate
+    partial = tl.load(dw_partial_ptr + g*N + offs, mask=mask, other=0.0)
+    new = partial + dy * xhat
+    ...                         # store back
+tl.atomic_xchg(lock, 0)         # release</code></pre>
+
+<p>The lock makes the read-modify-write atomic <em>and</em> the accumulation order fixed (deterministic), and it still needs the second reduce kernel over the <span class="math">[GROUPS, d]</span> partials. It works, but it serializes every program competing for the same group's lock — on hot groups that is real contention. The modern grouped-partial approach drops the lock entirely: each group's partial is touched by <code>atomic_add</code> (commutative, no read-modify-write you have to guard) or, if you want bitwise determinism without atomics, you assign each program a disjoint group so no slot is ever shared. The trade is the classic one:</p>
+
+<table>
+  <thead><tr><th>Approach</th><th>Writers / slot</th><th>Extra HBM</th><th>Determinism</th><th>Second kernel?</th></tr></thead>
+  <tbody>
+    <tr><td>atomic_add to [d]</td><td>B·T</td><td>0</td><td>❌ order-dependent</td><td>no</td></tr>
+    <tr><td>grouped partials via atomic_add</td><td>≤ B·T / GROUPS</td><td>GROUPS·d·4 B</td><td>❌ still order-dependent</td><td>yes (tiny)</td></tr>
+    <tr><td><strong>disjoint row-blocks + reduce</strong></td><td>1 (block owns its rows)</td><td>GROUPS·d·4 B</td><td>✅ (register accum + fixed reduce)</td><td>yes (tiny)</td></tr>
+    <tr><td>lock + partial (historical)</td><td>serialized per group</td><td>GROUPS·d·4 B</td><td>✅</td><td>yes</td></tr>
+  </tbody>
+</table>
+
+<svg viewBox="0 0 840 230" class="diagram" role="img" aria-label="dx is per-row parallel; dgamma/dbeta partials go to a grouped workspace then a reduce kernel sums groups to d">
+  <defs><marker id="n21" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <text x="20" y="22" font-size="12" font-weight="700" fill="var(--text-mute)">B·T rows, each a program — dx writes straight out, partial dγ/dβ fold into GROUPS rows</text>
+  <g font-size="10" fill="var(--text-mute)">
+    <rect class="node-bg" x="20"  y="32" width="120" height="40" rx="6"/><text x="80"  y="50" text-anchor="middle" font-weight="700" fill="var(--text)">rows → grp 0</text><text x="80"  y="66" text-anchor="middle">dx out + partial</text>
+    <rect class="node-bg" x="160" y="32" width="120" height="40" rx="6"/><text x="220" y="50" text-anchor="middle" font-weight="700" fill="var(--text)">rows → grp 1</text><text x="220" y="66" text-anchor="middle">dx out + partial</text>
+    <rect class="node-bg" x="300" y="32" width="120" height="40" rx="6"/><text x="360" y="50" text-anchor="middle" font-weight="700" fill="var(--text)">rows → grp 2</text><text x="360" y="66" text-anchor="middle">dx out + partial</text>
+    <text x="440" y="56" fill="var(--text)">…</text>
+  </g>
+  <text x="20" y="108" font-size="11" fill="var(--text-mute)">dx is independent per row. The partials reduce the B·T axis down to GROUPS:</text>
+  <rect class="node-bg" x="20" y="120" width="400" height="34" rx="6"/><text x="220" y="142" text-anchor="middle" font-size="11" font-weight="700">workspace  [GROUPS × d]  (fp32 partials)</text>
+  <path class="edge" d="M80 72 L120 120" marker-end="url(#n21)"/>
+  <path class="edge" d="M220 72 L220 120" marker-end="url(#n21)"/>
+  <path class="edge" d="M360 72 L320 120" marker-end="url(#n21)"/>
+  <rect class="node-bg" x="470" y="120" width="220" height="34" rx="6"/><text x="580" y="142" text-anchor="middle" font-size="11" font-weight="700">reduce kernel → dγ, dβ  [d]</text>
+  <path class="edge" d="M420 137 L470 137" marker-end="url(#n21)"/>
+  <text x="20" y="186" font-size="11" fill="var(--text-mute)">The reduce kernel sums GROUPS in a fixed order → deterministic. Atomics-to-[d] skip the workspace but lose that order.</text>
+</svg>
+
+<h2>Activation backward — fuse it into the epilogue</h2>
+<p>SiLU/GELU sit between matmuls in the MLP, and their backward is elementwise: <span class="math">dx = dy · f'(preact)</span>. Don't round-trip <span class="math">dpreact</span> through HBM — recompute the derivative from the saved pre-activation inside the matmul-backward epilogue, mirroring how the forward fused activation into the matmul epilogue (lesson 08). For SiLU, <span class="math">f'(x) = σ(x)·(1 + x·(1 − σ(x)))</span>:</p>
+
+<pre><code># inside the dgrad epilogue — preact was saved by the forward
+s   = tl.sigmoid(preact)                       # recompute, don't store
+dsilu = s * (1.0 + preact * (1.0 - s))         # SiLU'
+dx  = dy * dsilu                                # fused, no extra HBM pass</code></pre>
+
+<p>One saved tensor (the pre-activation), one fused multiply, zero extra HBM round-trips. Storing the derivative itself would cost a full <span class="math">d</span>-sized read for nothing — the same recompute reflex as the norm stat.</p>
+
+<h2>Worked numbers — B·T = 16384, d = 4096, bf16, H100 (3.35 TB/s)</h2>
+<ul>
+  <li><strong>dx</strong>: reads <span class="math">dy + x</span> (2 · 16384 · 4096 · 2 B = 0.27 GB), writes <span class="math">dx</span> (0.13 GB), recomputes <span class="math">σ</span> on chip. Bandwidth-bound: ~0.4 GB / 3.35 TB/s ≈ <strong>120 µs</strong>. The two <code>tl.sum</code> reductions are register/SMEM work hidden under the load latency — free.</li>
+  <li><strong>dγ/dβ partials</strong>: folded into the same dx pass (the kernel above writes them while it already has <span class="math">dy</span> and <span class="math">xhat</span> in registers), so no extra HBM read. The only added cost is the workspace: 256 groups · 4096 · 4 B = <strong>4 MB</strong>, plus a sub-microsecond reduce kernel that reads it back.</li>
+  <li><strong>If you stored x̂ instead of recomputing</strong>: +0.13 GB extra read ≈ <strong>+40 µs</strong>, a 33% slowdown on a bandwidth-bound kernel — for zero benefit. Recompute always wins for a norm.</li>
+</ul>
+
+<div class="callout warn">
+  <div class="label">Trap · wrong reduction axis</div>
+  The two in-row reductions (<code>c1</code>, <code>c2</code>) reduce along <code>axis=0</code> of the <em>row</em> (the d-axis, within one program). The dγ/dβ reduction reduces along the <em>token</em> axis (across programs, via the workspace). Mixing them up — e.g. summing dγ inside the row, or reducing dx's c2 across programs — is the single most common norm-backward bug. They live on orthogonal axes for a reason.
+</div>
+
+<h2>Interactive · dγ/dβ reduction — atomic contention vs two-pass workspace</h2>
+<p>Set the batch rows, feature width, and group count. The widget shows the atomic-to-[d] contention (writers per feature slot) against the grouped two-pass workspace cost, and flags the determinism trade.</p>
+
+<div class="widget"><div class="title">Cross-token weight-gradient reduction</div><p class="hint">Atomics-to-[d]: every row adds into the same d slots → B·T writers per slot. Grouped two-pass: ≤ GROUPS writers per slot, deterministic reduce, extra HBM = GROUPS·d·4 bytes.</p><div class="controls">
+<label class="inline">batch rows B·T <input id="t21-T" type="range" min="2048" max="131072" step="2048" value="16384"><span class="val" id="t21-T-v">16384</span></label>
+<label class="inline">feature d <input id="t21-d" type="range" min="1024" max="16384" step="256" value="4096"><span class="val" id="t21-d-v">4096</span></label>
+<label class="inline">groups <input id="t21-g" type="range" min="32" max="2048" step="32" value="256"><span class="val" id="t21-g-v">256</span></label>
+</div><canvas id="t21-canvas" class="dist-canvas" height="210"></canvas><p class="hint" id="t21-note"></p></div>
+
+<h2>Where this leaves you</h2>
+<p>You now have the two backward personalities in Triton code: the per-row dx kernel that recomputes its stat with masked fp32 reductions, and the cross-token dγ/dβ reduction with its grouped fp32 workspace and tiny reduce kernel — plus the lock/atomic alternatives and why the grouped two-pass one wins on determinism. That, with the matmul backward (lesson 19) and the fused cross-entropy backward (lesson 20), is the backward-pass core of training in Triton.</p>
+
+<p>This is the <strong>last lesson of the Triton track</strong>. The hardest backward of all — recomputing the entire N² score matrix, carrying the <span class="math">D = rowsum(dO ∘ O)</span> correction, running the two-GEMM rule inside a streaming K-loop — is FlashAttention backward, and the depth lives on the CUDA side: <a class="crumb-link" href="../../gpu_kernels/29_flash_attention_backward.html">gpu_kernels lesson 29</a>. Everything you built here (recompute-the-stat, fp32 grad accumulators, grouped reductions) is a prerequisite for reading it.</p>
+
+<footer class="lesson-nav">
+  <a href="20_fused_cross_entropy_triton.html"><span class="dir">Previous</span><span class="ttl">20 · Fused cross-entropy in Triton</span></a>
+  <a class="next" href="index.html"><span class="dir">↑ Series index</span><span class="ttl">All lessons</span></a>
+</footer>
+
+<script>
+(function(){
+  const ids=['T','d','g'];
+  const e=Object.fromEntries(ids.map(k=>[k,document.getElementById('t21-'+k)]));
+  const c=document.getElementById('t21-canvas'),ctx=c.getContext('2d'),note=document.getElementById('t21-note');
+  function draw(){
+    ids.forEach(k=>document.getElementById('t21-'+k+'-v').textContent=e[k].value);
+    c.width=c.clientWidth*devicePixelRatio;c.height=210*devicePixelRatio;ctx.setTransform(1,0,0,1,0,0);ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.clearRect(0,0,c.clientWidth,210);
+    const T=+e.T.value,d=+e.d.value,g=+e.g.value;
+    const atomicWriters=T;                 // atomics-to-[d]: every row hits the same slots
+    const groupedWriters=Math.min(g,T);    // grouped: at most GROUPS programs per slot
+    const wsMB=g*d*4/1e6;
+    const x0=300, barW=c.clientWidth-x0-100;
+    const rows=[
+      ['atomics→[d] writers / slot', Math.min(1,atomicWriters/131072), '#dc2626', atomicWriters.toLocaleString()+' writers'],
+      ['grouped writers / slot',     Math.min(1,groupedWriters/2048),  '#d97706', groupedWriters+' writers'],
+      ['two-pass workspace HBM',     Math.min(1,wsMB/100),             '#16a34a', wsMB.toFixed(1)+' MB'],
+    ];
+    rows.forEach(([n,frac,col,lbl],i)=>{
+      const y=24+i*46,w=frac*barW;
+      ctx.fillStyle='#eef1f5';ctx.fillRect(x0,y,barW,24);
+      ctx.fillStyle=col;ctx.fillRect(x0,y,w,24);
+      ctx.fillStyle='#1f2430';ctx.font='12px sans-serif';ctx.fillText(n,12,y+16);
+      ctx.fillStyle='#1f2430';ctx.fillText(lbl,x0+w+6,y+16);
+    });
+    ctx.fillStyle='#5b6573';ctx.font='12px sans-serif';
+    ctx.fillText('Fewer groups → smaller workspace + cheaper reduce, but each group reduces more rows serially.',12,178);
+    ctx.fillText('More groups → less per-slot contention, but bigger workspace and a fatter reduce pass.',12,196);
+    note.textContent='Grouped workspace = '+wsMB.toFixed(1)+' MB — negligible vs the '+(T*d*2/1e9).toFixed(2)+' GB activation — cuts writers-per-slot from '+atomicWriters.toLocaleString()+' (atomics) to '+groupedWriters+', and stays bitwise-deterministic. Atomics-to-[d] skip the '+wsMB.toFixed(1)+' MB but lose reproducibility.';
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</main>
+</body>
+</html>

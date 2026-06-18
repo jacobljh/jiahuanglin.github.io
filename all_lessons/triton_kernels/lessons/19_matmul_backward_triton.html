@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>19 · Matmul backward in Triton</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">Triton kernels / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">19 · matmul backward</span>
+    <span class="step-pill">lesson 19 / 21</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Matmul backward in Triton — two tl.dot kernels</h1>
+<p class="subtitle">The CUDA track derived the rule: one forward GEMM becomes <strong>two backward GEMMs</strong>, <span class="math">dX = dY·Wᵀ</span> and <span class="math">dW = Xᵀ·dY</span>. This lesson is the Triton code. You will see that both are the lesson-09 tiled-matmul skeleton with two changes: <strong>swap the strides to read a transpose for free</strong>, and <strong>split the contraction for dW</strong> because its output can't fill the grid.</p>
+
+<div class="callout">
+  <div class="label">Builds on</div>
+  Lesson 09 (the tiled <code>tl.dot</code> GEMM you are now reversing) is the skeleton for every kernel here. The <em>concepts</em> — why two GEMMs, why dW contracts the batch, why fp32, why split-K — are derived in <strong>gpu_kernels lesson 26</strong>. We won't re-derive them; we write the Triton.
+</div>
+
+<h2>The question this lesson answers</h2>
+<p>You have a Triton forward GEMM <span class="math">Y = X·W</span>. To train through it you must produce <span class="math">dX</span> and <span class="math">dW</span> from <span class="math">dY</span>. Both name a transposed operand. Do you launch a transpose kernel first? (No.) And why does the <span class="math">dW</span> kernel — same FLOPs as the others — show 20% SM occupancy in the profiler, and what's the Triton fix?</p>
+
+<h2>The two gradients, as shapes</h2>
+<p>With <span class="math">X ∈ ℝ<sup>T×K</sup></span> (T = batch·tokens), <span class="math">W ∈ ℝ<sup>K×N</sup></span>, <span class="math">Y ∈ ℝ<sup>T×N</sup></span>, and upstream <span class="math">dY ∈ ℝ<sup>T×N</sup></span>:</p>
+<pre class="math block">dX = dY · Wᵀ      shape T×K,  contracts over N
+dW = Xᵀ · dY      shape K×N,  contracts over T (batch·tokens!)</pre>
+<p>Same FLOP count as the forward (2·T·K·N) for each. The difference that matters for the code is the <strong>contraction dimension</strong> and the <strong>transposed operand</strong>, summarised here so you can read the kernels against it:</p>
+<table>
+  <thead><tr><th>GEMM</th><th>Out (M×N)</th><th>Contract</th><th>Transpose</th><th>Triton consequence</th></tr></thead>
+  <tbody>
+    <tr><td>forward <span class="math">Y=XW</span></td><td>T×N</td><td>K</td><td>—</td><td>lesson 09, as-is</td></tr>
+    <tr><td><span class="math">dX = dY·Wᵀ</span></td><td>T×K</td><td>N</td><td>W read as Wᵀ</td><td>swap W's strides</td></tr>
+    <tr><td><span class="math">dW = Xᵀ·dY</span></td><td>K×N</td><td>T</td><td>X read as Xᵀ</td><td>swap X's strides + split-K</td></tr>
+  </tbody>
+</table>
+
+<h2>The transpose is a stride swap, not a kernel</h2>
+<p>A matrix in memory is a base pointer plus two strides. "Transpose" means: when you build the pointer block, multiply the <em>row</em> index by the <em>column</em> stride and vice-versa. The bytes never move. For <span class="math">W ∈ ℝ<sup>K×N</sup></span> stored row-major (<code>stride_wk = N</code>, <code>stride_wn = 1</code>), reading the <em>(n, k)</em> element of <span class="math">Wᵀ</span> is just:</p>
+<pre><code># W[k, n]  lives at  w_ptr + k*stride_wk + n*stride_wn
+# Wᵀ[n, k] is the SAME element — index it with the strides swapped:
+#   w_ptr + n*stride_wn + k*stride_wk
+# In the dX kernel we want a (BN × BK) tile of Wᵀ, contracting over N:
+w_block = w_ptr + offs_n[:, None]*stride_wn + (k + offs_k)[None, :]*stride_wk
+#                  ^ N index on rows           ^ K index on cols
+#                    (the row stride is the SMALL one — that's the "transpose")</code></pre>
+<p>Compare to the lesson-09 forward, which read <code>W[k, n]</code> with <code>(k+offs_k)[:,None]*stride_wk + offs_n[None,:]*stride_wn</code>. Same pointer, the two <code>arange</code>s have traded which stride they scale. That is the entire transpose.</p>
+
+<div class="callout">
+  <div class="label">The catch the profiler shows</div>
+  Tensor-core <code>mma</code> wants its fragments in a particular layout (lesson 09). One transpose orientation lowers to a clean <code>wgmma</code>; the other may insert an in-SMEM transpose. So a backward GEMM can be measurably slower than the identically-sized forward — extra SMEM traffic, not extra math. You still never materialise the transpose; you let Triton handle the layout conversion inside the kernel.
+</div>
+
+<h2>Kernel 1 · dX = dY · Wᵀ</h2>
+<p>This is the lesson-09 skeleton verbatim, with <span class="math">A = dY</span> (T×N), <span class="math">B = Wᵀ</span> (N×K), output <span class="math">dX</span> (T×K), contracting over <strong>N</strong>. Only the <code>w</code> load differs from forward — its strides are swapped.</p>
+<pre><code>@triton.jit
+def dx_kernel(
+    dy_ptr, w_ptr, dx_ptr,
+    T, K, N,
+    s_dy_t, s_dy_n,            # dY strides (T×N)
+    s_w_k, s_w_n,              # W  strides (K×N) — NOT transposed in memory
+    s_dx_t, s_dx_k,           # dX strides (T×K)
+    BT: tl.constexpr, BK: tl.constexpr, BN: tl.constexpr,
+):
+    pid_t = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_t = pid_t*BT + tl.arange(0, BT)        # rows of dX  (T)
+    offs_k = pid_k*BK + tl.arange(0, BK)        # cols of dX  (K)
+    offs_n = tl.arange(0, BN)                    # contraction (N)
+
+    acc = tl.zeros((BT, BK), dtype=tl.float32)   # fp32 accumulator, always
+    for n in range(0, N, BN):
+        nn = n + offs_n
+        dy = tl.load(                            # dY tile  (BT × BN)
+            dy_ptr + offs_t[:, None]*s_dy_t + nn[None, :]*s_dy_n,
+            mask=(offs_t[:, None] &lt; T) &amp; (nn[None, :] &lt; N), other=0.,
+        )
+        # Wᵀ tile (BN × BK): index N on the ROW, K on the COL —
+        # i.e. multiply offs by s_w_n (rows) and s_w_k (cols). Stride swap = transpose.
+        wt = tl.load(
+            w_ptr + nn[:, None]*s_w_n + offs_k[None, :]*s_w_k,
+            mask=(nn[:, None] &lt; N) &amp; (offs_k[None, :] &lt; K), other=0.,
+        )
+        acc = tl.dot(dy, wt, acc)                # tensor cores fire
+
+    tl.store(
+        dx_ptr + offs_t[:, None]*s_dx_t + offs_k[None, :]*s_dx_k,
+        acc.to(tl.bfloat16),
+        mask=(offs_t[:, None] &lt; T) &amp; (offs_k[None, :] &lt; K),
+    )</code></pre>
+<p>Grid is <code>(cdiv(T, BT), cdiv(K, BK))</code> — one program per output tile of <span class="math">dX</span>. Because the output is <em>T×K</em> (T is huge), the grid is large and fills the GPU exactly like the forward. <span class="math">dX</span> is the easy backward GEMM.</p>
+
+<h2>Kernel 2 · dW = Xᵀ · dY — and why it starves</h2>
+<p>Now <span class="math">A = Xᵀ</span> (K×T), <span class="math">B = dY</span> (T×N), output <span class="math">dW</span> (K×N), contracting over <strong>T</strong>. The output is only K×N — the <em>weight</em> shape. Tiled at 128×128 that is <code>⌈K/128⌉·⌈N/128⌉</code> tiles. For K = 4096, N = 14336 that's 32·112 = 3584 tiles — fine. But shrink the layer (K = 1024, N = 1024 ⇒ 64 tiles) and you have fewer tiles than the ~132 SMs: most of the GPU is idle. Meanwhile the contraction T = tens of thousands is enormous. That mismatch is what split-K fixes.</p>
+
+<svg viewBox="0 0 760 240" class="diagram" role="img" aria-label="dW output is small KxN tiled across few blocks; split-K partitions the long T contraction across the third grid axis, each program writing a partial dW">
+  <defs><marker id="m19" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <g font-size="11" fill="var(--text-mute)">
+    <text x="20" y="22" font-weight="700" fill="var(--text)">dW = Xᵀ · dY      (contract T = batch·tokens)</text>
+
+    <g transform="translate(20,40)">
+      <rect width="60" height="120" fill="#dbeafe" stroke="#bfdbfe"/>
+      <text x="30" y="-6" text-anchor="middle" font-weight="700" fill="var(--text)">Xᵀ</text>
+      <text x="30" y="64" text-anchor="middle" font-family="var(--mono)">K×T</text>
+      <line x1="0" y1="40" x2="60" y2="40" stroke="#dc2626" stroke-dasharray="3,3"/>
+      <line x1="0" y1="80" x2="60" y2="80" stroke="#dc2626" stroke-dasharray="3,3"/>
+    </g>
+    <text x="92" y="105" font-size="16" fill="var(--text)">·</text>
+    <g transform="translate(110,40)">
+      <rect width="160" height="120" fill="#dcfce7" stroke="#86efac"/>
+      <text x="80" y="-6" text-anchor="middle" font-weight="700" fill="var(--text)">dY</text>
+      <text x="80" y="64" text-anchor="middle" font-family="var(--mono)">T×N</text>
+      <line x1="0" y1="40" x2="160" y2="40" stroke="#dc2626" stroke-dasharray="3,3"/>
+      <line x1="0" y1="80" x2="160" y2="80" stroke="#dc2626" stroke-dasharray="3,3"/>
+    </g>
+    <text x="285" y="105" font-size="16" fill="var(--text)">=</text>
+    <text x="200" y="190" text-anchor="middle" fill="var(--bad)">T split into 3 chunks → 3 grid programs per output tile</text>
+
+    <g transform="translate(320,55)">
+      <rect width="90" height="90" fill="#fef3c7" stroke="#fcd34d"/>
+      <text x="45" y="-6" text-anchor="middle" font-weight="700" fill="var(--text)">dW</text>
+      <text x="45" y="50" text-anchor="middle" font-family="var(--mono)">K×N (small!)</text>
+    </g>
+    <text x="430" y="80" fill="var(--text)" font-weight="700">split-K:</text>
+    <text x="430" y="100">each program computes a PARTIAL dW over its T-chunk,</text>
+    <text x="430" y="118">then all partials are summed (atomic_add or a reduction kernel)</text>
+    <text x="430" y="142" fill="var(--bad)">few output tiles + long T  ⇒  partition T across SMs</text>
+    <line x1="416" y1="100" x2="412" y2="100" stroke="var(--text-dim)" marker-end="url(#m19)"/>
+  </g>
+</svg>
+
+<p>The Triton move: add a <strong>third grid axis over K-splits</strong>. Each program owns one output tile <em>and</em> one slice of the T-contraction, computes a partial sum, and adds it into <span class="math">dW</span>.</p>
+
+<pre><code>@triton.jit
+def dw_kernel(
+    x_ptr, dy_ptr, dw_ptr,
+    T, K, N,
+    s_x_t, s_x_k,             # X strides (T×K) — NOT transposed in memory
+    s_dy_t, s_dy_n,           # dY strides (T×N)
+    s_dw_k, s_dw_n,           # dW strides (K×N)
+    SPLIT_T: tl.constexpr,     # number of T-chunks (the split-K factor)
+    BK: tl.constexpr, BN: tl.constexpr, BT: tl.constexpr,
+):
+    pid_k = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_s = tl.program_id(2)              # which slice of T this program owns
+
+    offs_k = pid_k*BK + tl.arange(0, BK)  # rows of dW   (K)
+    offs_n = pid_n*BN + tl.arange(0, BN)  # cols of dW   (N)
+    offs_t = tl.arange(0, BT)             # contraction within my T-slice
+
+    # this program walks only its chunk of T:  [t0, t0 + chunk)
+    chunk = tl.cdiv(T, SPLIT_T)
+    t0 = pid_s * chunk
+    t_end = tl.minimum(t0 + chunk, T)
+
+    acc = tl.zeros((BK, BN), dtype=tl.float32)
+    for t in range(t0, t_end, BT):
+        tt = t + offs_t
+        # Xᵀ tile (BK × BT): K on the ROW, T on the COL — strides swapped.
+        xt = tl.load(
+            x_ptr + offs_k[:, None]*s_x_k + tt[None, :]*s_x_t,
+            mask=(offs_k[:, None] &lt; K) &amp; (tt[None, :] &lt; t_end), other=0.,
+        )
+        dy = tl.load(                     # dY tile (BT × BN)
+            dy_ptr + tt[:, None]*s_dy_t + offs_n[None, :]*s_dy_n,
+            mask=(tt[:, None] &lt; t_end) &amp; (offs_n[None, :] &lt; N), other=0.,
+        )
+        acc = tl.dot(xt, dy, acc)
+
+    dw_block = dw_ptr + offs_k[:, None]*s_dw_k + offs_n[None, :]*s_dw_n
+    mask = (offs_k[:, None] &lt; K) &amp; (offs_n[None, :] &lt; N)
+    if SPLIT_T == 1:
+        tl.store(dw_block, acc.to(tl.float32), mask=mask)   # only writer, plain store
+    else:
+        tl.atomic_add(dw_block, acc, mask=mask)             # many writers per tile</code></pre>
+
+<p>Grid is <code>(cdiv(K, BK), cdiv(N, BN), SPLIT_T)</code>. With <code>SPLIT_T = 1</code> it is the plain GEMM; with <code>SPLIT_T = 8</code> each output tile is computed by 8 programs that each cover one-eighth of T and atomic-add their partial in. You have turned 64 idle tiles into 512 programs — enough to fill the SMs.</p>
+
+<h2>Atomics buy occupancy, cost determinism</h2>
+<p><code>tl.atomic_add</code> into the fp32 <span class="math">dW</span> buffer is the cheap split-K reduction, but the partials land in <strong>nondeterministic order</strong>, and fp32 addition is not associative — so two runs give bit-different gradients. That breaks exact reproducibility. The deterministic alternative is a workspace: each split writes its partial to <code>dw_partial[s]</code> (shape SPLIT_T×K×N) with a plain store, then a second kernel reduces along the split axis:</p>
+<pre><code># deterministic split-K: partials to workspace, then a fixed-order reduction
+#   dw_kernel writes dw_partial[pid_s]  (no atomics)
+@triton.jit
+def dw_reduce_kernel(part_ptr, dw_ptr, SPLIT_T, KN, s_split, BLK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid*BLK + tl.arange(0, BLK)
+    acc = tl.zeros((BLK,), dtype=tl.float32)
+    for s in range(SPLIT_T):                      # fixed order ⇒ deterministic
+        acc += tl.load(part_ptr + s*s_split + offs, mask=offs &lt; KN, other=0.)
+    tl.store(dw_ptr + offs, acc, mask=offs &lt; KN)</code></pre>
+<p>One extra pass over a SPLIT_T×K×N workspace (HBM traffic, not FLOPs). Use atomics by default; switch to the workspace reduction only when you need bitwise reproducibility (debugging a divergence, or a determinism SLA).</p>
+
+<h2>Accumulate into the grad buffer, never overwrite</h2>
+<p>Weight gradients are accumulated, not assigned: across micro-batches (gradient accumulation) and across uses of a shared/tied weight, the contributions sum. So even <code>SPLIT_T == 1</code> should read-modify-write when the buffer may already hold a partial:</p>
+<pre><code># grad-accumulation friendly: add into whatever is already there.
+prev = tl.load(dw_block, mask=mask, other=0.)
+tl.store(dw_block, prev + acc, mask=mask)
+# (with SPLIT_T &gt; 1, tl.atomic_add already does += atomically.)</code></pre>
+<p>The buffer is fp32 even in a bf16 model: repeated accumulation into bf16 drifts. Zero it only at the optimizer-step boundary.</p>
+
+<h2>Worked numbers: one MLP up-projection, 7B-class</h2>
+<p>K = 4096 (d_model), N = 14336 (d_ff), T = 8192 (batch·tokens), bf16. H100: ~490 TFLOP/s sustained bf16, 3.35 TB/s HBM, ~132 SMs.</p>
+<table>
+  <thead><tr><th>GEMM</th><th>FLOPs</th><th>Output tiles (128²)</th><th>Time @ 490 TFLOP/s</th></tr></thead>
+  <tbody>
+    <tr><td>forward <span class="math">Y=XW</span></td><td>2·8192·4096·14336 ≈ 0.96 TFLOP</td><td>⌈T/128⌉·⌈N/128⌉ = 64·112 = 7168</td><td>≈ 1.96 ms</td></tr>
+    <tr><td><span class="math">dX = dY·Wᵀ</span></td><td>0.96 TFLOP</td><td>64·32 = 2048</td><td>≈ 1.96 ms</td></tr>
+    <tr><td><span class="math">dW = Xᵀ·dY</span></td><td>0.96 TFLOP</td><td>32·112 = 3584</td><td>≈ 1.96 ms (ideal); slower in practice</td></tr>
+  </tbody>
+</table>
+<p>Three ~0.96 TFLOP GEMMs ≈ 2.9 TFLOP/layer/step → ~5.9 ms of GEMM at sustained rate. At <em>this</em> shape dW's 3584 tiles already exceed 132 SMs, so split-K isn't strictly needed — but the transpose layout conversion and the fp32 atomic epilogue still make dW the slowest of the three. Shrink the layer (attention's K=N=4096 q/k/v projections, or a small adapter) and dW's tile count drops below 132 → split-K becomes mandatory. The widget below lets you find that crossover.</p>
+
+<h2>The traps, collected</h2>
+<table>
+  <thead><tr><th>Trap</th><th>Symptom</th><th>Fix</th></tr></thead>
+  <tbody>
+    <tr><td>bf16 accumulator</td><td>Loss plateaus high; grads "noisy" — T-sum loses low bits.</td><td><code>acc = tl.zeros(..., tl.float32)</code> and an fp32 grad buffer.</td></tr>
+    <tr><td>Materialising the transpose</td><td>A transpose kernel in the trace; doubled HBM on W/X.</td><td>Swap which stride each <code>tl.arange</code> scales. Data never moves.</td></tr>
+    <tr><td>dW under-occupied</td><td>dW GEMM slow, low SM%, despite matching FLOPs.</td><td>Third grid axis over T-splits; atomic_add or reduce partials.</td></tr>
+    <tr><td>Atomic nondeterminism</td><td>Bit-different loss across runs; failed reproducibility.</td><td>Workspace + fixed-order reduction kernel when determinism required.</td></tr>
+    <tr><td>Overwriting the grad</td><td>Grad accumulation / weight tying silently broken.</td><td><code>+=</code> into the buffer; zero only at the step boundary.</td></tr>
+  </tbody>
+</table>
+
+<h2>Interactive · find dW's split-K crossover</h2>
+<p>Set the layer shape and batch. The bars show the three GEMM FLOPs (all equal). The readout shows dW's output-tile count against the ~132 SMs, and the split-K factor needed to fill the grid. Shrink K and N (or grow T) to watch dW starve.</p>
+
+<div class="widget"><div class="title">Three GEMMs · dW occupancy &amp; split-K</div><p class="hint">dW output is K×N, tiled at 128×128 ⇒ ⌈K/128⌉·⌈N/128⌉ tiles. Fewer than ~132 SMs ⇒ under-occupied ⇒ split the T-contraction so every SM has a partial dW to compute.</p><div class="controls">
+<label class="inline">K (in-features) <input id="t19-K" type="range" min="512" max="16384" step="256" value="4096"><span class="val" id="t19-K-v">4096</span></label>
+<label class="inline">N (out-features) <input id="t19-N" type="range" min="512" max="28672" step="256" value="14336"><span class="val" id="t19-N-v">14336</span></label>
+<label class="inline">T (batch·tokens) <input id="t19-T" type="range" min="1024" max="131072" step="1024" value="8192"><span class="val" id="t19-T-v">8192</span></label>
+</div><canvas id="t19-canvas" class="dist-canvas" height="230"></canvas><p class="hint" id="t19-note"></p></div>
+
+<h2>What's next</h2>
+<p>You can write both backward GEMMs, read a transpose as a stride swap, and split the dW contraction across the grid with the determinism trade-off in hand. Lesson 20 takes the matmul-into-a-loss case — the logits projection — where the forward GEMM and its backward must be <strong>fused</strong>, because materialising the [T, V] softmax and its gradient would blow the memory budget. Same two-GEMM rule, now with the softmax folded into the epilogue.</p>
+
+<footer class="lesson-nav">
+  <a href="18_backward_in_triton.html"><span class="dir">Previous</span><span class="ttl">18 · Backward in Triton</span></a>
+  <a class="next" href="20_fused_cross_entropy_triton.html"><span class="dir">Next →</span><span class="ttl">20 · Fused cross-entropy in Triton</span></a>
+</footer>
+
+<script>
+(function(){
+  const ids=['K','N','T'];
+  const e=Object.fromEntries(ids.map(k=>[k,document.getElementById('t19-'+k)]));
+  const c=document.getElementById('t19-canvas'),ctx=c.getContext('2d'),note=document.getElementById('t19-note');
+  const SMS=132, TILE=128;
+  function draw(){
+    ids.forEach(k=>document.getElementById('t19-'+k+'-v').textContent=e[k].value);
+    c.width=c.clientWidth*devicePixelRatio;c.height=230*devicePixelRatio;
+    ctx.setTransform(1,0,0,1,0,0);ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.clearRect(0,0,c.clientWidth,230);
+    const K=+e.K.value,N=+e.N.value,T=+e.T.value;
+    const flop=2*T*K*N;
+    const rows=[
+      ['forward  Y=XW   (contract K)', flop, '#2563eb'],
+      ['dX = dY·Wᵀ      (contract N)', flop, '#7c3aed'],
+      ['dW = Xᵀ·dY      (contract T)', flop, '#dc2626'],
+    ];
+    const max=flop*1.05;
+    rows.forEach(function(r,i){
+      var n=r[0],v=r[1],col=r[2];
+      var y=20+i*38, w=(c.clientWidth-300)*v/max;
+      ctx.fillStyle='#eef1f5';ctx.fillRect(290,y,c.clientWidth-300,22);
+      ctx.fillStyle=col;ctx.fillRect(290,y,w,22);
+      ctx.fillStyle='#1f2430';ctx.font='12px monospace';ctx.fillText(n,12,y+15);
+      ctx.fillStyle='#1f2430';ctx.font='12px sans-serif';ctx.fillText((v/1e12).toFixed(2)+' T',296+w+4,y+15);
+    });
+    const dwTiles=Math.ceil(K/TILE)*Math.ceil(N/TILE);
+    const fwdTiles=Math.ceil(T/TILE)*Math.ceil(N/TILE);
+    ctx.fillStyle='#1f2430';ctx.font='12px sans-serif';
+    ctx.fillText('forward output tiles: '+fwdTiles+'   (≫ '+SMS+' SMs → full)',12,158);
+    ctx.fillStyle = dwTiles<SMS ? '#b91c1c' : '#16a34a';
+    ctx.fillText('dW output tiles: '+dwTiles+(dwTiles<SMS?'  < '+SMS+' SMs → UNDER-OCCUPIED':'  ≥ SMs → ok'),12,180);
+    const splitK = dwTiles<SMS ? Math.ceil(SMS/dwTiles) : 1;
+    ctx.fillStyle='#5b6573';
+    ctx.fillText('SPLIT_T to fill the grid: '+splitK+'  (each program adds a partial dW in fp32)',12,202);
+    note.textContent = dwTiles<SMS
+      ? 'dW under-fills the GPU: its small K×N output makes only '+dwTiles+' tiles for '+SMS+' SMs. Set SPLIT_T='+splitK+' to partition the T-contraction so every SM gets a partial dW, then atomic_add (fast) or reduce the partials in a second kernel (deterministic).'
+      : 'dW output is large enough to fill the SMs here (SPLIT_T=1). Shrink K and N, or grow T, to watch dW starve and split-K turn on.';
+  }
+  Object.values(e).forEach(function(x){x.addEventListener('input',draw);});draw();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</main>
+</body>
+</html>

@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>20 · Fused cross-entropy in Triton</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">Triton kernels / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">20 · fused cross-entropy</span>
+    <span class="step-pill">lesson 20 / 21</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Fused cross-entropy in Triton — the memory kernel</h1>
+<p class="subtitle">The logits tensor is the biggest thing a language model ever holds, and the naive loss path keeps <strong>three copies</strong> of it. This lesson is the Triton mechanics of making all three vanish: an <code>@triton.jit</code> kernel that online-softmaxes a row of logits, writes <span class="math">dlogits</span> in place over the same buffer, and — the bigger win — never materializes the logits at all by chunking the lm-head matmul over tokens.</p>
+
+<div class="callout">
+  <div class="label">Builds on</div>
+  The running-max recurrence is the <strong>online softmax of lesson 10</strong> — same <span class="math">(m, ℓ)</span> update, now reducing over the vocabulary V instead of a sequence. The chunked-matmul trick uses the <strong>two-GEMM backward rule of lesson 19</strong>. The <em>concept</em> (why logits are the biggest tensor, the <span class="math">dlogits = (p − y)/N</span> identity, the ~24× memory cut) is <strong>CUDA lesson 27</strong> — read that for the architecture; this lesson is the Triton code.
+</div>
+
+<h2>The question this lesson answers</h2>
+<p>You know from CUDA lesson 27 that the loss is the memory bottleneck and that the fused kernel cuts it ~24×. But what does the kernel actually look like in Triton? How do you online-softmax a 128k-wide row in <code>BLOCK_V</code> tiles, write the gradient back over the probabilities buffer, and fold in <code>ignore_index</code> and label smoothing without a second pass — all while keeping the loss accumulation in fp32 so it doesn't drift?</p>
+
+<h2>Why this is a memory kernel, not a compute kernel</h2>
+<p>Recall the shapes (CUDA lesson 27). With <span class="math">B·T = 8192</span>, <span class="math">V = 128256</span>, <span class="math">d = 4096</span>, bf16:</p>
+<table>
+<thead><tr><th>Tensor</th><th>Shape</th><th>Size</th></tr></thead>
+<tbody>
+<tr><td>hidden activation X</td><td>(B·T)×d</td><td>8192 · 4096 · 2 = 0.067 GB</td></tr>
+<tr><td><strong>logits</strong></td><td>(B·T)×V</td><td>8192 · 128256 · 2 = <strong>2.10 GB</strong></td></tr>
+<tr><td>probs (softmax)</td><td>(B·T)×V</td><td>2.10 GB</td></tr>
+<tr><td>dlogits</td><td>(B·T)×V</td><td>2.10 GB</td></tr>
+</tbody>
+</table>
+<p>Three full <span class="math">(B·T)×V</span> tensors = <strong>6.3 GB</strong> for one tensor's worth of information, because <span class="math">V ≫ d</span>. The arithmetic per element is trivial (one <code>exp</code>, one subtract); every byte is read and written about once. This kernel's roofline is HBM bandwidth, not the tensor cores. The whole game is keeping bytes off HBM.</p>
+
+<h2>The identity that lets probs and dlogits share a buffer</h2>
+<p>Cross-entropy on softmax has the cleanest backward in deep learning. With <span class="math">p = softmax(logits)</span>, one-hot label <span class="math">y</span>, over N counted tokens:</p>
+<pre class="math block">loss = logsumexp(logits) − logits[true]   =   (m + log ℓ) − logits[true]
+dlogits = (p − y) / N</pre>
+<p>The gradient <em>is</em> the softmax, minus 1 at the true class, scaled by <span class="math">1/N</span>. So you never need a separate <span class="math">dlogits</span> tensor: compute <span class="math">p</span> into the logits buffer, then subtract the one-hot in place. <strong>probs and dlogits are the same buffer at two instants.</strong> Three tensors collapse to one — and trick 2 removes even that one.</p>
+
+<h2>The Triton kernel — one program per row</h2>
+<p>The first kernel assumes the logits already exist in HBM (you'll drop that assumption with trick 2). Each program owns one row of length V, walks it in <code>BLOCK_V</code> tiles, runs the lesson-10 recurrence to get <span class="math">(m, ℓ)</span>, then walks the row a second time writing <span class="math">dlogits</span> in place. Loss and the running sum stay in fp32.</p>
+
+<pre><code>import torch, triton, triton.language as tl
+
+@triton.jit
+def ce_fused_kernel(
+    logits_ptr,                 # [N_ROWS, V]  in/out: logits in, dlogits out (same buffer)
+    labels_ptr,                 # [N_ROWS]     int64 true class, or ignore_index
+    loss_ptr,                   # [N_ROWS]     fp32 per-row loss out
+    stride_row,                 # row stride of logits (in elements)
+    V, n_valid,                 # vocab size; number of non-ignored tokens (the 1/N divisor)
+    ignore_index,
+    smoothing,                  # label smoothing eps in [0, 1)
+    BLOCK_V: tl.constexpr,
+):
+    row = tl.program_id(0)
+    base = logits_ptr + row * stride_row
+    label = tl.load(labels_ptr + row)
+
+    # ignored row: zero its gradient, contribute no loss, return early
+    if label == ignore_index:
+        for off in range(0, V, BLOCK_V):
+            cols = off + tl.arange(0, BLOCK_V)
+            tl.store(base + cols, tl.zeros([BLOCK_V], tl.float32), mask=cols &lt; V)
+        tl.store(loss_ptr + row, 0.0)
+        return
+
+    # ---- pass 1: online softmax over the V dimension (lesson 10 recurrence) ----
+    m = -float('inf')           # running max   (fp32)
+    l = 0.0                     # running sum-of-exp at the current max (fp32)
+    for off in range(0, V, BLOCK_V):
+        cols = off + tl.arange(0, BLOCK_V)
+        x = tl.load(base + cols, mask=cols &lt; V, other=-float('inf')).to(tl.float32)
+        cm = tl.max(x, axis=0)
+        new_m = tl.maximum(m, cm)
+        l = l * tl.exp(m - new_m) + tl.sum(tl.exp(x - new_m), axis=0)
+        m = new_m
+
+    lse = m + tl.log(l)         # logsumexp, fully fp32 stable
+
+    # true-class logit (re-read just that one element)
+    x_true = tl.load(base + label).to(tl.float32)
+
+    # ---- loss, with label smoothing folded in ----
+    # hard CE: lse - x_true.  smoothing mixes in the mean logit: see note below.
+    loss = lse - x_true
+    if smoothing &gt; 0.0:
+        # smoothed target puts (1-eps) on true, eps/V on every class:
+        #   loss = (1-eps)*(lse - x_true) + eps*(lse - mean_logit)
+        # mean_logit needs a sum of logits; fold it into pass 1 in practice.
+        pass
+    tl.store(loss_ptr + row, loss / n_valid)
+
+    # ---- pass 2: write dlogits = (p - onehot)/N in place over the logits buffer ----
+    inv_l = 1.0 / l
+    for off in range(0, V, BLOCK_V):
+        cols = off + tl.arange(0, BLOCK_V)
+        x = tl.load(base + cols, mask=cols &lt; V, other=0.0).to(tl.float32)
+        p = tl.exp(x - m) * inv_l                       # softmax, recomputed from (m, l)
+        g = p - tl.where(cols == label, 1.0, 0.0)       # subtract the one-hot
+        g = g / n_valid                                 # scale by 1/N
+        tl.store(base + cols, g, mask=cols &lt; V)          # in place: overwrite logits</code></pre>
+
+<p>Four things an interviewer will look for:</p>
+<ul>
+  <li><strong><code>other=-float('inf')</code> on the pass-1 load.</strong> The lesson-04 boundary rule: masked lanes past V must not win the max. Use the identity of <code>max</code> (−∞) so the recurrence is unaffected.</li>
+  <li><strong>fp32 accumulators.</strong> Loads are <code>.to(tl.float32)</code> before any <code>exp</code> or reduction; <code>m</code> and <code>l</code> are fp32. A bf16 running sum over 128k terms loses the small contributions and the loss drifts vs the reference.</li>
+  <li><strong>The gradient is recomputed, not stored.</strong> Pass 1 keeps only <span class="math">(m, ℓ)</span> — two scalars. Pass 2 re-derives <span class="math">p = exp(x − m)/ℓ</span> from them and writes the gradient straight over the logits. No probs tensor ever exists.</li>
+  <li><strong><code>other=0.0</code> on the pass-2 load.</strong> Now we're computing <code>exp</code> values that get masked-stored anyway; 0.0 is harmless and avoids an <code>exp(-inf)</code> in lanes we won't write.</li>
+</ul>
+
+<div class="callout">
+  <div class="label">The wrapper picks the divisor and the tile</div>
+  <pre><code>def fused_ce(logits, labels, ignore_index=-100, smoothing=0.0):
+    N_ROWS, V = logits.shape
+    n_valid = (labels != ignore_index).sum().item()    # the 1/N divisor (counted once)
+    loss = torch.empty(N_ROWS, device=logits.device, dtype=torch.float32)
+    BLOCK_V = 16384 if V &gt; 16384 else triton.next_power_of_2(V)
+    ce_fused_kernel[(N_ROWS,)](
+        logits, labels, loss, logits.stride(0),
+        V, n_valid, ignore_index, smoothing,
+        BLOCK_V=BLOCK_V, num_warps=8,
+    )
+    return loss.sum(), logits        # logits buffer now holds dlogits</code></pre>
+  <code>n_valid</code> is the number of non-ignored tokens — the <span class="math">N</span> in <span class="math">(p − y)/N</span> — computed once on the host so every row divides by the same scalar.
+</div>
+
+<h2>ignore_index and label smoothing in the same pass</h2>
+<p>Both fold into the single fused pass — that's the point of fusing. <strong>ignore_index</strong> is the early-return branch: a padded/ignored row writes a zero gradient row and contributes 0 to the loss, and it is excluded from <code>n_valid</code> so it doesn't dilute the average. <strong>Label smoothing</strong> with eps spreads <span class="math">eps/V</span> probability mass onto every class and <span class="math">1 − eps</span> on the true one. The loss becomes</p>
+<pre class="math block">loss = (1 − eps)·(lse − x_true) + eps·(lse − mean_logit)</pre>
+<p>where <span class="math">mean_logit = (1/V)·Σ logits</span> — one extra running sum you accumulate alongside <span class="math">ℓ</span> in pass 1. The gradient picks up a uniform <span class="math">−eps/V</span> on every class plus the usual <span class="math">−(1 − eps)</span> at the true index. Same two passes, a couple more fp32 scalars carried between them; no second materialization.</p>
+
+<h2>Trick 2 · chunk the lm-head matmul so logits never materialize</h2>
+<p>The kernel above still needs the full <span class="math">(B·T)×V</span> logits in HBM. The bigger win (CUDA lesson 27) is to never compute them as one tensor. The logits come from a matmul <span class="math">logits = X·Wᵀ</span> with X of shape <span class="math">(B·T)×d</span> and W of shape <span class="math">V×d</span>. Loop over <strong>token chunks</strong>: for a chunk of rows <span class="math">X<sub>c</sub></span>, compute just that chunk's logits on chip, turn them into loss + gradient, push the gradient straight through the lesson-19 two-GEMM backward, and throw the chunk away.</p>
+
+<svg viewBox="0 0 860 250" class="diagram" role="img" aria-label="Naive path materializes three full logit-sized tensors; fused path streams token chunks and writes only loss and gradients">
+  <defs><marker id="c20" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <text x="20" y="22" font-size="12" font-weight="700" fill="#b91c1c">NAIVE — three full (B·T)×V tensors in HBM</text>
+  <g font-size="11" fill="var(--text-mute)">
+    <rect class="node-bg" x="20" y="32" width="120" height="44" rx="6"/><text x="80" y="52" text-anchor="middle" font-weight="700" fill="var(--text)">matmul</text><text x="80" y="68" text-anchor="middle">→ logits 2.1 GB</text>
+    <rect class="node-bg" x="180" y="32" width="120" height="44" rx="6"/><text x="240" y="52" text-anchor="middle" font-weight="700" fill="var(--text)">softmax</text><text x="240" y="68" text-anchor="middle">→ probs 2.1 GB</text>
+    <rect class="node-bg" x="340" y="32" width="120" height="44" rx="6"/><text x="400" y="52" text-anchor="middle" font-weight="700" fill="var(--text)">CE bwd</text><text x="400" y="68" text-anchor="middle">→ dlogits 2.1 GB</text>
+    <rect class="node-bg" x="500" y="32" width="120" height="44" rx="6"/><text x="560" y="52" text-anchor="middle" font-weight="700" fill="var(--text)">matmul bwd</text><text x="560" y="68" text-anchor="middle">→ dX, dW</text>
+    <path class="edge" d="M140 54 L180 54" marker-end="url(#c20)"/>
+    <path class="edge" d="M300 54 L340 54" marker-end="url(#c20)"/>
+    <path class="edge" d="M460 54 L500 54" marker-end="url(#c20)"/>
+    <text x="640" y="58" fill="#b91c1c">peak ≈ 6.3 GB</text>
+  </g>
+  <text x="20" y="128" font-size="12" font-weight="700" fill="#15803d">FUSED — one token chunk of logits at a time, on chip</text>
+  <g font-size="11" fill="var(--text-mute)">
+    <rect class="node-bg" x="20" y="138" width="170" height="64" rx="6"/><text x="105" y="160" text-anchor="middle" font-weight="700" fill="var(--text)">for each token chunk:</text><text x="105" y="178" text-anchor="middle">Xᶜ·Wᵀ → online softmax</text><text x="105" y="194" text-anchor="middle">→ loss += , dlogitsᶜ</text>
+    <rect class="node-bg" x="230" y="138" width="170" height="64" rx="6"/><text x="315" y="160" text-anchor="middle" font-weight="700" fill="var(--text)">same chunk, lesson 19:</text><text x="315" y="178" text-anchor="middle">dXᶜ = dlogitsᶜ·W</text><text x="315" y="194" text-anchor="middle">dW += dlogitsᶜᵀ·Xᶜ</text>
+    <rect class="node-bg" x="440" y="138" width="150" height="64" rx="6"/><text x="515" y="164" text-anchor="middle" font-weight="700" fill="var(--text)">HBM out:</text><text x="515" y="182" text-anchor="middle">scalar loss, dX, dW</text>
+    <path class="edge" d="M190 170 L230 170" marker-end="url(#c20)"/>
+    <path class="edge" d="M400 170 L440 170" marker-end="url(#c20)"/>
+    <text x="610" y="174" fill="#15803d">peak ≈ chunk +</text><text x="610" y="190" fill="#15803d">grads only</text>
+  </g>
+</svg>
+
+<p>At the algorithm level, the fused-linear-cross-entropy structure is a Python loop over chunks calling small Triton kernels — the per-chunk logits are too transient to be one giant <code>@triton.jit</code>, so libraries (Liger's <code>fused_linear_cross_entropy</code>, PyTorch's chunked CE) drive the loop in Python and fuse each chunk's softmax+CE. Per chunk:</p>
+
+<pre><code># X: [B*T, d], W: [V, d] (lm-head, weight-tied or not). CHUNK rows at a time.
+dX = torch.empty_like(X)
+dW = torch.zeros_like(W, dtype=torch.float32)     # fp32 grad accumulator
+total_loss = 0.0
+for c0 in range(0, X.shape[0], CHUNK):
+    Xc = X[c0:c0+CHUNK]                            # [CHUNK, d]
+    logits_c = Xc @ W.T                            # [CHUNK, V] transient — never the full tensor
+    # fused CE on this chunk: writes dlogits_c IN PLACE over logits_c, returns chunk loss
+    loss_c = ce_fused_kernel[(Xc.shape[0],)](logits_c, labels[c0:c0+CHUNK], ...)
+    total_loss += loss_c
+    # lesson 19 two-GEMM backward, on the chunk:
+    dX[c0:c0+CHUNK] = logits_c @ W                 # dXc = dlogits_c · W
+    dW += logits_c.T.to(torch.float32) @ Xc        # dW += dlogits_cᵀ · Xc  (accumulate fp32)
+    del logits_c                                   # the only big buffer — freed each iteration</code></pre>
+
+<p>The full <span class="math">(B·T)×V</span> tensor never exists. HBM holds X, W, the scalar loss, and the gradients <span class="math">dX</span> (size of X) and <span class="math">dW</span> (size of W) you were going to compute anyway. The only transient is one chunk's logits, <span class="math">CHUNK·V·2</span> bytes. You recompute each chunk's logits on the way out instead of reading them back — extra FLOPs, but the lm-head is a tiny slice of total model FLOPs and you were memory-bound here, so it's nearly free.</p>
+
+<h2>Worked numbers — H100</h2>
+<p><span class="math">B·T = 8192</span>, <span class="math">V = 128256</span>, <span class="math">d = 4096</span>, bf16, CHUNK = 1024 rows. H100 HBM is 3.35 TB/s.</p>
+<table>
+<thead><tr><th>Path</th><th>Logit-space HBM peak</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Naive (logits + probs + dlogits)</td><td>3 · 2.10 = <strong>6.3 GB</strong></td><td>Three full (B·T)×V tensors live at once.</td></tr>
+<tr><td>Kernel above (in-place dlogits)</td><td>2.10 GB</td><td>probs and dlogits reuse the logits buffer — 3× → 1×.</td></tr>
+<tr><td>Fully fused (chunk the matmul)</td><td>1 chunk = 1024 · 128256 · 2 ≈ <strong>0.26 GB</strong></td><td>Logits never materialize. ~24× smaller peak.</td></tr>
+</tbody>
+</table>
+<p>Bandwidth check on the in-place kernel: it reads the 2.10 GB logits twice (pass 1 + pass 2) and writes 2.10 GB once ≈ 6.3 GB of HBM traffic, so ≈ 6.3 / 3350 ≈ <strong>1.9 ms</strong> at roofline — pure bandwidth, no tensor cores. On a 7B model the 6.3 GB → 0.26 GB swing is routinely the difference between fitting a sequence length and an OOM, with bit-identical math.</p>
+
+<h2>Traps</h2>
+<table>
+<thead><tr><th>Trap</th><th>Symptom</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>exp without max-subtraction</td><td>inf/NaN at large logits; <code>tl.exp(100)</code> is +inf</td><td>the online running-max recurrence — always <code>exp(x − m)</code></td></tr>
+<tr><td>bf16 loss / dW accumulation</td><td>loss drifts vs torch reference; grad noise over 128k terms</td><td><code>.to(tl.float32)</code> on load; fp32 <code>m, l</code>; fp32 dW accumulator</td></tr>
+<tr><td>chunk / BLOCK_V too large</td><td>register spill, occupancy collapse, or chunk logits spill to HBM</td><td>size BLOCK_V so a tile fits in registers; autotune CHUNK so one chunk fits on chip</td></tr>
+<tr><td>ignored rows counted in N</td><td>loss scaled by the wrong divisor</td><td>exclude ignore_index from <code>n_valid</code>; zero their gradient row</td></tr>
+</tbody>
+</table>
+
+<h2>Interactive · logit-space HBM vs the knobs</h2>
+<p>Drag vocab, tokens, and chunk size. The bars are the naive 3×|logits| peak, the in-place 1×|logits| peak, and the fully-fused per-chunk transient. Watch the crossover: push the chunk up to the full batch and you're back to materializing everything.</p>
+
+<div class="widget"><div class="title">Logit-space HBM: naive vs in-place vs fully fused</div><p class="hint">Naive = 3·(B·T)·V·2 bytes. In-place = 1·(B·T)·V·2 (probs and dlogits share the buffer). Fully fused = one chunk = CHUNK·V·2 bytes transient, plus the gradients you'd compute anyway.</p><div class="controls">
+<label class="inline">vocab V <input id="t20-V" type="range" min="32000" max="262144" step="2000" value="128256"><span class="val" id="t20-V-v">128256</span></label>
+<label class="inline">tokens B·T <input id="t20-T" type="range" min="2048" max="65536" step="1024" value="8192"><span class="val" id="t20-T-v">8192</span></label>
+<label class="inline">chunk rows <input id="t20-c" type="range" min="256" max="16384" step="256" value="1024"><span class="val" id="t20-c-v">1024</span></label>
+</div><canvas id="t20-canvas" class="dist-canvas" height="210"></canvas><p class="hint" id="t20-note"></p></div>
+
+<h2>What's next</h2>
+<p>You've now seen the two structural moves of memory-efficient backward kernels in Triton: <strong>fuse a reduction so the intermediate never lands</strong> (probs/dlogits share a buffer; the online recurrence keeps only two scalars), and <strong>recompute on the way out instead of storing</strong> (chunk the matmul, recompute each chunk's logits in the backward). Lesson 21 applies the recompute idea to normalization: recompute the per-row mean/rstd instead of saving them, and handle the dgamma/dbeta reduction <em>across</em> tokens — the column-reduction problem that atomics or a two-pass split both solve.</p>
+
+<footer class="lesson-nav">
+  <a href="19_matmul_backward_triton.html"><span class="dir">Previous</span><span class="ttl">19 · Matmul backward in Triton</span></a>
+  <a class="next" href="21_norm_backward_triton.html"><span class="dir">Next →</span><span class="ttl">21 · Norm backward in Triton</span></a>
+</footer>
+
+<script>
+(function(){
+  const ids=['V','T','c'];
+  const e=Object.fromEntries(ids.map(k=>[k,document.getElementById('t20-'+k)]));
+  const c=document.getElementById('t20-canvas'),ctx=c.getContext('2d'),note=document.getElementById('t20-note');
+  function draw(){
+    ids.forEach(k=>document.getElementById('t20-'+k+'-v').textContent=e[k].value);
+    c.width=c.clientWidth*devicePixelRatio;c.height=210*devicePixelRatio;ctx.setTransform(1,0,0,1,0,0);ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.clearRect(0,0,c.clientWidth,210);
+    const V=+e.V.value,T=+e.T.value;let chunk=Math.min(+e.c.value,T);
+    const naive=3*T*V*2/1e9, inplace=T*V*2/1e9, fused=chunk*V*2/1e9;
+    const rows=[
+      ['naive  3·(B·T)·V  (logits+probs+dlogits)', naive, '#dc2626'],
+      ['in-place kernel  1·(B·T)·V', inplace, '#d97706'],
+      ['fully fused  one token chunk', fused, '#16a34a'],
+    ];
+    const max=naive*1.05;
+    rows.forEach(([n,v,col],i)=>{
+      const y=26+i*42,w=(c.clientWidth-330)*v/max;
+      ctx.fillStyle='#eef1f5';ctx.fillRect(320,y,c.clientWidth-330,26);
+      ctx.fillStyle=col;ctx.fillRect(320,y,w,26);
+      ctx.fillStyle='#1f2430';ctx.font='11px monospace';ctx.fillText(n,12,y+17);
+      ctx.fillStyle='#1f2430';ctx.font='12px sans-serif';ctx.fillText(v.toFixed(2)+' GB',326+w+4,y+17);
+    });
+    const cut=naive/fused;
+    ctx.fillStyle='#5b6573';ctx.font='12px sans-serif';
+    ctx.fillText('fully-fused peak is '+cut.toFixed(1)+'× smaller than naive',12,176);
+    note.textContent = chunk>=T
+      ? '⚠ Chunk ≥ batch: the chunk is the whole logits tensor — no streaming benefit. Shrink the chunk.'
+      : 'One token chunk ('+(fused).toFixed(2)+' GB) replaces the '+naive.toFixed(1)+' GB naive peak. Each chunk’s logits are recomputed in the backward (lesson 19 two-GEMM) — cheap, because the loss is memory-bound, not compute-bound.';
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</main>
+</body>
+</html>

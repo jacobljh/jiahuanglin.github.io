@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>18 · Backward in Triton</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">Triton kernels / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">18 · backward in triton</span>
+    <span class="step-pill">lesson 18 / 21</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Backward in Triton — autograd.Function and the backward grid</h1>
+<p class="subtitle">Lessons 01–14 built the forward half: a <code>@triton.jit</code> kernel turns <span class="math">x</span> into <span class="math">y</span>, a thin wrapper calls it. To <em>train</em>, you need the other half — a <strong>second, separate</strong> Triton kernel that turns <span class="math">dy</span> back into <span class="math">dx</span> (and <span class="math">dw</span>). This lesson is the mechanics of wiring the two together with <code>torch.autograd.Function</code>, choosing the backward grid, and the four traps that cost everyone a day.</p>
+
+<div class="callout">
+  <div class="label">Builds on</div>
+  Lesson <strong>14</strong> showed the <code>RMSNormFn</code> skeleton — <code>forward</code>/<code>backward</code>, <code>ctx.save_for_backward</code>, gradcheck. This lesson opens a new Part and goes deeper: the actual backward <em>kernels</em>, the grid you launch them on, and fp32 accumulation. The <em>concept</em> source is the CUDA track's lesson <strong>25</strong> (the backward pass as a kernel chain — the tape, the activation-memory peak, the save-vs-recompute trade). We reference it; we don't re-derive the 6N FLOP arithmetic here. This lesson is Triton-mechanics: real runnable code.
+</div>
+
+<h2>The question this lesson answers</h2>
+<p>You have a working forward Triton kernel. How do you make it <em>differentiable</em> so it drops into a training loop and <code>loss.backward()</code> just works? The answer is one class — <code>torch.autograd.Function</code> — with two static methods and one contract. Get the contract wrong and you get silent zero-gradients or a shape error three frames deep in autograd. Get it right and your kernel is indistinguishable from a built-in op.</p>
+
+<h2>The mental model: two kernels, one node</h2>
+<p>A forward kernel reads <span class="math">x</span>, writes <span class="math">y = f(x)</span>. Its backward is a <em>different</em> kernel: it reads the upstream gradient <span class="math">dy = ∂L/∂y</span> plus whatever the forward saved, and writes <span class="math">dx = (∂y/∂x)ᵀ · dy</span> — the vector-Jacobian product. The two kernels do not share code; they share <em>saved tensors</em>. The glue that makes autograd see them as one differentiable node is <code>torch.autograd.Function</code>.</p>
+
+<svg viewBox="0 0 860 240" class="diagram" role="img" aria-label="Forward kernel produces y and saves tensors into ctx; backward kernel consumes dy plus saved tensors to produce dx and dw">
+  <defs><marker id="b18" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <text x="20" y="22" font-size="12" font-weight="700" fill="var(--text-mute)">FORWARD — compute y, stash what backward will need</text>
+  <g font-size="11" fill="var(--text-mute)">
+    <rect class="node-bg" x="20"  y="34" width="120" height="44" rx="6"/><text x="80"  y="54" text-anchor="middle" font-weight="700" fill="var(--text)">x, w</text><text x="80" y="70" text-anchor="middle">inputs</text>
+    <rect class="node-bg" x="200" y="34" width="150" height="44" rx="6"/><text x="275" y="54" text-anchor="middle" font-weight="700" fill="var(--text)">fwd kernel</text><text x="275" y="70" text-anchor="middle">y = f(x, w)</text>
+    <rect class="node-bg" x="410" y="34" width="120" height="44" rx="6"/><text x="470" y="54" text-anchor="middle" font-weight="700" fill="var(--text)">y</text><text x="470" y="70" text-anchor="middle">output</text>
+    <rect class="node-bg" x="600" y="34" width="240" height="44" rx="6"/><text x="720" y="54" text-anchor="middle" font-weight="700" fill="var(--text)">ctx.save_for_backward(x, w, …)</text><text x="720" y="70" text-anchor="middle">lives in HBM until backward</text>
+  </g>
+  <path class="edge" d="M140 56 L200 56" marker-end="url(#b18)"/>
+  <path class="edge" d="M350 56 L410 56" marker-end="url(#b18)"/>
+  <path class="edge" d="M350 70 L600 70" marker-end="url(#b18)" stroke-dasharray="4 3"/>
+  <text x="20" y="138" font-size="12" font-weight="700" fill="var(--text-mute)">BACKWARD — separate kernel, reads dy + saved tensors</text>
+  <g font-size="11" fill="var(--text-mute)">
+    <rect class="node-bg" x="20"  y="150" width="120" height="44" rx="6"/><text x="80"  y="170" text-anchor="middle" font-weight="700" fill="var(--text)">dy</text><text x="80" y="186" text-anchor="middle">from downstream</text>
+    <rect class="node-bg" x="200" y="150" width="150" height="44" rx="6"/><text x="275" y="170" text-anchor="middle" font-weight="700" fill="var(--text)">bwd kernel</text><text x="275" y="186" text-anchor="middle">dx, dw = vjp</text>
+    <rect class="node-bg" x="410" y="150" width="200" height="44" rx="6"/><text x="510" y="170" text-anchor="middle" font-weight="700" fill="var(--text)">dx, dw</text><text x="510" y="186" text-anchor="middle">to upstream / optimizer</text>
+  </g>
+  <path class="edge" d="M140 172 L200 172" marker-end="url(#b18)"/>
+  <path class="edge" d="M350 172 L410 172" marker-end="url(#b18)"/>
+  <path class="edge" d="M720 78 L300 150" marker-end="url(#b18)" stroke-dasharray="4 3"/>
+  <text x="560" y="120" font-size="10" fill="var(--text-mute)">saved tensors flow forward → backward</text>
+</svg>
+
+<h2>A complete minimal example — fused scaled-SiLU, end to end</h2>
+<p>Let's do a real differentiable op, not a stub. Take a fused activation <span class="math">y = w · silu(x) = w · x · sigmoid(x)</span>, elementwise, where <span class="math">w</span> is a single learnable scalar (a per-tensor scale, like a learned gate). It is small enough to read in one screen and exercises every part of the contract: a tensor input <span class="math">x</span>, a tensor parameter <span class="math">w</span> whose gradient is a <em>reduction</em>, and a non-differentiable flag.</p>
+
+<p>The math we need. With <span class="math">s = sigmoid(x)</span> and <span class="math">silu(x) = x·s</span>:</p>
+<div class="math block">∂y/∂x = w · (s + x·s·(1 − s)) = w · (s + silu(x)·(1 − s))
+∂L/∂x = dy · ∂y/∂x
+∂L/∂w = Σ over all elements of (dy · silu(x))</div>
+
+<p>Notice the asymmetry already: <span class="math">dx</span> is elementwise (same shape as <span class="math">x</span>), but <span class="math">dw</span> is a <strong>scalar reduction</strong> over every element. That split is what makes the backward grid different from the forward grid. Here is the whole thing:</p>
+
+<pre><code>import torch, triton, triton.language as tl
+
+# ---- forward kernel: y = w * silu(x) ----
+@triton.jit
+def silu_fwd_kernel(x_ptr, w_ptr, y_ptr, n, BLOCK: tl.constexpr):
+    pid  = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs &lt; n
+    x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)   # compute in fp32
+    w = tl.load(w_ptr)                                    # scalar, broadcast
+    s = tl.sigmoid(x)
+    y = w * x * s
+    tl.store(y_ptr + offs, y.to(tl.float16), mask=mask)
+
+# ---- backward kernel: dx (elementwise) + partial dw (per-block reduction) ----
+@triton.jit
+def silu_bwd_kernel(dy_ptr, x_ptr, w_ptr, dx_ptr, dw_partial_ptr,
+                    n, BLOCK: tl.constexpr):
+    pid  = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs &lt; n
+    dy = tl.load(dy_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    x  = tl.load(x_ptr  + offs, mask=mask, other=0.0).to(tl.float32)
+    w  = tl.load(w_ptr)
+    s    = tl.sigmoid(x)
+    silu = x * s
+    # dx = dy * dy/dx
+    dydx = w * (s + silu * (1.0 - s))
+    dx   = dy * dydx
+    tl.store(dx_ptr + offs, dx.to(tl.float16), mask=mask)
+    # dw = sum(dy * silu) — reduce this block, atomically add the partial
+    dw_block = tl.sum(dy * silu, axis=0)                  # fp32 scalar
+    tl.atomic_add(dw_partial_ptr, dw_block)
+
+# ---- launchers ----
+def silu_forward(x, w):
+    y = torch.empty_like(x)
+    n = x.numel()
+    grid = lambda meta: (triton.cdiv(n, meta['BLOCK']),)
+    silu_fwd_kernel[grid](x, w, y, n, BLOCK=1024)
+    return y
+
+def silu_backward(dy, x, w):
+    dx = torch.empty_like(x)
+    dw = torch.zeros(1, device=x.device, dtype=torch.float32)  # fp32 accumulator
+    n = x.numel()
+    grid = lambda meta: (triton.cdiv(n, meta['BLOCK']),)
+    silu_bwd_kernel[grid](dy, x, w, dx, dw, n, BLOCK=1024)
+    return dx, dw.to(w.dtype)
+
+# ---- the autograd.Function: glues the two kernels into one node ----
+class ScaledSiLU(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, w, inplace=False):
+        x = x.contiguous()                  # guard non-contiguous (trap 3)
+        y = silu_forward(x, w)
+        ctx.save_for_backward(x, w)         # backward needs x and w
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        x, w = ctx.saved_tensors
+        dy = dy.contiguous()                # dy can arrive non-contiguous (trap 3)
+        dx, dw = silu_backward(dy, x, w)
+        return dx, dw, None                 # one grad PER forward arg, in order
+
+scaled_silu = ScaledSiLU.apply             # use this in your nn.Module</code></pre>
+
+<p>Read the <code>backward</code> return line carefully — it is the line everyone gets wrong. <code>forward</code> took three positional args <span class="math">(x, w, inplace)</span>, so <code>backward</code> returns exactly three values in that order: <code>dx</code> for <code>x</code>, <code>dw</code> for <code>w</code>, and <code>None</code> for <code>inplace</code> (a non-differentiable bool). Drop the <code>None</code> and autograd raises a shape mismatch with a stack trace that points nowhere useful.</p>
+
+<div class="callout ok">
+  <div class="label">Always gradcheck (lesson 14)</div>
+  Before trusting any of this, run <code>torch.autograd.gradcheck(scaled_silu, (x_fp64, w_fp64))</code> with fp64 inputs and <code>requires_grad=True</code>. Finite differences will catch a wrong sign or a missing factor that a wall-clock test never will. The kernels above store fp16 outputs for speed; for gradcheck, run a fp64 path or relax <code>atol</code>.
+</div>
+
+<h2>Save vs recompute — the decision at the Triton level</h2>
+<p>The CUDA lesson 25 framed this as a bandwidth-vs-compute trade. At the Triton level it becomes a concrete choice about what you pass to <code>ctx.save_for_backward</code> vs what you recompute with a few <code>tl</code> ops inside the backward kernel. The rule:</p>
+
+<ul>
+  <li><strong>Recompute anything cheap to derive from a tensor you already hold.</strong> In the example above we saved <span class="math">x</span> and recomputed <span class="math">s = sigmoid(x)</span> and <span class="math">silu = x·s</span> inside the backward kernel — three flops per element. Saving <span class="math">s</span> instead would have cost a full extra fp16 tensor in HBM for the lifetime of the step. Recompute wins easily.</li>
+  <li><strong>Recompute one-scalar-per-row stats</strong> (the mean, the rstd, the row max of a softmax). They cost one reduction pass to regenerate but only one float per row to store — and they are needed by the elementwise body anyway, so the read is nearly free. This is exactly the RMSNorm <code>rstd</code> recompute and the FlashAttention <span class="math">m, ℓ</span> recompute (lessons 20–21).</li>
+  <li><strong>Save full tensors you cannot regenerate</strong> — the actual inputs <span class="math">x, w</span> to a matmul. There is no cheaper source; you must save them.</li>
+</ul>
+
+<table><thead><tr><th>What the bwd needs</th><th>Save it?</th><th>Why, at the Triton level</th></tr></thead><tbody>
+<tr><td><span class="math">x</span> (a primary input)</td><td><strong>save</strong></td><td>No cheaper source. It is already live.</td></tr>
+<tr><td><span class="math">sigmoid(x)</span>, <span class="math">silu(x)</span></td><td>recompute</td><td>3 flops/elt inside the kernel vs a whole HBM tensor.</td></tr>
+<tr><td>row mean / rstd / softmax max</td><td>recompute (save x)</td><td>one reduction pass; the elementwise body re-reads x anyway.</td></tr>
+<tr><td>dropout mask</td><td>save the seed, regen mask</td><td>8 bytes vs a full bool tensor.</td></tr>
+</tbody></table>
+
+<p>The interactive widget below lets you find the crossover for a row-stat feature: as the feature gets wider, saving it costs more HBM, while recomputing it costs more FLOPs. One of them wins, and the answer flips with width.</p>
+
+<h2>The backward grid is not the forward grid</h2>
+<p>The forward of our example launched one program per <code>BLOCK</code> of elements — a flat 1D grid over <code>n</code>. The backward launched the <em>same</em> 1D grid for <span class="math">dx</span>, but <span class="math">dw</span> is a reduction over all <code>n</code> elements down to a single scalar. We handled it with <code>tl.atomic_add</code> from every block into one fp32 cell. That is the simplest correct backward grid, and for a scalar it is fine.</p>
+
+<p>For a <em>vector</em> parameter the choice gets real. Consider RMSNorm's <span class="math">dw</span> (here <span class="math">w ∈ ℝ<sup>d</sup></span>): each of the <span class="math">B·T</span> token rows contributes a length-<span class="math">d</span> partial, and you must sum across all rows. Two grids:</p>
+
+<table><thead><tr><th>Backward grid for dw</th><th>Shape</th><th>Trade-off</th></tr></thead><tbody>
+<tr><td><strong>One program per row, atomic_add into dw[d]</strong></td><td>grid = (B·T,)</td><td>Simple, but B·T atomics contend on the same d cells → serialization and <em>non-determinism</em> (float add isn't associative).</td></tr>
+<tr><td><strong>Two-pass: write a [num_blocks, d] partials buffer, then reduce</strong></td><td>grid = (num_blocks,) then a reduction grid over d</td><td>Deterministic, no contention; costs one extra small HBM tensor and a second launch. This is what production RMSNorm does (lesson 21).</td></tr>
+</tbody></table>
+
+<p>So you typically pick the backward grid like this:</p>
+<ol>
+  <li><strong>For <span class="math">dx</span></strong> (same shape as <span class="math">x</span>): mirror the forward grid — one program per row or per block. The map is structurally identical to forward.</li>
+  <li><strong>For <span class="math">dw</span></strong> (a reduction across the batch dimension): a <em>separate</em> grid sized to the reduction, with either atomics (small, non-critical) or a two-pass partials buffer (deterministic, the production choice).</li>
+</ol>
+
+<p>This is why "the backward is the harder kernel" (lesson 14): forward is one grid, backward is often two — one map and one reduce.</p>
+
+<h2>fp32 accumulation, and why gradients use +=</h2>
+<p>Two non-negotiables for gradient kernels, both from CUDA lesson 25's "three kernel-shaped facts":</p>
+
+<p><strong>1. Accumulate gradients in fp32.</strong> Notice <code>dw</code> was allocated as <code>torch.zeros(1, dtype=torch.float32)</code> and the in-kernel reduction <code>tl.sum(...)</code> ran on <code>.to(tl.float32)</code> values. A gradient reduction sums many small contributions; in fp16/bf16 the small terms vanish under the running total (the same swamping that breaks an fp16 sum-of-squares). The accumulator is <em>always</em> fp32 (<code>tl.float32</code>), even when the output gradient is later cast back down. Worked: summing <span class="math">B·T = 32,768</span> contributions of magnitude <span class="math">~10⁻³</span> in bf16 (7 mantissa bits, ~2 decimal digits) loses everything past the second digit once the partial sum exceeds ~1; in fp32 (23-bit mantissa) you keep ~7 digits and the sum is correct.</p>
+
+<p><strong>2. Gradients accumulate with <code>+=</code>, not <code>=</code>.</strong> A weight used by many tokens receives a contribution from each — its gradient is the <em>sum</em>. That is why we used <code>tl.atomic_add</code> rather than a store. The same logic extends one level up: across <strong>gradient-accumulation microbatches</strong>, PyTorch leaves the previous <code>.grad</code> in place and your backward <em>adds</em> to it. So a backward kernel that <code>store</code>s <code>dw</code> instead of accumulating will silently overwrite the gradient from the previous microbatch. When autograd hands you an existing <code>dw</code> buffer (the <span class="math">w</span> output slot), you must add into it, not clobber it.</p>
+
+<div class="callout warn">
+  <div class="label">Worked memory number (H100, 3.35 TB/s HBM)</div>
+  Our backward reads <code>dy</code> and <code>x</code> (2 fp16 reads) and writes <code>dx</code> (1 fp16 write): <span class="math">3 × 2 bytes = 6 bytes</span> of HBM traffic per element. For <span class="math">n = 2³⁰</span> (~1.07×10⁹ elements) that is <span class="math">~6.4 GB</span>. At 3.35 TB/s the floor is <span class="math">6.4 / 3,350 ≈ 1.9 ms</span> — and since SiLU-backward is ~15 flops/elt (~16 GFLOP total, trivially under the ~490 TFLOP/s bf16 ceiling), the kernel is firmly <strong>memory-bound</strong>. The <code>dw</code> atomics add negligible traffic. Optimize for bandwidth, not math.
+</div>
+
+<h2>The four traps</h2>
+<table><thead><tr><th>Trap</th><th>Symptom</th><th>Fix</th></tr></thead><tbody>
+<tr><td><strong>Forgot to save what backward needs</strong></td><td><code>ctx.saved_tensors</code> KeyError, or you recompute from a tensor that was already freed</td><td>Save every tensor the bwd kernel loads. If you free <span class="math">x</span> on the forward, you cannot recompute <span class="math">sigmoid(x)</span> on the backward.</td></tr>
+<tr><td><strong>Wrong order / count of returned grads</strong></td><td>"function returned an incorrect number of gradients" or a shape mismatch</td><td><code>backward</code> returns exactly one value per <em>positional</em> <code>forward</code> arg, in the same order. <code>None</code> for each non-tensor / non-diff arg.</td></tr>
+<tr><td><strong>Non-contiguous <code>dy</code></strong></td><td>Garbage gradients; <code>dy</code> arrives transposed/strided from an upstream view</td><td>Don't assume contiguity. Either <code>dy = dy.contiguous()</code> or pass real strides into the kernel and index with them.</td></tr>
+<tr><td><strong>Missing <code>None</code> for non-diff args</strong></td><td>Crash on the <code>inplace</code>/<code>eps</code>/flag argument</td><td>Return <code>None</code> in that slot — autograd needs a placeholder for every input even when there is no gradient.</td></tr>
+</tbody></table>
+
+<h2>Interactive · save-vs-recompute crossover</h2>
+<p>A backward kernel needs a per-row feature (think the softmax probabilities, or a normalization buffer). You can <strong>save</strong> it on the forward — costs HBM you must read back — or <strong>recompute</strong> it in the backward — costs FLOPs but no extra HBM. Both costs scale with the tensor's size, so the size <em>cancels</em>: the verdict turns on a single ratio — how many FLOPs it takes to recompute one element versus the machine's FLOP-to-byte budget. On an H100 (3.35 TB/s HBM, ~490 TFLOP/s bf16) saving costs a round-trip of 4 bytes/element, so recompute wins until it costs more than ≈ 585 flops/element. Drag the recompute cost and watch the crossover; the size sliders only scale both bars equally.</p>
+
+<div class="widget"><div class="title">Save the tensor, or recompute it?</div><p class="hint">Per token row: saving costs an extra HBM round-trip of (width × 2 bytes); recomputing costs (width × flops/elt) of compute. Crossover depends on the machine's FLOP-to-byte ratio.</p><div class="controls">
+<label class="inline">rows B·T <input id="b18-rows" type="range" min="4096" max="262144" step="4096" value="65536"><span class="val" id="b18-rows-v">65536</span></label>
+<label class="inline">feature width <input id="b18-w" type="range" min="1" max="8192" step="1" value="64"><span class="val" id="b18-w-v">64</span></label>
+<label class="inline">recompute flops/elt <input id="b18-f" type="range" min="1" max="1200" step="1" value="6"><span class="val" id="b18-f-v">6</span></label>
+</div><canvas id="b18-canvas" class="dist-canvas" height="220"></canvas><p class="hint" id="b18-note"></p></div>
+
+<h2>What this sets up</h2>
+<p>You can now take any forward Triton kernel, give it a correct backward kernel, wire them with <code>torch.autograd.Function</code>, pick a backward grid (one map for <span class="math">dx</span>, one reduce for <span class="math">dw</span>), accumulate in fp32, and dodge the four traps. The next lesson applies all of this to the op every model is built from — the <strong>matmul backward</strong>, which is not one kernel but <em>two</em> GEMMs (<span class="math">dX = dY·Wᵀ</span>, <span class="math">dW = Xᵀ·dY</span>) with transposed layouts and an fp32 accumulator on each.</p>
+
+<footer class="lesson-nav">
+  <a href="17_algorithms_data_structures.html"><span class="dir">Previous</span><span class="ttl">17 · Algorithms &amp; data structures</span></a>
+  <a class="next" href="19_matmul_backward_triton.html"><span class="dir">Next →</span><span class="ttl">19 · Matmul backward in Triton</span></a>
+</footer>
+
+<script>
+(function(){
+  const rows=document.getElementById('b18-rows');
+  const wEl =document.getElementById('b18-w');
+  const fEl =document.getElementById('b18-f');
+  const c=document.getElementById('b18-canvas'),ctx=c.getContext('2d'),note=document.getElementById('b18-note');
+  const HBM=3.35e12;      // bytes/s
+  const FLOPS=490e12;     // bf16 flop/s
+  function draw(){
+    document.getElementById('b18-rows-v').textContent=rows.value;
+    document.getElementById('b18-w-v').textContent=wEl.value;
+    document.getElementById('b18-f-v').textContent=fEl.value;
+    c.width=c.clientWidth*devicePixelRatio;c.height=220*devicePixelRatio;
+    ctx.setTransform(1,0,0,1,0,0);ctx.scale(devicePixelRatio,devicePixelRatio);
+    const W=c.clientWidth,H=220;
+    ctx.clearRect(0,0,W,H);
+    const R=+rows.value, w=+wEl.value, fpe=+fEl.value;
+    // SAVE cost: extra HBM round trip = write on fwd + read on bwd = 2 * (R*w*2 bytes)
+    const saveBytes = 2 * R * w * 2;
+    const saveT = saveBytes / HBM;                 // seconds
+    // RECOMPUTE cost: R*w*fpe flops on bwd
+    const recompFlops = R * w * fpe;
+    const recompT = recompFlops / FLOPS;           // seconds
+    const max=Math.max(saveT, recompT, 1e-12);
+    const rowsBar=[
+      ['save (extra HBM)', saveT, (saveBytes/1e9).toFixed(2)+' GB', '#dc2626'],
+      ['recompute (extra FLOPs)', recompT, (recompFlops/1e9).toFixed(2)+' GFLOP', '#16a34a'],
+    ];
+    rowsBar.forEach(([n,v,lab,col],i)=>{
+      const y=34+i*60, bw=(W-300)*v/max;
+      ctx.fillStyle='#eef1f5';ctx.fillRect(210,y,W-300,30);
+      ctx.fillStyle=col;ctx.fillRect(210,y,Math.max(1,bw),30);
+      ctx.fillStyle='#1f2430';ctx.font='12px sans-serif';ctx.fillText(n,16,y+14);
+      ctx.fillText((v*1e3).toFixed(3)+' ms · '+lab, 16, y+27);
+    });
+    const winner = saveT < recompT ? 'SAVE' : 'RECOMPUTE';
+    const ratio = (Math.max(saveT,recompT)/Math.min(saveT,recompT)).toFixed(1);
+    const crossover = Math.round(4*FLOPS/HBM); // flops/elt where save==recompute
+    ctx.fillStyle='#1f2430';ctx.font='13px sans-serif';
+    ctx.fillText('Cheaper: '+winner+'  ('+ratio+'× vs the other) · crossover ≈ '+crossover+' flops/elt', 16, 180);
+    note.textContent = winner==='RECOMPUTE'
+      ? 'Recompute wins: at '+fpe+' flops/element it costs far less FLOP-time than saving costs in HBM round-trips (crossover ≈ '+crossover+' flops/elt). This is the common case and exactly why recompute-heavy kernels dominate training — FlashAttention regenerates the score matrix, RMSNorm recomputes rstd, gradient checkpointing recomputes whole blocks.'
+      : 'Save wins: recomputing this feature costs '+fpe+' flops/element — above the ≈ '+crossover+' flops/elt crossover — so the recompute FLOP-time now exceeds the HBM round-trip of just saving it. Save it. (Also save when the tensor is a primary input you can\'t regenerate, like matmul\'s X and W.)';
+  }
+  [rows,wEl,fEl].forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</main>
+</body>
+</html>
