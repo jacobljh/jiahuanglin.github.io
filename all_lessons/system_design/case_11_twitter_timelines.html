@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C11 - Design Twitter-style timelines</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  main { overflow-wrap: break-word; }
+  .case-meta { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 22px; }
+  .case-meta .chip { background: var(--bg-elev); }
+  table { table-layout: fixed; }
+  th, td { overflow-wrap: anywhere; }
+  .linear-list li { margin: 8px 0; }
+  .source-note { color: var(--text-mute); font-size: 13px; margin-top: 8px; }
+  @media (max-width: 560px) {
+    header.topnav .inner { flex-wrap: wrap; gap: 8px; }
+    header.topnav .step-pill { margin-left: 0; white-space: normal; }
+    main { padding-inline: 14px; }
+    th, td { padding: 6px 5px; font-size: 12px; }
+  }
+</style>
+</head>
+<body>
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">system_design</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="syllabus.html">cases</a>
+    <span class="crumb">/</span>
+    <span class="crumb">C11</span>
+    <span class="step-pill">C11 / C44</span>
+  </div>
+</header>
+<main>
+
+<h1>Design Twitter-style timelines</h1>
+<p class="subtitle">"Build Twitter's feed" is really three different feeds wearing one name. The senior move is to say which one you're building before you draw a single box — because each is built by a completely different machine.</p>
+<div class="case-meta">
+  <span class="chip">Satellite of C08 (feed fanout)</span>
+  <span class="chip">Case drill</span>
+  <span class="chip">Name-the-timeline first</span>
+</div>
+
+<div class="callout">
+  <div class="label">First principle</div>
+  A timeline is a <em>materialised join</em> between a stream of posts and a social graph, and the only question that matters is <strong>when you pay for that join</strong>. Pay at write time (push the post into every follower's list) and reads are a dumb lookup but a single viral post triggers millions of writes. Pay at read time (pull each followee's posts and merge) and writes are trivial but a user who follows thousands does an expensive graph fan-in on every refresh. <strong>The push/pull crossover is derived in C08 — here we run that same machinery at production graph scale, where the graph is so skewed that no single answer survives.</strong> The deltas this case adds are the <em>three-timelines framing</em> and <em>cache invalidation</em>.</div>
+
+<h2>Don't re-derive the crossover — point at C08</h2>
+<p>The classic interview trap is to spend ten minutes re-deriving fanout-on-write vs fanout-on-read. Don't. That derivation — the break-even where <span class="math">writes_per_post · followers</span> overtakes <span class="math">reads · followees</span> — lives in <a href="case_08_news_feed.html">C08 (news feed)</a>, and a senior candidate references it in one sentence: <em>"this is the C08 crossover; I'll use the hybrid push/pull split it lands on."</em> What C08 does <em>not</em> stress, and what makes Twitter specifically hard, is two things:</p>
+<ul>
+  <li><strong>The graph is power-law, not uniform.</strong> A handful of accounts have 10–100M followers while the median user has a few hundred. A uniform crossover threshold is meaningless when the follower count spans seven orders of magnitude — you need a <em>per-author</em> decision, not a global one.</li>
+  <li><strong>"The feed" is not one product surface.</strong> Profile, home, and mentions are three timelines with three different build strategies, three different cost profiles, and three different consistency needs. Conflating them is the single most common way this design goes muddy.</li>
+</ul>
+
+<h2>The three timelines (the meta-signal)</h2>
+<p>Before any architecture, separate the three things the prompt calls "timeline." Saying this out loud is the strongest early signal you can send.</p>
+
+<div class="ascii">
+  THREE TIMELINES — three different machines
+
+  (1) PROFILE timeline  — "everything @alice posted"
+      build: APPEND-BY-AUTHOR. One author → one ordered stream. Trivial.
+      ┌────────────┐
+      │ tweets by  │  WRITE: append tweet to alice's own stream
+      │   @alice   │  READ : range-scan alice's stream by time
+      └────────────┘  → no graph, no fanout. A single-partition append-log.
+
+  (2) HOME timeline     — "everything the people @bob follows posted"
+      build: PERSONALISED-ACROSS-FOLLOWS. The hard one.
+      followees → → → ┐
+        @alice  ──┐    │   HYBRID:
+        @carol  ──┼──▶ │   push ordinary authors' IDs into bob's home cache
+        @VIRAL  ··┘    │   pull viral authors' streams at read time
+                       ▼
+              ┌──────────────── HYDRATION ────────────────┐
+   bob reads: │ merge(pushed IDs, pulled-viral IDs) by time │ → IDs
+              │ filter blocked/deleted/visibility           │
+              │ hydrate IDs → bodies from tweet store/cache │ → feed
+              └─────────────────────────────────────────────┘
+
+  (3) MENTIONS timeline — "everyone who @-mentioned @bob"
+      build: NOTIFICATION-LIKE. Write on mention-parse, not on follow-graph.
+      tweet text contains "@bob" → append tweet ID to bob's mentions list
+      → small, write-driven, independent of who follows whom.
+</div>
+
+<p>Profile is a single-author append log — the easy case, near-free at any scale. Mentions is notification plumbing: when a post is parsed, any <code>@handle</code> it contains gets the post ID appended to that handle's mentions list, completely independent of the follow graph. <strong>Home is the only one that needs the C08 hybrid</strong>, because it's the only one that joins a stream against an arbitrary, skewed set of follows. Designing all three with the same fanout machinery is the mistake; the rest of this case is about home.</p>
+
+<h2>Clarify the contract</h2>
+<p>Treat the prompt as a product contract before a box diagram. The system must:</p>
+<ul>
+  <li>Post short messages + media references; serve the <strong>profile</strong>, <strong>home</strong>, and <strong>mentions</strong> timelines.</li>
+  <li>Handle follow / unfollow / block / mute, and have those take effect promptly.</li>
+  <li>Support viral accounts (tens of millions of followers) without write storms.</li>
+  <li>Feel near-real-time on home reads without making every read an expensive graph fan-in.</li>
+</ul>
+<p>What it need <em>not</em> do, and saying so buys credibility: home need not be perfectly chronological (ranking is allowed and expected), need not be strongly consistent (a post showing up 2s late is fine), and need not retain infinite scrollback (a bounded window — a few hundred recent IDs — covers nearly all reads; older reads fall back to the pull path).</p>
+
+<h2>Put numbers on it</h2>
+<p>Two numbers force every later decision: the <strong>read/write asymmetry</strong> and the <strong>IDs-vs-bodies storage gap</strong>.</p>
+
+<p><strong>Reads dominate writes.</strong> Take 200M daily actives each opening the app ~10×/day and refreshing a few times per open — call it ~50 home reads/user/day. That's <span class="math">200M · 50 = 10<sup>10</sup></span> reads/day ≈ <span class="math">10<sup>10</sup> / 86400 ≈ 116k</span> reads/s, and several× that at peak. Writes are far rarer — if 10% of users post 2×/day that's <span class="math">20M · 2 / 86400 ≈ 460</span> posts/s. <strong>Reads outrun writes by ~250×</strong>, which is the entire argument for fanout-on-<em>write</em> for ordinary authors: do the join once at write time so the 116k reads/s become cheap list lookups.</p>
+
+<p><strong>But the viral author breaks that.</strong> A push to 100M followers is 100M list writes <em>per post</em>. At even 460 posts/s, if a fraction come from mega-accounts the write amplification is catastrophic — a single celebrity tweet is more fanout work than millions of ordinary posts combined. So mega-accounts are flipped to fanout-on-<em>read</em>: their post is written once to their profile stream, and pulled in at each follower's hydration. The threshold is per-author, typically tens of thousands of followers.</p>
+
+<p><strong>Store IDs, not bodies — the ~100× number.</strong> A home timeline is a list of <em>post IDs</em>, not post contents. An ID (snowflake) is 8 bytes; a hydrated tweet body — text, author, media refs, counts — is easily 1–2 KB. Materialising 800 IDs per home timeline costs <span class="math">800 · 8 B = 6.4 KB</span>; materialising the bodies would cost <span class="math">800 · ~1.6 KB ≈ 1.3 MB</span> — roughly <strong>200×</strong> more, multiplied across every follower of every author. That gap is why home timelines are stored as ID lists and bodies are <em>hydrated on read</em> from a shared tweet store/cache (one cached copy per tweet, not one per follower).</p>
+
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">Home reads / sec (avg)</div><div class="v">~116k</div></div>
+  <div class="kpi"><div class="k">Posts / sec (avg)</div><div class="v">~460</div></div>
+  <div class="kpi"><div class="k">Read : write ratio</div><div class="v">~250×</div></div>
+  <div class="kpi"><div class="k">IDs vs bodies storage</div><div class="v">~100–200×</div></div>
+  <div class="kpi"><div class="k">Viral fanout / post</div><div class="v">up to 100M writes</div></div>
+  <div class="kpi"><div class="k">Home window kept</div><div class="v">~800 IDs</div></div>
+</div>
+
+<h2>Data model &amp; API</h2>
+<p>Keep the surface small; let it express the product op, not the shard/cache layout.</p>
+<table>
+  <thead><tr><th>Store / API</th><th>Shape &amp; why</th></tr></thead>
+  <tbody>
+    <tr><td><code>tweets</code></td><td>Canonical, by <code>(author_id, snowflake_id)</code>. Single source of truth for the body + a <strong>visibility flag</strong> (live / deleted / restricted). Hydration reads here.</td></tr>
+    <tr><td><code>profile_timeline</code></td><td>Append-only per author: list of that author's tweet IDs by time. Built by the author's own write. No graph.</td></tr>
+    <tr><td><code>home_timeline</code></td><td>Per user: bounded list (~800) of tweet IDs, written by the fanout workers for ordinary authors. Cache-resident (Redis-class), rebuildable.</td></tr>
+    <tr><td><code>mentions</code></td><td>Per user: list of tweet IDs that <code>@</code>-mentioned them, written at parse time.</td></tr>
+    <tr><td><code>graph</code></td><td>Follow edges + block/mute edges. <code>followers(author)</code> drives push; <code>followees(user)</code> drives the viral pull merge.</td></tr>
+    <tr><td colspan="2"><code>POST /tweets</code> · <code>GET /home_timeline?cursor=</code> · <code>GET /users/{id}/timeline</code> · <code>GET /mentions</code> · <code>POST /follow</code> · <code>POST /block</code></td></tr>
+  </tbody>
+</table>
+
+<h2>Linearized design — follow a post, then a read</h2>
+<ol class="linear-list">
+  <li><strong>Write.</strong> A post is written once, canonically, to <code>tweets</code> and appended to the author's <code>profile_timeline</code>. Cheap, single-partition, always done.</li>
+  <li><strong>Classify the author.</strong> If <span class="math">followers &lt; threshold</span> (ordinary), enqueue a <strong>fanout job</strong>. If viral, do nothing more on write — readers will pull it.</li>
+  <li><strong>Fanout (async).</strong> Workers read <code>followers(author)</code> and append the new ID to each follower's <code>home_timeline</code>, trimming to the bounded window. This is C11's heaviest pipe; it rides the async queue (<a href="11_async_messaging.html">lesson 11</a>) so a posting spike never blocks the writer.</li>
+  <li><strong>Mention parse.</strong> In parallel, parse <code>@handles</code> and append the ID to each mentioned user's <code>mentions</code> list.</li>
+  <li><strong>Read (home).</strong> Fetch the user's pushed ID list; <strong>pull</strong> recent IDs from each <em>viral</em> followee's profile stream; merge by time into a candidate set.</li>
+  <li><strong>Hydration.</strong> Filter the candidate IDs against block/mute and the canonical visibility flag, then hydrate surviving IDs → bodies from the shared tweet cache. Rank the bounded set, return a stable cursor.</li>
+</ol>
+<p>The first bottleneck is step 3 (viral fanout) — solved by the per-author push/pull split. The second, subtler bottleneck is step 6: <strong>hydration is where correctness lives</strong>, and the next two deep dives are about not corrupting it.</p>
+
+<h2>Deep dives</h2>
+
+<h3>1. Name which timeline you're designing — the meta-signal</h3>
+<p>This is worth restating as its own move because it's the differentiator between a junior and senior answer. A junior hears "design Twitter" and starts drawing a fanout pipeline. A senior says: <em>"There are three timelines. Profile is an append log — trivial. Mentions is a notification list — write-on-parse, graph-independent. Home is the hard one, and it's the C08 hybrid at skewed graph scale. I'll design home; the other two fall out of the same tweet store."</em> Naming the surface scopes the problem, signals you know the product, and prevents you from accidentally applying expensive fanout to the two timelines that don't need it. The whole rest of the interview is then about home.</p>
+
+<h3>2. Follow / unfollow don't rewrite infinite history</h3>
+<p>The naive read of "home timeline = posts from everyone you follow" implies that following someone should inject all their history into your timeline, and unfollowing should rip it back out. At graph scale that's a non-starter: a follow could rewrite an unbounded list, and an unfollow could require scanning and editing millions of cached timelines. The discipline is to make graph mutations <strong>bounded and lazy</strong>:</p>
+<ul>
+  <li><strong>Follow:</strong> backfill only a <em>recent window</em> of the new followee's posts into your home timeline (e.g. their last few dozen, time-merged) — bounded work — and from now on you receive their fanout. You do not reconstruct their entire history; older posts surface via the pull path if you scroll far back.</li>
+  <li><strong>Unfollow / block / mute:</strong> stop fanning <em>future</em> posts to you, and rely on <strong>hydration-time filtering</strong> for anything already sitting in your cached timeline. You do not eagerly scrub the cache. The stale IDs are harmless — they get filtered on the next read and cleaned asynchronously.</li>
+</ul>
+<p>So follow does bounded forward work; unfollow does <em>no</em> eager work and leans on the filter. The cost you accept is a few wasted IDs in the cache; the cost you refuse is rewriting infinite history on every graph edge change.</p>
+
+<h3>3. Cache invalidation — mark canonical, filter at hydration, clean async</h3>
+<p>Deletion exposes the same trap. A tweet pushed to 5M home timelines lives as 5M cached IDs. When the author deletes it, the wrong instinct is to delete the ID from all 5M lists synchronously — a second fanout storm, and one that must hit lists that may have aged out or live on cold shards. <a href="06_caching.html">Lesson 06</a>'s invalidation problem at fanout scale.</p>
+<p>The correct pattern flips <em>where</em> truth lives. The cached ID lists are not authoritative; the <code>tweets</code> store's <strong>visibility flag is</strong>. So:</p>
+<ul>
+  <li><strong>On delete/restrict:</strong> flip the canonical visibility flag in <code>tweets</code>. One write. The 5M cached IDs are now stale-but-harmless pointers.</li>
+  <li><strong>On read (hydration):</strong> every ID is checked against the canonical flag before its body is served. A deleted/restricted tweet's ID resolves to nothing and is dropped from the response. <strong>The user never sees it</strong>, even though the ID is still in their cached list.</li>
+  <li><strong>Async cleanup:</strong> a background sweep removes dead IDs from timelines lazily, on its own schedule, off the hot path.</li>
+</ul>
+<p>This is the same invariant as the unfollow case, generalised: <strong>cached timelines are a hint; the canonical tweet store is the truth; correctness is enforced at hydration, never by rewriting fanned-out copies.</strong> This is DDIA Ch. 11's <em>derived/materialised data</em> in its purest form — the home timeline is a derived view, and you keep a derived view correct by re-deriving (filtering) from the source on read, not by trying to keep every copy perfectly in sync.</p>
+
+<div class="ascii">
+  HYDRATION as the correctness gate (delete & block, same path)
+
+  cached home_timeline (hint):  [ t91 t88 t87(deleted) t85 t83(by-blocked-user) t80 ]
+                                         │
+                                         ▼
+   ┌──────────────────────── HYDRATE ───────────────────────────┐
+   │ for each ID:                                                │
+   │   canonical visibility live?  ──no──▶ DROP (t87 deleted)    │
+   │   author/blocker relationship ok? ─no─▶ DROP (t83 blocked)  │
+   │   else fetch body from shared tweet cache                   │
+   └─────────────────────────────────────────────────────────────┘
+                                         │
+                                         ▼
+            served feed:  [ t91 t88 t85 t80 ]   ← t87, t83 never surfaced
+            async sweep later removes t87, t83 from the stored list
+</div>
+
+<h2>Trade-offs</h2>
+<table>
+  <thead><tr><th>Choice</th><th>Buys</th><th>Costs</th><th>Choose when</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Push (fanout-on-write)</strong></td><td>O(1) home reads — just a list lookup</td><td>write storm ∝ followers; viral posts melt the queue</td><td>ordinary authors (followers below threshold)</td></tr>
+    <tr><td><strong>Pull (fanout-on-read)</strong></td><td>trivial writes; viral-safe</td><td>read-time graph fan-in; cost ∝ followees</td><td>viral authors; deep scrollback</td></tr>
+    <tr><td><strong>Hybrid push/pull</strong></td><td>bounds both write storm and read fan-in</td><td>merge complexity at hydration; per-author classification</td><td>real social graphs (the C08 answer, the default here)</td></tr>
+    <tr><td><strong>Hydration-time filter vs timeline rewrite</strong></td><td>O(1) deletes/blocks; no second fanout</td><td>a few wasted cached IDs; filter on every read</td><td>any large-fanout system (always, in practice)</td></tr>
+    <tr><td><strong>Chronological vs ranked home</strong></td><td>chrono: predictable, simple MVP</td><td>ranked: needs a model, lower predictability</td><td>chrono for the interview MVP; ranked for the product</td></tr>
+  </tbody>
+</table>
+<p>The sharpest trade-off is <strong>hydration-time filtering vs timeline rewrite</strong>. Rewrite gives you "clean" stored lists at the price of turning every delete, block, and visibility change into a fresh fanout storm against millions of cached copies — exactly the write amplification you adopted hybrid fanout to avoid. Filtering at hydration accepts that stored lists contain dead pointers, in exchange for making every visibility change a single canonical write. Because reads outrun writes ~250×, you might think doing work per-read is the expensive side — but the filter is a cheap flag check per ID, while the rewrite is millions of list edits per change. Filtering wins decisively, and it's the same call every large fanout system makes.</p>
+
+<h2>Failure modes</h2>
+<table>
+  <thead><tr><th>Failure</th><th>Mitigation</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Viral fanout storm</strong></td><td>Per-author push/pull threshold; viral authors are pull-only, never fanned out.</td></tr>
+    <tr><td><strong>Fanout queue backlog</strong></td><td>Async queue absorbs spikes (<a href="11_async_messaging.html">lesson 11</a>); home is eventually consistent — a few seconds of lag is acceptable, writes never block.</td></tr>
+    <tr><td><strong>Blocked/deleted content leaks into a cached feed</strong></td><td>Hydration-time visibility filter against the canonical flag — the cached ID is harmless because it's never served.</td></tr>
+    <tr><td><strong>Hot graph shard (mega-account's followers)</strong></td><td>That account is pull-path, so we never read its giant follower set on the hot path (<a href="07_partitioning.html">lesson 07</a>).</td></tr>
+    <tr><td><strong>Home cache evicted / timeline gap after outage</strong></td><td>Rebuild from profile streams (push side) + viral pull + graph snapshot — home is fully derived data, so it's reconstructible.</td></tr>
+    <tr><td><strong>Ranking service down</strong></td><td>Fall back to chronological merge of the candidate set — degraded, not broken.</td></tr>
+  </tbody>
+</table>
+
+<h2>Interview Q&amp;A</h2>
+<div class="callout">
+  <ol>
+    <li><strong>"Design Twitter's feed" — where do you start?</strong> <em>(senior answer)</em> By naming that "feed" is three timelines: profile (append-by-author, trivial), mentions (write-on-parse, graph-independent), and home (the hard, personalised one). I design home; the other two fall out of the same canonical tweet store. Scoping to the right surface is the first signal.</li>
+    <li><strong>Push or pull?</strong> <em>(senior answer)</em> Neither alone — hybrid, and I won't re-derive the crossover because it's the C08 result. Ordinary authors push (reads outrun writes ~250×, so pre-compute the join); viral authors pull (a 100M-follower push is a write storm). The threshold is per-author followers, because the graph is power-law and a single global threshold is meaningless.</li>
+    <li><strong>Why store post IDs in home timelines instead of the posts themselves?</strong> <em>(senior answer)</em> An ID is 8 bytes, a hydrated body is 1–2 KB — about 100–200× larger, multiplied across every follower. Storing IDs and hydrating bodies from one shared tweet cache on read keeps a single copy per tweet instead of millions, and lets visibility/edits stay correct because the body is fetched fresh.</li>
+    <li><strong>What happens to my home timeline when I follow someone?</strong> <em>(senior answer)</em> I backfill only a bounded recent window of their posts and start receiving their fanout — I never reconstruct their full history. Following is bounded forward work; deep scrollback into their past comes via the pull path, not a rewrite.</li>
+    <li><strong>And when I unfollow or block?</strong> <em>(senior answer)</em> Stop fanning future posts, and do <em>no</em> eager cache scrub. Anything already cached is filtered at hydration against the block edge and the canonical visibility flag, then cleaned asynchronously. Eager scrubbing of millions of cached lists is the storm we're avoiding.</li>
+    <li><strong>A blocked user's reply is sitting in a cached timeline and leaks to the user — fix it.</strong> <em>(senior answer)</em> The leak means visibility is being trusted in the stored list instead of enforced at hydration. The fix is not to rewrite the timeline — it's to make hydration the gate: every candidate ID is checked against the canonical visibility flag and the block edge <em>before</em> its body is served, so the offending ID resolves to nothing and is dropped from the response. The cached ID stays put, harmlessly, and an async sweep removes it later. Timeline rewrite would "fix" this one case by re-introducing fanout-scale write amplification on every block — the wrong trade.</li>
+    <li><strong>How do you delete a tweet that's been fanned out to 5M timelines?</strong> <em>(senior answer)</em> Flip one canonical visibility flag in the tweet store. The 5M cached IDs become stale-but-harmless pointers that hydration drops; a background sweep cleans them lazily. One write, not 5M. This is DDIA Ch. 11's derived-data discipline: re-derive correctness from the source on read.</li>
+    <li><strong>Is home timeline strongly consistent?</strong> <em>(senior answer)</em> No, and it shouldn't be. Home is derived/materialised data delivered through an async fanout queue; a post arriving a couple of seconds late is fine, and that slack is exactly what lets the queue absorb posting spikes without blocking writers. The strong guarantees live in the canonical tweet store; the timeline is an eventually-consistent view of it.</li>
+  </ol>
+</div>
+
+<h2>Related lessons</h2>
+<p>This case is a <strong>satellite of <a href="case_08_news_feed.html">C08 (news feed)</a></strong> — the push/pull crossover is derived there; here we run the same machinery at skewed graph scale and add the three-timelines framing and cache invalidation. The async fanout pipe is <a href="11_async_messaging.html">lesson 11 (async messaging)</a>'s queue, sized so a posting spike never blocks writers. Hydration's "one cached body per tweet, filter on read" is <a href="06_caching.html">lesson 06 (caching)</a>'s invalidation problem at fanout scale. Keeping the mega-account's follower set off the hot read path is <a href="07_partitioning.html">lesson 07 (partitioning)</a>'s hot-shard avoidance. DDIA threads through: Ch. 1 frames this exact fanout example; Ch. 11 (derived/materialised data) is why hydration-time filtering is correct; Ch. 5 (replication/read replicas) underpins serving 116k reads/s off cached views.</p>
+<div class="case-meta">
+  <a class="chip" href="case_08_news_feed.html">C08 · News feed (anchor)</a>
+  <a class="chip" href="06_caching.html">Caching</a>
+  <a class="chip" href="11_async_messaging.html">Async messaging</a>
+  <a class="chip" href="07_partitioning.html">Partitioning</a>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  "Build Twitter" is three timelines, not one: profile (append log), mentions (write-on-parse), and home (the C08 hybrid at power-law graph scale). Don't re-derive the push/pull crossover — point at C08 and spend your time on the deltas. Store home timelines as 8-byte IDs, not 1–2 KB bodies (~100× cheaper), and hydrate from one shared cache. Above all, never rewrite fanned-out copies to enforce a change: follows backfill a bounded window, unfollows and deletes flip canonical state, and <strong>hydration is the gate where visibility is enforced</strong>. The cached timeline is a hint; the tweet store is the truth.</div>
+
+<footer class="lesson-nav">
+  <a href="case_10_search_autocomplete.html"><span class="dir">Previous</span><span class="ttl">Previous case</span></a>
+  <a class="next" href="case_12_google_docs_collaboration.html"><span class="dir">Next</span><span class="ttl">Next case</span></a>
+</footer>
+
+</main>
+</body>
+</html>

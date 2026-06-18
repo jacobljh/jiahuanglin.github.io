@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>15 · Rate limiting &amp; the API edge</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">system_design</a>
+    <span class="crumb">/</span>
+    <span class="crumb">15 · rate limiting &amp; edge</span>
+    <span class="step-pill">lesson 15 / 19</span>
+  </div>
+</header>
+<main>
+
+<h1>Rate limiting &amp; the API edge</h1>
+<p class="subtitle">Every request enters through a front door. That door is the cheapest place on Earth to enforce cross-cutting concerns and to keep the load behind it bounded — so that's exactly where you put the cop.</p>
+
+<div class="callout">
+  <div class="label">First principle</div>
+  A request that never touches your business logic costs almost nothing to reject. A request that reaches a saturated database costs you the database — and every other request queued behind it. So the optimal place to drop excess load is as <em>early</em> and as <em>cheaply</em> as possible: the API gateway. Rate limiting is just <strong>admission control</strong> — the planned, fair sibling of lesson 13's emergency load shedding. It converts <em>unbounded</em> incoming load into a <em>bounded</em> stream the backend can actually serve.</div>
+
+<h2>The API gateway: the front door</h2>
+<p>Before "rate limiting," name the thing doing it. The <strong>API gateway</strong> is a single logical entry point that sits between clients and your services and handles the concerns that <em>every</em> request needs, so that no individual service has to:</p>
+<ul>
+  <li><strong>TLS termination</strong> — decrypt once at the edge instead of in every service.</li>
+  <li><strong>Authn / authz</strong> — verify the token / API key once; pass a trusted identity inward.</li>
+  <li><strong>Routing &amp; composition</strong> — map <code>/v2/orders</code> to the right service; fan out and merge for BFF-style aggregation.</li>
+  <li><strong>Request / response shaping</strong> — protocol translation, header injection, payload size caps.</li>
+  <li><strong>Observability hooks</strong> — one place to emit per-request metrics, traces, and logs (lesson 16).</li>
+  <li><strong>Rate limiting</strong> — the focus here.</li>
+</ul>
+
+<div class="callout warn">
+  <div class="label">The trade-off you must name out loud</div>
+  Centralising these concerns protects and simplifies the backends — but the gateway is now an <strong>extra network hop on every request</strong> and a <strong>critical-path component</strong>. If it dies, the whole API dies. So it must itself be replicated, stateless where possible, and fast (lesson 13: don't let the door become the SPOF). The gateway buys you leverage at the cost of being the single most important box to keep alive.</div>
+
+<p>Concretely, the gateway is a function in front of your fleet: <code>edge(req) → {reject early | forward}</code>. A rejected request costs maybe a TLS handshake plus a counter lookup — call it tens of microseconds and zero downstream resources. The same request, admitted into a saturated system, might consume a connection, a thread, a database query, and seconds of tail latency that delays a hundred well-behaved requests behind it. That asymmetry — cheap to reject, expensive to over-admit — is the entire economic argument for the edge.</p>
+
+<h3>Why rate limit — it's about protecting the system, not punishing users</h3>
+<p>Rate limiting is rarely about being mean to a client. The real motivations, in rough order of importance:</p>
+<ul>
+  <li><strong>Keep backends below saturation.</strong> Lesson 02's utilisation cliff: as ρ→1, queueing latency blows up superlinearly. A limiter caps arrivals so ρ stays in the safe zone.</li>
+  <li><strong>Fairness across tenants.</strong> One noisy client (or a runaway retry loop) should not starve everyone else. Per-tenant limits give isolation.</li>
+  <li><strong>Abuse / DoS / scraper defence.</strong> Reject floods cheaply at the edge before they cost real resources.</li>
+  <li><strong>Cost control.</strong> Bound calls to expensive downstreams (a paid third-party API, an LLM, a query that scans a partition).</li>
+</ul>
+
+<p>Note what's <em>not</em> on that list: "stop people from using your product." If your limits are routinely rejecting legitimate users, the answer is usually more capacity or higher limits, not a tighter clamp. The limiter is a safety valve sized to protect supply, not a tool to ration demand below what you can actually serve. A useful test: every 429 you emit should map to either real abuse or genuine backend pressure. A flood of 429s with the backend at 30% utilisation means your limit is mis-sized, not that the limiter is "working."</p>
+
+<h3>Sizing the limit from first principles</h3>
+<p>Before choosing an algorithm, derive the <em>number</em>. Start from the backend's safe capacity, not from a round number that "feels right." Suppose a service instance can serve <strong>500 req/s</strong> at p99 latency before lesson 02's queue blows up, you run <strong>10 instances</strong>, and you want to stay at <strong>70% utilisation</strong> for headroom against spikes and failures (13). Safe aggregate ≈ <span class="math">500 · 10 · 0.7 = 3500</span> req/s. If you have ~700 active tenants and want rough fairness, a baseline per-tenant sustained rate of <span class="math">3500 / 700 = 5</span> req/s is the floor; premium tiers get more, and you over-subscribe deliberately because not all tenants are active at once. The limit is a <em>budget allocation</em>, not a moral judgement — re-derive it whenever capacity or tenant count changes.</p>
+
+<h2>The algorithms</h2>
+<p>Five canonical algorithms. The axes that matter: how they treat <em>bursts</em>, how much <em>memory</em> they cost per key, and how <em>accurate</em> they are at the window boundary.</p>
+
+<table>
+  <thead><tr><th>Algorithm</th><th>How it works</th><th>Burst behaviour</th><th>Memory / key</th><th>Accuracy</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Fixed window</strong></td><td>One counter per calendar window (e.g. per minute); increment, reject above limit, reset at window edge.</td><td>Allows a spike at each edge.</td><td>O(1) — one int.</td><td>Poor: <em>boundary burst</em> lets through up to 2× the limit.</td></tr>
+    <tr><td><strong>Sliding window log</strong></td><td>Store the timestamp of every request; count those within the trailing window.</td><td>Exact — no edge artifact.</td><td>O(requests) — every timestamp.</td><td>Exact, but memory explodes under load.</td></tr>
+    <tr><td><strong>Sliding window counter</strong></td><td>Keep current + previous fixed-window counts; weight the previous by how much it still overlaps the trailing window.</td><td>Smooths the boundary.</td><td>O(1) — two ints.</td><td>Near-exact; cheap. <strong>Common production choice.</strong></td></tr>
+    <tr><td><strong>Token bucket</strong></td><td>Bucket of capacity B refills at r tokens/s; each request spends a token; reject (429) if empty.</td><td><strong>Allows bursts up to B</strong>, caps sustained rate at r.</td><td>O(1) — tokens + timestamp.</td><td>Exact on average rate; burst-friendly.</td></tr>
+    <tr><td><strong>Leaky bucket</strong></td><td>Requests enter a queue that drains at a constant rate r; overflow is dropped.</td><td><strong>No downstream bursts</strong> — output is a smooth r.</td><td>O(queue depth).</td><td>Smooths output; adds queueing delay.</td></tr>
+  </tbody>
+</table>
+
+<h3>The boundary-burst flaw, concretely</h3>
+<p>Suppose the limit is 100 req/min with a <strong>fixed window</strong>. A client sends 100 requests at 00:00:59 and another 100 at 00:01:00. Both windows individually pass — but the backend saw <strong>200 requests in one second</strong>. That's 2× the intended limit, delivered in a microburst. Sliding-window counter fixes this by blending the two windows.</p>
+
+<p class="math block">accepted(t) ≈ count<sub>cur</sub> + count<sub>prev</sub> · ( 1 − elapsed_in_window / window )</p>
+
+<p>The mental model for the two bucket algorithms is worth memorising: <strong>token bucket = "allow bursts, cap the average"</strong>; <strong>leaky bucket = "enforce a smooth constant rate, no bursts."</strong> In practice most APIs prefer token bucket because short bursts are usually fine and even desirable — a user loading a page fires 30 requests at once and that's normal. Leaky bucket earns its place specifically when the <em>downstream</em> is fragile: a third-party API with its own hard limit, a legacy mainframe, a payment processor — anything where you'd rather add a few milliseconds of queueing delay than ever exceed a smooth rate.</p>
+
+<p>One subtlety worth saying out loud: token bucket and the sliding-window counter are <em>computationally equivalent</em> in the steady state — both converge accepted-rate to r. The difference is in the <em>transient</em>. Token bucket stores "credit" you can spend in a lump; the window counter spreads admission more evenly. If you want a client to be able to save up for a big batch job, token bucket; if you want maximally smooth admission, the counter.</p>
+
+<h2>Token-bucket math</h2>
+<p>Two parameters define everything:</p>
+<ul>
+  <li><strong>Capacity B</strong> (tokens) — the maximum <em>burst</em> you'll absorb instantly.</li>
+  <li><strong>Refill rate r</strong> (tokens/s) — the <em>sustainable</em> long-run throughput.</li>
+</ul>
+<p>Each arriving request takes one token; if the bucket is empty it's rejected with 429. Over any long interval the accepted rate converges to <strong>min(λ, r)</strong> regardless of how spiky λ is — that's the whole point. The bucket starts full, so the first burst of up to B is admitted at once; beyond that, admission is gated by refill.</p>
+
+<div class="callout ok">
+  <div class="label">Worked example</div>
+  Set <span class="math">B = 100</span> tokens, <span class="math">r = 20</span> tokens/s. Backend can sustain ~20 req/s per tenant comfortably (02 headroom).
+  <ul>
+    <li><strong>Idle client suddenly sends 100:</strong> bucket is full → all 100 admitted instantly (the allowed burst). Bucket now empty.</li>
+    <li><strong>Then a steady 50 req/s arrives:</strong> only 20/s refill, so 20/s pass and <span class="math">50 − 20 = 30</span> req/s are rejected. Sustained accepted rate = min(50, 20) = 20.</li>
+    <li><strong>Time for the initial burst capacity to drain under that 50/s:</strong> the deficit is <span class="math">λ − r = 30</span> tokens/s drained from a 100-token bucket → <span class="math">B / (λ − r) = 100 / 30 ≈ 3.3 s</span> of "free burst" before steady rejection kicks in.</li>
+    <li><strong>Recovery:</strong> after the flood stops, the bucket refills at 20/s, fully replenishing in <span class="math">B / r = 100 / 20 = 5 s</span>, ready for the next burst.</li>
+  </ul>
+  Net: the tenant gets a generous burst allowance <em>and</em> a hard cap on average load. The backend never sees more than 20 sustained req/s from this key.</div>
+
+<div class="ascii">
+   clients                  API GATEWAY  (replicated, stateless)              services
+  ─────────         ┌────────────────────────────────────────────┐        ───────────
+   app  ──┐         │  TLS term → authn/authz → RATE LIMIT → route │   ┌──▶  orders
+   app  ──┼───────▶ │  ┌───────── token bucket per API key ──────┐ │ ──┼──▶  users
+   bot  ──┘         │  │ tokens: ▣▣▣▣▣▣▢▢▢▢   refill r/s          │ │   └──▶  billing
+                    │  │ spend 1 / req · empty ⇒ 429 + Retry-After │ │
+                    │  └───────────────────────────────────────────┘ │
+                    └────────────────────────────────────────────┘
+          accepted rate ⟶ min(λ, r)      rejected (429) ⟶ max(0, λ−r) in steady state
+</div>
+
+<div class="callout">
+  <div class="label">Follow one request through the front door</div>
+  <ol>
+    <li>The client opens a TCP connection and completes the <strong>TLS handshake — which terminates here, at the gateway</strong>, not at the backend. The orders service never sees raw bytes off the wire; it only ever talks to the trusted edge.</li>
+    <li>The gateway extracts the <strong>API key / token</strong> and verifies <strong>authn / authz</strong>. An unauthenticated or unauthorised caller is rejected right here — we don't spend a token, and we don't route anything inward.</li>
+    <li>For that key, the gateway runs an <strong>atomic token-bucket check</strong>. If the bucket is empty, it returns <strong>429 with <code>Retry-After</code> immediately</strong> — having touched nothing downstream. No connection, no thread, no query.</li>
+    <li>A token is spent and the request is <strong>routed to the orders service</strong>. This is the <em>first</em> step that consumes real backend resources — a connection, a worker thread, a DB query.</li>
+    <li>The response is shaped (headers, payload caps) and <strong>metrics / traces are emitted</strong> (16) before it's handed back to the client.</li>
+  </ol>
+  The punchline: steps 1–3 are deliberately the <em>cheap</em> part — a handshake and a counter lookup, tens of microseconds and zero downstream cost. Only step 4 costs backend resources. That is exactly why the limiter (the "cop") stands at <strong>step 3, before the expensive work</strong>, never after it.</div>
+
+<h2>Distributed rate limiting</h2>
+<p>Everything above assumed a single bucket. Now make it real: you have a fleet of <strong>N</strong> gateway nodes behind a load balancer, autoscaling up and down, and a client's requests land on different nodes. Where does the counter live? This is where the interview earns its "senior" label, and the recurring theme is <strong>accuracy vs. coordination cost</strong>.</p>
+
+<table>
+  <thead><tr><th>Approach</th><th>How</th><th>Accuracy</th><th>Cost / risk</th></tr></thead>
+  <tbody>
+    <tr><td><strong>(a) Per-node local</strong></td><td>Each node holds its own bucket with limit L; no coordination.</td><td>Approximate. Effective global limit ≈ <span class="math">N·L</span> and <em>drifts with N</em> as you autoscale; a client spread evenly across nodes can do N·L.</td><td>Cheapest — zero network hops, no shared state. Over-permissive; you set L = limit/N and hope the LB spreads evenly.</td></tr>
+    <tr><td><strong>(b) Centralised shared counter</strong></td><td>One store (Redis) holds the counter; nodes do an atomic <code>INCR</code> / a Lua script / a <code>CL.THROTTLE</code> (redis-cell) per request.</td><td>Accurate — single source of truth, exact global limit.</td><td>Adds a <strong>network hop per request</strong> (sub-ms but real), makes the store a <strong>dependency / SPOF</strong> (13) and a <strong>hot key</strong> (07) for a popular tenant.</td></tr>
+    <tr><td><strong>(c) Hybrid (local + global budget)</strong></td><td>Local token buckets that periodically <em>borrow</em> a slice of a global budget and sync residuals back.</td><td>Eventually-accurate — small transient over/under-shoot between syncs.</td><td>Low coordination (sync every 100ms–1s, not per request). More code; this is lesson 09's eventual-consistency trade-off applied to counters.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <div class="label">Picking sensibly</div>
+  If your limit is a soft guard against saturation, <strong>(a) local is often enough</strong> — being 2× off rarely matters and you pay nothing. If the limit is a hard contractual quota (billing, a paid tier), you need <strong>(b) centralised</strong> accuracy — then protect the Redis with replication and accept the hop. At very high RPS where the hot key or the hop hurts, move to <strong>(c) hybrid</strong>. Don't reach for Redis reflexively; ask "how wrong can I afford to be?" first.</div>
+
+<h3>Why the centralised path needs atomicity</h3>
+<p>The naive centralised implementation — read counter, compare to limit, write counter+1 — has a textbook <strong>race</strong>: two nodes read 99 (limit 100), both decide they're under, both write 100, and you've admitted 101. Under high concurrency this leaks badly. The fix is to make check-and-increment <strong>atomic on the store</strong>: Redis <code>INCR</code> is atomic, but to also apply the limit and TTL in one round trip you ship a <strong>Lua script</strong> (Redis executes it atomically server-side) or use a purpose-built module like <strong>redis-cell</strong>'s <code>CL.THROTTLE</code>, which implements a token bucket (GCRA) in one atomic call and returns remaining tokens and retry-after for free. The lesson generalises: a distributed counter is only correct if the read-modify-write is atomic where the data lives.</p>
+
+<div class="ascii">
+  token bucket over time   (B=10, r=2/s, λ spikes to 6/s for 5s)
+  tokens ▲
+      10 ┤█▙                                  refill 2/s ↘
+       8 ┤█ ▜▖           burst of 10 admitted instantly
+       6 ┤█   ▜▖         then deficit (6−2)=4/s drains the bucket
+       4 ┤█     ▜▖
+       2 ┤█       ▜▙▁▁▁▁▁▁▁  empty ⇒ admit only 2/s, reject 4/s (429)
+       0 ┤█__________▔▔▔▔▔▔▔▔▔▔________ refills back to 10 in B/r=5s after spike
+         └┬────┬────┬────┬────┬────┬──▶ t (s)
+          0    1    2    3    4    5
+</div>
+
+<h2>The client contract</h2>
+<p>Rejecting a request is only half the job — you must tell the client <em>how</em> to behave so it doesn't make things worse. The standard contract:</p>
+<ul>
+  <li><strong>HTTP 429 Too Many Requests</strong> on rejection.</li>
+  <li><strong><code>Retry-After</code></strong> header — seconds (or a date) until the client may retry. A well-behaved client waits this long.</li>
+  <li><strong>Rate-limit headers</strong> on every response: <code>RateLimit-Limit</code>, <code>RateLimit-Remaining</code>, <code>RateLimit-Reset</code> — so clients self-throttle <em>before</em> hitting 429.</li>
+  <li>Good clients then apply <strong>exponential backoff with jitter</strong> (lesson 13) — never a tight retry loop, which turns your limiter into a thundering-herd amplifier.</li>
+</ul>
+
+<p>There's a sharp distinction between <strong>429 (Too Many Requests)</strong> and <strong>503 (Service Unavailable)</strong>: 429 means "you specifically have exceeded your quota — slow down," while 503 means "the service as a whole is overloaded" (lesson 13's shedding). Clients can and should treat them differently — a 429 says back off on this key, a 503 says the whole service is hurting. Emitting the right one is part of the contract. And whatever you do, the rejection path must be <em>cheaper</em> than the success path; if computing "should I reject?" itself touches the database, an attacker can DoS you through your own limiter.</p>
+<p><strong>Where to key the limit</strong> is its own decision: per <strong>API key</strong> (best — stable identity tied to a tenant/plan), per <strong>user</strong>, or per <strong>IP</strong>. IP is the fallback when there's no identity, but beware the <strong>NAT / shared-IP pitfall</strong>: an entire office, a carrier-grade NAT, or a corporate proxy shares one IP, so an IP limit can throttle thousands of innocent users together while a distributed botnet sails under it. Layer keys: a coarse per-IP limit for anonymous traffic plus a precise per-key limit for authenticated traffic. Also consider <strong>request coalescing / dedup</strong> at the edge — collapse identical concurrent reads into one downstream call.</p>
+
+<p>Two more dimensions appear in good designs. First, <strong>limit granularity</strong>: a single global per-key limit is crude; production systems usually limit <em>per endpoint class</em>, because a cheap <code>GET /health</code> and an expensive <code>POST /report</code> shouldn't draw from the same budget. The natural extension is <strong>weighted / cost-based limiting</strong> — each request spends a number of tokens proportional to its estimated cost (GitHub's API uses exactly this, charging more "points" for heavier GraphQL queries). Second, <strong>where the limiter physically lives</strong>: an in-process check at your own gateway is one option, but you can also push limiting to a CDN / WAF edge (Cloudflare, Fastly) so abusive traffic is rejected on a different continent before it ever reaches your region — cheapest of all, at the cost of the edge having coarser identity information.</p>
+
+<h2>Token-bucket simulator</h2>
+<p>Set capacity B, refill rate r, and incoming rate λ. Watch the steady-state split and how long the burst budget lasts.</p>
+
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">Sustained accepted = min(λ, r)</div><div class="v" id="k-acc">—</div></div>
+  <div class="kpi"><div class="k">Burst absorbed instantly = B</div><div class="v" id="k-burst">—</div></div>
+  <div class="kpi"><div class="k">Steady reject = max(0, λ−r)</div><div class="v" id="k-rej">—</div></div>
+  <div class="kpi"><div class="k">Time to drain bucket</div><div class="v" id="k-drain">—</div></div>
+</div>
+
+<div class="widget" id="tb">
+  <div class="title">Token bucket: bursts vs. sustained rate</div>
+  <div class="hint">Token bucket allows bursts up to B then caps the average at r. A <strong>leaky bucket</strong> instead queues requests and drains at a steady r — no downstream burst at all, but added queueing delay. Pick token bucket when bursts are fine, leaky when downstream needs a smooth feed.</div>
+  <div class="controls">
+    <label class="inline">Capacity B (tokens): <input type="range" id="B" min="1" max="500" value="100" step="1"> <span class="val" id="vB">100</span></label>
+    <label class="inline">Refill r (tokens/s): <input type="range" id="r" min="1" max="200" value="20" step="1"> <span class="val" id="vr">20</span></label>
+    <label class="inline">Incoming λ (req/s): <input type="range" id="lam" min="1" max="400" value="50" step="1"> <span class="val" id="vlam">50</span></label>
+  </div>
+  <div class="callout" id="tb-out"><div class="label">Verdict</div><span id="tb-txt">—</span></div>
+</div>
+
+<h2>Interview prompts you should be ready for</h2>
+<div class="callout">
+  <ol>
+    <li><strong>Why put the rate limiter at the gateway and not in each service?</strong> <em>(senior answer)</em> It's the cheapest, earliest place to drop excess load before it costs real resources, and it centralises a cross-cutting concern so services stay simple. The cost is an extra hop and a critical-path component that must be replicated — don't let the door become the SPOF.</li>
+    <li><strong>Token bucket vs. leaky bucket — when each?</strong> <em>(senior answer)</em> Token bucket allows bursts up to B and caps the <em>average</em> at r — right when short bursts are normal (page loads, batch fan-out). Leaky bucket queues and drains at a constant r, producing a smooth downstream feed with no bursts, at the cost of queueing delay — right when the downstream can't tolerate spikes at all.</li>
+    <li><strong>Explain the fixed-window boundary-burst flaw.</strong> <em>(senior answer)</em> A client can send the full limit at the end of one window and again at the start of the next, delivering 2× the limit in a tiny interval. Sliding-window counter fixes it by weighting the previous window's count by its remaining overlap — O(1) memory, near-exact.</li>
+    <li><strong>How do you rate limit across N autoscaling gateway nodes?</strong> <em>(senior answer)</em> Three options on an accuracy-vs-coordination spectrum: per-node local (free, approximate, effective limit drifts as N·L), centralised Redis counter (accurate, adds a per-request hop plus a hot-key/SPOF risk), or hybrid local buckets that periodically borrow from a global budget (eventually accurate, low coordination). Choose by how wrong you can afford to be.</li>
+    <li><strong>What does a good 429 response look like?</strong> <em>(senior answer)</em> Status 429 with <code>Retry-After</code> and <code>RateLimit-Limit/Remaining/Reset</code> headers so clients self-throttle and back off with jitter. Without that contract clients hammer in a tight loop and amplify the overload.</li>
+    <li><strong>Should you key limits on IP?</strong> <em>(senior answer)</em> Only as a fallback for anonymous traffic. Shared NAT/CGNAT means one IP can be thousands of users, so IP limits both over-punish innocents and under-catch distributed attacks. Prefer per-API-key/per-user; layer a coarse per-IP cap underneath.</li>
+    <li><strong>How does rate limiting relate to load shedding (lesson 13)?</strong> <em>(senior answer)</em> Same goal — keep the backend below the saturation cliff — different timing. Rate limiting is planned, per-key admission control enforced continuously; load shedding is the emergency reaction when you're already overloaded. A good system does both: the limiter is the steady gatekeeper, shedding is the circuit breaker.</li>
+    <li><strong>Your limiter's Redis goes down — now what?</strong> <em>(senior answer)</em> Decide the failure mode deliberately. Fail-open (allow traffic) keeps the API up but removes protection; fail-closed (reject) protects backends but causes an outage. Usually fall back to per-node local limits (degraded accuracy, still bounded) and alert — that's the hybrid design paying off.</li>
+  </ol>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  The edge is where unbounded demand meets bounded supply. An API gateway makes that boundary cheap to defend: reject early, reject for the right reasons (protect the backend, not punish the user), and tell the client how to behave. Token bucket — burst up to B, average down to r — is the default; sliding-window counter is the cheap-and-accurate counter. The hard part is distribution: every accuracy gain costs coordination, so size the mechanism to how wrong you can afford to be, and never let the front door become the single point of failure.</div>
+
+<footer class="lesson-nav">
+  <a href="14_optimization.html"><span class="dir">← Previous</span><span class="ttl">14 · Optimisation playbook</span></a>
+  <a class="next" href="16_observability.html"><span class="dir">Next →</span><span class="ttl">16 · Observability &amp; operability</span></a>
+</footer>
+</main>
+<script>
+(function(){
+  var B=document.getElementById('B'), r=document.getElementById('r'), lam=document.getElementById('lam');
+  var vB=document.getElementById('vB'), vr=document.getElementById('vr'), vlam=document.getElementById('vlam');
+  var out=document.getElementById('tb-out'), txt=document.getElementById('tb-txt');
+  function compute(){
+    var b=+B.value, rr=+r.value, l=+lam.value;
+    var accepted=Math.min(l, rr);
+    var reject=Math.max(0, l-rr);
+    var drain = l>rr ? (b/(l-rr)) : Infinity;
+    return {b:b, r:rr, l:l, accepted:accepted, reject:reject, drain:drain};
+  }
+  function diagnose(s){
+    if(s.l <= s.r)
+      return ['Within budget','var(--ok)',
+        'λ='+s.l+' ≤ r='+s.r+' req/s. The bucket never runs dry in steady state — every request gets a token and bursts up to B='+s.b+' are absorbed instantly. Accepted ≈ min(λ,r)='+s.accepted+'/s, zero steady rejection. This is exactly the regime you want.'];
+    if(s.l <= s.r*2)
+      return ['Bursts only, then steady rejects','var(--warn)',
+        'λ='+s.l+' slightly exceeds r='+s.r+'. The full bucket (B='+s.b+') absorbs the first burst, draining in B/(λ−r)='+s.drain.toFixed(2)+'s; after that the limiter rejects '+s.reject+'/s steadily. Remember: bursts are <em>allowed up to B</em>, but the <em>sustained</em> rate is hard-capped at r. Either this λ is genuinely abusive (correct to reject) or your r is set too low for legitimate demand.'];
+    return ['Heavy rejection — admission control working','var(--bad)',
+      'λ='+s.l+' ≫ r='+s.r+'. The bucket drains almost immediately (B/(λ−r)='+s.drain.toFixed(2)+'s) and the limiter rejects '+s.reject+'/s with 429s. This is the limiter <strong>protecting the backend</strong> from the 02 saturation cliff — it is doing its job. Only raise r if the backend has measured headroom; otherwise this is correct admission control, and clients should back off (Retry-After + jitter).'];
+  }
+  function update(){
+    vB.textContent=B.value; vr.textContent=r.value; vlam.textContent=lam.value;
+    var s=compute();
+    document.getElementById('k-acc').textContent=s.accepted+' req/s';
+    document.getElementById('k-burst').textContent=s.b+' tokens';
+    document.getElementById('k-rej').textContent=s.reject+' req/s';
+    document.getElementById('k-drain').textContent = s.drain===Infinity ? 'never — within budget' : s.drain.toFixed(2)+' s';
+    var d=diagnose(s);
+    out.style.borderLeftColor=d[1];
+    txt.innerHTML='<strong>'+d[0]+'.</strong> '+d[2];
+  }
+  [B,r,lam].forEach(function(el){ el.addEventListener('input',update); el.addEventListener('change',update); });
+  update();
+})();
+</script>
+</body>
+</html>

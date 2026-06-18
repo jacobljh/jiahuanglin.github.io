@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C39 - Match buy and sell orders</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  main { overflow-wrap: break-word; }
+  .case-meta { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 22px; }
+  .case-meta .chip { background: var(--bg-elev); }
+  table { table-layout: fixed; }
+  th, td { overflow-wrap: anywhere; }
+  .linear-list li { margin: 8px 0; }
+  .source-note { color: var(--text-mute); font-size: 13px; margin-top: 8px; }
+  @media (max-width: 560px) {
+    header.topnav .inner { flex-wrap: wrap; gap: 8px; }
+    header.topnav .step-pill { margin-left: 0; white-space: normal; }
+    main { padding-inline: 14px; }
+    th, td { padding: 6px 5px; font-size: 12px; }
+  }
+</style>
+</head>
+<body>
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">system_design</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="syllabus.html">cases</a>
+    <span class="crumb">/</span>
+    <span class="crumb">C39</span>
+    <span class="step-pill">C39 / C44</span>
+  </div>
+</header>
+<main>
+
+<h1>Match buy and sell orders</h1>
+<p class="subtitle">The matching engine is the exchange's kernel: a tiny, single-threaded state machine whose only job is to decide — for a stream of orders — exactly which trades happen, in exactly what order, every single time you replay the tape. Correctness is the product. Speed is a constraint.</p>
+<div class="case-meta">
+  <span class="chip">Satellite of C37 (exchange anchor)</span>
+  <span class="chip">Owns: matching kernel</span>
+  <span class="chip">Price-time priority</span>
+  <span class="chip">Deterministic replay</span>
+</div>
+
+<div class="callout">
+  <div class="label">Where this sits in the exchange arc</div>
+  This is one of three deliberately linked cases. <a href="case_37_stock_exchange.html">C37</a> is the <strong>system overview</strong> — gateways, sequencer, order book, market-data fan-out, the durability story — and is the anchor you should read first. <a href="case_38_microsecond_exchange.html">C38</a> owns the <strong>microsecond latency budget</strong> (kernel bypass, busy-poll, NUMA pinning). This page, C39, owns the <strong>matching kernel itself</strong>: the price-time priority rule, the data structure that makes "best price" O(1), and why the whole thing must replay deterministically. We will not re-derive C37's architecture — we link to it and go deep on the kernel.</div>
+
+<h2>The hinge: matching is a deterministic state machine, not a database query</h2>
+<div class="callout">
+  <div class="label">First principle</div>
+  A matching engine is a pure function: <code>match(state, command) → (state', trades)</code>. Given the same starting book and the same <em>ordered</em> sequence of commands, it must produce byte-identical fills — on the primary, on the hot standby, on the auditor's machine three years later. That is not a nice-to-have; it is the definition of a fair market. Every design decision below is downstream of this one requirement: <strong>the output must be a deterministic function of an agreed input order.</strong></div>
+
+<p>Notice what this rules out. The engine cannot consult wall-clock time mid-match (two replays would diverge), cannot read a shared cache (stale reads differ), cannot run the matching loop on multiple threads racing for the same price level (interleavings differ), and cannot let floating-point summation reorder. The forcing constraint is <em>reproducibility under replay</em>, and it pushes the design toward something that feels almost retro: a single thread, all state in memory, fed by one totally-ordered input log. This is DDIA Ch. 7's deepest insight made literal — the strongest isolation level, serializability, is <em>defined</em> as "as if executed serially, one at a time," and the matching engine simply <em>is</em> a single-threaded serial executor. There is no isolation anomaly because there is no concurrency.</p>
+
+<h2>1. Clarify the contract — and what it is NOT</h2>
+<p>Treat the prompt as a product contract before a box diagram. The kernel must:</p>
+<ul>
+  <li>Maintain a <strong>bid book</strong> (buyers, sorted by price descending) and an <strong>ask book</strong> (sellers, price ascending).</li>
+  <li>Match incoming marketable orders by <strong>price-time priority</strong>: best price first; ties broken by earliest arrival (FIFO within a level).</li>
+  <li>Support <strong>limit, market, cancel, and replace</strong>; emit partial fills.</li>
+  <li>Produce a deterministic <strong>trade stream</strong> plus the resting-order residual, and a book snapshot on demand.</li>
+  <li><strong>Replay deterministically</strong> from the input command log — bit-for-bit identical fills.</li>
+</ul>
+<p>And explicitly what it need <em>not</em> do, because these belong to C37's surrounding system, not the kernel: it does <em>not</em> persist to a database on the hot path (durability comes from the sequenced input log, replayed into a hot standby — see below), does <em>not</em> do auth, risk-limit, or balance checks (the gateway does pre-trade risk before the sequencer), does <em>not</em> handle multi-symbol sharding policy (C37: one symbol → one kernel instance), and does <em>not</em> own the wire latency budget (C38). Keeping the kernel this small is what lets it stay a few thousand lines of branch-predictable, allocation-free code.</p>
+
+<h2>2. Put numbers on the data structure — array of price levels vs tree map</h2>
+<p>The single most consequential kernel decision is how to store price levels. The matching loop does one thing constantly: <em>find the best (top-of-book) price, repeatedly.</em> So the question is "what is the cost of `best_bid()` / `best_ask()`, and of insert/cancel?" Two candidates:</p>
+
+<table>
+  <thead><tr><th>Structure</th><th>best-price</th><th>insert at level</th><th>cancel</th><th>memory</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Sorted tree map</strong> (RB-tree / skip list keyed by price)</td><td>O(log L)</td><td>O(log L)</td><td>O(log L) node removal</td><td>O(L<sub>active</sub>) — only populated levels</td></tr>
+    <tr><td><strong>Dense array of price levels</strong> (price index → level)</td><td>O(1) amortised (track a moving best pointer)</td><td>O(1)</td><td>O(1) tombstone</td><td>O(L<sub>max</sub>) — all ticks pre-allocated</td></tr>
+  </tbody>
+</table>
+
+<p>Now do the arithmetic that decides it. Take an instrument with a bounded, regulated tick grid: price range <strong>$0.01 to $1000</strong> at a <strong>$0.01 tick</strong>. The number of representable price levels is</p>
+<p class="math block">L<sub>max</sub> = (1000 − 0.01) / 0.01 ≈ 100,000 levels</p>
+<p>Pre-allocate an array of 100,000 slots, each a small struct (head/tail pointer into a FIFO queue + aggregate qty), say <strong>~32 bytes</strong>. That is <span class="math">100,000 · 32 = 3.2 MB</span> per side, <strong>~6.4 MB for the full book</strong> — trivially L1/L2-adjacent, cache-friendly, and never touches the allocator after startup. In exchange for that fixed memory you get <strong>O(1) access to any price level by direct indexing</strong> and an O(1) best-price read by advancing a single "best level" cursor. Compare the tree map: it only stores the handful of active levels (maybe a few hundred), so its memory is smaller, but every best-price read pays <span class="math">O(log L) ≈ log<sub>2</sub>(100,000) ≈ 17</span> pointer-chasing, cache-missing comparisons — and you do this on the hottest line of the hottest loop in the building.</p>
+
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">Price levels (1c tick, $0.01–$1000)</div><div class="v">~100,000</div></div>
+  <div class="kpi"><div class="k">Dense array, full book</div><div class="v">~6.4 MB</div></div>
+  <div class="kpi"><div class="k">best-price: array vs tree</div><div class="v">O(1) vs ~17 hops</div></div>
+  <div class="kpi"><div class="k">Orders that never fill (cancelled)</div><div class="v">~90%</div></div>
+</div>
+
+<div class="callout warn">
+  <div class="label">The condition that flips the answer</div>
+  The dense array wins <em>only</em> when the tick grid is <strong>bounded and not sparse</strong> — equities and futures, where regulated tick sizes cap L<sub>max</sub> in the hundreds of thousands. For instruments with a huge or unbounded price range relative to the tick (some crypto pairs span many orders of magnitude, or use floating tick sizes), the array becomes mostly empty and the memory blows up — there the tree map's O(L<sub>active</sub>) memory is the right call, and you pay the log L. Production equity engines almost universally pick the array; this is the textbook "tempting shortcut" only when you forget to check that the price range is actually bounded.</div>
+
+<h2>3. The cancel-rate fact that drives the queue design</h2>
+<p>One operational number dominates the data-structure choice for <em>within</em> a price level: in modern markets, <strong>roughly 90% of submitted orders are cancelled before they ever fill.</strong> The order-to-trade ratio at high-frequency venues runs well above 10:1. So cancel is not a rare path — it is the <em>dominant</em> path. That changes the math entirely.</p>
+
+<p>If you model each price level's FIFO as a doubly-linked list and store, in an <strong>order-ID → node</strong> hash map, a direct pointer to each resting order, then both insert and cancel are O(1). But a true node removal on cancel costs you the pointer surgery <em>plus</em> map deletion <em>plus</em> potential allocator churn — and you pay it on 90% of orders. The cheaper alternative is a <strong>tombstone</strong>: on cancel, flip a `cancelled` flag on the node and leave it in the queue; the matching loop skips tombstoned nodes lazily when it walks the level, and a background compaction reclaims them. Tombstoning makes cancel a single branch-free store, at the cost of queues that bloat with dead nodes between compactions. Given a 90% cancel rate, the tombstone's "do almost nothing on the hot cancel path, clean up in bulk later" is usually the right trade — it is the same LSM-tree intuition from DDIA Ch. 3 (cheap deletes via markers, amortised compaction) applied to an in-memory queue.</p>
+
+<h2>4. Data model &amp; API</h2>
+<p>Keep the surface minimal; the kernel speaks in commands, not internal layout.</p>
+<table>
+  <thead><tr><th>Command</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>new_order(id, side, type, price, qty)</code></td><td>Match against the opposite book; rest the residual (limit) or reject the residual (market/IOC).</td></tr>
+    <tr><td><code>cancel_order(id)</code></td><td>Tombstone the resting order found via the order-ID map.</td></tr>
+    <tr><td><code>replace_order(id, price', qty')</code></td><td>Cancel + re-add. A price change <em>loses time priority</em> (goes to the back of the new level) — a fairness rule, not an implementation detail.</td></tr>
+    <tr><td><code>snapshot_book()</code></td><td>Deterministic dump of resting orders for recovery / audit.</td></tr>
+  </tbody>
+</table>
+<p>The core records: a <strong>price level</strong> (FIFO queue head/tail + aggregate qty), an <strong>order</strong> (id, side, price, remaining qty, queue node), an <strong>order-ID map</strong> (id → node, for O(1) cancel), a <strong>trade</strong> (maker id, taker id, price, qty, seq), and the <strong>sequence number</strong> stamped by the sequencer on every command.</p>
+
+<h2>5. Linearized design — follow one aggressive order</h2>
+<ol class="linear-list">
+  <li><strong>Sequence first.</strong> Every accepted command passes through the C37 sequencer, which stamps a monotonic <strong>sequence number</strong>. This is the total order; the kernel only ever sees commands in this order. (DDIA Ch. 9: total order broadcast.)</li>
+  <li><strong>Read the opposite top-of-book.</strong> For a buy, look at the best ask via the O(1) best-price cursor.</li>
+  <li><strong>Cross test.</strong> If the buy's limit price ≥ best ask, it is <em>marketable</em> — match. Otherwise rest it.</li>
+  <li><strong>Walk FIFO within the level.</strong> Fill against the oldest resting order at that price first, then the next, emitting a trade per fill, decrementing both quantities. Skip tombstoned nodes.</li>
+  <li><strong>Sweep levels.</strong> If the order still has quantity and the next price level is still marketable, advance the best cursor and repeat (this is how a large/market order "walks the book").</li>
+  <li><strong>Rest the residual.</strong> Any unfilled limit quantity is inserted at the back of its own price level (FIFO tail); a market/IOC residual is cancelled.</li>
+  <li><strong>Append outputs to the log.</strong> Commands in, trades out — both appended to the sequenced log that feeds the hot standby and the audit trail.</li>
+</ol>
+
+<div class="ascii">
+  PRICE-TIME PRIORITY — an aggressive BUY 250 @ limit 100.02 walks the ask side
+
+  ASK book (sellers, ascending)          incoming: BUY 250 @ 100.02
+  price    FIFO queue (oldest → newest)
+  ─────    ──────────────────────────────
+  100.00   [A:100][B: 80]      ← best ask, fill these first (better price)
+  100.01   [C:120]
+  100.02   [D: 60]             ← still marketable (100.02 ≤ limit 100.02)
+  100.03   [E:200]             ← NOT marketable, untouched
+
+  step 1: best ask = 100.00. FIFO: fill A(100) then B(80) → 180 done, 70 left
+  step 2: advance to 100.01. fill C: take 70 of 120 → C partial, 50 rests; buy done
+  step 3: residual 0 → nothing to rest.
+
+  TRADES (in sequence):  A↔buy 100@100.00 · B↔buy 80@100.00 · C↔buy 70@100.01
+  book after:            100.00 empty · 100.01 [C:50] · 100.02 [D:60] · 100.03 [E:200]
+
+  Better price ALWAYS fills before worse price. Same price → earliest order (A before B).
+  Identical input sequence ⇒ identical trades ⇒ deterministic replay.
+</div>
+
+<h2>6. Deep dives</h2>
+
+<h3>(a) Price-time priority and why the structure follows the rule</h3>
+<p>The rule is two-level: <strong>price priority</strong> (a better price always trades first) then <strong>time priority</strong> (at equal price, the order that arrived earlier trades first). The data structure is just this rule made physical. Price priority is why levels are <em>sorted</em> and why best-price must be cheap — you always touch the top of the book first. Time priority is why each level is a <strong>FIFO queue</strong> and why every command carries a monotonic sequence number: "earlier" is defined by sequence position, not wall clock. Get those two structures right and the matching loop is almost trivial — "while marketable, fill the front of the best opposite level." Note the fairness corollary mentioned above: changing an order's price moves it to the back of the new level, because otherwise you could jump the queue for free.</p>
+
+<h3>(b) Deterministic replay = state-machine replication</h3>
+<p>Durability here does <em>not</em> come from writing the book to a database on each trade — that would put a disk round-trip in the microsecond hot path. Instead: persist only the <strong>sequenced input log</strong>, and recover the book by <em>replaying</em> it through the same deterministic kernel. This is exactly DDIA Ch. 9's <strong>state-machine replication</strong> and Ch. 11's <strong>event sourcing</strong>: the log of commands is the source of truth; the order book is a derived view, a fold over the log. A hot standby runs the identical kernel against the identical sequenced stream and stays bit-for-bit in lockstep, ready to take over with zero divergence. The auditor can reconstruct any trade from three years ago by replaying the tape. None of this works unless the kernel is a pure deterministic function — which is why the "no wall clock, no shared cache, single thread, no FP reordering" rules from the hinge are non-negotiable. The sequencer providing the total order (Ch. 9, total order broadcast — itself a consensus problem, foundation lesson 10) is the keystone: <strong>one agreed input order makes one reproducible output.</strong></p>
+
+<h3>(c) Tombstone vs node removal under 90% cancels; market vs limit</h3>
+<p>Covered numerically in §3: with ~90% of orders cancelled, the cancel path is the hot path, so a <strong>tombstone</strong> (flag-and-skip, bulk-compact later) usually beats true node removal (pointer surgery + map delete + allocator churn) on the hot path, at the cost of dead-node bloat between compactions. Choose true removal only if memory pressure or queue-walk overhead from tombstones measurably dominates — i.e. when cancels are <em>rare</em>, which is the opposite of these markets.</p>
+<p>On <strong>market vs limit</strong>: a market order has no price bound, so it walks the book sweeping every level until filled — which means in a thin book it can fill at a far worse price than the top, the <strong>slippage</strong> risk. Limit-only venues never slip past the limit but can leave orders unfilled. Retail-facing venues offer market orders for simplicity and bolt on protection — price collars / banding that reject or convert a market order if it would walk too far from the reference price. The kernel stays deterministic either way; the collar is just another deterministic check on the sequenced command.</p>
+
+<h2>7. Trade-offs</h2>
+<table>
+  <thead><tr><th>Choice</th><th>Buys</th><th>Costs</th><th>Choose when</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Array of price levels vs tree map</strong></td><td>O(1) best-price &amp; insert; cache-friendly, allocation-free</td><td>~6.4 MB fixed even for sparse books; needs a bounded tick grid</td><td>Bounded-tick instruments (equities, futures) — the common case</td></tr>
+    <tr><td><strong>Tombstone cancel vs node removal</strong></td><td>Branch-free O(1) cancel on the dominant path</td><td>Dead-node bloat; needs background compaction</td><td>High cancel rate (~90% order-to-trade) — i.e. always, in modern markets</td></tr>
+    <tr><td><strong>Market orders vs limit-only</strong></td><td>User simplicity; guaranteed fill</td><td>Slippage; needs collars/banding</td><td>Retail-facing venues</td></tr>
+    <tr><td><strong>In-memory book + log replay vs database book</strong></td><td>Microsecond matching; deterministic recovery</td><td>Durability lives in the log, not the book; needs replication discipline</td><td>Any real matching engine</td></tr>
+  </tbody>
+</table>
+<p>The sharpest of these is the last: putting the book <em>only</em> in memory feels reckless until you internalise that the <strong>sequenced log is the durable truth and the book is a replayable derivation</strong> (DDIA Ch. 11). A database-backed book would be durable but would add a disk write to a path measured in nanoseconds — and would still not give you deterministic replay for audit. The in-memory-plus-log design gets both microsecond latency and stronger auditability, precisely because it inverts the usual "the database is the source of truth" instinct.</p>
+
+<h2>8. Failure modes</h2>
+<table>
+  <thead><tr><th>Failure</th><th>Mitigation</th></tr></thead>
+  <tbody>
+    <tr><td>Replay diverges (non-determinism)</td><td>Ban wall-clock reads, shared caches, multi-threaded matching, FP reordering in the kernel; make it a pure function of sequenced input.</td></tr>
+    <tr><td>Cancel races a fill for the same order</td><td>Route both through the one sequencer; the lower sequence number wins, deterministically (see Q&amp;A).</td></tr>
+    <tr><td>Bad tick / out-of-grid price</td><td>Validate tick increment at the gateway before sequencing; the kernel assumes clean input.</td></tr>
+    <tr><td>Book corruption / standby drift</td><td>Periodic deterministic snapshot + checksum; rebuild by replaying the log from the last good snapshot.</td></tr>
+    <tr><td>Tombstone bloat starves cache</td><td>Bound queue dead-ratio; trigger compaction at a threshold.</td></tr>
+  </tbody>
+</table>
+
+<h2>9. Interview Q&amp;A</h2>
+<div class="callout">
+  <ol>
+    <li><strong>A cancel and a fill for the same order race — which wins, and how do you make it deterministic?</strong> <em>(senior answer)</em> They don't actually "race," because both events pass through the <strong>one sequencer</strong> first and are stamped with sequence numbers. The kernel processes commands strictly in sequence order, single-threaded. So the winner is simply whichever has the lower sequence number: if the cancel was sequenced before the matching event that would fill the order, the order is already tombstoned and cannot fill; if the fill's command sequenced first, the order fills (possibly fully) and the later cancel finds nothing or only the residual. There is no nondeterminism because there is no concurrency at the matching step — the total order <em>is</em> the tiebreak. This is DDIA Ch. 9's total-order-broadcast turning "who got there first?" into "what is the smaller sequence number?", which every replica answers identically.</li>
+    <li><strong>Why an array of price levels instead of a balanced tree?</strong> <em>(senior answer)</em> For a bounded tick grid ($0.01–$1000 at 1c ≈ 100k levels, ~6.4 MB), the array gives O(1) best-price and O(1) insert/cancel with a cache-friendly, allocation-free layout, versus the tree's ~17-comparison, cache-missing O(log L) on the hottest loop. The tree only wins when the price range is sparse/unbounded relative to the tick, where the array's fixed memory blows up — so check that assumption before defaulting to the array.</li>
+    <li><strong>How is the book durable if it lives only in memory?</strong> <em>(senior answer)</em> Durability comes from the sequenced input log, not the book. The book is a deterministic fold over that log (event sourcing, DDIA Ch. 11); recover by replaying the log into the identical kernel. A hot standby replays the same stream live and stays bit-identical. This keeps the hot path off disk while making recovery and audit stronger than a DB-backed book.</li>
+    <li><strong>Why FIFO within a price level, and what does a price-change replace do to it?</strong> <em>(senior answer)</em> FIFO encodes time priority — at equal price, the earlier order trades first, where "earlier" means lower sequence number. A replace that changes price loses time priority and goes to the back of the new level, otherwise traders could repeatedly re-price to jump the queue for free. Quantity-only decreases can sometimes keep priority depending on venue rules.</li>
+    <li><strong>Why single-threaded? Isn't that leaving performance on the table?</strong> <em>(senior answer)</em> Single-threaded matching is what makes the engine a serializable state machine (DDIA Ch. 7 — serializability is literally "as if run serially"), which is what makes deterministic replay and lockstep standbys possible. You buy correctness and auditability. You recover the lost parallelism by <em>sharding by symbol</em> (C37): one kernel per symbol, many kernels across cores — each independently deterministic.</li>
+    <li><strong>How do you handle the ~90% cancel rate cheaply?</strong> <em>(senior answer)</em> Tombstone on cancel — flip a flag, skip lazily during the level walk, compact in the background — so the dominant path is a single branch-free store rather than pointer surgery plus allocator churn. Keep an order-ID → node map for O(1) lookup. Bound the dead-node ratio so tombstones don't starve cache.</li>
+    <li><strong>What protects a market order from disastrous slippage?</strong> <em>(senior answer)</em> Price collars / banding: a deterministic pre-match check that rejects or halts a market order if it would walk beyond a band around the reference price. It keeps the kernel deterministic (it's just another check on the sequenced command) while protecting retail users from sweeping a thin book.</li>
+  </ol>
+</div>
+
+<h2>Related lessons</h2>
+<p>Read <a href="case_37_stock_exchange.html">C37</a> first — it is the <strong>exchange overview anchor</strong> (sequencer, fan-out, durability, symbol sharding) that this kernel plugs into. <a href="case_38_microsecond_exchange.html">C38</a> owns the <strong>microsecond latency budget</strong> that this single-threaded kernel must hit. Foundation lesson <a href="10_consensus_coordination.html">10 (consensus &amp; coordination)</a> is where the sequencer's <strong>total order</strong> ultimately comes from, and <a href="09_consistency_cap.html">09 (consistency &amp; CAP)</a> frames why a strongly-ordered single writer is the right consistency model for a fair market.</p>
+<div class="case-meta">
+  <a class="chip" href="case_37_stock_exchange.html">C37 exchange overview</a>
+  <a class="chip" href="case_38_microsecond_exchange.html">C38 latency budget</a>
+  <a class="chip" href="10_consensus_coordination.html">10 · consensus</a>
+  <a class="chip" href="09_consistency_cap.html">09 · consistency</a>
+  <a class="chip" href="12_distributed_transactions.html">12 · transactions/idempotency</a>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  The matching kernel is a deterministic single-threaded state machine: <code>match(state, command) → (state', trades)</code>, fed by one totally-ordered input log. Price-time priority is the rule; a dense array of price levels (~6.4 MB for a bounded tick grid) makes best-price O(1); FIFO queues with tombstone cancels handle the ~90% cancel rate cheaply. Durability and lockstep standbys come from replaying the sequenced log (state-machine replication / event sourcing), and the "cancel-vs-fill race" dissolves because both events carry sequence numbers — the lower one wins, identically, on every replica. Get the order right and the rest is bookkeeping.</div>
+
+<footer class="lesson-nav">
+  <a href="case_38_microsecond_exchange.html"><span class="dir">Previous</span><span class="ttl">Previous case</span></a>
+  <a class="next" href="case_40_secure_api_access.html"><span class="dir">Next</span><span class="ttl">Next case</span></a>
+</footer>
+
+</main>
+</body>
+</html>

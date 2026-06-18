@@ -1,0 +1,528 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>41 · Query understanding</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">search_ads_recsys</a>
+    <span class="crumb">/</span>
+    <span class="crumb">41 · query understanding</span>
+    <span class="step-pill">search · 2 / 10</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Query understanding — from raw string to structured intent</h1>
+<p class="subtitle">The funnel from <a href="40_search_vs_recommendation.html">lesson 40</a> starts with a string the user typed. Before a single posting list is touched, that string is normalized, tokenized, corrected, expanded, segmented, and tagged. Every one of those transforms trades recall against precision — your job is to name the trade for each.</p>
+
+<div class="callout">
+  <div class="label">The plan</div>
+  <ul style="margin:6px 0;">
+    <li><strong>The analysis pipeline</strong> — Unicode normalization, tokenization (whitespace vs CJK vs subword), stopwords, stemming vs lemmatization. The terms that come out feed <a href="42_inverted_index_bm25.html">the inverted index in lesson 42</a>.</li>
+    <li><strong>Spelling correction</strong> — the noisy-channel model, weighted edit distance worked by hand, and ranking candidates with a query-log language model. Autocorrect vs "did you mean" (forward-link <a href="46_autocomplete_suggest.html">lesson 46</a>).</li>
+    <li><strong>Query expansion</strong> — classic (synonyms, pseudo-relevance feedback / Rocchio) vs neural (embedding neighbours, doc2query), with a worked Rocchio reweight and the precision cost of drift.</li>
+    <li><strong>Segmentation &amp; phrase detection</strong> — why "new york times" must not become three independent terms.</li>
+    <li><strong>Intent, NER, and structured tagging</strong> — turning <code>cheap iphone charger</code> into facets that <a href="47_personalization_ecommerce.html">e-commerce search (lesson 47)</a> can filter and sort on.</li>
+    <li><strong>The LLM era</strong> — LLM query rewriting and its latency/cost caveat (link <a href="26_llm_genai.html">lesson 26</a>).</li>
+  </ul>
+</div>
+
+<p>The one engineering line to carry through every section: <strong>each transform either widens the set of documents that can match (recall) or narrows it toward the user's true intent (precision), and a senior engineer can state which, and the failure mode, for every stage.</strong> Normalization and expansion buy recall; phrase detection and tagging buy precision; spelling correction and segmentation are recall-then-precision in one move. Get the direction wrong and you either return nothing or return everything.</p>
+
+<h2>The analysis pipeline, in order</h2>
+
+<p><strong>Analysis</strong> (the IR term) is the deterministic transform from a raw query (and, symmetrically, from each document at index time) into the sequence of <em>terms</em> that the index keys on. The cardinal rule: <strong>the query analyzer and the document analyzer must agree.</strong> If the index stored <code>running</code> stemmed to <code>run</code> but the query analyzer leaves <code>running</code> alone, the term never matches and recall silently dies. Most production bugs in this layer are an asymmetry between the two paths.</p>
+
+<div class="ascii">
+  raw query:  "Café  RUNNING-shoes，纽约"
+                     │
+   ┌─────────────────▼─────────────────┐
+   │ 1. Unicode normalize (NFKC,        │   fold width/compat, casefold,
+   │    casefold, strip diacritics)     │   drop accents  → recall↑
+   └─────────────────┬─────────────────┘
+                     │  "cafe running-shoes,纽约"
+   ┌─────────────────▼─────────────────┐
+   │ 2. Tokenize                        │   split on space/punct;
+   │    (ws + lang-aware + CJK seg)     │   segment 纽约→[纽约]; subword OOV
+   └─────────────────┬─────────────────┘
+                     │  [cafe][running][shoes][纽约]
+   ┌─────────────────▼─────────────────┐
+   │ 3. Stopword policy (mostly KEEP)   │   drop only in legacy/precision modes
+   └─────────────────┬─────────────────┘
+                     │  [cafe][running][shoes][纽约]
+   ┌─────────────────▼─────────────────┐
+   │ 4. Stem OR lemmatize               │   running→run  → recall↑ (over-stem risk)
+   └─────────────────┬─────────────────┘
+                     │  [cafe][run][shoe][纽约]   ← analyzed TERMS
+                     ▼
+            feed inverted index (lesson 42)
+</div>
+
+<h3>1 · Unicode normalization</h3>
+
+<p>A user typing <code>café</code> on a Mac and another pasting <code>café</code> from a PDF can produce <em>different byte sequences</em> for the same visible string: one is the precomposed code point <span class="math">U+00E9</span>, the other is <code>e</code> + a combining acute accent <span class="math">U+0301</span>. Byte-equality fails; the term won't match. <strong>NFKC</strong> (Normalization Form KC — Compatibility Composition) is the standard fix: it canonicalizes composed/decomposed forms <em>and</em> folds compatibility variants (full-width <span class="math">ＡＢＣ</span> → <code>ABC</code>, the ligature <span class="math">ﬁ</span> → <code>fi</code>, <span class="math">①</span> → <code>1</code>). Then <strong>casefold</strong> (a more aggressive lowercase that also handles e.g. German <span class="math">ß</span> → <code>ss</code>) and optional <strong>diacritic folding</strong> (<code>café</code> → <code>cafe</code>, <code>naïve</code> → <code>naive</code>).</p>
+
+<p><strong>The trade.</strong> Every fold is a recall-for-precision swap. Diacritic folding lets <code>resume</code> match <code>résumé</code> — great for English users who skip accents. But in French, <code>marché</code> (market) and <code>marche</code> (walks/step) are different words; fold them and you inject ambiguity. <em>Failure mode:</em> a blanket accent-strip applied to a French or Vietnamese corpus collapses distinct words and tanks precision. The senior move is to make folding locale-aware, not global.</p>
+
+<h3>2 · Tokenization</h3>
+
+<p>Tokenization splits the normalized string into tokens. Three regimes you must distinguish:</p>
+
+<table>
+  <thead><tr><th>Regime</th><th>Method</th><th>Why it exists / breaks</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>Whitespace + punctuation</strong></td>
+      <td>Split on spaces and most punctuation. <code>running-shoes</code> → <code>running</code>, <code>shoes</code>.</td>
+      <td>Fine for English-like scripts. Breaks on <code>C++</code>, <code>node.js</code>, <code>3.5"</code>, product SKUs — punctuation carries meaning. Token filters/whitelists patch this.</td>
+    </tr>
+    <tr>
+      <td><strong>Language-aware / CJK segmentation</strong></td>
+      <td>Chinese/Japanese/Thai have <em>no spaces</em>. Need a segmenter: dictionary + Viterbi (jieba), CRF, or BPE. <code>纽约时报</code> → <code>纽约</code>(New York) <code>时报</code>(Times).</td>
+      <td>Segmentation is ambiguous: <code>北京大学</code> = <code>北京</code>+<code>大学</code> (Beijing University) <em>or</em> <code>北</code>+<code>京大</code>+<code>学</code>. Wrong cut = wrong terms = wrong matches. Common fallback: index character bigrams so partial matches survive a bad cut.</td>
+    </tr>
+    <tr>
+      <td><strong>Subword / BPE</strong></td>
+      <td>Break rare/unknown words into known fragments. <code>antifragility</code> → <code>anti</code> <code>frag</code> <code>ility</code>.</td>
+      <td>Handles out-of-vocabulary (OOV) terms and morphologically rich languages. Trade: subword fragments are noisier match units; a fragment match isn't a word match. Mostly used in neural retrieval (lesson 43), less in classic BM25.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p><strong>The trade.</strong> Aggressive splitting (hyphens, dots) raises recall (<code>node.js</code> finds docs that wrote <code>node js</code>) but lowers precision (<code>C++</code> queries match every doc containing a bare <code>c</code>). CJK segmentation is recall-vs-precision in the cut itself: under-segmenting keeps long phrases (precise, low recall), over-segmenting into characters maximizes recall but matches noise.</p>
+
+<h3>3 · Stopwords — why modern BM25 mostly keeps them</h3>
+
+<p><strong>Stopwords</strong> are extremely frequent function words (<code>the</code>, <code>a</code>, <code>of</code>, <code>to</code>). Classic IR dropped them: in a 1990s memory-and-disk-constrained index, the posting list for <code>the</code> covers ~every document and costs a fortune to store and intersect, while contributing almost nothing to ranking. So dropping them was a pure win on cost.</p>
+
+<p>Modern systems mostly <strong>keep</strong> stopwords. Two reasons. First, BM25 (lesson 42) already <em>down-weights</em> them automatically via IDF — a term in every document has near-zero inverse document frequency, so it barely moves the score even if present. The cost-saving motivation is gone now that storage is cheap and skip-lists make long posting lists fast. Second, dropping them destroys phrase queries and changes meaning: <code>to be or not to be</code> becomes empty; <code>the office</code> (the show) becomes <code>office</code>; <code>vitamin a</code> loses the <code>a</code> that <em>is</em> the query. <em>Failure mode of dropping:</em> the query <code>flights to paris</code> and <code>flights from paris</code> become identical. The senior position: keep stopwords for matching, rely on IDF to neutralize their weight, and special-case them only inside phrase detection.</p>
+
+<h3>4 · Stemming vs lemmatization</h3>
+
+<p>Both collapse morphological variants so <code>run</code> matches <code>running</code>/<code>ran</code>/<code>runs</code> — a recall move. They differ in how, and in what they cost.</p>
+
+<table>
+  <thead><tr><th></th><th>Stemming (e.g. Porter)</th><th>Lemmatization</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Method</strong></td><td>Rule-based suffix chopping. No dictionary, no part-of-speech. Fast, language-specific rule sets.</td><td>Dictionary + morphological analysis + part-of-speech. Maps to the true base form (lemma).</td></tr>
+    <tr><td><strong>Example wins</strong></td><td><code>connection, connected, connecting</code> → <code>connect</code></td><td><code>better</code> → <code>good</code>; <code>was, is, are</code> → <code>be</code> (stemming can't do these)</td></tr>
+    <tr><td><strong>Over-stemming (false merge)</strong></td><td><code>university</code> and <code>universe</code> → <code>univers</code>; <code>organization</code> and <code>organ</code> → <code>organ</code>; <code>news</code> → <code>new</code></td><td>Rare — POS and lexicon prevent it</td></tr>
+    <tr><td><strong>Under-stemming (missed merge)</strong></td><td><code>data</code> / <code>datum</code> not merged</td><td>Handled via lexicon</td></tr>
+    <tr><td><strong>Cost</strong></td><td>Microseconds, no model</td><td>10–100× slower; needs POS tagger + dictionary per language; latency in the analyzer hot path</td></tr>
+  </tbody>
+</table>
+
+<p><strong>The trade.</strong> Stemming over-merges, hurting precision: a query for <code>universe</code> retrieves <code>university</code> docs because both became <code>univers</code>. Lemmatization is precise but pays POS-tagging latency on every query and needs per-language resources. The pragmatic default in web/e-commerce search is a <em>light</em> stemmer (Porter or KStem, which is more conservative) for high-recall languages, and skipping stemming entirely where precision dominates (legal, code, exact-SKU). Whatever you pick, <strong>apply the identical transform at index time</strong> — the asymmetry bug again.</p>
+
+<h2>Spelling correction — the noisy-channel model</h2>
+
+<p>Roughly 10–15% of web queries contain a typo. Correcting them is a large recall lever (the misspelled term has an empty or wrong posting list). The standard framing is the <strong>noisy-channel model</strong>: the user <em>intended</em> a correct word <span class="math">c</span> but a noisy channel (fat fingers, bad spelling) emitted the observed string <span class="math">w</span>. We invert it with Bayes:</p>
+
+<div class="math block">ĉ = argmax<sub>c ∈ candidates</sub> P(c | w) = argmax<sub>c</sub> P(w | c) · P(c)</div>
+
+<p>Two factors, each with a name and a job:</p>
+<ul>
+  <li><strong>P(c)</strong> — the <em>prior / language model</em>. How likely is <span class="math">c</span> to be a query at all? Estimated from the query log: frequent past queries get high prior. This is what makes <code>the</code> beat <code>teh</code> and makes domain-specific terms self-correct (a shoe site's log makes <code>nike</code> a high-prior correction for <code>nkie</code>).</li>
+  <li><strong>P(w | c)</strong> — the <em>error / channel model</em>. Given the user meant <span class="math">c</span>, how likely were they to type <span class="math">w</span>? Driven by <strong>weighted edit distance</strong>: fewer/cheaper edits ⇒ higher probability.</li>
+</ul>
+
+<h3>Weighted edit distance: Damerau-Levenshtein, worked</h3>
+
+<p>Plain Levenshtein distance counts the minimum insertions, deletions, and substitutions to turn one string into another. <strong>Damerau-Levenshtein</strong> adds a fourth operation — <em>transposition</em> of two adjacent characters — because swapping neighbours (<code>teh</code>→<code>the</code>) is one of the most common real typos and Levenshtein would charge it as two edits. <strong>Keyboard-adjacency weighting</strong> further says a substitution of two physically-adjacent keys (<code>s</code>↔<code>d</code>) is cheaper than distant keys (<code>s</code>↔<code>p</code>), because the former is a far more probable slip.</p>
+
+<p>Worked example: distance from typed <code>teh</code> to candidate <code>the</code>.</p>
+
+<div class="ascii">
+        ""   t    h    e          (candidate "the" across top)
+   ""    0   1    2    3
+   t     1   0    1    2
+   e     2   1   (1)   2          ← cell (e,h): not equal; min(diag 0, up 1, left 1)+1
+   h     3   2    1   (1)         ← Damerau: 'eh' vs 'he' transposition → cost 1
+
+   Levenshtein DP fills min(sub, ins, del); Damerau adds a transposition
+   move: if s[i],s[i-1] == t[j-1],t[j] then also consider d[i-2][j-2]+1.
+</div>
+
+<p>Plain Levenshtein <code>teh</code>→<code>the</code> = <strong>2</strong> (substitute position 2 <code>e</code>→<code>h</code>, substitute position 3 <code>h</code>→<code>e</code>). With the transposition rule, the adjacent pair <code>eh</code>↔<code>he</code> is a single operation, so Damerau-Levenshtein = <strong>1</strong>. That single-edit candidate gets a much higher <span class="math">P(w|c)</span> than any 2-edit alternative — which is exactly why transposition matters: <code>teh</code> should correct to <code>the</code> (1 edit, transposition), not to <code>tea</code> (1 substitution) once the prior is folded in.</p>
+
+<h3>Ranking candidates with a query-log language model</h3>
+
+<p>Concretely: user types <code>teh</code>. Candidate generator (all dictionary/log words within Damerau distance ≤ 2, via a BK-tree or a deletion-index like SymSpell) yields <code>the</code>, <code>tea</code>, <code>ten</code>. Toy numbers — channel probability from edit cost, prior from query-log frequency (per million queries):</p>
+
+<table>
+  <thead><tr><th>candidate c</th><th>edit</th><th>P(w=teh | c) channel</th><th>P(c) prior (log freq)</th><th>P(w|c)·P(c) ∝</th></tr></thead>
+  <tbody>
+    <tr><td><code>the</code></td><td>1 transposition</td><td>0.20</td><td>0.050 (50,000 / M)</td><td><strong>0.01000</strong></td></tr>
+    <tr><td><code>tea</code></td><td>1 substitution h→a</td><td>0.08</td><td>0.0008 (800 / M)</td><td>0.000064</td></tr>
+    <tr><td><code>ten</code></td><td>1 substitution h→n</td><td>0.06</td><td>0.0010 (1,000 / M)</td><td>0.000060</td></tr>
+  </tbody>
+</table>
+
+<p>Even though <code>tea</code> and <code>ten</code> are also single edits, <code>the</code> wins by ~150× — almost all of it from the prior (<code>the</code> is enormously more frequent in the log than <code>tea</code>/<code>ten</code>). This is the key intuition: <strong>the channel model narrows to plausible typos; the query-log prior picks the winner.</strong> A spelling corrector with no prior corrects <code>nkie</code> to a dictionary word like <code>nice</code>; a corrector with a shoe-store query-log prior corrects it to <code>nike</code>. The prior is where your domain lives.</p>
+
+<div class="callout warn">
+  <div class="label">Autocorrect vs "did you mean" — do not conflate</div>
+  Two products, two risk profiles. <strong>Autocorrect</strong> silently rewrites the query and searches the corrected form. Use it only when confidence is very high (the corrected form dominates by orders of magnitude, like above) — a wrong silent rewrite is infuriating because the user sees results for a word they didn't type. <strong>"Did you mean &lt;X&gt;?"</strong> searches the original but offers a one-click suggestion; use it when confidence is moderate. The deciding number is the posterior margin <span class="math">P(c₁|w) / P(c₂|w)</span> and whether the original even has results. The full suggestion/autocomplete machinery is <a href="46_autocomplete_suggest.html">lesson 46</a>; here it is enough to know the decision is a calibrated-confidence threshold, not a coin flip.
+</div>
+
+<h2>Query expansion — buy recall, watch the drift</h2>
+
+<p>Expansion <em>adds</em> terms to the query so documents that used different words can still match. It is the single biggest recall lever and the single biggest precision risk. The terms are added as <em>optional</em> (SHOULD) clauses with lower weight, not mandatory ones, so they boost recall without forcing every expansion to appear.</p>
+
+<h3>Classic expansion</h3>
+
+<ul>
+  <li><strong>Synonym dictionaries / thesauri.</strong> Hand-curated or mined: <code>laptop</code> ⇒ <code>notebook</code>, <code>nyc</code> ⇒ <code>new york city</code>, <code>tv</code> ⇒ <code>television</code>. Precise, controllable, but static and expensive to maintain across domains and languages.</li>
+  <li><strong>Pseudo-relevance feedback (PRF) / Rocchio.</strong> Assume the top-<span class="math">k</span> documents from a first-pass search are relevant (hence <em>pseudo</em> — no human said so), then reweight the query vector toward their terms. This automatically discovers corpus-specific expansions.</li>
+</ul>
+
+<h3>Rocchio reweighting, worked</h3>
+
+<p>In the vector-space view a query is a weighted term vector <span class="math">q</span>. Rocchio moves it toward the centroid of (pseudo-)relevant docs and away from non-relevant ones:</p>
+
+<div class="math block">q' = α·q + β·(1/|D<sub>r</sub>|)·Σ<sub>d∈D<sub>r</sub></sub> d − γ·(1/|D<sub>nr</sub>|)·Σ<sub>d∈D<sub>nr</sub></sub> d</div>
+
+<p>Toy worked numbers. Original query <code>jaguar speed</code> over a 4-term vocabulary {<code>jaguar</code>, <code>speed</code>, <code>animal</code>, <code>car</code>}. Initial <span class="math">q = (1, 1, 0, 0)</span>. PRF: the top-2 returned docs (treated as relevant) happen to be about the car, with term vectors <span class="math">d₁ = (1, 1, 0, 1)</span> and <span class="math">d₂ = (1, 0, 0, 1)</span>; one non-relevant doc (about the animal) <span class="math">d₃ = (1, 0, 1, 0)</span>. Use <span class="math">α = 1, β = 0.75, γ = 0.25</span>.</p>
+
+<div class="ascii">
+  relevant centroid  = ((1+1)/2, (1+0)/2, 0, (1+1)/2) = (1.0, 0.5, 0.0, 1.0)
+  nonrel  centroid   = (1, 0, 1, 0)
+
+  q' = 1·(1,1,0,0)
+     + 0.75·(1.0, 0.5, 0.0, 1.0)
+     - 0.25·(1.0, 0.0, 1.0, 0.0)
+
+  jaguar : 1 + 0.75·1.0 - 0.25·1.0 = 1 + 0.75 - 0.25 = 1.50
+  speed  : 1 + 0.75·0.5 - 0.25·0.0 = 1 + 0.375      = 1.375
+  animal : 0 + 0.75·0.0 - 0.25·1.0 = -0.25  → clamp to 0
+  car    : 0 + 0.75·1.0 - 0.25·0.0 = 0.75   ← NEW expansion term
+
+  q' = (1.50, 1.375, 0.0, 0.75)
+</div>
+
+<p>The query learned to add <code>car</code> (weight 0.75) and suppress <code>animal</code> — it disambiguated <code>jaguar</code> toward the car sense <em>because the first-pass results leaned that way.</em> That is also the danger: if the first-pass top-<span class="math">k</span> were actually about the animal, Rocchio would amplify the wrong sense. PRF amplifies whatever bias the first pass had — <strong>query drift.</strong></p>
+
+<h3>Neural expansion</h3>
+
+<ul>
+  <li><strong>Embedding nearest-terms.</strong> Use a term/word embedding (or the dense query embedding from lesson 43) to pull semantically near terms: <code>sneaker</code> ≈ <code>trainer</code>, <code>running shoe</code>. Captures synonymy no thesaurus listed, but neighbours include co-occurring-but-wrong terms (<code>sneaker</code> ≈ <code>sock</code>), so it drifts more than a curated dictionary.</li>
+  <li><strong>doc2query / docTTTTquery.</strong> Flip the problem: at <em>index</em> time, a seq2seq model generates the queries each document would answer and appends them to the doc. The expansion lives in the index, not the query — zero query-time latency, and it bridges vocabulary mismatch from the document side. Effectively a learned, document-conditioned synonym set.</li>
+</ul>
+
+<div class="callout">
+  <div class="label">Gating expansion — the precision cost</div>
+  Expansion drift is real money: expand <code>apple</code> to <code>fruit</code> on an electronics store and you bury the iPhones. Gates a senior names: (1) add expansions as <em>weighted optional</em> clauses, never mandatory; (2) cap the number of expansions and their total weight; (3) gate on <em>query confidence</em> — don't expand a query that already has plenty of high-precision results, expand the long-tail / zero-result queries where recall is the bottleneck; (4) gate on <em>head ambiguity</em> — never expand a navigational query (<code>facebook login</code>) where the user knows exactly what they want. The frame: <strong>expansion helps the tail and hurts the head.</strong>
+</div>
+
+<h2>Query segmentation &amp; phrase detection</h2>
+
+<p>A bag-of-terms analysis throws away word order. For many queries that is fine; for some it is fatal. <code>new york times</code> as three independent terms (<code>new</code> AND <code>york</code> AND <code>times</code>) matches a document about <em>"the new times in York"</em> — wrong. The query means the newspaper, a single concept. <strong>Query segmentation</strong> groups adjacent tokens into phrases (multi-word expressions) so they are matched as a unit.</p>
+
+<p>Why it matters for the inverted index (lesson 42): a phrase match requires <strong>positional</strong> postings — the index must store <em>where</em> in each document a term appears, so <code>new york times</code> only matches when the three terms are adjacent and in order. That is more expensive than a plain term match, so you only promote high-confidence phrases. Detection signals: query-log co-occurrence / pointwise mutual information (the trigram appears together far more than chance), a known-entities gazetteer, or a learned segmenter. <strong>The trade:</strong> phrase matching is a precision tool — it shrinks the matching set to documents with the exact adjacency, raising precision but risking recall if the document phrased it slightly differently (<code>the New York Times</code> vs <code>NY Times</code>). The standard hedge is to issue <em>both</em>: the phrase as a strong-weighted optional clause plus the loose AND, so the phrase match floats to the top without excluding the rest.</p>
+
+<h2>Intent classification, NER, and structured tagging</h2>
+
+<p>Everything above operated on words. This stage operates on <em>meaning</em>: classify what the user wants and extract the structured fields a backend can act on.</p>
+
+<h3>Intent classification — the Broder types</h3>
+
+<p>From lesson 40, the classic taxonomy of web-search intent (Broder 2002):</p>
+<ul>
+  <li><strong>Navigational</strong> — go to a specific known destination (<code>facebook login</code>, <code>chase bank</code>). One right answer; do <em>not</em> expand or diversify; precision is everything.</li>
+  <li><strong>Informational</strong> — learn about a topic (<code>how does bm25 work</code>). Many good answers; expansion and diversity help.</li>
+  <li><strong>Transactional</strong> — do something / buy something (<code>cheap iphone charger</code>, <code>book flight to paris</code>). Triggers commerce ranking, price/availability signals.</li>
+</ul>
+<p>Intent is usually a lightweight classifier (logistic regression / small transformer) over the query plus log features. It <em>gates the rest of the pipeline</em>: a navigational query turns off expansion and diversity; a transactional one turns on price sorting and inventory filters. Misclassifying navigational as informational is the classic precision failure — the user wanted exactly one site and you handed them a topic page.</p>
+
+<h3>Named-entity recognition &amp; entity linking</h3>
+
+<p><strong>NER</strong> tags spans with types: in <code>cheap iphone charger</code>, <code>iphone</code> is a PRODUCT/BRAND span. <strong>Entity linking</strong> then resolves the span to a canonical entity in a knowledge base / catalog: the surface form <code>iphone</code> → entity <code>Apple iPhone (brand=Apple, product-line=iPhone)</code>. Linking is what lets <code>iphone</code>, <code>i-phone</code>, and <code>apple phone</code> all resolve to the same node — disambiguation against a catalog, not string matching.</p>
+
+<h3>Structured tagging → facets</h3>
+
+<p>For e-commerce especially, the goal is to decompose the query into the catalog's structured fields. Worked: <code>cheap iphone charger</code> →</p>
+
+<table>
+  <thead><tr><th>field</th><th>value</th><th>source</th><th>backend effect</th></tr></thead>
+  <tbody>
+    <tr><td>intent</td><td>transactional</td><td>intent classifier</td><td>commerce ranking on</td></tr>
+    <tr><td>brand</td><td>Apple / iPhone</td><td>NER + entity linking</td><td>filter <code>brand_compat=Apple</code></td></tr>
+    <tr><td>category</td><td>charger / cables &amp; chargers</td><td>NER → category map</td><td>filter <code>category=charger</code></td></tr>
+    <tr><td>price-intent</td><td><code>cheap</code> → sort ascending / price ≤ p25</td><td>modifier lexicon</td><td>re-sort or filter on price</td></tr>
+  </tbody>
+</table>
+
+<p>Those fields are exactly the <strong>facets</strong> that structured / e-commerce search exposes — the filter-and-sort controls in lesson 47. Query understanding is what auto-populates them from free text, so <code>cheap iphone charger</code> behaves like the user had clicked Brand: Apple, Category: Chargers, Sort: price-low-to-high. <strong>The trade:</strong> every extracted facet that you turn into a <em>hard filter</em> trades recall for precision — tag <code>cheap</code> as a hard <code>price ≤ p25</code> filter and you exclude the $9 charger priced at p26. Senior practice is to apply tags as ranking <em>boosts/soft-sorts</em> rather than hard filters unless the field is unambiguous (a confidently-linked brand is safe to filter; a fuzzy modifier like <code>cheap</code> is safer as a sort signal).</p>
+
+<h2>The LLM era — rewrite power, latency tax</h2>
+
+<p>An LLM (lesson 26) can do much of this pipeline in one shot and better: <strong>query rewriting</strong> (<code>chrgr for iphn</code> → <code>iPhone charger</code>, fixing spelling, expanding abbreviations, and normalizing all at once), <strong>conversational rewriting</strong> (resolving <code>and a cheaper one?</code> against prior turns), and <strong>semantic expansion</strong> (generating intent-faithful synonyms and related terms with far less drift than embedding-neighbour expansion, because the model reasons about sense). It can also emit the structured tags directly as JSON.</p>
+
+<div class="callout warn">
+  <div class="label">The latency/cost caveat</div>
+  Query understanding sits in the <em>blocking</em> path before retrieval — every millisecond is added to every search. An LLM call is 100–1000 ms and a per-query cost; classic analysis is sub-millisecond and free. So the LLM-in-the-loop pattern is reserved for where it pays: long-tail / zero-result queries, conversational sessions, hard ambiguity — gated, not default. The high-QPS head is served by the cheap deterministic pipeline above, often <em>distilled</em> from offline LLM labels (run the LLM offline to build synonym tables, doc2query expansions, and tagging training data; serve the cheap student online). The senior framing matches the rest of the lesson: the LLM is another recall/precision lever, and its extra knob is latency/cost — use it on the tail where the deterministic pipeline is weakest, not on the head where it is already good and fast.
+</div>
+
+<h2>One query through every stage</h2>
+
+<p>Putting it together — the user types <code>café RUNNING-shose nyc</code> (note the typo <code>shose</code>):</p>
+
+<div class="ascii">
+  RAW        : "café RUNNING-shose nyc"
+  NORMALIZE  : casefold + diacritic-fold + NFKC
+             → "cafe running-shose nyc"
+  TOKENIZE   : split on space + hyphen
+             → [cafe] [running] [shose] [nyc]
+  SPELL      : [shose] not in lexicon; Damerau-1 candidates {shoes(prior hi), shore, hose}
+             noisy-channel → "shoes" (transposition s↔e), confidence high → autocorrect
+             → [cafe] [running] [shoes] [nyc]
+  SEGMENT    : "nyc" is an entity surface form (gazetteer), not 3 tokens — keep as unit
+  STEM       : running→run, shoes→shoe  (cafe, nyc unchanged)
+             → [cafe] [run] [shoe] [nyc]
+  EXPAND     : synonym nyc ⇒ "new york city" (optional, weighted 0.5)
+             embedding shoe ≈ sneaker (optional, weighted 0.4)
+             → core:[cafe][run][shoe][nyc]  opt:[new york city]^0.5 [sneaker]^0.4
+  TAG        : intent=informational/transactional(mixed); location=NYC(entity);
+             category=running-shoe; modifier=café? (likely typo'd brand or place → low conf)
+             → facets {location:NYC, category:running_shoe}
+  OUT        : analyzed terms + weights + facets  →  inverted index (lesson 42)
+</div>
+
+<p>Trace the recall/precision ledger: normalization, spelling, stemming, and expansion all <em>widened</em> the matchable set (recall up); segmentation of <code>nyc</code> and the location/category facets <em>narrowed</em> toward intent (precision up). Every arrow had a direction, and a senior can name it.</p>
+
+<h2>Interactive · query-understanding pipeline</h2>
+
+<p>Type a query (or pick an example) and watch it transform stage by stage. The lexicon, synonym map, and typo model below are a small built-in toy — deterministic, no network — so the exact corrections are illustrative, but the <em>stages and their order</em> are real.</p>
+
+<div class="widget" id="qu-widget">
+  <div class="title">Run a query through the analysis pipeline</div>
+  <div class="hint">Toy lexicon/synonym/typo maps in JS — the corrections are illustrative, the pipeline order is the real lesson. Try a typo like <code>iphn chrgr</code> or a phrase like <code>new york times</code>.</div>
+
+  <div class="controls" style="flex-direction:column; align-items:stretch;">
+    <label class="inline">query:
+      <input type="text" id="qu-input" value="café RUNNING-shose nyc" style="flex:1; min-width:220px;">
+    </label>
+    <div style="margin-top:6px;">
+      <button type="button" class="chip" data-q="café RUNNING-shose nyc">café RUNNING-shose nyc</button>
+      <button type="button" class="chip" data-q="cheap iphn chrgr">cheap iphn chrgr</button>
+      <button type="button" class="chip" data-q="new york times subscription">new york times subscription</button>
+      <button type="button" class="chip" data-q="teh runing shoos">teh runing shoos</button>
+      <button type="button" class="chip" data-q="facebook login">facebook login</button>
+    </div>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">core terms</div><div class="v" id="qu-ncore">—</div></div>
+    <div class="kpi"><div class="k">corrections</div><div class="v" id="qu-ncorr">—</div></div>
+    <div class="kpi"><div class="k">expansions</div><div class="v" id="qu-nexp">—</div></div>
+    <div class="kpi"><div class="k">intent</div><div class="v" id="qu-intent">—</div></div>
+  </div>
+
+  <div class="callout" id="qu-stages">
+    <div class="label">Stage-by-stage</div>
+    <div id="qu-body" style="font-family:var(--mono,monospace); font-size:13px; line-height:1.7;">—</div>
+  </div>
+</div>
+
+<h2>Interview prompts you should be ready for</h2>
+
+<div class="callout">
+  <ol style="margin:4px 0;">
+    <li>"You stem at index time but not at query time. What happens, and how would you catch it?" <em>(The analyzer asymmetry bug: the query term never matches the stemmed index term, recall silently collapses with no error. Catch it by asserting query-analyzer == doc-analyzer in tests, and by alerting on a recall/zero-result-rate jump after any analyzer change.)</em></li>
+    <li>"Walk me through correcting <code>teh</code> to <code>the</code>. Where does the domain knowledge live?" <em>(Noisy channel: P(w|c)·P(c). Damerau transposition makes it a 1-edit correction so the channel model is high; but the query-log prior P(c) is what beats <code>tea</code>/<code>ten</code> — the prior is where domain lives. A corrector with no prior corrects to dictionary words, not to what your users actually search.)</em></li>
+    <li>"When do you autocorrect silently vs show 'did you mean'?" <em>(A calibrated-confidence threshold on the posterior margin and whether the original has results. Silent rewrite only when the corrected form dominates by orders of magnitude and the original is near-zero-result; otherwise suggest, because a wrong silent rewrite shows results for a word the user didn't type.)</em></li>
+    <li>"Query expansion doubled recall but precision dropped and revenue fell. Diagnose." <em>(Query drift: expansion fired on head/navigational queries that didn't need it, or PRF amplified a wrong first-pass sense, or expansions were mandatory instead of weighted-optional. Fix: gate expansion to long-tail/zero-result queries, cap weight, never expand navigational, soft-clause not hard-clause.)</em></li>
+    <li>"Why must <code>new york times</code> be a phrase, and what does that cost the index?" <em>(Bag-of-terms matches scrambled/unrelated docs; the query is one concept. Phrase matching needs positional postings — more storage and a more expensive intersection — so you only promote high-confidence phrases (PMI/gazetteer) and usually issue phrase-as-boost alongside the loose AND to protect recall. Sets up positional index in lesson 42.)</em></li>
+    <li>"Where would you put an LLM in query understanding, and where would you refuse to?" <em>(It's a blocking pre-retrieval stage — 100–1000 ms and per-query cost on every search. Use the LLM on the tail: long-tail/zero-result/conversational/ambiguous queries, or offline to distill synonym tables, doc2query, and tagging labels for a cheap online student. Refuse it on the high-QPS head where the deterministic pipeline is already good and fast.)</em></li>
+  </ol>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Query understanding turns a raw string into analyzed terms, corrections, expansions, phrases, and structured facets — and every transform is a recall-vs-precision trade you must be able to name. Normalization, spelling correction, and expansion buy recall; phrase detection and tagging buy precision; spelling correction is noisy-channel (P(w|c)·P(c), with the query-log prior carrying the domain); expansion is gated to the tail because it drifts on the head; the analyzer must be identical at index and query time or recall dies silently; and the LLM is a tail-only lever whose extra knob is latency and cost. The terms and facets you produce here are exactly what the inverted index in lesson 42 keys on.
+</div>
+
+<footer class="lesson-nav">
+  <a href="40_search_vs_recommendation.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">Search vs. recommendation</span>
+  </a>
+  <a class="next" href="42_inverted_index_bm25.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">The inverted index &amp; BM25</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  // ---- toy resources (deterministic, no network) ----
+  var LEXICON = {
+    "the":1,"a":1,"of":1,"to":1,"and":1,"in":1,"for":1,"cafe":1,"running":1,"run":1,
+    "shoes":1,"shoe":1,"nyc":1,"cheap":1,"iphone":1,"charger":1,"new":1,"york":1,
+    "times":1,"subscription":1,"facebook":1,"login":1,"sneaker":1,"trainer":1,
+    "apple":1,"sock":1,"city":1,"speed":1
+  };
+  // typo -> {to, kind, conf}
+  var TYPO = {
+    "shose":{to:"shoes",kind:"transposition",conf:0.95},
+    "shoos":{to:"shoes",kind:"substitution",conf:0.88},
+    "runing":{to:"running",kind:"insertion(double n)",conf:0.93},
+    "teh":{to:"the",kind:"transposition",conf:0.97},
+    "iphn":{to:"iphone",kind:"omission",conf:0.9},
+    "chrgr":{to:"charger",kind:"omission(vowels)",conf:0.9}
+  };
+  // synonym/expansion: term -> [{term, w}]
+  var SYN = {
+    "nyc":[{t:"new york city",w:0.5}],
+    "shoe":[{t:"sneaker",w:0.4}],
+    "shoes":[{t:"sneaker",w:0.4}],
+    "iphone":[{t:"apple phone",w:0.4}]
+  };
+  // light stemmer (toy): a few rules
+  function stem(t){
+    if (t.indexOf(" ")>=0) return t;            // phrases untouched
+    if (/ing$/.test(t) && t.length>5) return t.replace(/ning$|ing$/, function(m){return m==="ning"?"n":"";});
+    if (/oes$/.test(t)) return t.replace(/oes$/,"oe");  // shoes->shoe
+    if (/s$/.test(t) && t.length>3 && !/ss$/.test(t)) return t.replace(/s$/,"");
+    return t;
+  }
+  // entity gazetteer (segmentation / NER)
+  var ENTITY = { "nyc":"NYC", "new york city":"NYC", "facebook":"Facebook", "iphone":"Apple iPhone" };
+  // phrase gazetteer (multi-word)
+  var PHRASES = ["new york times","new york city"];
+  var STOP = {"the":1,"a":1,"of":1,"to":1,"and":1,"in":1,"for":1};
+
+  function esc(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+  function chips(arr,cls){ return arr.map(function(x){ return '<span class="tag '+(cls||'')+'">'+esc(x)+'</span>'; }).join(" "); }
+
+  function normalize(raw){
+    var s = raw.toLowerCase();
+    // diacritic fold (café->cafe, naïve->naive)
+    s = s.normalize ? s.normalize("NFKD").replace(/[\u0300-\u036f]/g,"") : s;
+    // NFKC-ish width fold handled by normalize NFKC below if present
+    if (s.normalize) s = s.normalize("NFKC");
+    return s;
+  }
+  function tokenize(s){
+    return s.split(/[\s,]+/).filter(Boolean).flatMap(function(t){
+      return t.split(/[-]/).filter(Boolean);   // split hyphens
+    });
+  }
+
+  function analyze(raw){
+    var norm = normalize(raw);
+    var toks = tokenize(norm);
+
+    // spelling
+    var corrections = [];
+    var corrected = toks.map(function(t){
+      if (!LEXICON[t] && TYPO[t]){
+        corrections.push({from:t, to:TYPO[t].to, kind:TYPO[t].kind, conf:TYPO[t].conf});
+        return TYPO[t].to;
+      }
+      return t;
+    });
+
+    // phrase detection: scan for known multi-word phrases
+    var joined = corrected.join(" ");
+    var phrases = [];
+    PHRASES.forEach(function(p){ if (joined.indexOf(p)>=0) phrases.push(p); });
+
+    // stopwords (kept, just flagged)
+    var stopFlagged = corrected.filter(function(t){ return STOP[t]; });
+
+    // stem
+    var stemmed = corrected.map(stem);
+
+    // expansion
+    var expansions = [];
+    stemmed.forEach(function(t){
+      (SYN[t]||[]).forEach(function(e){ expansions.push({t:e.t, w:e.w, from:t}); });
+    });
+
+    // intent (toy rules)
+    var intent = "informational";
+    if (/\b(login|signin|sign in)\b/.test(joined) || ENTITY[corrected[0]] && corrected.length<=2 && /facebook|gmail/.test(joined)) intent="navigational";
+    if (/\b(cheap|buy|charger|subscription|book|order|price)\b/.test(joined)) intent="transactional";
+
+    // entities / facets
+    var entities = [];
+    corrected.forEach(function(t){ if (ENTITY[t]) entities.push({surface:t, entity:ENTITY[t]}); });
+    phrases.forEach(function(p){ if (ENTITY[p]) entities.push({surface:p, entity:ENTITY[p]}); });
+
+    var facets = {};
+    if (joined.indexOf("nyc")>=0) facets.location = "NYC";
+    if (joined.indexOf("iphone")>=0) facets.brand = "Apple";
+    if (joined.indexOf("charger")>=0) facets.category = "charger";
+    if (joined.indexOf("shoe")>=0 || stemmed.indexOf("shoe")>=0) facets.category = "running_shoe";
+    if (/\bcheap\b/.test(joined)) facets.price_intent = "sort price asc";
+
+    return {raw:raw, norm:norm, toks:toks, corrected:corrected, corrections:corrections,
+            phrases:phrases, stopFlagged:stopFlagged, stemmed:stemmed,
+            expansions:expansions, intent:intent, entities:entities, facets:facets};
+  }
+
+  function render(r){
+    document.getElementById("qu-ncore").textContent  = r.stemmed.length;
+    document.getElementById("qu-ncorr").textContent  = r.corrections.length;
+    document.getElementById("qu-nexp").textContent   = r.expansions.length;
+    document.getElementById("qu-intent").textContent = r.intent;
+
+    var rows = [];
+    rows.push('<div><strong>1 · normalize</strong> &nbsp;<span style="color:var(--text-mute)">casefold + diacritic-fold + NFKC</span><br>&nbsp;&nbsp;→ '+esc(r.norm)+'</div>');
+    rows.push('<div><strong>2 · tokenize</strong> &nbsp;<span style="color:var(--text-mute)">split space + hyphen</span><br>&nbsp;&nbsp;→ '+chips(r.toks)+'</div>');
+
+    var corrTxt = r.corrections.length
+      ? r.corrections.map(function(c){ return esc(c.from)+'→<strong>'+esc(c.to)+'</strong> <span style="color:var(--text-mute)">('+c.kind+', conf '+c.conf+', '+(c.conf>=0.95?'autocorrect':'did-you-mean')+')</span>'; }).join("<br>&nbsp;&nbsp;&nbsp;&nbsp;")
+      : '<span style="color:var(--text-mute)">no typos found</span>';
+    rows.push('<div><strong>3 · spell (noisy channel)</strong><br>&nbsp;&nbsp;→ '+corrTxt+'</div>');
+
+    var phr = r.phrases.length ? chips(r.phrases,'reward') : '<span style="color:var(--text-mute)">none</span>';
+    rows.push('<div><strong>4 · segment / phrase</strong> &nbsp;<span style="color:var(--text-mute)">positional match (lesson 42)</span><br>&nbsp;&nbsp;→ '+phr+'</div>');
+
+    var stopTxt = r.stopFlagged.length ? chips(r.stopFlagged)+' <span style="color:var(--text-mute)">(kept; IDF down-weights)</span>' : '<span style="color:var(--text-mute)">none</span>';
+    rows.push('<div><strong>5 · stopwords</strong><br>&nbsp;&nbsp;→ '+stopTxt+'</div>');
+
+    rows.push('<div><strong>6 · stem</strong><br>&nbsp;&nbsp;→ '+chips(r.stemmed)+'</div>');
+
+    var expTxt = r.expansions.length
+      ? r.expansions.map(function(e){ return esc(e.t)+'<span style="color:var(--text-mute)">^'+e.w+' (from '+esc(e.from)+')</span>'; }).join(", ")
+      : '<span style="color:var(--text-mute)">none</span>';
+    rows.push('<div><strong>7 · expand</strong> &nbsp;<span style="color:var(--text-mute)">weighted optional clauses</span><br>&nbsp;&nbsp;→ '+expTxt+'</div>');
+
+    var entTxt = r.entities.length
+      ? r.entities.map(function(e){ return esc(e.surface)+'→<strong>'+esc(e.entity)+'</strong>'; }).join(", ")
+      : '<span style="color:var(--text-mute)">none linked</span>';
+    var fac = Object.keys(r.facets);
+    var facTxt = fac.length ? fac.map(function(k){ return k+'='+esc(r.facets[k]); }).join(", ") : '—';
+    rows.push('<div><strong>8 · intent + NER + tag</strong><br>&nbsp;&nbsp;intent: <strong>'+r.intent+'</strong><br>&nbsp;&nbsp;entities: '+entTxt+'<br>&nbsp;&nbsp;facets: '+facTxt+'</div>');
+
+    rows.push('<div style="border-top:1px solid var(--border); margin-top:6px; padding-top:6px;"><strong>OUT → inverted index</strong><br>&nbsp;&nbsp;core: '+chips(r.stemmed)+(r.expansions.length?' &nbsp;opt: '+r.expansions.map(function(e){return esc(e.t)+'^'+e.w;}).join(" "):'')+'</div>');
+
+    document.getElementById("qu-body").innerHTML = rows.join('<div style="height:6px"></div>');
+  }
+
+  function run(){ render(analyze(document.getElementById("qu-input").value || "")); }
+
+  document.getElementById("qu-input").addEventListener("input", run);
+  Array.prototype.forEach.call(document.querySelectorAll("#qu-widget .chip"), function(b){
+    b.addEventListener("click", function(){
+      document.getElementById("qu-input").value = b.getAttribute("data-q");
+      run();
+    });
+  });
+  run();
+})();
+</script>
+
+</body>
+</html>

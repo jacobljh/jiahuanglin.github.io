@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C17 - Design large file upload and serving</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  main { overflow-wrap: break-word; }
+  .case-meta { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 22px; }
+  .case-meta .chip { background: var(--bg-elev); }
+  table { table-layout: fixed; }
+  th, td { overflow-wrap: anywhere; }
+  .linear-list li { margin: 8px 0; }
+  .source-note { color: var(--text-mute); font-size: 13px; margin-top: 8px; }
+  @media (max-width: 560px) {
+    header.topnav .inner { flex-wrap: wrap; gap: 8px; }
+    header.topnav .step-pill { margin-left: 0; white-space: normal; }
+    main { padding-inline: 14px; }
+    th, td { padding: 6px 5px; font-size: 12px; }
+  }
+</style>
+</head>
+<body>
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">system_design</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="syllabus.html">cases</a>
+    <span class="crumb">/</span>
+    <span class="crumb">C17</span>
+    <span class="step-pill">C17 / C44</span>
+  </div>
+</header>
+<main>
+
+<h1>Design large file upload and serving</h1>
+<p class="subtitle">A 10 GB upload over a home connection takes an hour. Networks drop, browsers close, laptops sleep — so the only sane design treats <em>failure as the normal case</em> and never makes the user start over.</p>
+<div class="case-meta">
+  <span class="chip">Anchor: resumable multipart</span>
+  <span class="chip">Control plane vs data plane</span>
+  <span class="chip">Idempotent commit</span>
+</div>
+
+<div class="callout">
+  <div class="label">First principle</div>
+  Over a long transfer, the probability that <em>something</em> interrupts you approaches 1. You cannot prevent the interruption — you can only choose how much work it destroys. Design the unit of work so a failure throws away <strong>one chunk</strong>, not the whole file. Everything in this lesson — chunking, signed URLs, manifests, idempotent commits — falls out of that single decision: make the retry unit small, make every retry safe to repeat, and never let the app server stand between the client and the bytes.</div>
+
+<p>This is the <strong>anchor</strong> case for resumable multipart upload, chunk dedup, and idempotent commit. Other cases lean on the machinery here: <a href="case_14_youtube.html">C14 (video transcode)</a> and <a href="case_15_google_drive.html">C15 (file sync)</a> are <em>consumers</em> of an upload pipeline; <a href="case_16_s3_object_storage.html">C16 (object storage)</a> provides the durable substrate underneath it. So we teach the upload protocol in full and let those cases reference it.</p>
+
+<h2>1. Why failure dominates the design</h2>
+<p>Start with the transfer time, because it sets the whole problem. Take a <strong>10 GB</strong> file over a <strong>20 Mbps</strong> uplink — a generous home connection. 10 GB = 80,000 Mb (using 8 bits/byte and 1000-based units), so the floor is:</p>
+
+<p class="math block">80,000 Mb ÷ 20 Mbps = 4,000 s ≈ 67 min</p>
+
+<p>Call it <strong>~68 minutes</strong> in ideal conditions, longer in practice. That is not a request; it is a <em>session</em> that has to survive Wi-Fi blips, a closed lid, a roaming handoff, a process restart. Treat the whole upload as one atomic HTTP PUT and a single dropped packet at minute 66 costs the user the entire hour. That is the forcing function: <strong>the transfer is too long to be all-or-nothing.</strong></p>
+
+<p>The fix is to slice the file into independently-retryable <strong>parts</strong>. With <strong>8 MB</strong> parts, a 10 GB file is:</p>
+
+<p class="math block">10 GB ÷ 8 MB = 10,240 MB ÷ 8 MB = 1,280 parts</p>
+
+<p>Now put a failure rate on it. Suppose each part PUT fails with probability <strong>p = 0.5%</strong> (a transient TCP reset, a 5xx from the store, a timeout). Expected failed parts over the whole upload:</p>
+
+<p class="math block">1,280 × 0.005 = 6.4 parts ≈ 51 MB re-uploaded</p>
+
+<p>So across a 10 GB upload you expect to re-send about <strong>6–7 parts (~50 MB)</strong> — under 0.5% of the file — instead of restarting all 10 GB on the first hiccup. <em>That</em> is the entire economic argument for resumable chunking, in two numbers.</p>
+
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">10 GB @ 20 Mbps</div><div class="v">≈ 68 min</div></div>
+  <div class="kpi"><div class="k">Parts @ 8 MB</div><div class="v">1,280</div></div>
+  <div class="kpi"><div class="k">Expected retries @ p=0.5%</div><div class="v">≈ 6.4 parts</div></div>
+  <div class="kpi"><div class="k">Re-uploaded on failure</div><div class="v">~50 MB vs 10 GB</div></div>
+</div>
+
+<div class="callout ok">
+  <div class="label">Invariant to protect</div>
+  A completed file is <strong>published only when every part is present and its bytes verify against the manifest</strong>, and any operation the client retries — part PUT or <code>complete</code> — is <strong>idempotent</strong>. Resumability is worthless if a resumed-or-retried upload can publish a corrupt or half-assembled file. Correctness lives in the commit, not the transfer.</div>
+
+<h2>2. Clarify the contract</h2>
+<p>Treat the prompt as a product contract before a box diagram. The system must:</p>
+<ul>
+  <li><strong>Upload large files over unreliable networks</strong> — chunked, with parts retried independently.</li>
+  <li><strong>Resume after interruption</strong> — the client can ask "which parts do you already have?" and send only the rest.</li>
+  <li><strong>Verify integrity</strong> — guarantee the bytes that land are the bytes the client meant to send.</li>
+  <li><strong>Serve downloads efficiently</strong> — from object store / CDN, never proxied byte-by-byte through app servers.</li>
+  <li><strong>Reclaim abandoned uploads</strong> — expire sessions and garbage-collect orphaned parts.</li>
+</ul>
+<p>And explicitly what it need <em>not</em> do: it is <strong>not</strong> a transcoding pipeline (that is C14, downstream of commit), <strong>not</strong> a delta-sync engine (C15), and the app server is <strong>not</strong> a byte proxy. The app issues credentials and records metadata; the bytes flow client → object store directly. Naming these non-goals out loud is what keeps the design small.</p>
+
+<h2>3. Data model &amp; API</h2>
+<p>The data model is the first architecture. Keep the API expressing the product operation, not the storage layout.</p>
+
+<table>
+  <thead><tr><th>API / operation</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>POST /uploads</code> (create)</td><td>Opens an upload session: returns an <code>uploadId</code>, target metadata, part size, and an expiration. Control plane only — no bytes.</td></tr>
+    <tr><td><code>GET /uploads/{id}/parts</code></td><td>Lists which part numbers + checksums are already durably stored — this is what makes <em>resume</em> possible.</td></tr>
+    <tr><td><code>PUT</code> part (to signed URL)</td><td>Uploads one numbered chunk <em>directly to the object store</em>. Keyed by <code>(uploadId, partNumber)</code> so a repeat is idempotent.</td></tr>
+    <tr><td><code>POST /uploads/{id}/complete</code></td><td>Client sends the manifest (the part list + expected checksums). Server validates and atomically publishes.</td></tr>
+    <tr><td><code>GET /files/{id}/url</code></td><td>Returns a short-lived signed download URL (CDN-fronted for public/shareable content).</td></tr>
+  </tbody>
+</table>
+
+<p>The session record is the spine:</p>
+<div class="case-meta">
+<span class="chip">uploadId</span><span class="chip">objectKey</span><span class="chip">partSize</span><span class="chip">parts[]: {n, etag/checksum, size}</span><span class="chip">state: open|completing|published|aborted</span><span class="chip">expiresAt</span>
+</div>
+<p>This is DDIA Ch. 4 (encoding) territory: the <strong>manifest</strong> — the ordered list of parts and their checksums — is the canonical encoding of "what this file is." Assembly and verification both read from it, so its integrity <em>is</em> the file's integrity.</p>
+
+<h2>4. Control plane vs data plane</h2>
+<p>The single most important structural decision: <strong>the app server never touches the file bytes.</strong> It runs the <em>control plane</em> — create the session, mint signed URLs, validate, publish. The <em>data plane</em> — the actual gigabytes — flows from client straight to the object store.</p>
+
+<div class="ascii">
+                          CONTROL PLANE (app servers — metadata only, no bytes)
+                   ┌──────────────────────────────────────────────────────────┐
+   ┌────────┐  (1) │  create session → uploadId, partSize, expiry              │
+   │ CLIENT │ ────▶│  (2) issue SIGNED URLs for parts 1..N                     │
+   │        │ ◀────│  (3) list already-stored parts  (resume)                  │
+   │        │      │  (5) complete → validate manifest + checksums → PUBLISH   │
+   └───┬────┘      └───────────────────────────────┬──────────────────────────┘
+       │                                           │ records part metadata
+       │  (4) PUT part k  ─────────── DATA PLANE ──┼──────────────▶ ┌──────────────┐
+       │      (bytes go DIRECT to store, signed)   │                │ OBJECT STORE │
+       └──────────────────────────────────────────────────────────▶│  parts +     │
+                  app never proxies a single byte                   │  manifest    │
+                                                                    └──────────────┘
+   manifest assembly:  parts[1..N] + checksums  ──(validate)──▶  published object key
+</div>
+
+<p>Why this split is non-negotiable: if the app proxied bytes, a few thousand concurrent 10 GB uploads would saturate app-server NICs and turn a stateless, cheap-to-scale tier into a bandwidth bottleneck — the exact failure the trade-off table below warns against. By handing the client a <strong>signed URL</strong> (a time-boxed, scoped credential to PUT one specific object key), the store does the heavy lifting and the app stays a thin metadata service. This is the same control/data-plane separation that lets <a href="case_16_s3_object_storage.html">C16</a>'s storage fleet scale independently of any front-end.</p>
+
+<h2>5. Linearized design — follow one upload through</h2>
+<ol class="linear-list">
+<li><strong>Create.</strong> Client calls <code>create</code> with file size and a content hash. Server allocates an <code>objectKey</code>, picks a part size, writes an <code>open</code> session with <code>expiresAt</code>, returns the <code>uploadId</code>. No bytes yet.</li>
+<li><strong>Resume check.</strong> On (re)connect the client calls <code>list parts</code>. The server returns the part numbers already stored. The client uploads only the missing ones — this is the line that turns "restart 10 GB" into "send the 6 parts you lost."</li>
+<li><strong>Upload parts (data plane).</strong> For each missing part the client PUTs the chunk to its signed URL, <em>directly to the object store</em>, including a per-part checksum. Parts go in parallel (say 4–8 at once) to fill the bandwidth-delay product. The store records each part under <code>(uploadId, partNumber)</code> and returns an ETag/checksum.</li>
+<li><strong>Complete.</strong> Client calls <code>complete</code> with the full manifest. Server validates: all N parts present? each stored checksum match the manifest? If yes, it instructs the store to assemble and <strong>atomically publish</strong> the object key. If no, it returns the list of bad/missing parts and stays <code>open</code>.</li>
+<li><strong>Serve.</strong> Downloads go through a short-lived signed URL, CDN-fronted for shareable content, so app servers never proxy download bytes either (<a href="06_caching.html">caching</a>).</li>
+<li><strong>Reclaim.</strong> A background sweep aborts sessions past <code>expiresAt</code> and garbage-collects their orphaned parts so abandoned uploads do not leak storage forever.</li>
+</ol>
+
+<p>The first bottleneck this exposes is <em>not</em> bandwidth — that is the store's problem now — it is the <strong>commit step's correctness under retries</strong>, which is where the rest of the lesson lives.</p>
+
+<h2>6. Deep dives</h2>
+
+<h3>6.1 Chunk size: a three-way tension</h3>
+<p>Part size is the one tuning knob that touches everything. It trades off three quantities at once:</p>
+
+<table>
+  <thead><tr><th>Make parts SMALLER →</th><th>Effect on resume granularity</th><th>Effect on metadata/request overhead</th><th>Effect on parallelism</th></tr></thead>
+  <tbody>
+    <tr><td><strong>e.g. 1 MB</strong></td><td>Excellent — a failure wastes ≤1 MB.</td><td>Bad — 10,240 parts, 10k metadata rows + requests, more round trips.</td><td>Good — many units to spread across connections.</td></tr>
+    <tr><td><strong>e.g. 8 MB</strong></td><td>Good — failure wastes ≤8 MB (~6.4 parts expected, ~50 MB total).</td><td>Moderate — 1,280 parts; comfortable metadata volume.</td><td>Good — plenty of parallel units.</td></tr>
+    <tr><td><strong>e.g. 256 MB</strong></td><td>Poor — one failure re-sends 256 MB; on a flaky link you may never finish a part.</td><td>Excellent — only 40 parts, tiny metadata.</td><td>Limited — few units; hard to saturate bandwidth.</td></tr>
+  </tbody>
+</table>
+
+<p>The optimum is <em>tied to the network failure rate</em>. Expected wasted bandwidth from retries scales roughly as <span class="math">N · p · partSize</span>, but since <span class="math">N = fileSize / partSize</span>, that is <span class="math">fileSize · p</span> for the <em>re-send</em> volume — note part size cancels there. What part size actually controls is the <em>granularity</em> of each loss (you re-send in whole-part units) versus the <em>fixed overhead</em> of more parts (each part costs a request, a signed URL, a metadata row, a round trip). So: on a <strong>lossy link, go smaller</strong> — you want each loss to be cheap and you can't afford a giant part to keep failing mid-flight. On a <strong>clean link, go larger</strong> — amortize the per-part overhead. 8 MB is a sane default precisely because at p≈0.5% the retry waste (~50 MB) is already negligible, so you bias toward fewer parts and lower overhead. (Note S3's hard limit of 10,000 parts also forces part size up for very large files: a 1 TB object needs parts ≥ ~100 MB.)</p>
+
+<h3>6.2 Direct-to-store upload via signed URLs</h3>
+<p>A <strong>signed URL</strong> is a capability: the control plane computes an HMAC over (object key, HTTP method, expiry, optional content constraints) using a secret the store also knows. The store validates the signature on arrival — no app-server involvement, no long-lived credentials handed to the client. This is what physically realizes the control/data-plane split: the app grants the <em>right</em> to write one specific part for the next few minutes, and the bytes flow on a path the app never sees.</p>
+<p>The senior nuance is <strong>scoping</strong>. A part-upload URL should be scoped to exactly <code>(bucket, key, partNumber)</code>, a single PUT, with a short expiry. If you over-scope (e.g. a wildcard write URL), a leaked URL becomes a write primitive over your bucket. The download side is symmetric: short-lived signed GET URLs, optionally with a CDN in front (<a href="06_caching.html">caching</a>) so the store isn't the egress bottleneck either. The <a href="13_fault_tolerance.html">failure-as-normal</a> stance applies here too — if a URL expires mid-upload (the part took longer than the expiry on a slow link), the client just re-fetches a fresh URL from the control plane and retries the part. Resume already handles this.</p>
+
+<h3>6.3 Integrity — a 200 OK does not prove the right bytes landed</h3>
+<p>This is the subtlest part and the one juniors skip. A successful HTTP PUT means "the store accepted some bytes for this key." It does <strong>not</strong> mean those are the bytes the client intended: a truncated body that still got a 200, a buggy proxy that re-chunked, a client bug that read the wrong file offset, bit-rot between accept and durability — all return 200. <strong>Transport success is not data correctness.</strong></p>
+<p>So integrity is enforced with checksums at two levels, mirroring DDIA Ch. 4's "the encoding is the contract":</p>
+<ul>
+  <li><strong>Per-part checksum.</strong> The client computes a hash (CRC32C/MD5/SHA-256) of each chunk and sends it with the PUT. The store verifies <em>on write</em> and stores the checksum. A part whose bytes don't match its declared checksum is rejected — caught at minute 30, not at publish.</li>
+  <li><strong>Final manifest check.</strong> At <code>complete</code>, the client's manifest lists every part number and its expected checksum. The server verifies that the stored set exactly equals the manifest — every part present, every checksum matches, no extras — <em>before</em> assembling. Optionally it computes a whole-file hash (a hash-of-hashes, like S3's multipart ETag) and compares to the content hash the client declared at <code>create</code>.</li>
+</ul>
+<p>This double check protects against <em>both</em> client bugs (wrong bytes sent) and storage bugs (wrong bytes stored), and it is what makes the commit trustworthy.</p>
+
+<h3>6.4 Idempotent, atomic commit (the hard part)</h3>
+<p>Two retry hazards, both DDIA Ch. 11 idempotency patterns:</p>
+<p><strong>Idempotent part PUT.</strong> A client times out on part 47, doesn't know if it landed, and re-sends it. Because parts are keyed by <code>(uploadId, partNumber)</code>, the re-send simply overwrites/coincides with the same logical slot — uploading part 47 twice is indistinguishable from uploading it once. No duplicate, no corruption. This is the chunk-dedup property: the address of a part is a deterministic function of its identity, not of when it arrived.</p>
+<p><strong>Atomic publish.</strong> <code>complete</code> is the linearization point. It must be all-or-nothing: validate the full manifest, and only then flip the object from <code>completing</code> to <code>published</code> in a single atomic step (a conditional metadata write / compare-and-set on session state). A second <code>complete</code> on an already-published session returns the same result — it is a no-op, not a re-publish. Until publish succeeds, no reader can resolve the object key; after it succeeds, all readers see the whole file. There is no window in which a download sees a half-assembled object.</p>
+
+<h2>7. Trade-offs</h2>
+<table>
+  <thead><tr><th>Choice</th><th>Buys</th><th>Costs</th><th>Choose when</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Proxy upload through app vs direct-to-store</strong></td><td>Central control: inline scanning, transforms, byte-level auth.</td><td>App tier becomes a bandwidth bottleneck; loses stateless cheap scaling.</td><td>Small files, or strict in-line scanning is mandatory.</td></tr>
+    <tr><td><strong>Small chunks vs large chunks</strong></td><td>Fine-grained, cheap retries; better parallelism on flaky links.</td><td>More metadata rows, more requests, more round-trip overhead.</td><td>Unstable networks / high per-part failure rate.</td></tr>
+    <tr><td><strong>Serve through app vs signed URL + CDN</strong></td><td>Per-byte authorization control, audit on every read.</td><td>Expensive app egress; no edge caching.</td><td>Highly sensitive downloads needing per-request authz.</td></tr>
+    <tr><td><strong>Scan before publish vs scan after</strong></td><td>Pre-publish scan = malware never served.</td><td>Slower time-to-available; blocks the commit.</td><td>Public sharing / untrusted uploaders → scan first.</td></tr>
+  </tbody>
+</table>
+<p>The sharpest one is <strong>proxy vs direct</strong>. The reflex "route it through the app so we can scan and authorize every byte" feels safe and is almost always wrong at scale: it converts a stateless tier into a multi-gigabit pipe and makes your app the SPOF for every upload. The senior move is to keep the data plane direct-to-store and move the controls <em>off the hot path</em> — scan asynchronously after upload but <em>before</em> publish (the object is invisible until the scan and manifest both pass), and authorize at URL-issue time rather than per byte. You get the safety without making the app proxy 10 GB streams.</p>
+
+<h2>8. Failure modes</h2>
+<table>
+  <thead><tr><th>Failure</th><th>Mitigation</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Client re-uploads a part it already sent</strong></td><td>Parts keyed by <code>(uploadId, partNumber)</code> → idempotent; the repeat is a no-op (dedup).</td></tr>
+    <tr><td><strong><code>complete</code> called but a part never landed</strong></td><td>Manifest validation rejects before assembly; session stays <code>open</code>, client re-sends only the missing part.</td></tr>
+    <tr><td><strong>Part PUT returns 200 with wrong/truncated bytes</strong></td><td>Per-part checksum verified on write + final manifest checksum check; bad part rejected, not published.</td></tr>
+    <tr><td><strong>Signed URL expires mid-upload (slow link)</strong></td><td>Client refetches a fresh URL and retries the part; resume state is unaffected.</td></tr>
+    <tr><td><strong>User abandons upload</strong></td><td>Session <code>expiresAt</code> sweep aborts and GCs orphaned parts so storage doesn't leak.</td></tr>
+    <tr><td><strong>Duplicate <code>complete</code> calls</strong></td><td>Atomic CAS on session state → second call is a no-op returning the same published result.</td></tr>
+    <tr><td><strong>CDN serves a revoked/replaced file</strong></td><td>Short TTLs + explicit purge on revocation; version the object key so a new version is a new path.</td></tr>
+  </tbody>
+</table>
+
+<h2>9. Interview Q&amp;A</h2>
+<div class="callout">
+  <ol>
+    <li><strong>Client calls <code>complete</code> but part 47 never landed — how do you guarantee you don't publish a corrupt file?</strong> <em>(senior answer)</em> <code>complete</code> is the linearization point, not the part PUTs. It validates the full manifest first: every part number present and every stored per-part checksum matching the client's declared manifest (optionally a whole-file hash-of-hashes against the content hash from <code>create</code>). If part 47 is missing or its checksum is wrong, <code>complete</code> fails, the session stays <code>open</code>, and the client resumes by re-sending just part 47. Only when validation passes does the server atomically flip <code>completing → published</code> via a CAS; before that flip the object key resolves to nothing, so no reader ever sees a half-assembled file. And because the part PUT is idempotent on <code>(uploadId, partNumber)</code>, the re-sent part 47 can't create a duplicate.</li>
+    <li><strong>How do you size the chunk?</strong> <em>(senior answer)</em> Tie it to the network failure rate. Smaller parts make each loss cheap and improve parallelism but inflate metadata/request overhead; larger parts amortize overhead but waste more per failure and can fail to finish on flaky links. On a clean link bias large; on a lossy one bias small. The re-send <em>volume</em> is roughly fileSize·p regardless of part size, so for typical p (~0.5%) the retry waste is already tiny and you pick part size to minimize overhead — 8 MB for a 10 GB file (1,280 parts, ~50 MB expected re-send). Watch the store's 10,000-part cap for huge files.</li>
+    <li><strong>Why not just proxy uploads through the app server so you can scan and authorize?</strong> <em>(senior answer)</em> Because that turns a stateless tier into a multi-gigabit proxy and the SPOF for every upload. Keep the data plane direct-to-store via signed URLs; move controls off the hot path — scan asynchronously after upload but before publish (object invisible until both scan and manifest pass), authorize at URL-issue time. Same safety, no byte proxying.</li>
+    <li><strong>A part PUT returned 200 — are you done?</strong> <em>(senior answer)</em> No. A 200 means the store accepted some bytes, not the right bytes — truncation, a re-chunking proxy, a client offset bug, or bit-rot all return 200. Transport success ≠ data correctness. You verify a per-part checksum on write and re-verify the whole set against the manifest at <code>complete</code>. Integrity is asserted by checksums at two levels, not inferred from HTTP status.</li>
+    <li><strong>Two requests both call <code>complete</code> concurrently — what happens?</strong> <em>(senior answer)</em> The publish is a single atomic compare-and-set on session state (<code>completing → published</code>). The first wins and publishes; the second sees the state already advanced and returns the same published result as a no-op. <code>complete</code> is idempotent — re-running it never re-assembles or double-publishes.</li>
+    <li><strong>How does resume actually work?</strong> <em>(senior answer)</em> On reconnect the client asks the control plane to list stored parts for the <code>uploadId</code> (part numbers + checksums). It diffs against its own part list and uploads only the missing ones. Because part addresses are deterministic <code>(uploadId, partNumber)</code>, re-sending an ambiguous part is safe. The session's <code>expiresAt</code> bounds how long resume stays valid.</li>
+    <li><strong>What happens to abandoned uploads?</strong> <em>(senior answer)</em> Every session carries an <code>expiresAt</code>. A background sweep aborts expired sessions and garbage-collects their orphaned parts, so a user who closes the tab at 80% doesn't leak 8 GB indefinitely. This is a lifecycle policy on uncommitted parts, separate from the published-object lifecycle.</li>
+    <li><strong>How do you keep download bandwidth off your app servers?</strong> <em>(senior answer)</em> Symmetric to upload: hand out short-lived signed GET URLs, fronted by a CDN for public/shareable content (<a href="06_caching.html">caching</a>). The app authorizes at URL-issue time and never proxies download bytes. For revocation, use short TTLs plus explicit purge, and version object keys so a replacement is a new path.</li>
+  </ol>
+</div>
+
+<h2>Related lessons</h2>
+<p>This case anchors resumable multipart for the set: <a href="case_14_youtube.html">C14 (transcode)</a> consumes a completed upload as its input and reuses the same chunk/idempotency machinery on the segment level; <a href="case_15_google_drive.html">C15 (file sync)</a> is the delta-aware sibling — same resumable upload, plus block-level diffing — so it references the protocol here rather than re-deriving it. The durable substrate the parts and manifest live on is <a href="case_16_s3_object_storage.html">C16 (object-storage durability)</a>. The whole stance — treat interruption as the normal case, retry the small unit safely — is foundation lesson <a href="13_fault_tolerance.html">13 (fault tolerance)</a> applied to a long-lived transfer, and the small, intentional surface follows <a href="03_api_design.html">03 (API design)</a>. Edge serving leans on <a href="06_caching.html">06 (caching)</a>.</p>
+<div class="case-meta">
+<a class="chip" href="case_14_youtube.html">C14 transcode</a>
+<a class="chip" href="case_15_google_drive.html">C15 file sync</a>
+<a class="chip" href="case_16_s3_object_storage.html">C16 object storage</a>
+<a class="chip" href="03_api_design.html">API design</a>
+<a class="chip" href="13_fault_tolerance.html">Fault tolerance</a>
+<a class="chip" href="06_caching.html">Caching</a>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  A 10 GB upload over 20 Mbps takes ~68 minutes — long enough that interruption is guaranteed, so the design's job is to make a failure cost <em>one part</em>, not the file. Slice into ~1,280 8 MB parts (≈6.4 expected retries, ~50 MB re-sent vs 10 GB restarted), send them <strong>direct to the object store via signed URLs</strong> so the app never proxies bytes, and make every retryable operation safe: part PUTs idempotent on <code>(uploadId, partNumber)</code>, and <code>complete</code> an atomic, manifest-validated, checksum-checked publish. A 200 OK proves transport, never correctness — integrity comes from per-part checksums plus a final manifest check. Get the commit right and resumability is free; get it wrong and resumability just lets you publish corruption faster.</div>
+
+<footer class="lesson-nav">
+  <a href="case_16_s3_object_storage.html"><span class="dir">Previous</span><span class="ttl">Previous case</span></a>
+  <a class="next" href="case_18_storage_interfaces.html"><span class="dir">Next</span><span class="ttl">Next case</span></a>
+</footer>
+
+</main>
+</body>
+</html>

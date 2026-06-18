@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>42 · Inverted index &amp; BM25</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">search_ads_recsys</a>
+    <span class="crumb">/</span>
+    <span class="crumb">42 · inverted index &amp; BM25</span>
+    <span class="step-pill">search · 3 / 10</span>
+  </div>
+</header>
+
+<main>
+
+<h1>The inverted index &amp; BM25 — lexical retrieval that still wins</h1>
+<p class="subtitle">Before you reach for embeddings, understand the data structure and scoring function that have carried production search for forty years: a term→document map and a length-normalised, saturation-aware bag-of-words score. Cheap, exact, interpretable, and still the backbone of every serious search engine.</p>
+
+<div class="callout">
+  <div class="label">The plan</div>
+  <ul style="margin:6px 0;">
+    <li><strong>The data structure.</strong> Term dictionary → posting lists (docid, tf, positions). Why "inverted," how it's built at scale (SPIMI / external merge), and how postings are compressed (gap encoding + variable-byte) with a concrete byte count.</li>
+    <li><strong>Boolean + phrase/proximity</strong> retrieval, and why positions earn their storage cost.</li>
+    <li><strong>Scoring, built up:</strong> tf intuition → TF-IDF → the full <strong>BM25</strong> formula, deriving the engineering intent of <span class="math">k₁</span> (tf saturation) and <span class="math">b</span> (length normalisation), then <strong>BM25F</strong> for fields.</li>
+    <li><strong>Efficiency:</strong> term-at-a-time vs document-at-a-time, and <strong>WAND / block-max WAND</strong> top-<span class="math">k</span> pruning, with a worked threshold-skip example.</li>
+    <li><strong>Where lexical fails</strong> — vocabulary mismatch and semantics — which is exactly the hand-off to dense &amp; hybrid retrieval next door.</li>
+  </ul>
+</div>
+
+<p>This lesson depends on <a href="41_query_understanding.html">lesson 41 (query understanding)</a>: the query that arrives here has already been tokenised, lowercased, stemmed, and stop-word-filtered into a list of <em>analysed terms</em>. The index was built by running documents through the <em>same</em> analyzer. That symmetry — query and document analysed identically — is the quiet precondition for everything below; break it and exact matches silently disappear. We set up <a href="43_dense_hybrid_retrieval.html">lesson 43 (dense &amp; hybrid retrieval)</a>, where embeddings cover the cases BM25 cannot, and <a href="49_search_system_design.html">lesson 49 (serving)</a>, which shards and replicates the index you build here.</p>
+
+<h2>Why "inverted," and what's in a posting list</h2>
+
+<p>A document is naturally a <em>forward</em> map: doc → terms it contains. To find the documents containing a term, you'd scan every document — <span class="math">O(N)</span> per query term, hopeless at scale. The <strong>inverted index</strong> flips it: term → list of documents containing it. "Inverted" is relative to that forward map. The query "find docs with term <em>t</em>" becomes a single dictionary lookup followed by a walk down a precomputed list.</p>
+
+<p>Two structures:</p>
+<ul>
+  <li><strong>Term dictionary</strong> — every distinct term, mapping to (document frequency <span class="math">df</span>, a pointer to its posting list). Held in memory or a compact on-disk structure (an FST / sorted block index). Lookups must be <span class="math">O(1)</span>-ish.</li>
+  <li><strong>Posting list</strong> — for one term, the documents that contain it, in <em>ascending docid order</em>. Each posting is at minimum a docid; for scoring we also store the <strong>term frequency</strong> <span class="math">tf</span> (occurrences in that doc); for phrase/proximity queries we also store the <strong>positions</strong> (token offsets within the doc).</li>
+</ul>
+
+<div class="ascii">
+TERM DICTIONARY                 POSTING LISTS  (docid, tf, [positions])
+─────────────────               ───────────────────────────────────────────────
+ "neural"   df=3   ──────────▶  (7, 2, [4,19]) → (88, 1, [3]) → (140, 4, [1,5,9,22])
+ "network"  df=4   ──────────▶  (7, 1, [5])    → (88, 2, [4,57]) → (140, 3, [2,6,23]) → (512, 1, [0])
+ "search"   df=2   ──────────▶  (12, 1, [0])   → (140, 1, [40])
+ "index"    df=5   ──────────▶  (3, 1, [8])    → (12, 2, [2,11]) → (88, 1, [60]) → (140, 1, [41]) → (901, 3, [...])
+                                 └─ ascending docid order; gaps compressed; skip pointers every √len entries
+
+The query "neural network" intersects the "neural" and "network" lists:
+ both contain docids {7, 88, 140}; positions let us verify the *phrase* "neural network"
+ (position of "network" == position of "neural" + 1) in doc 7 ([4,19] vs [5]: 4→5 adjacent ✓).
+</div>
+
+<p>The phrase "neural network" is not just "both terms present." In doc 7, "neural" sits at positions {4, 19} and "network" at {5}; since <span class="math">5 = 4 + 1</span>, the bigram is adjacent — a true phrase match. Without positions you could only answer the Boolean question (both terms somewhere in the doc), which is why positions exist despite roughly doubling the index size.</p>
+
+<h2>Building the index at scale: SPIMI</h2>
+
+<p>You cannot sort a web-scale &lt;term, docid, tf&gt; stream in RAM. The production algorithm is <strong>SPIMI</strong> (Single-Pass In-Memory Indexing) feeding an <strong>external merge sort</strong>:</p>
+
+<ol>
+  <li>Stream documents. Maintain an in-memory dictionary mapping term → growing posting list (a real list, not a sorted array — append is <span class="math">O(1)</span>).</li>
+  <li>When memory fills, sort the dictionary's terms, write the whole block to disk as a sorted run, free RAM, continue. Each run is a self-contained mini-index.</li>
+  <li>After the pass, <strong>k-way merge</strong> the sorted runs: terms appearing in multiple runs have their posting lists concatenated (already in docid order within each run because we processed documents in id order). The merge is sequential disk I/O — the regime disks are good at.</li>
+</ol>
+
+<p>The key property: SPIMI never holds the global vocabulary in RAM and never random-writes — it's append + sequential-merge, so it scales to indices far larger than memory. Index builds are embarrassingly parallel by document shard; merge happens per shard. (Lesson 49 returns to sharding for <em>serving</em>; here it's a build concern.)</p>
+
+<h2>Posting-list compression: gaps + variable-byte</h2>
+
+<p>Posting lists dominate index size, and they're full of redundancy: docids are ascending, so store <strong>gaps</strong> (deltas) instead of absolute ids. A list <span class="math">[7, 88, 140, 512, 901]</span> becomes gaps <span class="math">[7, 81, 52, 372, 389]</span>. Gaps are smaller than ids, and for frequent terms (dense lists) the gaps are tiny. Then encode each gap with <strong>variable-byte (varbyte)</strong>: 7 bits of payload per byte, the top bit a continuation flag, so a number &lt; 128 costs 1 byte, &lt; 16384 costs 2 bytes, etc.</p>
+
+<div class="callout">
+  <div class="label">Worked compression: one short posting list</div>
+  Take docids <span class="math">[7, 88, 140, 512, 901]</span>.<br><br>
+  <strong>Naïve fixed 32-bit:</strong> 5 × 4 B = <strong>20 bytes</strong>.<br><br>
+  <strong>Gap-encode:</strong> first id stored as-is, rest as deltas → <span class="math">[7, 81, 52, 372, 389]</span>.<br><br>
+  <strong>Varbyte each gap</strong> (1 byte if &lt; 128, else 2 bytes):
+  <table style="margin:8px 0;">
+    <thead><tr><th>gap</th><th>&lt; 128?</th><th>bytes</th></tr></thead>
+    <tbody>
+      <tr><td>7</td><td>yes</td><td>1</td></tr>
+      <tr><td>81</td><td>yes</td><td>1</td></tr>
+      <tr><td>52</td><td>yes</td><td>1</td></tr>
+      <tr><td>372</td><td>no (needs 2 bytes: 372 = 2·128 + 116)</td><td>2</td></tr>
+      <tr><td>389</td><td>no</td><td>2</td></tr>
+    </tbody>
+  </table>
+  Total = 1+1+1+2+2 = <strong>7 bytes</strong> vs 20 bytes raw → <strong>2.9× smaller</strong> on this tiny list. On real lists with long runs of small gaps (popular terms), 4–8× is routine; <strong>PForDelta</strong> / Frame-of-Reference encodings, which batch-encode a block of gaps to a common bit-width and store the rare large "exceptions" separately, push frequent-term lists toward <strong>~1 byte or less per posting</strong>. The decode is a tight, branch-light, SIMD-friendly loop — compression here <em>buys</em> latency (less I/O, more list per cache line), it doesn't cost it.
+</div>
+
+<h3>Skip pointers</h3>
+
+<p>Intersecting two posting lists (an AND query) walks both in docid order. If list A is short and list B is huge, you waste time stepping through B's postings that A will never match. <strong>Skip pointers</strong> — a sparse forward index laid over a list, typically one skip every <span class="math">√(list length)</span> postings — let you leap past blocks whose entire docid range is below the docid you're seeking. For a list of length <span class="math">L</span>, <span class="math">√L</span> skips give the classic <span class="math">O(√L)</span> seek. Modern engines generalise this to <strong>block-max</strong> indexes (store, per block, the max docid <em>and</em> the max score contribution), which power the WAND pruning below.</p>
+
+<h2>Boolean, phrase, and proximity retrieval</h2>
+
+<p>The matching layer answers "which docs are eligible," before scoring ranks them:</p>
+<ul>
+  <li><strong>AND</strong> ("neural" AND "network"): intersect posting lists. Walk both, advance the cursor on the smaller docid, emit on equality. Skip pointers accelerate. Cost is dominated by the shorter list.</li>
+  <li><strong>OR</strong>: union — emit any docid in either list. The candidate set is large; this is where top-<span class="math">k</span> pruning (WAND) pays off most.</li>
+  <li><strong>NOT</strong>: exclude a list's docids from the candidate set.</li>
+  <li><strong>Phrase</strong> ("machine learning"): AND the lists, then for surviving docs check positions — does "learning" occur at position(of "machine") + 1? Uses the positions array.</li>
+  <li><strong>Proximity</strong> ("machine" NEAR/5 "learning"): like phrase but allow a window — any pair of positions within distance 5. More forgiving than a strict phrase; useful for query understanding's looser intents.</li>
+</ul>
+
+<p>Phrase and proximity are why positions are stored. They roughly double posting-list size (a tf-only posting is ~1 byte compressed; adding positions adds one varbyte gap per occurrence) — the classic precision-vs-storage trade. Many engines store positions in a separate file read only when a query needs them, so Boolean/scored-only queries never pay the cost.</p>
+
+<h2>Scoring: tf intuition → TF-IDF → BM25</h2>
+
+<p>Matching gives a candidate set; scoring orders it. Build the intuition in three steps.</p>
+
+<p><strong>1. Term frequency (tf).</strong> A doc that says "jaguar" five times is probably more about jaguars than one that says it once. So score rises with <span class="math">tf</span>. But not linearly forever — the 20th occurrence tells you almost nothing the 5th didn't. We want <em>saturation</em>.</p>
+
+<p><strong>2. Inverse document frequency (idf).</strong> A term in almost every document ("the") discriminates nothing; a rare term ("photosynthesis") is highly informative. Weight each term by how rare it is across the corpus. The BM25 idf form:</p>
+
+<div class="math block">IDF(t) = ln( 1 + (N − df + 0.5) / (df + 0.5) )</div>
+
+<p>where <span class="math">N</span> is the number of docs and <span class="math">df</span> is how many contain <span class="math">t</span>. The <span class="math">+0.5</span> smoothing and the <span class="math">1 +</span> keep it non-negative even for terms in most documents — unlike the classic <span class="math">ln(N/df)</span> which can go negative.</p>
+
+<p><strong>3. TF-IDF</strong> multiplies them: <span class="math">tf · idf</span>, summed over query terms. It captures both intuitions but has two flaws BM25 fixes: tf grows unboundedly (no saturation), and a long document accumulates more term occurrences just by being long (no length normalisation). BM25 (Robertson &amp; Spärck Jones, "Okapi BM25") repairs both:</p>
+
+<div class="math block">score(q, d) = Σ<sub>t∈q</sub> IDF(t) · ( tf · (k₁ + 1) ) / ( tf + k₁ · (1 − b + b · |d| / avgdl) )</div>
+
+<p>Read it as <span class="math">IDF(t)</span> (how informative the term is) times a <strong>saturating, length-normalised tf term</strong>. Two knobs:</p>
+
+<table>
+  <thead><tr><th>Knob</th><th>What it controls</th><th>Engineering intent</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><span class="math">k₁</span><br>(typ. 1.2–2.0)</td>
+      <td><strong>tf saturation.</strong> As <span class="math">tf → ∞</span>, the tf term → <span class="math">(k₁+1)</span>, a hard ceiling. <span class="math">k₁</span> sets how fast you approach it. Small <span class="math">k₁</span> ⇒ saturates almost immediately (presence matters, count barely does). Large <span class="math">k₁</span> ⇒ closer to linear tf.</td>
+      <td>Diminishing returns on repeated terms. The 2nd occurrence of "jaguar" should add more than the 12th. Without it, keyword-stuffing a word 100 times would dominate ranking — exactly the spam BM25 resists by design.</td>
+    </tr>
+    <tr>
+      <td><span class="math">b</span><br>(typ. 0.75)</td>
+      <td><strong>length normalisation.</strong> The denominator scales <span class="math">tf</span> by <span class="math">(1 − b + b · |d|/avgdl)</span>. At <span class="math">b = 0</span>: no normalisation, raw tf. At <span class="math">b = 1</span>: full normalisation by relative length. <span class="math">b = 0.75</span> is a calibrated middle.</td>
+      <td>A long document shouldn't win just by being long. If <span class="math">|d| &gt; avgdl</span> the effective tf is discounted; if shorter, boosted. Without it, a 10,000-word page mentioning your term 8 times outranks a tight 200-word page mentioning it 8 times — usually the wrong call.</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <div class="label">Worked BM25, end to end — and why tf saturates</div>
+  Corpus: <span class="math">N = 1,000,000</span> docs. Term <span class="math">t</span> with <span class="math">df = 1,000</span>. Document <span class="math">|d| = 300</span> tokens, <span class="math">avgdl = 250</span>. Parameters <span class="math">k₁ = 1.2</span>, <span class="math">b = 0.75</span>.<br><br>
+
+  <strong>Step 1 — IDF.</strong><br>
+  <span class="math">IDF = ln(1 + (N − df + 0.5)/(df + 0.5)) = ln(1 + (1,000,000 − 1,000 + 0.5)/(1,000.5))</span><br>
+  <span class="math">= ln(1 + 999,000.5 / 1,000.5) = ln(1 + 998.50) = ln(999.50) ≈ <strong>6.907</strong></span>.<br><br>
+
+  <strong>Step 2 — length-normalisation factor</strong> (the bracket in the denominator):<br>
+  <span class="math">1 − b + b·|d|/avgdl = 1 − 0.75 + 0.75 × (300/250) = 0.25 + 0.75 × 1.2 = 0.25 + 0.90 = <strong>1.15</strong></span>.<br>
+  So <span class="math">k₁ · 1.15 = 1.2 × 1.15 = 1.38</span>. (Because <span class="math">|d| &gt; avgdl</span>, this is &gt; <span class="math">k₁</span> = 1.2 — the doc is penalised for being longer than average.)<br><br>
+
+  <strong>Step 3 — tf component at <span class="math">tf = 5</span>:</strong><br>
+  <span class="math">(tf · (k₁+1)) / (tf + k₁·1.15) = (5 × 2.2) / (5 + 1.38) = 11.0 / 6.38 = <strong>1.724</strong></span>.<br>
+  <span class="math">score = IDF × 1.724 = 6.907 × 1.724 ≈ <strong>11.91</strong></span>.<br><br>
+
+  <strong>Step 4 — double tf to 10 (saturation check):</strong><br>
+  <span class="math">(10 × 2.2) / (10 + 1.38) = 22.0 / 11.38 = <strong>1.933</strong></span>.<br>
+  <span class="math">score = 6.907 × 1.933 ≈ <strong>13.35</strong></span>.<br><br>
+
+  <strong>The point:</strong> doubling tf from 5→10 raised the tf component only <span class="math">1.724 → 1.933</span> (+12%), and the score <span class="math">11.91 → 13.35</span> (+12%) — <em>not</em> +100%. The ceiling is <span class="math">k₁+1 = 2.2</span>; at <span class="math">tf = 5</span> we're already at <span class="math">1.724/2.2 = 78%</span> of it. This is <span class="math">k₁</span> doing its job: the marginal value of one more occurrence collapses. Set <span class="math">k₁</span> higher (say 2.0) and the curve straightens; set it near 0 and the 1st occurrence is nearly everything. <em>(The widget below lets you watch this curve bend.)</em>
+</div>
+
+<h3>BM25F — fields don't deserve equal weight</h3>
+
+<p>Real documents have <strong>fields</strong>: a title, a body, anchor text, headers. A query term in the <em>title</em> is far stronger evidence than the same term buried in the body. The naïve fix — score each field with BM25 and add — is wrong, because tf saturation is non-linear: saturating each field separately then summing double-counts and breaks the single-saturation property. <strong>BM25F</strong> does it correctly: combine the per-field term frequencies <em>first</em> into a single weighted, per-field-length-normalised pseudo-tf, then apply BM25's saturation <em>once</em>:</p>
+
+<div class="math block">tf̃(t,d) = Σ<sub>f</sub> w<sub>f</sub> · tf(t, f) / (1 − b<sub>f</sub> + b<sub>f</sub> · |d<sub>f</sub>| / avgdl<sub>f</sub>)</div>
+
+<p>with per-field boost <span class="math">w<sub>f</sub></span> (e.g. title 3.0, body 1.0) and per-field length norm <span class="math">b<sub>f</sub></span>. Then plug <span class="math">tf̃</span> into the BM25 numerator/denominator with a global <span class="math">k₁</span>. The senior point: <strong>saturate once, after combining fields</strong> — otherwise a term in title <em>and</em> body gets two near-ceiling contributions, over-rewarding redundancy.</p>
+
+<h2>Query processing efficiency: TAAT vs DAAT vs WAND</h2>
+
+<p>Given the candidate set, you need the top <span class="math">k</span> by score — fast. Two evaluation orders, then the pruning trick.</p>
+
+<table>
+  <thead><tr><th>Strategy</th><th>How</th><th>Trade-off</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>Term-at-a-time (TAAT)</strong></td>
+      <td>Process one term's whole posting list, accumulating partial scores into a per-doc accumulator hash, then the next term, then sort.</td>
+      <td>Simple; but needs an accumulator for every doc that matches <em>any</em> term (huge for OR queries) and can't prune early — you touch every posting.</td>
+    </tr>
+    <tr>
+      <td><strong>Document-at-a-time (DAAT)</strong></td>
+      <td>Advance all term cursors together in docid order; for each docid, sum the contributions of the terms present, push into a top-<span class="math">k</span> heap.</td>
+      <td>Bounded memory (just the heap), and — crucially — it knows the current <span class="math">k</span>-th best score (the <strong>threshold</strong>), which enables skipping. The default in Lucene/modern engines.</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="ascii">
+DAAT cursor walk over "neural"(N) + "network"(K) + "search"(S), top-k heap tracks threshold θ
+─────────────────────────────────────────────────────────────────────────────────────────────
+ N:  7    88        140              512
+ K:  7    88        140                      ...
+ S:       12              140
+
+ docid →  7 :  N+K present       → score, push to heap
+          12:  S only            → score, push
+          88:  N+K present       → score, push
+          140: N+K+S all present → highest possible → push, raises θ
+          512: N only            → if N's max contribution ≤ θ, the cursor SKIPS it entirely
+
+ The heap's k-th score is the threshold θ. Once θ is high, any docid whose
+ *upper-bound* score (sum of its terms' max contributions) ≤ θ is provably
+ not in the top-k → skip via skip pointers / block-max. That is WAND.
+</div>
+
+<h3>WAND and block-max WAND</h3>
+
+<p><strong>WAND</strong> (Weak AND / Weighted AND, Broder et al. 2003) makes DAAT skip postings that <em>cannot</em> make the top <span class="math">k</span>. Precompute, per term, its <strong>maximum possible contribution</strong> <span class="math">UB<sub>t</sub></span> (the largest BM25 term-score any doc could get from this term — driven by the term's IDF and best tf). Keep the term cursors sorted by current docid. To find the next candidate that <em>could</em> beat the threshold <span class="math">θ</span>:</p>
+
+<ol>
+  <li>Sort cursors by docid. Walk a running sum of <span class="math">UB<sub>t</sub></span> down the sorted cursors until the partial sum exceeds <span class="math">θ</span>. The cursor at which the sum crosses <span class="math">θ</span> is the <strong>pivot</strong> — its docid is the earliest doc that could possibly clear <span class="math">θ</span>.</li>
+  <li>Advance all earlier cursors to at least the pivot docid (skip pointers make this cheap). Fully score the pivot only if all required terms align; otherwise repeat.</li>
+</ol>
+
+<div class="callout warn">
+  <div class="label">Worked WAND skip</div>
+  Three query terms with max contributions: <span class="math">UB("neural") = 6.9</span>, <span class="math">UB("network") = 4.2</span>, <span class="math">UB("the") = 0.3</span>. Current heap threshold <span class="math">θ = 8.0</span> (we already have <span class="math">k</span> docs scoring ≥ 8).<br><br>
+  <strong>Can a doc with only "network" + "the" beat θ?</strong> Upper bound <span class="math">= 4.2 + 0.3 = 4.5 &lt; 8.0</span>. <strong>No.</strong> So any docid where "neural" is absent is hopeless — WAND advances the "network" and "the" cursors past every docid below the next "neural" docid. If "neural" next appears at docid 9,000 and "network" was sitting at docid 600, we skip ~8,400 postings of "network" in one seek instead of scoring each.<br><br>
+  <strong>Pivot logic:</strong> sort cursors by docid, accumulate UBs: <span class="math">6.9</span> (neural) → still &lt; 8.0; <span class="math">6.9 + 4.2 = 11.1 ≥ 8.0</span> → pivot is the "network" cursor's docid. Only docs at/after that docid where the UB sum clears θ get fully scored. Every posting skipped is BM25 arithmetic and I/O <em>not</em> performed.<br><br>
+  <strong>Block-max WAND (BMW)</strong> sharpens this: instead of one global <span class="math">UB<sub>t</sub></span> per term, store a per-<em>block</em> max score (from the block-max index). The upper bound for a region uses the local block maxima, which are far tighter than the global max, so the pivot advances faster and skips more. BMW is the standard top-<span class="math">k</span> algorithm in modern Lucene/PISA-class engines — it can prune 80–95% of postings on common multi-term queries while returning the <em>exact</em> top <span class="math">k</span> (it's safe pruning, not approximate).
+</div>
+
+<h2>Interactive · BM25 score explorer</h2>
+
+<p>Move the sliders and watch the three pieces of BM25 update live: the <strong>IDF</strong> (rarity weight), the <strong>length-normalisation factor</strong> (the denominator bracket), and the <strong>tf-saturation component</strong>. The bar chart sweeps <span class="math">tf</span> from 1 to 20 at your current settings so you can <em>see</em> the saturation ceiling bend down as <span class="math">k₁</span> shrinks, and the whole curve sink as <span class="math">b</span> penalises an over-length document. This is the real BM25 arithmetic, not an approximation.</p>
+
+<div class="widget" id="bm25-widget">
+  <div class="title">Compute a BM25 term-score and watch tf saturate</div>
+  <div class="hint">Exact BM25 (Okapi form). The bar chart plots the full score across tf = 1…20 at the current df/N/|d|/avgdl/k₁/b. Lower k₁ ⇒ earlier saturation; higher b with |d| &gt; avgdl ⇒ the whole curve drops.</div>
+
+  <div class="controls" style="flex-direction: column; align-items: stretch;">
+    <label class="inline">term freq tf: <input type="range" id="tf" min="1" max="20" step="1" value="5"><span class="val" id="tf-v">5</span></label>
+    <label class="inline">doc freq df: <input type="range" id="df" min="1" max="500000" step="1" value="1000"><span class="val" id="df-v">1000</span></label>
+    <label class="inline">corpus size N: <input type="range" id="N" min="10000" max="5000000" step="10000" value="1000000"><span class="val" id="N-v">1000000</span></label>
+    <label class="inline">doc length |d|: <input type="range" id="dl" min="20" max="2000" step="10" value="300"><span class="val" id="dl-v">300</span></label>
+    <label class="inline">avg length avgdl: <input type="range" id="avgdl" min="20" max="2000" step="10" value="250"><span class="val" id="avgdl-v">250</span></label>
+    <label class="inline">k₁ (saturation): <input type="range" id="k1" min="0.1" max="3.0" step="0.1" value="1.2"><span class="val" id="k1-v">1.2</span></label>
+    <label class="inline">b (length norm): <input type="range" id="b" min="0" max="1" step="0.05" value="0.75"><span class="val" id="b-v">0.75</span></label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">IDF(t)</div><div class="v" id="kpi-idf">—</div></div>
+    <div class="kpi"><div class="k">length-norm factor</div><div class="v" id="kpi-lnf">—</div></div>
+    <div class="kpi"><div class="k">tf-saturation component</div><div class="v" id="kpi-tfc">—</div></div>
+    <div class="kpi"><div class="k">BM25 score</div><div class="v" id="kpi-score">—</div></div>
+  </div>
+
+  <div style="margin-top:10px;">
+    <div class="label inline">score across tf = 1…20 (▮ = your current tf)</div>
+    <div id="bars" style="margin-top:6px;"></div>
+  </div>
+
+  <div class="callout" id="bm25-explainer">
+    <div class="label" id="bm25-exp-label">Reading</div>
+    <div id="bm25-exp-text">—</div>
+  </div>
+</div>
+
+<h2>Where lexical retrieval fails</h2>
+
+<p>BM25 is a <strong>bag-of-words, exact-term</strong> scorer. Its strengths are precisely its blind spots:</p>
+
+<ul>
+  <li><strong>Vocabulary mismatch.</strong> Query "car" won't match a document that only says "automobile." BM25 sees two different terms with zero overlap. Synonym expansion (lesson 41) and dense retrieval (lesson 43) exist to bridge this.</li>
+  <li><strong>Synonymy &amp; morphology.</strong> "running shoes" vs "shoe for runners" — stemming helps a little, but lexical matching can't know "NYC" ≈ "New York City" without an explicit synonym map.</li>
+  <li><strong>No semantics / no word order beyond phrases.</strong> "dog bites man" and "man bites dog" score identically (same bag of words). BM25 cannot represent meaning, only term overlap.</li>
+  <li><strong>Polysemy.</strong> "jaguar" (animal vs car) — BM25 has no notion of sense; it matches the surface string regardless of intent.</li>
+</ul>
+
+<p>And yet it still wins constantly: it is exact (a doc with your literal rare term <em>will</em> be found — no recall cliff for tail/long-tail and exact-phrase queries), interpretable (you can read off <em>why</em> a doc scored what it did — IDF × saturated tf, term by term), cheap (no GPU, milliseconds, trivially shardable), and zero-shot (no training, works on a brand-new corpus instantly). The modern answer is not "replace BM25 with embeddings" but <strong>hybrid</strong>: run lexical and dense in parallel and fuse. That's exactly where <a href="43_dense_hybrid_retrieval.html">lesson 43</a> goes, and why <a href="03_embeddings_ann.html">lesson 03's</a> ANN index is the dense complement to the inverted index here — two retrieval engines, fused, each covering the other's failures.</p>
+
+<h2>Interview prompts you should be ready for</h2>
+
+<div class="callout">
+  <ol style="margin: 4px 0;">
+    <li>"Why does BM25 saturate term frequency, and what controls it?" <em>(The 20th occurrence of a word adds almost nothing the 5th didn't — and unbounded tf invites keyword-stuffing spam. <span class="math">k₁</span> sets the approach rate to the ceiling <span class="math">k₁+1</span>. A junior says "tf × idf"; a senior names the saturation and the spam-resistance it buys.)</em></li>
+    <li>"Walk me through a full BM25 score for given N, df, tf, |d|, avgdl." <em>(Compute IDF = ln(1+(N−df+0.5)/(df+0.5)), the length-norm bracket 1−b+b·|d|/avgdl, then the saturating tf term. The signal is doing the arithmetic cleanly and noting |d| &gt; avgdl penalises the doc.)</em></li>
+    <li>"How would you combine title and body relevance — just add two BM25 scores?" <em>(No — saturate once. BM25F combines per-field tf into a single normalised pseudo-tf first, then applies saturation once, so a term in both fields isn't double-counted near the ceiling.)</em></li>
+    <li>"Top-k over a billion-doc OR query is slow. How do you make it fast without losing correctness?" <em>(DAAT + WAND / block-max WAND: precompute per-term (per-block) max contributions, maintain the top-k threshold θ, skip any docid whose upper-bound score ≤ θ. It's safe pruning — exact top-k, 80–95% postings skipped.)</em></li>
+    <li>"Your index doubled in size and you didn't add positions. Where did the bytes go, and how do you get them back?" <em>(Probably stored absolute docids or fp32 ids instead of gap + varbyte; or stored positions inline. Fixes: delta-encode, varbyte/PForDelta, split positions into a lazily-read file. Cite a concrete ratio — e.g. 20 B → 7 B on a short list, 4–8× on real lists.)</em></li>
+    <li>"BM25 returns nothing for a query you know has good answers. Diagnose." <em>(Vocabulary mismatch — query terms don't literally appear; or an analyzer asymmetry between index and query time (different stemming/tokenisation) silently killing exact matches. Senior move: check the analyzer symmetry first, then reach for synonyms / dense hybrid, not more BM25 tuning.)</em></li>
+  </ol>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  The inverted index is a term→posting-list map (docid, tf, positions), built by single-pass in-memory indexing + external merge, and kept tiny by gap encoding + varbyte/PForDelta. BM25 scores it with two ideas worth internalising: <strong>IDF</strong> weights rarity, and a <strong>saturating, length-normalised tf</strong> term governed by <span class="math">k₁</span> (diminishing returns, spam resistance) and <span class="math">b</span> (don't let long docs win by length). DAAT + block-max WAND make top-<span class="math">k</span> fast by skipping postings that provably can't beat the threshold — exact, not approximate. Lexical retrieval is cheap, exact, interpretable, and zero-shot; it fails only on meaning and vocabulary, which is precisely the job you hand to dense &amp; hybrid retrieval next. Senior signal: you can compute a BM25 score by hand, defend the two knobs, and explain why you'd still run BM25 even after you have embeddings.
+</div>
+
+<footer class="lesson-nav">
+  <a href="41_query_understanding.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">41 · Query understanding</span>
+  </a>
+  <a class="next" href="43_dense_hybrid_retrieval.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">43 · Dense &amp; hybrid retrieval</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const ids = ['tf','df','N','dl','avgdl','k1','b'];
+  function val(id){ return parseFloat(document.getElementById(id).value); }
+
+  function idf(N, df){
+    return Math.log(1 + (N - df + 0.5) / (df + 0.5));
+  }
+  function lengthNorm(b, dl, avgdl){
+    return 1 - b + b * (dl / avgdl);
+  }
+  function tfComponent(tf, k1, lnf){
+    return (tf * (k1 + 1)) / (tf + k1 * lnf);
+  }
+  function bm25(tf, N, df, dl, avgdl, k1, b){
+    const I = idf(N, df);
+    const lnf = lengthNorm(b, dl, avgdl);
+    const c = tfComponent(tf, k1, lnf);
+    return { I: I, lnf: lnf, c: c, score: I * c };
+  }
+  function fmtCount(x){
+    if (x >= 1e6) return (x/1e6).toFixed(2)+'M';
+    if (x >= 1e3) return (x/1e3).toFixed(0)+'K';
+    return Math.round(x).toString();
+  }
+
+  function update(){
+    const tf = val('tf'), df = val('df'), N = val('N');
+    const dl = val('dl'), avgdl = val('avgdl'), k1 = val('k1'), b = val('b');
+
+    // keep df <= N so idf stays sensible
+    const dfEff = Math.min(df, Math.max(1, N - 1));
+
+    document.getElementById('tf-v').textContent    = tf;
+    document.getElementById('df-v').textContent    = fmtCount(dfEff);
+    document.getElementById('N-v').textContent     = fmtCount(N);
+    document.getElementById('dl-v').textContent    = dl;
+    document.getElementById('avgdl-v').textContent = avgdl;
+    document.getElementById('k1-v').textContent    = k1.toFixed(1);
+    document.getElementById('b-v').textContent     = b.toFixed(2);
+
+    const r = bm25(tf, N, dfEff, dl, avgdl, k1, b);
+
+    document.getElementById('kpi-idf').textContent   = r.I.toFixed(3);
+    document.getElementById('kpi-lnf').textContent   = r.lnf.toFixed(3);
+    document.getElementById('kpi-tfc').textContent   = r.c.toFixed(3) + ' / ' + (k1 + 1).toFixed(1);
+    document.getElementById('kpi-score').textContent = r.score.toFixed(2);
+
+    // --- bar chart: score across tf = 1..20 ---
+    const bars = document.getElementById('bars');
+    let maxScore = 0;
+    const row = [];
+    for (let t = 1; t <= 20; t++){
+      const s = bm25(t, N, dfEff, dl, avgdl, k1, b).score;
+      row.push(s);
+      if (s > maxScore) maxScore = s;
+    }
+    let html = '';
+    for (let t = 1; t <= 20; t++){
+      const s = row[t-1];
+      const pct = maxScore > 0 ? (s / maxScore * 100) : 0;
+      const cur = (t === tf);
+      const fillColor = cur ? 'var(--accent)' : 'var(--ok)';
+      const mark = cur ? '▮' : '';
+      html += '<div style="display:flex;align-items:center;gap:8px;margin:2px 0;font-size:11px;">'
+            + '<span style="width:64px;color:var(--text-mute);text-align:right;">tf=' + t + ' ' + mark + '</span>'
+            + '<span class="bar" style="flex:1;background:var(--bg-elev);height:12px;border-radius:3px;overflow:hidden;">'
+            + '<span class="fill" style="display:block;height:100%;width:' + pct.toFixed(1) + '%;background:' + fillColor + ';"></span>'
+            + '</span>'
+            + '<span style="width:52px;color:var(--text-mute);">' + s.toFixed(2) + '</span>'
+            + '</div>';
+    }
+    bars.innerHTML = html;
+
+    // --- explainer ---
+    const ceiling = k1 + 1;
+    const fracOfCeiling = r.c / ceiling;       // how close current tf is to saturation ceiling
+    const label = document.getElementById('bm25-exp-label');
+    const text  = document.getElementById('bm25-exp-text');
+    const box   = document.getElementById('bm25-explainer');
+
+    // saturation reading at current tf
+    const sat = (fracOfCeiling * 100).toFixed(0);
+    // length penalty / boost
+    let lenMsg, lenColor;
+    if (dl > avgdl){
+      lenMsg = 'This doc (|d|=' + dl + ') is <strong>longer</strong> than average (' + avgdl + '), so b is <strong>penalising</strong> it: the length-norm factor ' + r.lnf.toFixed(3) + ' &gt; 1 inflates the denominator and shrinks the tf component.';
+      lenColor = 'var(--warn)';
+    } else if (dl < avgdl){
+      lenMsg = 'This doc (|d|=' + dl + ') is <strong>shorter</strong> than average (' + avgdl + '), so b is <strong>boosting</strong> it: the length-norm factor ' + r.lnf.toFixed(3) + ' &lt; 1 shrinks the denominator and raises the tf component.';
+      lenColor = 'var(--ok)';
+    } else {
+      lenMsg = 'This doc is exactly average length, so the length-norm factor is ' + r.lnf.toFixed(3) + ' (≈1) — no boost, no penalty.';
+      lenColor = 'var(--ok)';
+    }
+
+    label.textContent = 'BM25 score = ' + r.score.toFixed(2) + '  (IDF ' + r.I.toFixed(2) + ' × tf-comp ' + r.c.toFixed(3) + ')';
+    text.innerHTML =
+      'At tf=' + tf + ', the tf component is ' + r.c.toFixed(3) + ' of a hard ceiling of k₁+1 = ' + ceiling.toFixed(1)
+      + ' — that is <strong>' + sat + '% saturated</strong>. '
+      + 'Notice in the bars how each higher tf adds less than the last: that bending-over curve <em>is</em> k₁ at work. Drop k₁ toward 0 and the curve snaps to its ceiling almost immediately (presence &gt; count); push it to 3 and it straightens toward linear. '
+      + lenMsg
+      + ' IDF = ' + r.I.toFixed(3) + ' scales the whole thing by the term\'s rarity (df=' + fmtCount(dfEff) + ' of N=' + fmtCount(N) + ').';
+    box.style.borderLeftColor = lenColor;
+  }
+
+  ids.forEach(id => document.getElementById(id).addEventListener('input', update));
+  update();
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>45 · Multi-stage &amp; semantic reranking</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">search_ads_recsys</a>
+    <span class="crumb">/</span>
+    <span class="crumb">45 · semantic reranking</span>
+    <span class="step-pill">search · 6 / 10</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Multi-stage &amp; semantic reranking</h1>
+<p class="subtitle">The cascade exists because cost-per-document rises 100–1000× at each stage. You can only afford the most accurate model on a handful of documents — so reranking is where you spend a latency budget to buy accuracy, and the whole craft is spending it wisely.</p>
+
+<div class="callout">
+  <div class="label">The plan</div>
+  <ul style="margin:6px 0;">
+    <li><strong>Cascade economics.</strong> Why the funnel narrows by 10–100× per stage: cost-per-doc climbs faster than accuracy, so you can only afford the expensive model on the few survivors.</li>
+    <li><strong>Bi-encoder vs cross-encoder.</strong> The central distinction. Separate encoding (precomputable, indexable, cheap) vs joint encoding (full query×doc attention, accurate, can't be precomputed). This is <em>the</em> reason retrieval and reranking use different models.</li>
+    <li><strong>Late interaction (ColBERT).</strong> The middle ground — per-token doc embeddings precomputed, query-time MaxSim. Compare all three on accuracy / query-cost / storage.</li>
+    <li><strong>Pushing accuracy upstream.</strong> Distillation (cross-encoder teacher → bi-encoder student) and LLM rerankers (listwise RankGPT, pointwise relevance) with their real latency cost.</li>
+    <li><strong>The blend layer.</strong> Diversity, dedup, freshness, business rules — the last place to enforce them, and why it lives after relevance.</li>
+    <li><strong>Worked latency math + a budget-explorer widget</strong> so you can do the rerank arithmetic out loud.</li>
+  </ul>
+</div>
+
+<p>This lesson depends on two predecessors. From <a href="43_dense_hybrid_retrieval.html">43 (dense &amp; hybrid retrieval)</a> you have the <em>bi-encoder</em>: query and document encoded into separate vectors, scored by dot product, precomputed and indexed in an ANN structure — that's how retrieval pulls a thousand candidates out of millions cheaply. From <a href="44_learning_to_rank.html">44 (learning to rank)</a> you have the mid-stage <em>GBDT/LTR</em> ranker that scores those thousand on hundreds of features. This lesson adds the final, most expensive stage — the neural reranker that runs on the top few dozen — and explains the model architectures (cross-encoder, late interaction) that make accuracy buyable. It sets up <a href="48_search_evaluation.html">48 (relevance evaluation)</a> — how you prove the rerank actually helped — and <a href="49_search_system_design.html">49 (system design)</a>, where the whole cascade gets a latency budget.</p>
+
+<h2>The cascade exists because cost rises faster than accuracy</h2>
+
+<p>A search pipeline is a <strong>cascade</strong> (also called a multi-stage retrieval-and-ranking funnel; <a href="01_funnel.html">lesson 1</a> introduced the recsys version). Each stage takes the survivors of the previous one, applies a more expensive and more accurate model, and passes a smaller set forward. The reason this shape is forced — not a convenience but a necessity — is a single inequality:</p>
+
+<p class="math block">cost-per-document × number-of-documents ≤ stage latency budget</p>
+
+<p>The left side is what you spend; the right is what you have. Retrieval scores millions of documents, so its per-doc cost must be near-zero (a dot product, or a posting-list increment). The reranker is a transformer that does full attention over a query and a document — milliseconds per pair — so it can only touch a handful. If cost-per-doc rises 100–1000× from one stage to the next, the candidate count <em>must</em> fall by a similar factor to keep the product under budget. That is the whole logic of the funnel.</p>
+
+<div class="ascii">  query "best wireless earbuds for running"
+     │
+     ▼
+  ┌────────────────────────────────────────────────────────────┐
+  │ STAGE 1 · RETRIEVE          N ≈ 10,000,000 docs            │
+  │   BM25 (inverted index)  +  dense bi-encoder (ANN)         │
+  │   cost ≈ 0.0005 ms/doc   ·   precomputed doc vectors       │   ~10 ms
+  │   keeps: top ~1,000                                        │
+  └─────────────────┬──────────────────────────────────────────┘
+                    │   ÷ 10,000  (10M → 1K)
+                    ▼
+  ┌────────────────────────────────────────────────────────────┐
+  │ STAGE 2 · MID-RANK          N ≈ 1,000 docs                 │
+  │   GBDT / LTR over hundreds of features  (lesson 44)        │
+  │   cost ≈ 0.05 ms/doc                                       │   ~20 ms
+  │   keeps: top ~50–100                                       │
+  └─────────────────┬──────────────────────────────────────────┘
+                    │   ÷ 20  (1K → 50)
+                    ▼
+  ┌────────────────────────────────────────────────────────────┐
+  │ STAGE 3 · RERANK            N ≈ 50 docs                    │
+  │   cross-encoder transformer  (query × doc joint attention) │
+  │   cost ≈ 8 ms/doc  (batched/parallel → effective ~1–2 ms)  │   ~50–100 ms
+  │   keeps: top ~10 (the SERP)                                │
+  └─────────────────┬──────────────────────────────────────────┘
+                    │   blend
+                    ▼
+  ┌────────────────────────────────────────────────────────────┐
+  │ STAGE 4 · BLEND / RERANK-FOR-BUSINESS                      │
+  │   diversity + dedup (MMR), freshness boost, business rules │   ~3 ms
+  │   produces final top-10 shown to the user                 │
+  └────────────────────────────────────────────────────────────┘
+
+  cost/doc:   0.0005 ms  ->  0.05 ms  ->  8 ms        (~100x and ~160x jumps)
+  doc count:  10,000,000 ->  1,000    ->  50   -> 10  (~10^4x and ~20x cuts)</div>
+
+<p><strong>Worked numbers — the budget at each stage.</strong> Suppose retrieval has 10 ms. At 0.0005 ms/doc that is <span class="math">10 / 0.0005 = 20,000</span> dot products of headroom — but ANN (<a href="03_embeddings_ann.html">lesson 3</a>) lets it touch millions without scoring them all, so the real constraint there is the index, not the per-doc cost. The mid-ranker gets 20 ms at 0.05 ms/doc → it can score <span class="math">20 / 0.05 = 400</span> docs comfortably, ~1,000 if you push it. The reranker gets, say, 50 ms at 8 ms/doc → <span class="math">50 / 8 ≈ 6</span> docs <em>sequentially</em>. That is far too few — which is exactly why reranking lives and dies on batching and parallelism, the subject of the widget below. Without them, the expensive stage can rerank single digits; with them, dozens.</p>
+
+<div class="callout">
+  <div class="label">Why each stage must cut by ~10–100×, not less</div>
+  If a stage only halved the candidate set, the next (100× costlier) stage would blow its budget by ~50×. The cut factor has to roughly cancel the cost-per-doc jump. A 100× cost jump wants a ~10–100× count cut so latency stays roughly flat across stages. This is also why you don't see a four-stage cascade where every stage costs 2× the last — there'd be no point; the funnel earns its complexity only when each stage is dramatically more expensive <em>and</em> dramatically more selective than the one before. A senior tell: when asked "why not just run the cross-encoder on all 1,000?", you answer with the arithmetic — 1,000 × 8 ms = 8 s — not a hand-wave.
+</div>
+
+<h2>Bi-encoder vs cross-encoder — the central distinction</h2>
+
+<p>Everything about why retrieval and reranking use <em>different</em> neural models comes down to <strong>when the query meets the document</strong>. There are two architectures, and the difference is whether they interact early (inside the transformer) or late (only at the dot product).</p>
+
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 300" width="660" height="300" style="display:block; margin: 14px auto; font-family: sans-serif; font-size: 12px;">
+  <!-- ===================== BI-ENCODER (left) ===================== -->
+  <text x="165" y="22" text-anchor="middle" fill="var(--accent)" font-size="13" font-weight="700">Bi-encoder</text>
+  <text x="165" y="38" text-anchor="middle" fill="var(--text-mute)" font-size="10.5">encode separately → dot product</text>
+
+  <text x="105" y="52" text-anchor="middle" fill="var(--text-mute)" font-size="10">query tokens</text>
+  <text x="225" y="52" text-anchor="middle" fill="var(--text-mute)" font-size="10">doc tokens</text>
+  <rect x="60" y="58" width="90" height="32" rx="4" fill="var(--bg-elev)" stroke="var(--border)"/>
+  <text x="105" y="78" text-anchor="middle" fill="var(--text)" font-size="11">query enc</text>
+  <rect x="180" y="58" width="90" height="32" rx="4" fill="var(--bg-elev)" stroke="var(--border)"/>
+  <text x="225" y="78" text-anchor="middle" fill="var(--text)" font-size="11">doc enc</text>
+
+  <text x="105" y="106" text-anchor="middle" fill="var(--text-mute)" font-size="10">q ∈ ℝ^d</text>
+  <text x="225" y="106" text-anchor="middle" fill="var(--text-mute)" font-size="10">d ∈ ℝ^d</text>
+
+  <line x1="105" y1="110" x2="152" y2="148" stroke="var(--border)" stroke-width="1.2"/>
+  <line x1="225" y1="110" x2="178" y2="148" stroke="var(--border)" stroke-width="1.2"/>
+  <circle cx="165" cy="160" r="16" fill="var(--accent)" opacity="0.85"/>
+  <text x="165" y="164" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">⟨·,·⟩</text>
+  <text x="165" y="192" text-anchor="middle" fill="var(--text)" font-size="11">score</text>
+
+  <rect x="180" y="212" width="120" height="62" rx="5" fill="var(--bg-elev)" stroke="var(--ok)" stroke-dasharray="3 2"/>
+  <text x="240" y="230" text-anchor="middle" fill="var(--ok)" font-size="10.5" font-weight="700">doc vector</text>
+  <text x="240" y="245" text-anchor="middle" fill="var(--ok)" font-size="10.5" font-weight="700">PRECOMPUTED</text>
+  <text x="240" y="260" text-anchor="middle" fill="var(--text-mute)" font-size="9.5">indexed in ANN</text>
+  <text x="240" y="271" text-anchor="middle" fill="var(--text-mute)" font-size="9.5">→ retrieval</text>
+
+  <line x1="332" y1="40" x2="332" y2="290" stroke="var(--border)" stroke-width="1" stroke-dasharray="4 4"/>
+
+  <!-- ===================== CROSS-ENCODER (right) ===================== -->
+  <text x="500" y="22" text-anchor="middle" fill="var(--bad)" font-size="13" font-weight="700">Cross-encoder</text>
+  <text x="500" y="38" text-anchor="middle" fill="var(--text-mute)" font-size="10.5">encode jointly → full cross-attention</text>
+
+  <rect x="400" y="50" width="200" height="22" rx="3" fill="var(--code-bg)" stroke="var(--border)"/>
+  <text x="500" y="65" text-anchor="middle" fill="var(--text)" font-size="10">[CLS] query [SEP] doc [SEP]</text>
+
+  <rect x="415" y="92" width="170" height="78" rx="5" fill="var(--bg-elev)" stroke="var(--bad)"/>
+  <text x="500" y="112" text-anchor="middle" fill="var(--bad)" font-size="11" font-weight="700">transformer</text>
+  <text x="500" y="127" text-anchor="middle" fill="var(--text-mute)" font-size="9.5">every query token attends</text>
+  <text x="500" y="139" text-anchor="middle" fill="var(--text-mute)" font-size="9.5">to every doc token</text>
+  <g stroke="var(--bad)" stroke-width="0.6" opacity="0.5">
+    <line x1="440" y1="152" x2="500" y2="162"/>
+    <line x1="465" y1="152" x2="540" y2="162"/>
+    <line x1="500" y1="152" x2="440" y2="162"/>
+    <line x1="540" y1="152" x2="465" y2="162"/>
+    <line x1="560" y1="152" x2="500" y2="162"/>
+  </g>
+
+  <line x1="500" y1="72" x2="500" y2="90" stroke="var(--border)" stroke-width="1.2"/>
+  <line x1="500" y1="170" x2="500" y2="188" stroke="var(--border)" stroke-width="1.2"/>
+  <text x="500" y="202" text-anchor="middle" fill="var(--text)" font-size="11">relevance score</text>
+
+  <rect x="412" y="216" width="176" height="58" rx="5" fill="var(--bg-elev)" stroke="var(--bad)" stroke-dasharray="3 2"/>
+  <text x="500" y="234" text-anchor="middle" fill="var(--bad)" font-size="10.5" font-weight="700">CANNOT precompute</text>
+  <text x="500" y="249" text-anchor="middle" fill="var(--text-mute)" font-size="9.5">score depends on the pair;</text>
+  <text x="500" y="261" text-anchor="middle" fill="var(--text-mute)" font-size="9.5">run once per candidate at</text>
+  <text x="500" y="272" text-anchor="middle" fill="var(--text-mute)" font-size="9.5">query time → reranking</text>
+</svg>
+
+<p><strong>Bi-encoder.</strong> The query and each document are encoded <em>independently</em> into fixed vectors, and the relevance score is their dot product (or cosine). Because the document vector doesn't depend on the query, you can compute it once at index time and store it. At query time you encode only the query and do a vector search — that's <a href="43_dense_hybrid_retrieval.html">dense retrieval (43)</a>. The architecture's defining property is precisely that <em>the document side is precomputable and indexable</em>. The cost: query and document never see each other inside the model, so the score can only capture coarse, query-independent notions of what the document is "about." A passage that answers the query through subtle term overlap or negation often scores no differently than a topically-similar passage that doesn't actually answer it.</p>
+
+<p><strong>Cross-encoder.</strong> The query and a document are concatenated into a single input — <code>[CLS] query [SEP] document [SEP]</code> — and fed <em>jointly</em> into one transformer. Now every query token can attend to every document token through full self-attention. The model can directly represent "does this specific phrase in the document answer this specific part of the query?" This is dramatically more accurate — typically several NDCG points over a bi-encoder on the same data. The cost is the mirror image of the bi-encoder's benefit: <strong>the score depends on the (query, document) pair, so nothing can be precomputed.</strong> You must run the full transformer forward pass for every candidate, at query time. That is why a cross-encoder is a reranking model and never a retrieval model — you cannot index a function that hasn't yet seen the query.</p>
+
+<table>
+  <thead><tr><th></th><th>Bi-encoder</th><th>Cross-encoder</th></tr></thead>
+  <tbody>
+    <tr><td><strong>When q meets d</strong></td><td>Late — only at the dot product, outside the network</td><td>Early — inside the transformer, full cross-attention</td></tr>
+    <tr><td><strong>Doc encoding</strong></td><td>Query-independent → <strong>precompute &amp; index</strong></td><td>Query-dependent → <strong>cannot precompute</strong></td></tr>
+    <tr><td><strong>Query-time cost</strong></td><td>~0 marginal per doc (vectors already exist; one ANN search)</td><td>One full transformer pass <em>per candidate</em></td></tr>
+    <tr><td><strong>Accuracy</strong></td><td>Good for recall; misses fine-grained relevance</td><td>State of the art per-pair relevance</td></tr>
+    <tr><td><strong>Role</strong></td><td>Retrieval (millions of docs)</td><td>Reranking (tens of docs)</td></tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <div class="label">The one-line reason you can't "just use the cross-encoder everywhere"</div>
+  A bi-encoder amortizes the document-encoder cost across all future queries — encode 10M docs once, reuse forever. A cross-encoder amortizes nothing: its cost is <span class="math">(queries) × (candidates per query) × (forward-pass cost)</span>. At 8 ms/pair, scoring 10M docs for a <em>single</em> query is <span class="math">10,000,000 × 8 ms = 80,000 s ≈ 22 hours</span>. The bi-encoder isn't "the cheap approximation we tolerate" — it's the only thing that makes retrieval tractable. The cross-encoder isn't "the model we'd use everywhere if we could afford it" — it's structurally a reranker. Conflating the two is the most common conceptual error in this space.
+</div>
+
+<h2>The reranking latency math, done explicitly</h2>
+
+<p>Reranking <span class="math">N</span> candidates with a cross-encoder costing <span class="math">c</span> ms per pair has a naive cost of <span class="math">N × c</span> if you run them one at a time. The whole engineering problem is that this number is enormous unless you control both <span class="math">N</span> and the effective per-doc cost. Three regimes:</p>
+
+<table>
+  <thead><tr><th>Scenario</th><th>Arithmetic</th><th>Verdict</th></tr></thead>
+  <tbody>
+    <tr><td>Rerank all retrieved, sequential</td><td><span class="math">N = 1,000, c = 8 ms → 1,000 × 8 = 8,000 ms = 8 s</span></td><td>Infeasible. No user waits 8 s.</td></tr>
+    <tr><td>Rerank top-50, sequential</td><td><span class="math">N = 50, c = 8 ms → 50 × 8 = 400 ms</span></td><td>Still too slow for most surfaces (web search wants &lt;100 ms reranking).</td></tr>
+    <tr><td>Rerank top-50, batched + parallel</td><td><span class="math">50 docs in 1 batch on a GPU ≈ 1 forward pass ≈ 15–30 ms</span>; or split across 4 replicas → less each</td><td>Feasible. This is the real deployment.</td></tr>
+    <tr><td>Bi-encoder rerank (precomputed)</td><td>~0 marginal/doc — vectors already in the index; just dot products</td><td>Essentially free, but lower accuracy. The retrieval score itself.</td></tr>
+  </tbody>
+</table>
+
+<p>The crucial subtlety the table makes concrete: <strong>a cross-encoder forward pass is not linear in <span class="math">N</span> on real hardware.</strong> A GPU processing a batch of 50 (query, doc) pairs does it in roughly one forward pass of wall-clock time — the 8 ms/pair figure is the <em>amortized</em> cost, and batching collapses it. So the real latency knob is "how big a batch fits, and across how many replicas," not "8 ms times N." The widget below lets you turn those knobs. But batching has a ceiling — sequence length, GPU memory, and tail latency from the slowest doc in the batch — so you cannot make <span class="math">N</span> arbitrarily large for free. The two levers remain: keep <span class="math">N</span> small (let the mid-ranker do the culling), and batch hard.</p>
+
+<div class="callout">
+  <div class="label">NDCG gain from reranking saturates in N — so spending budget past the knee is waste</div>
+  Reranking can only reorder documents it receives, and it can only <em>help</em> NDCG by promoting a relevant doc that the mid-ranker placed below the cut. Most such mis-rankings live in the top ~50–100: that's where relevant and near-relevant docs are densely interleaved and the cross-encoder's fine-grained judgment pays off. Below rank ~100, the candidates the mid-ranker placed there are mostly genuinely irrelevant — promoting them rarely changes the top-10 the user sees. So the NDCG-gain-vs-<span class="math">N</span> curve rises steeply then flattens.
+  <br><br>
+  <strong>Worked intuition.</strong> Say reranking top-25 buys +0.040 NDCG@10, top-50 buys +0.052, top-100 buys +0.056, top-200 buys +0.057. Going 50→100 doubles your cost for +0.004; 100→200 doubles it again for +0.001. The marginal NDCG per millisecond is collapsing. The senior move is to <em>find the knee empirically</em> (sweep <span class="math">N</span> on a judged set, plot NDCG@10 vs <span class="math">N</span>) and set <span class="math">N</span> just past it — typically 50–100 — rather than reranking everything retrieval handed you.
+</div>
+
+<h2>Late interaction (ColBERT) — the middle ground</h2>
+
+<p>The bi-encoder collapses a whole document into one vector before the query is known; the cross-encoder refuses to collapse anything and pays for it at query time. <strong>Late interaction</strong> (ColBERT, Khattab &amp; Zaharia 2020) sits between them with a clever trick: precompute a vector <em>per token</em> of the document, not one per document. The query is also encoded per token at query time. The relevance score is <strong>MaxSim</strong>: for each query token, find its best-matching document token (max dot product over the document's token vectors), then sum those maxima over query tokens.</p>
+
+<p class="math block">score(q, d) = Σ<sub>i ∈ q-tokens</sub>  max<sub>j ∈ d-tokens</sub> ⟨ q<sub>i</sub>, d<sub>j</sub> ⟩</p>
+
+<p>This recovers much of the cross-encoder's <em>token-level</em> matching ("does some doc token strongly match this query token?") while keeping the document side precomputable — the per-token doc vectors don't depend on the query, so they can be computed at index time and stored. The query-time work is just the MaxSim aggregation: cheap dot products and maxes, no transformer forward pass per candidate. ColBERT can even drive retrieval directly (via a token-level ANN index), but its most common use is exactly the role of this lesson: a cheap, accurate reranker over the mid-stage candidates.</p>
+
+<p><strong>Worked numbers — the storage cost.</strong> A bi-encoder stores one vector per doc: at <span class="math">d = 768</span> fp16, that's <span class="math">768 × 2 = 1,536</span> bytes ≈ 1.5 KB/doc. ColBERT stores one vector per token; a 200-token document at the same dim is <span class="math">200 × 1,536 = 307,200</span> bytes ≈ 300 KB/doc — <strong>~200× the storage</strong>. In practice you compress aggressively: project to <span class="math">d = 128</span> and quantize to ~2 bits/dim (ColBERTv2's residual compression), bringing it down to roughly <span class="math">200 × 128 × 0.25 ≈ 6.4</span> KB/doc — still several× a bi-encoder, but workable. The trade is explicit: ColBERT buys cross-encoder-adjacent accuracy and bi-encoder-adjacent query latency by paying in <em>index storage</em>.</p>
+
+<table>
+  <thead><tr><th></th><th>Bi-encoder</th><th>Late interaction (ColBERT)</th><th>Cross-encoder</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Accuracy</strong></td><td>baseline</td><td>+ (near cross-encoder on many tasks)</td><td>highest</td></tr>
+    <tr><td><strong>Query-time cost / doc</strong></td><td>~0 (1 dot product)</td><td>low (MaxSim: token-matrix dot products, no transformer)</td><td>high (full transformer pass)</td></tr>
+    <tr><td><strong>Doc encoding precomputed?</strong></td><td>yes (1 vector)</td><td>yes (one vector per token)</td><td>no</td></tr>
+    <tr><td><strong>Storage / doc</strong></td><td>~1 vector (~1.5 KB)</td><td>~tokens × vectors (~6–300 KB)</td><td>0 stored (recomputed each query)</td></tr>
+    <tr><td><strong>Typical role</strong></td><td>retrieval</td><td>retrieval or cheap rerank</td><td>final rerank on tens of docs</td></tr>
+  </tbody>
+</table>
+
+<p>The frame to carry away: <strong>each architecture trades along precompute-vs-accuracy by choosing the granularity at which it commits to a representation before seeing the query.</strong> Bi-encoder commits one vector per doc (most precompute, least accuracy). Cross-encoder commits nothing (no precompute, most accuracy). ColBERT commits per-token vectors (precompute the representation, defer the <em>interaction</em>) — buying accuracy with storage rather than query-time compute.</p>
+
+<h2>Pushing accuracy upstream: distillation</h2>
+
+<p>If the cross-encoder is the most accurate model but too expensive to run on many docs, the natural question is: can we transfer its judgment into a cheaper model that <em>can</em> run earlier and on more docs? Yes — that's <strong>distillation</strong> (the teacher→student idea from <a href="26_llm_genai.html">lesson 26</a>). Run the expensive cross-encoder <em>offline</em> as a <em>teacher</em> over a large set of (query, doc) pairs, producing soft relevance scores. Train a bi-encoder or ColBERT <em>student</em> to match those scores (typically a margin or KL/MSE loss on the teacher's score distribution, not just the binary labels). The student inherits much of the teacher's relevance ordering while keeping the cheap, indexable architecture.</p>
+
+<p>Why this works and why it matters: the binary click/judgment labels are sparse and noisy, but the teacher's <em>soft</em> scores carry a rich, dense signal — relative ordering among negatives, degrees of relevance — that a bi-encoder could never learn from labels alone. Distillation is how modern dense retrievers (and ColBERTv2) got good: the accuracy of cross-attention is <em>baked into</em> the retrieval/rerank model at train time, so you pay the cross-encoder cost once, offline, instead of per-query forever. The senior framing: <em>distillation moves accuracy upstream in the cascade, where it's cheap to apply, by paying for it once at training time instead of every query at serving time.</em></p>
+
+<h2>LLM rerankers — the newest, most expensive tier</h2>
+
+<p>Large language models can rerank, and they're increasingly used as either the top tier of the cascade or as offline judges/teachers. Three prompting styles, each with a different latency/cost profile:</p>
+
+<ul>
+  <li><strong>Pointwise (relevance prompting).</strong> Ask the LLM, per document, "Is this document relevant to this query? Rate 0–3" or "yes/no with a probability." Score each candidate independently, sort by the score. Simplest, parallelizable across docs, but <span class="math">N</span> separate LLM calls — expensive, and the model never sees documents side by side so it can't calibrate relative judgments well.</li>
+  <li><strong>Listwise (RankGPT-style).</strong> Put many documents in one prompt and ask the LLM to output a permutation: "Rank these passages by relevance, output the order." One (or a few) calls instead of <span class="math">N</span>, and the model sees documents together so it judges <em>relatively</em> — usually the most accurate LLM approach. Limits: context window caps how many docs fit, so long candidate lists need a <em>sliding-window</em> pass (rank a window, slide, merge); and the output is a permutation, not calibrated scores, which complicates blending with other signals.</li>
+  <li><strong>Pairwise.</strong> Ask "is A more relevant than B?" for pairs, aggregate into an order. Most accurate per-comparison but <span class="math">O(N²)</span> calls in the worst case — usually only viable with sorting-network tricks to cut the comparison count.</li>
+</ul>
+
+<div class="callout warn">
+  <div class="label">The LLM-reranker latency/cost reality</div>
+  An LLM reranking call is <em>hundreds of milliseconds to seconds</em> and costs real money per query — orders of magnitude more than a cross-encoder, which is itself orders of magnitude more than a bi-encoder. A listwise pass over 20 passages with a frontier model can be 1–3 s and is dominated by output-token generation (the model must emit the full ranked order). Pointwise over 50 docs is 50 calls, parallelizable but expensive. <strong>Consequence:</strong> LLM rerankers are mostly used (a) <em>offline</em> as teachers/judges to distill into cheap online models, (b) on <em>very</em> small candidate sets (top 5–10) where the per-query cost is bounded, or (c) on low-QPS, high-value surfaces (enterprise RAG, legal/medical search) where latency and cost tolerances are looser than web search. Putting a frontier LLM in the synchronous path of a billion-QPS web search is not how production systems work — interviewers expect you to know that and reach for distillation instead. When you need an LLM, see <a href="26_llm_genai.html">lesson 26</a> for the build-vs-buy and pricing reasoning; never quote model prices from memory.
+</div>
+
+<h2>Interactive · rerank budget explorer</h2>
+
+<p>This widget makes the rerank arithmetic concrete. Pick how many docs you rerank (<span class="math">N</span>), the per-doc cross-encoder cost, and how much parallelism/batching you have. It reports the total added latency, whether it fits a chosen latency budget, and an approximate (saturating) NDCG-gain curve, then renders a verdict: worth it, over budget, or past the saturation point. The cost and NDCG models are <em>toy approximations</em> — they get the shape and order of magnitude right so the trade-off feels real, not the precise numbers for your stack.</p>
+
+<div class="widget" id="rr-widget">
+  <div class="title">Spend your rerank budget: how big an N can you afford, and is it worth it?</div>
+  <div class="hint">Toy model. Latency = ceil(N / parallelism) × (per-doc cost + small batch overhead). NDCG gain saturates in N: gain(N) = G_max × N / (N + N₅₀), where N₅₀ is the N at which you have captured half the achievable gain. Real numbers depend on your model, hardware, and judged set — use this to reason about the shape.</div>
+
+  <div class="controls" style="flex-direction: column; align-items: stretch; gap: 8px;">
+    <label class="inline">N (docs reranked): <input type="range" id="rr-n" min="5" max="1000" step="5" value="50"><span class="val" id="rr-n-v">50</span></label>
+    <label class="inline">per-doc cross-encoder cost (ms): <input type="range" id="rr-c" min="1" max="30" step="0.5" value="8"><span class="val" id="rr-c-v">8</span></label>
+    <label class="inline">batch parallelism (docs/pass): <input type="range" id="rr-p" min="1" max="64" step="1" value="16"><span class="val" id="rr-p-v">16</span></label>
+    <label class="inline">latency budget for rerank (ms): <input type="range" id="rr-b" min="20" max="500" step="10" value="120"><span class="val" id="rr-b-v">120</span></label>
+  </div>
+
+  <div class="kpi-grid" style="margin-top: 12px;">
+    <div class="kpi"><div class="k">added latency</div><div class="v" id="rr-lat">—</div></div>
+    <div class="kpi"><div class="k">fits budget?</div><div class="v" id="rr-fit">—</div></div>
+    <div class="kpi"><div class="k">approx NDCG@10 gain</div><div class="v" id="rr-gain">—</div></div>
+    <div class="kpi"><div class="k">marginal gain / +50 docs</div><div class="v" id="rr-marg">—</div></div>
+  </div>
+
+  <div style="margin: 14px 0;">
+    <svg id="rr-curve" viewBox="0 0 600 180" width="100%" style="max-width: 600px; display: block; background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px;"></svg>
+  </div>
+
+  <div class="callout" id="rr-callout">
+    <div class="label" id="rr-label">Verdict</div>
+    <div id="rr-text">—</div>
+  </div>
+</div>
+
+<h2>The blend layer — relevance is not the last word</h2>
+
+<p>After the reranker produces a relevance-ordered list, one more stage runs: the <strong>blend</strong> (or "rerank-for-business") stage. Its job is everything relevance scoring deliberately ignores, and — critically — <strong>this is the last place in the pipeline where you can enforce these constraints</strong>, because nothing downstream sees the full candidate set anymore. Four concerns:</p>
+
+<ul>
+  <li><strong>Diversity &amp; dedup.</strong> The top-10 by pure relevance can be 10 near-identical results (the same product from 10 sellers, 10 paraphrases of one article). The user wants <em>coverage</em>. The standard tool is <strong>MMR</strong> (Maximal Marginal Relevance): greedily build the result list, at each step picking the candidate that maximizes <span class="math">λ · relevance − (1 − λ) · max-similarity-to-already-selected</span>. The <span class="math">λ</span> knob trades relevance against novelty. Exact-duplicate removal (same canonical URL, same product ID) is a hard dedup that runs even before MMR. See <a href="20_fairness_diversity.html">lesson 20</a> for the full diversity/fairness treatment.</li>
+  <li><strong>Freshness boosts.</strong> For news, social, or trending queries, recency is part of relevance but the reranker (trained on older judgments) under-weights it. A freshness boost — e.g. multiply score by a time-decay factor, or reserve slots for recent docs — corrects this at blend time without retraining.</li>
+  <li><strong>Business rules.</strong> Sponsored slots, pinned results, editorial overrides, supply/inventory constraints, contractual placements. These are policy, not relevance, and they belong here — out of the model, in an auditable rule layer. See <a href="47_personalization_ecommerce.html">lesson 47</a> for business blending in e-commerce and marketplace search.</li>
+  <li><strong>Per-entity caps.</strong> "No more than 2 results from one domain/seller/creator in the top 10." A listwise constraint the per-item reranker structurally cannot see, because it scores documents independently.</li>
+</ul>
+
+<div class="callout">
+  <div class="label">Why the blend layer is last, and why that's load-bearing</div>
+  Diversity, caps, and dedup are <em>listwise</em> properties — they depend on the whole set of results, not any single document. The reranker scores documents independently (even a cross-encoder scores one (query, doc) pair at a time), so it cannot enforce "at most 2 per seller" or "these two are duplicates." Only a stage that sees the full ranked set can. And it must run <em>after</em> relevance ranking, because diversity/business adjustments are perturbations <em>on top of</em> a relevance ordering — you diversify the good results, you don't diversify first and rank second (that would surface diverse-but-irrelevant junk). The interview tell: when asked "where do you enforce diversity / dedup / sponsored placement?", the senior answer is "the blend stage, after relevance reranking, because these are listwise constraints and this is the last stage that sees the whole list." A junior tries to bake them into the ranker's score and gets a tangled, unauditable objective.
+</div>
+
+<h2>Interview prompts you should be ready for</h2>
+
+<div class="callout">
+  <ol style="margin: 4px 0;">
+    <li>"Why does search use a bi-encoder for retrieval but a cross-encoder for reranking — why not one model?" <em>(The core distinction. Bi-encoder's doc side is query-independent → precomputable &amp; indexable, so it scales to millions; cross-encoder's joint attention is query-dependent → can't precompute, so it only runs on the few survivors. Says the magic word: amortization. The bi-encoder amortizes doc encoding across all queries; the cross-encoder amortizes nothing.)</em></li>
+    <li>"Your reranker is a cross-encoder at 8 ms/doc. The PM wants to rerank all 1,000 retrieved docs. What do you say?" <em>(Do the arithmetic out loud: 1,000 × 8 = 8 s, infeasible. Then: keep N small (50–100, past the NDCG knee), batch hard so per-doc cost collapses, and let the mid-ranker cull. A junior says "we'll optimize the model"; a senior says "we'll bound N and batch.")</em></li>
+    <li>"You bumped N from 50 to 500 and NDCG@10 barely moved but latency 10×'d. Why?" <em>(NDCG gain saturates in N — almost all the reorderable relevance is in the top ~50–100; below that the candidates are genuinely irrelevant and promoting them doesn't change the top-10. You spent budget past the knee. Find the knee empirically and stop there.)</em></li>
+    <li>"What's ColBERT and when would you reach for it over a cross-encoder?" <em>(Late interaction: per-token doc vectors precomputed, query-time MaxSim. Near-cross-encoder accuracy at far lower query cost, but multiplies storage by tokens-per-doc. Reach for it when you want better-than-bi-encoder accuracy at scale and can pay the storage / can't pay cross-encoder query latency.)</em></li>
+    <li>"You want cross-encoder accuracy but cross-encoder latency is too high. Options?" <em>(Distillation: cross-encoder teacher → bi-encoder/ColBERT student, baking the accuracy in at train time so you pay the cost once offline. Plus: shrink N, batch, smaller/quantized cross-encoder, or only rerank the top-K with the expensive model. The senior insight is moving accuracy upstream via distillation.)</em></li>
+    <li>"Where do you enforce result diversity, dedup, freshness, and sponsored placement — in the ranker or somewhere else?" <em>(The blend stage, after relevance reranking. These are listwise constraints (depend on the whole set) and policy, not per-doc relevance; the reranker scores docs independently and structurally can't see them. It's the last stage that sees the full list. Don't tangle them into the ranker's objective.)</em></li>
+  </ol>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  The cascade is an economic structure: cost-per-doc rises 100–1000× per stage, so the candidate count must fall 10–100× per stage to keep latency flat, and the expensive model only ever touches a handful of docs. The bi-encoder vs cross-encoder split is the load-bearing idea — separate encoding is precomputable and indexable (retrieval); joint encoding is accurate but query-time-only (reranking). ColBERT's late interaction buys a middle ground with storage; distillation pushes cross-encoder accuracy upstream by paying once offline; LLM rerankers are accurate but too slow/costly for the synchronous web-search path, so they mostly serve as offline teachers or on tiny candidate sets. Reranking buys accuracy with latency — so keep N just past the NDCG knee, batch hard, and leave the listwise concerns (diversity, dedup, freshness, business rules) to the final blend stage, the last place that sees the whole list.
+</div>
+
+<footer class="lesson-nav">
+  <a href="44_learning_to_rank.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">44 · Learning to rank for search</span>
+  </a>
+  <a class="next" href="46_autocomplete_suggest.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">46 · Autocomplete, suggestions &amp; spelling</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  function $(id){ return document.getElementById(id); }
+  function val(id){ return parseFloat($(id).value); }
+
+  // Toy NDCG-gain model: saturating in N.
+  //   gain(N) = G_MAX * N / (N + N50)
+  // G_MAX is the maximum achievable gain from reranking; N50 is the N at which
+  // half of G_MAX is captured (the "knee" scale). These are illustrative.
+  const G_MAX = 0.060;   // max NDCG@10 gain a perfect rerank could add over the mid-ranker
+  const N50   = 35;      // half the gain captured by N=35; curve flattens beyond ~100
+  const BATCH_OVERHEAD_MS = 4; // fixed per-pass overhead (kernel launch, padding, transfer)
+
+  function gain(N){ return G_MAX * N / (N + N50); }
+
+  function latency(N, c, p){
+    // Number of sequential passes when you process p docs in parallel per pass.
+    const passes = Math.ceil(N / p);
+    // Each pass costs roughly one per-doc time (parallel docs overlap) plus overhead.
+    return passes * (c + BATCH_OVERHEAD_MS);
+  }
+
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  function el(tag, attrs){
+    const e = document.createElementNS(SVG_NS, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+  function txt(x, y, s, fill, size, anchor, weight){
+    const t = el('text', { x:x, y:y, fill:fill||'var(--text)', 'font-size':size||10,
+                           'font-family':'var(--mono)', 'text-anchor':anchor||'start' });
+    if (weight) t.setAttribute('font-weight', weight);
+    t.textContent = s;
+    return t;
+  }
+
+  function drawCurve(N){
+    const svg = $('rr-curve');
+    svg.innerHTML = '';
+    const W=600, H=180, padR=16, padT=16, padB=30, padL=46;
+    const x0=padL, x1=W-padR, y0=H-padB, y1=padT;
+    const Nmax=1000;
+    const xOf = n => x0 + (n/Nmax)*(x1-x0);
+    const yOf = g => y0 - (g/G_MAX)*(y0-y1);
+
+    // axes
+    svg.appendChild(el('line', { x1:x0, y1:y0, x2:x1, y2:y0, stroke:'var(--border)', 'stroke-width':1 }));
+    svg.appendChild(el('line', { x1:x0, y1:y0, x2:x0, y2:y1, stroke:'var(--border)', 'stroke-width':1 }));
+    svg.appendChild(txt((x0+x1)/2, H-6, 'N (docs reranked)', 'var(--text-mute)', 10, 'middle'));
+    svg.appendChild(txt(x0-6, y1+4, 'NDCG gain', 'var(--text-mute)', 10, 'end'));
+    svg.appendChild(txt(x0-6, y0, '0', 'var(--text-mute)', 9, 'end'));
+    svg.appendChild(txt(x0-6, y1+10, G_MAX.toFixed(3), 'var(--text-mute)', 9, 'end'));
+
+    // gridline at the "knee" (N50)
+    svg.appendChild(el('line', { x1:xOf(N50), y1:y0, x2:xOf(N50), y2:y1, stroke:'var(--text-dim)',
+                                 'stroke-width':1, 'stroke-dasharray':'3 3', opacity:0.5 }));
+    svg.appendChild(txt(xOf(N50)+3, y1+10, 'knee', 'var(--text-mute)', 9, 'start'));
+
+    // saturating curve
+    let pts='';
+    for (let n=0; n<=Nmax; n+=10){ pts += (n===0?'M':'L') + xOf(n).toFixed(1) + ' ' + yOf(gain(n)).toFixed(1) + ' '; }
+    svg.appendChild(el('path', { d:pts, fill:'none', stroke:'var(--accent)', 'stroke-width':2 }));
+
+    // marker at current N
+    const cx=xOf(N), cy=yOf(gain(N));
+    svg.appendChild(el('line', { x1:cx, y1:y0, x2:cx, y2:cy, stroke:'var(--ok)', 'stroke-width':1, 'stroke-dasharray':'2 2' }));
+    svg.appendChild(el('circle', { cx:cx, cy:cy, r:4.5, fill:'var(--ok)', stroke:'var(--text)', 'stroke-width':1 }));
+    svg.appendChild(txt(Math.min(cx+6, x1-70), Math.max(cy-6, y1+12),
+                        'N='+N+' -> +'+gain(N).toFixed(3), 'var(--ok)', 9.5, 'start', '700'));
+  }
+
+  function update(){
+    const N = Math.round(val('rr-n'));
+    const c = val('rr-c');
+    const p = Math.round(val('rr-p'));
+    const b = Math.round(val('rr-b'));
+    $('rr-n-v').textContent = N;
+    $('rr-c-v').textContent = c;
+    $('rr-p-v').textContent = p;
+    $('rr-b-v').textContent = b;
+
+    const lat = latency(N, c, p);
+    const g = gain(N);
+    const gPlus = gain(N+50) - g;   // marginal gain from 50 more docs
+
+    $('rr-lat').textContent  = lat.toFixed(0) + ' ms';
+    $('rr-gain').textContent = '+' + g.toFixed(3);
+    $('rr-marg').textContent = '+' + gPlus.toFixed(4);
+
+    const fits = lat <= b;
+    $('rr-fit').textContent = fits ? 'yes (' + (b-lat).toFixed(0) + ' ms spare)' : 'NO (+' + (lat-b).toFixed(0) + ' ms)';
+    $('rr-fit').style.color = fits ? 'var(--ok)' : 'var(--bad)';
+
+    drawCurve(N);
+
+    const box=$('rr-callout'), label=$('rr-label'), text=$('rr-text');
+    // "Past the knee" heuristic: marginal gain per +50 docs has dropped below a small threshold.
+    const pastKnee = gPlus < 0.0015;
+    let color, lbl, msg;
+
+    if (!fits){
+      color='var(--bad)'; lbl='Over budget';
+      msg='Reranking <code>'+N+'</code> docs at <code>'+c+' ms/doc</code> with parallelism <code>'+p+
+          '</code> takes <code>'+lat.toFixed(0)+' ms</code> — over your <code>'+b+
+          ' ms</code> budget by <code>'+(lat-b).toFixed(0)+' ms</code>. Levers, in order: '+
+          'raise parallelism/batch size, shrink N (the gain curve is saturating anyway), or use a cheaper per-doc model '+
+          '(distill the cross-encoder into a lighter student, or quantize). Note <code>'+Math.ceil(N/p)+
+          '</code> sequential passes drive this — the win is in fewer passes, i.e. more parallelism.';
+    } else if (pastKnee){
+      color='var(--warn)'; lbl='Fits — but you are past the saturation point';
+      msg='It fits (<code>'+lat.toFixed(0)+'/'+b+' ms</code>), but the NDCG curve has flattened: another 50 docs buys only <code>+'+
+          gPlus.toFixed(4)+'</code>. You are spending latency for almost no quality. '+
+          'Pull N back toward the knee (~'+N50+'–'+(N50*3)+') and reclaim the budget for something that moves the metric — '+
+          'a better mid-ranker, more retrieval recall, or a stronger rerank model on a smaller N.';
+    } else {
+      color='var(--ok)'; lbl='Worth it';
+      msg='Reranking <code>'+N+'</code> docs fits in <code>'+lat.toFixed(0)+'/'+b+' ms</code> ('+
+          Math.ceil(N/p)+' passes) and buys <code>+'+g.toFixed(3)+'</code> NDCG@10, with <code>+'+gPlus.toFixed(4)+
+          '</code> still on the table for the next 50 docs. You are on the steep part of the curve — '+
+          'this is the rerank budget being spent well. Push N a bit higher while the marginal gain stays worthwhile and the budget holds.';
+    }
+    box.style.borderLeftColor=color;
+    label.textContent=lbl;
+    text.innerHTML=msg;
+  }
+
+  ['rr-n','rr-c','rr-p','rr-b'].forEach(id => $(id).addEventListener('input', update));
+  update();
+})();
+</script>
+
+</body>
+</html>

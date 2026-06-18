@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C31 - Design a realtime gaming leaderboard</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  main { overflow-wrap: break-word; }
+  .case-meta { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 22px; }
+  .case-meta .chip { background: var(--bg-elev); }
+  table { table-layout: fixed; }
+  th, td { overflow-wrap: anywhere; }
+  .linear-list li { margin: 8px 0; }
+  .source-note { color: var(--text-mute); font-size: 13px; margin-top: 8px; }
+  @media (max-width: 560px) {
+    header.topnav .inner { flex-wrap: wrap; gap: 8px; }
+    header.topnav .step-pill { margin-left: 0; white-space: normal; }
+    main { padding-inline: 14px; }
+    th, td { padding: 6px 5px; font-size: 12px; }
+  }
+</style>
+</head>
+<body>
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">system_design</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="syllabus.html">cases</a>
+    <span class="crumb">/</span>
+    <span class="crumb">C31</span>
+    <span class="step-pill">C31 / C44</span>
+  </div>
+</header>
+<main>
+
+<h1>Design a realtime gaming leaderboard</h1>
+<p class="subtitle">"Sort 100M players by score" sounds like one line of SQL. The whole problem is that the sort changes 50,000 times a second and everyone wants their rank back in a few milliseconds — so the real question is which rank you actually owe exactly, and which you can fake.</p>
+<div class="case-meta">
+  <span class="chip">Source: Vol. 2 Ch. 10</span>
+  <span class="chip">Case drill</span>
+  <span class="chip">Trade-off first</span>
+</div>
+
+<div class="callout">
+  <div class="label">First principle</div>
+  A leaderboard is a <strong>continuously re-sorted index</strong>, not a list. The cost is never in storing the scores — it is in answering <em>"what number am I?"</em> when the ordering mutates under you constantly. A naive answer ("count everyone above me") is <span class="math">O(N)</span> per query and dies at the first million players. The entire design is an argument about how to make rank a <span class="math">O(log N)</span> structural property of a sorted index instead of a scan — and then about realising you almost never owe an <em>exact</em> rank except at the very top, which lets you cheat everywhere else.</div>
+
+<h2>0. The hinge</h2>
+<p>The hinge is the moment the prompt stops being generic and the architecture becomes forced. Here it arrives the instant you write the numbers down: <strong>50k writes/s each re-orders a shared index, and rank queries must be <span class="math">O(log N)</span>, not <span class="math">O(N)</span></strong>. Every interesting decision — sorted sets over SQL, a top-k cache, range partitioning, exact-vs-approximate rank, season namespacing — falls out of defending that one constraint. Lead with it.</p>
+<div class="callout warn">
+  <div class="label">Tempting but wrong</div>
+  The reflex answer is "<code>SELECT COUNT(*) WHERE score &gt; mine</code> with an index on score." A B-tree index on score gives you ordered traversal, but a <em>rank</em> still means counting the rows above you — <span class="math">O(N)</span> per query unless the index carries subtree cardinalities. At 100M rows and tens of thousands of rank reads per second that is a non-starter. The job is to pick a structure where <em>rank itself</em> is cheap, and a Redis sorted set (a skip list) is the canonical one.</p>
+</div>
+
+<h2>1. Clarify the contract</h2>
+<p>Treat the prompt as a product contract before a box diagram. What it must do:</p>
+<ul>
+  <li><strong>Submit a score</strong> for a player, keeping their best (or latest) score per board.</li>
+  <li><strong>Return the top-k</strong> of a board (the page everyone stares at).</li>
+  <li><strong>Return a single player's rank</strong> and the slice of players around them ("you are #4,021 of 100M").</li>
+  <li><strong>Scope boards</strong> by season / time window, by region, and by friend set.</li>
+</ul>
+<p>What it explicitly need <em>not</em> do, and saying so out loud earns signal: it is <strong>not a system of record</strong> — the authoritative score lives in the game's match-result store; the leaderboard is a derived, rebuildable view (DDIA Ch. 11's <em>materialized view</em>: a read-optimised projection you can always recompute from the source events). It does not need transactional consistency with the wallet or the match log. And tail ranks do not need to be exact — nobody renders "you are #8,403,118" and checks the last three digits.</p>
+
+<h2>2. Put numbers on the shape</h2>
+<p>The numbers are what make the structure choice forced. Take <strong>100M players</strong> on a board and <strong>50k score updates/s</strong> at peak.</p>
+
+<p><strong>Memory per board.</strong> A Redis sorted-set entry is roughly a 64-bit double score plus the member string plus skip-list pointers — call it ~64 B amortised per member. So one board is</p>
+<p class="math block">100\,000\,000 \times 64\,\text{B} \approx 6.4\,\text{GB}</p>
+<p>That fits in RAM on a single large node, which is exactly why an in-memory sorted set is viable at all — but it is big enough that you will not casually hold dozens of boards on one machine, and it is the number that motivates partitioning later.</p>
+
+<p><strong>Cost of a write / rank read.</strong> A sorted set is a skip list: <code>ZADD</code> (insert/update) and <code>ZREVRANK</code> (rank query) are both <span class="math">O(\log N)</span>. At 100M members,</p>
+<p class="math block">\log_2(10^8) \approx 27 \text{ comparisons}</p>
+<p>So every write and every rank read is ~27 pointer hops, not 100M. That single fact — <span class="math">27 \ll 10^8</span> — is the whole reason this design works. At 50k writes/s that is ~1.35M comparisons/s of ordering work, trivial for one core.</p>
+
+<p><strong>Read amplification, and the cache that kills it.</strong> Reads dwarf writes — most traffic is "show me the top 100." If the hot top-k page is cached and <strong>99% of reads hit it</strong>, then only 1% reach the sorted set, and the expensive rank-recompute work effectively disappears for the common case. The cache converts a re-sorting-index problem into a near-static-page problem for the 99% path.</p>
+
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">Players / board</div><div class="v">100M</div></div>
+  <div class="kpi"><div class="k">Sorted-set RAM / board</div><div class="v">≈ 6.4 GB</div></div>
+  <div class="kpi"><div class="k">ZADD / ZREVRANK cost</div><div class="v">≈ 27 hops</div></div>
+  <div class="kpi"><div class="k">Top-k cache hit-rate</div><div class="v">≈ 99%</div></div>
+</div>
+
+<h2>3. Define the surface area</h2>
+<p>Keep the API small and expressed in product terms; the season, shard, and cache layout must not leak into it.</p>
+<table>
+  <thead><tr><th>API / operation</th><th>Why it exists</th></tr></thead>
+  <tbody>
+    <tr><td><code>submit_score(player, board, score, session_id)</code></td><td>Idempotent write keyed by <code>session_id</code> (a match can be reported twice); keeps the best score for the active season.</td></tr>
+    <tr><td><code>get_top(board, k)</code></td><td>The hot read. Served from the top-k cache almost always.</td></tr>
+    <tr><td><code>get_rank(player, board)</code></td><td>Single-player rank. <span class="math">O(\log N)</span> at the top; approximate below the cutoff (deep dive 1).</td></tr>
+    <tr><td><code>get_around(player, board, w)</code></td><td>The <span class="math">w</span> players just above/below you — one <code>ZREVRANGE</code> slice once you know the rank.</td></tr>
+    <tr><td><code>get_friends_rank(player, board)</code></td><td>Fetch the friend set's scores (small N), sort locally — a different problem from global rank.</td></tr>
+  </tbody>
+</table>
+
+<h2>4. Model the data</h2>
+<p>The data model is the first architecture. The leaderboard is two layers over a source of truth it does not own.</p>
+<div class="case-meta">
+  <span class="chip">match results (source of truth)</span><span class="chip">sorted set per (board, season)</span><span class="chip">top-k cache</span><span class="chip">player→best-score map</span><span class="chip">anti-cheat / quarantine state</span>
+</div>
+<p>The key naming carries the whole season story: the sorted set is keyed <code>lb:{game}:{board}:{season}</code>. A new season is a new key — see deep dive 2. The member is the player ID; the score is the game score, with a tie-break encoded into the score's low bits (deep dive on ties below). The authoritative best-score-per-player lives in a durable store so the sorted set can be rebuilt from scratch (DDIA Ch. 11: the materialized view is derived state, never the system of record).</p>
+
+<h2>5. Linearized design</h2>
+<p>Walk a score update and a rank read through the system in the order they actually move; the first bottleneck exposes itself.</p>
+<ol class="linear-list">
+  <li><strong>Validate &amp; deduplicate.</strong> A match-end event arrives with <code>session_id</code>. Reject duplicates idempotently (see lesson 12) so a retried report can't double-count.</li>
+  <li><strong>Decide if it's the player's best.</strong> Read the current best from the player→score map; if the new score isn't higher, stop — most updates don't change the ordering at all.</li>
+  <li><strong>Update the sorted set.</strong> One <code>ZADD lb:{board}:{season} score player</code> — <span class="math">O(\log N) \approx 27</span> hops. This is the only write that touches the ordered index.</li>
+  <li><strong>Invalidate / refresh top-k.</strong> If the new score breaks into the cached top-k, refresh that page; otherwise the cache is untouched (the common case for the 99% of updates that don't crack the top).</li>
+  <li><strong>Read path: top-k.</strong> <code>get_top</code> hits the cache (~99%) and returns a near-static page. On miss, one <code>ZREVRANGE 0 k-1</code>.</li>
+  <li><strong>Read path: my rank.</strong> <code>ZREVRANK player</code> for an exact top rank, or an approximate bucket lookup below the cutoff (deep dive 1), then <code>ZREVRANGE</code> for the neighbours.</li>
+</ol>
+
+<div class="ascii">
+  WRITE PATH (50k/s)                                          READ PATH (read-heavy)
+  ──────────────────                                          ───────────────────────
+  match-end ─▶ dedup ─▶ "is it a PB?" ──no──▶ drop            get_top  ─▶ ┌───────────────┐
+   (session_id)          │ yes                                            │  TOP-K CACHE  │ ◀── 99% hits
+                         ▼                                                │  top 100 page │     (near-static)
+              ┌──────────────────────────────────────┐                   └──────┬────────┘
+              │  SORTED SET  lb:{board}:{season}       │                          │ 1% miss
+              │  (skip list — ZADD/ZREVRANK O(log N))  │ ◀────────────────────────┘
+              │                                        │   get_rank ─▶ ZREVRANK (exact, top)
+              │  bucket by score range for scale:      │              ─▶ bucket lookup (approx, tail)
+              │   [≥9000]  [8000–8999] … [0–999]       │   get_around ─▶ ZREVRANGE slice
+              └────────────┬───────────────────────────┘
+                           │ if new score cracks top-k
+                           ▼  refresh cached page
+                     TOP-K CACHE
+</div>
+
+<p>The bottleneck the walk exposes: it is <em>not</em> the writes (27 hops × 50k/s is nothing) and <em>not</em> the cached reads (99% are a page lookup). It is the <strong>1% of reads that ask for an exact deep rank</strong> plus the memory ceiling of a single board. Both are addressed in the deep dives.</p>
+
+<h2>6. Deep dives</h2>
+
+<h3>Deep dive 1 — Exact rank vs approximate: exactness only matters at the top</h3>
+<p>This is the decision worth your strongest minutes. A <code>ZREVRANK</code> is <span class="math">O(\log N)</span> and exact — cheap enough. So why approximate at all? Because the moment you <em>partition</em> the board (deep dive 3), a global rank stops being one skip-list lookup: you must ask every shard "how many players do you have above score S?" and sum. That cross-shard fan-out is what gets expensive at the tail.</p>
+<p>The insight that rescues you: <strong>rank precision is only valuable near the top</strong>. The player ranked #3 vs #4 cares about the exact integer — there's a prize, a name on a wall, bragging rights. The player ranked ~#8.4M does not; "top 9%" or "top 8.4M" is indistinguishable to them from the true 8,403,118. So split the board at a <strong>cutoff</strong> (say the top 10k):</p>
+<ul>
+  <li><strong>Above the cutoff:</strong> keep an exact sorted set. Ranks are <code>ZREVRANK</code>, exact, fast — this set is tiny (10k members, sub-MB).</li>
+  <li><strong>Below the cutoff:</strong> serve an <em>approximate</em> rank from a <strong>histogram of score buckets</strong> (a count-min / percentile sketch). To answer "rank of score S," sum the counts of all buckets above S's bucket — <span class="math">O(\text{buckets})</span>, independent of N, and cheap to keep incrementally as scores move. The error is bounded by bucket width, which is invisible at the tail.</li>
+</ul>
+<p>This is DDIA Ch. 3's lesson restated: a sorted structure (SSTable / skip list) makes <em>ordered</em> reads and exact rank cheap where you need them; a coarse summary structure makes <em>approximate</em> aggregate counts cheap where exactness is wasted. You pay for precision only on the 10k entries that justify it.</p>
+
+<h3>Deep dive 2 — Season resets via namespacing (an O(1) metadata operation)</h3>
+<p>A season reset sounds destructive — "wipe 100M scores and start over" — and if you model it as deletes it is a 6.4 GB churn that hammers the node mid-event. Instead, <strong>namespace the board by season in the key</strong>: <code>lb:arena:s14</code> vs <code>lb:arena:s15</code>. "Reset" becomes flipping the active-season pointer to <code>s15</code>; new scores land in a fresh, empty sorted set, and the old season's key is read-only history you can archive or expire with a TTL on your own schedule.</p>
+<p>This is why namespacing is the right move and a season column in a shared table is wrong: with a column, a reset means rewriting or filtering 100M rows on every query forever; with a key prefix it's an O(1) pointer flip and the old data is physically separate. It also fixes the season-reset race for free — a late-arriving score for the previous season is written to <code>s14</code>, never accidentally counted in <code>s15</code>, because they are different keys.</p>
+
+<h3>Deep dive 3 — Partition the sorted set by score range for scale</h3>
+<p>One board is 6.4 GB and a write hotspot if a single game blows up. To scale past one node, partition. The naive choice — partition by <em>player ID hash</em> — is wrong here: it scatters every rank query across all shards because rank is about <em>order</em>, and player ID has nothing to do with score order. Instead <strong>partition by score range</strong>: shard 0 holds scores ≥9000, shard 1 holds 8000–8999, and so on.</p>
+<p>Range partitioning is DDIA Ch. 6's key-range strategy, and it brings Ch. 6's named hazard with it: <strong>hot-spotting</strong>. A range partition keeps related keys together so range scans (top-k, rank-counting) stay local — but it concentrates load on whichever range is hot. For leaderboards the hot range is structurally predictable: the <strong>top</strong> shard is read constantly (everyone watches the leaders) and the <strong>bottom</strong> shard absorbs the season-start pile-up. Mitigate by giving the top range its own replicas and its own cache (this is exactly the top-k cache earning its place again — lesson 06), and by splitting hot ranges finer than cold ones. A rank query now becomes "find my shard by score, get my offset within it, add the populations of all higher shards" — the higher-shard populations are the bucket counts from deep dive 1, so the two ideas compose.</p>
+
+<div class="ascii">
+  RANGE-PARTITIONED BOARD                exact rank(S) = offset_in_my_shard
+  ───────────────────────                            + Σ population(higher shards)
+   ┌──────────┐  hot: leaders read constantly
+   │ ≥ 9000   │  → extra replicas + top-k cache (lesson 06)
+   ├──────────┤
+   │ 8000–8999│  warm
+   ├──────────┤
+   │   …      │  ← my score lands here: ZREVRANK gives offset within shard
+   ├──────────┤
+   │ 0 – 999  │  hot at season start: million players pile at 0
+   └──────────┘  → tie-break by timestamp, approximate buckets below cutoff
+</div>
+
+<h3>The sharpest senior question — the score=0 pile-up</h3>
+<div class="callout warn">
+  <div class="label">"A million players sit at score=0 at season start. Serve get_rank without an O(N) ties scan."</div>
+  At reset, the bottom shard has a million members all tied at 0. <code>ZREVRANK</code> returns <em>a</em> rank, but every tied player gets a different integer determined by member sort order, and asking "which of the million am I?" naively means scanning the tie group — <span class="math">O(N)</span>, the exact thing we forbade. Three composed fixes: <strong>(1) namespace by season</strong> so the pile-up is isolated to the new season's key and never mixed with last season's spread (deep dive 2). <strong>(2) Tie-break inside the score</strong>: store <code>composite = score · 2^k − timestamp</code> so earlier achievers rank above later ones — now no two players are truly tied, the ordering is total, and the structure stays <span class="math">O(\log N)</span> with no scan. <strong>(3) Below the cutoff, don't compute an integer at all</strong>: everyone in the 0-bucket is honestly "unranked / top 100%" via the approximate buckets of deep dive 1. The senior move is recognising that an exact integer rank for a million tied players is a <em>meaningless</em> number you should refuse to compute, not an expensive one you should optimise.</p>
+</div>
+
+<h2>7. Trade-offs</h2>
+<table>
+  <thead><tr><th>Choice</th><th>Buys</th><th>Costs</th><th>Choose when</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Exact rank vs approximate (bucketed)</strong></td><td>Exact integer rank; cross-shard fan-out avoided.</td><td>Exactness costs O(log N) per shard summed; only worth it for a few entries.</td><td>Above the cutoff (top-k competitive); approximate everywhere below.</td></tr>
+    <tr><td><strong>Sorted set (skip list) vs SQL index</strong></td><td>Rank as an O(log N) structural property, in-RAM.</td><td>Volatile, derived state you must be able to rebuild; ~6.4 GB/board.</td><td>Always for the index; SQL/store keeps the source of truth.</td></tr>
+    <tr><td><strong>Range-partition vs single node</strong></td><td>Scale past one node's RAM; local range scans.</td><td>Hot-spotting on top/bottom ranges; rank needs shard population sums.</td><td>Board &gt; one node, or a hot range needs isolated capacity.</td></tr>
+    <tr><td><strong>Cache top-k vs live query</strong></td><td>~99% of reads become a static page; rank-recompute disappears.</td><td>Brief staleness on the top page after a lead change.</td><td>Always — reads dwarf writes and the top page is the hot read.</td></tr>
+    <tr><td><strong>Realtime publish vs delayed (anti-cheat)</strong></td><td>Engagement; instant gratification.</td><td>Fraud exposure — a cheated score is visibly #1 before review.</td><td>Casual boards realtime; competitive boards quarantine until verified.</td></tr>
+  </tbody>
+</table>
+<p>The sharpest trade-off is <strong>exact vs approximate rank</strong>, because it is the one that scales the whole design. If you insist on exact global rank everywhere, range partitioning forces a fan-out-and-sum on every single rank read and the top shard's cache stops helping the tail. Conceding that the tail tolerates approximation is what lets the top stay exact and cheap — you spend your precision budget only where a human can perceive the difference.</p>
+
+<h2>8. Failure modes</h2>
+<table>
+  <thead><tr><th>Failure</th><th>Mitigation</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Cheater takes top rank</strong></td><td>Quarantine suspicious scores in a side state; rank publicly only after anti-cheat verification. The top is exactly where you can afford the review latency.</td></tr>
+    <tr><td><strong>Hot top shard / hot global board</strong></td><td>Top-k cache (lesson 06) absorbs the read flood; extra replicas on the top range; split the hot range finer (lesson 07).</td></tr>
+    <tr><td><strong>Season reset race / late score</strong></td><td>Namespace by season key; a stray score writes to the old season's set, never the new one. O(1) pointer flip, no 100M-row churn.</td></tr>
+    <tr><td><strong>Duplicate score submit</strong></td><td>Idempotency keyed by <code>session_id</code> + player (lesson 12) so a retried match report can't double-count.</td></tr>
+    <tr><td><strong>Sorted-set node loss</strong></td><td>It's a derived materialized view — rebuild from the durable best-score store. Replicate the hot top range so reads survive a node loss without a full rebuild wait.</td></tr>
+  </tbody>
+</table>
+
+<h2>9. Interview prompts you should be ready for</h2>
+<div class="callout">
+  <ol>
+    <li><strong>Why a Redis sorted set instead of an indexed SQL column?</strong> <em>(senior answer)</em> A B-tree index gives ordered traversal but a rank still means counting rows above you — O(N) per query unless the index stores subtree cardinalities. A sorted set is a skip list where ZADD and ZREVRANK are both O(log N) ≈ 27 hops at 100M members; rank is a structural property of the index, not a scan. The score store stays the source of truth; the sorted set is a rebuildable view.</li>
+    <li><strong>How big is one board and why does it matter?</strong> <em>(senior answer)</em> ~100M × ~64 B ≈ 6.4 GB — fits in RAM on a big node, which is why in-memory sorted sets are viable, but big enough that you won't pack many boards per node, which is what motivates range partitioning.</li>
+    <li><strong>When do you serve approximate rank, and how?</strong> <em>(senior answer)</em> Everywhere below a top-k cutoff. Keep an exact sorted set for the top (say 10k members) and answer tail ranks from a histogram of score buckets — sum the counts above your bucket, O(buckets) and independent of N. Precision is only perceptible near the top, so spend it only there.</li>
+    <li><strong>How do you handle a season reset on a live 100M-player board?</strong> <em>(senior answer)</em> Namespace the board by season in the key and flip an active-season pointer — O(1). New scores land in a fresh empty set; the old season becomes read-only history with a TTL. Never model it as 100M deletes, and never as a season column that you filter on every query forever.</li>
+    <li><strong>A million players are tied at score=0 at season start — serve get_rank without an O(N) tie scan.</strong> <em>(senior answer)</em> Encode a tie-break into the score (e.g. score·2^k − timestamp) so the ordering is total and stays O(log N) with no scan; isolate the pile-up by season namespace; and below the cutoff refuse to compute an exact integer — everyone in the 0-bucket is honestly "top 100%." An exact rank among a million ties is a meaningless number, not an expensive one.</li>
+    <li><strong>Why partition by score range and not by player ID hash?</strong> <em>(senior answer)</em> Rank is about order, and player ID has no relation to score order — hashing scatters every rank query across all shards. Range partitioning (DDIA Ch. 6) keeps order local so rank = offset-in-shard + populations of higher shards, at the cost of hot-spotting on the top and bottom ranges, which you isolate with replicas and the top-k cache.</li>
+    <li><strong>How does the top-k cache change the math?</strong> <em>(senior answer)</em> Reads dwarf writes and they nearly all want the same top page. A ~99% hit-rate means only 1% of reads touch the sorted set, so the rank-recompute and cross-shard work disappears for the common case — the cache turns a continuously re-sorted index into a near-static page for almost all traffic.</li>
+    <li><strong>How do you stop a cheater from sitting at #1?</strong> <em>(senior answer)</em> Quarantine suspicious scores in a side state and publish a top rank only after anti-cheat verification. The top is precisely where you can afford a little review latency, because it's a tiny set and it's the only place exactness (and integrity) is perceived.</li>
+  </ol>
+</div>
+
+<h2>Related foundation lessons</h2>
+<p>The design leans on three foundation lessons, each for a specific reason. <strong>Range partitioning and the hot-shard hazard</strong> (lesson <a href="07_partitioning.html">07</a>) is the backbone of deep dive 3 — partitioning by score range is what scales the board past one node, and its hot top/bottom ranges are exactly Ch. 6's hot-spotting. The <strong>top-k cache</strong> (lesson <a href="06_caching.html">06</a>) is what makes the read-heavy workload tractable: a ~99% hit-rate on the hot page removes the rank-recompute cost from the common path and protects the hot top shard. And the score-update flow is best modeled as a <strong>stream of match-end events</strong> feeding a materialized view, so async messaging (lesson <a href="11_async_messaging.html">11</a>) is how submissions arrive durably and idempotently; idempotent dedup of those events draws on lesson <a href="12_distributed_transactions.html">12</a>.</p>
+<div class="case-meta">
+  <a class="chip" href="06_caching.html">Caching</a>
+  <a class="chip" href="07_partitioning.html">Partitioning</a>
+  <a class="chip" href="11_async_messaging.html">Async messaging</a>
+  <a class="chip" href="12_distributed_transactions.html">Transactions and idempotency</a>
+  <a class="chip" href="04_data_modeling_storage.html">Data modeling and storage</a>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  A leaderboard is a continuously re-sorted index, and the whole craft is making "what number am I?" an O(log N) structural property instead of an O(N) scan. A skip-list sorted set gives you that — ~27 hops at 100M players — and a top-k cache absorbs the ~99% of reads that just want the leaders. Scale comes from range-partitioning by score (DDIA Ch. 6, with its hot-shard tax), seasons are an O(1) key-namespace flip not a mass delete (DDIA Ch. 11's rebuildable materialized view), and the load-bearing realisation is that exact rank only matters at the top: concede approximation in the tail and the million-player score=0 pile-up stops being a problem you compute and becomes a number you correctly refuse to.</div>
+
+<footer class="lesson-nav">
+  <a href="case_30_flash_sale.html"><span class="dir">Previous</span><span class="ttl">Previous case</span></a>
+  <a class="next" href="case_32_payment_system.html"><span class="dir">Next</span><span class="ttl">Next case</span></a>
+</footer>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C19 - Design a proximity service</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  main { overflow-wrap: break-word; }
+  .case-meta { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 22px; }
+  .case-meta .chip { background: var(--bg-elev); }
+  table { table-layout: fixed; }
+  th, td { overflow-wrap: anywhere; }
+  .linear-list li { margin: 8px 0; }
+  .source-note { color: var(--text-mute); font-size: 13px; margin-top: 8px; }
+  @media (max-width: 560px) {
+    header.topnav .inner { flex-wrap: wrap; gap: 8px; }
+    header.topnav .step-pill { margin-left: 0; white-space: normal; }
+    main { padding-inline: 14px; }
+    th, td { padding: 6px 5px; font-size: 12px; }
+  }
+</style>
+</head>
+<body>
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">system_design</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="syllabus.html">cases</a>
+    <span class="crumb">/</span>
+    <span class="crumb">C19</span>
+    <span class="step-pill">C19 / C44</span>
+  </div>
+</header>
+<main>
+
+<h1>Design a proximity service</h1>
+<p class="subtitle">"Show me restaurants near me" is a range query in two dimensions — and the entire trick is turning a circle on a map into a <em>bounded</em> set of storage keys you can look up in O(1), then ranking what comes back.</p>
+<div class="case-meta">
+  <span class="chip">Source: Vol. 2 Ch. 1, archive</span>
+  <span class="chip">Serving-path satellite of C22</span>
+  <span class="chip">Trade-off first</span>
+</div>
+
+<div class="callout">
+  <div class="label">First principle — this is a range query in disguise</div>
+  A relational index is one-dimensional: a B-tree on <code>price</code> lets you scan a contiguous range, but it has no notion of "close in both lat <em>and</em> lng at once." A naïve <code>WHERE dist(lat,lng, ?,?) &lt; r</code> has to compute a haversine distance against <em>every</em> row — a full table scan that gets slower as the world fills up. The whole design exists to avoid that scan: <strong>map 2-D coordinates to a 1-D key whose prefix encodes locality</strong>, so "nearby in space" becomes "nearby in keyspace," and a range query becomes a handful of exact key lookups. This is DDIA Ch.&nbsp;3's multi-dimensional index problem, solved by space-filling curves.</div>
+
+<div class="callout warn">
+  <div class="label">Scope: this is the serving path. The index <em>mechanics</em> live in C22.</div>
+  This case owns the <strong>product and serving</strong> path: nearby search, the candidate-set / ranking split, cache-by-cell, and location privacy. It does <strong>not</strong> re-derive how geohash interleaves bits, how a quadtree subdivides, or the precise neighbor-cell algorithm — that is the anchor, <a href="case_22_geospatial_indexes.html">C22 (geospatial indexes)</a>. When the boundary problem comes up below, we name <em>why</em> it bites and <em>what</em> the fix buys; for the bit-level <em>how</em>, we point to C22. The streaming / moving-object variant (live driver and friend locations) is <a href="case_20_nearby_friends.html">C20</a>.</div>
+
+<h2>1. Clarify the contract</h2>
+<p>Treat the prompt as a product contract before a box diagram. A proximity service must:</p>
+<ul>
+  <li><strong>Find places near a point</strong> — <code>(lat, lng, radius)</code> → a ranked list of nearby businesses.</li>
+  <li><strong>Filter</strong> by category, radius, open-now, rating.</li>
+  <li><strong>Rank</strong> the bounded candidate set by distance, relevance, and quality.</li>
+  <li><strong>Be fast on mobile</strong> — p99 well under ~200&nbsp;ms; this is an interactive read.</li>
+  <li><strong>Accept place updates</strong> — but the data is <em>mostly static</em> (a restaurant moves rarely), so writes are cheap and we can precompute aggressively.</li>
+</ul>
+<p>And, just as important, what it need <strong>not</strong> do: it is <em>not</em> a tracking system for fast-moving objects (that asymmetry — read-heavy, write-rare — is what lets us pre-bin places into cells; the moment objects move every second, the write path dominates and you are in C20's world). It need not be strongly consistent — a place that opened five minutes ago can be missing from one query; this is eventual-consistency territory, not a ledger.</p>
+
+<h2>2. Put numbers on the shape</h2>
+<p>The load-bearing number is <strong>geohash precision vs. cell size</strong>, because it sets both candidate count and cache granularity. Each geohash character adds ~5 bits, shrinking the cell ~32× in area:</p>
+<table>
+  <thead><tr><th>Geohash length</th><th>≈ cell width</th><th>Use</th></tr></thead>
+  <tbody>
+    <tr><td>5</td><td>≈ 5&nbsp;km</td><td>region / city-scale</td></tr>
+    <tr><td><strong>6</strong></td><td><strong>≈ 1.2&nbsp;km</strong></td><td>neighborhood — good default for "nearby"</td></tr>
+    <tr><td><strong>7</strong></td><td><strong>≈ 150&nbsp;m</strong></td><td>street block — dense urban precision</td></tr>
+    <tr><td>8</td><td>≈ 38&nbsp;m</td><td>single building</td></tr>
+  </tbody>
+</table>
+<p>Now the design driver. Candidate count is <span class="math">density × cell_area</span>, and you size precision so a single cell returns a workable candidate set. In dense Manhattan, place density might be <strong>~2000 restaurants/km²</strong>. At length&nbsp;6 (1.2&nbsp;km ≈ 1.44&nbsp;km² area) one cell holds <span class="math">2000 · 1.44 ≈ 2900</span> candidates — too many to hydrate and rank per query. Drop to length&nbsp;7 (150&nbsp;m, ≈&nbsp;0.0225&nbsp;km²): <span class="math">2000 · 0.0225 ≈ 45</span> per cell — comfortable. In a rural area at <strong>~5 restaurants/km²</strong>, a length-7 cell holds <span class="math">5 · 0.0225 ≈ 0.1</span> — essentially empty, so you must <em>expand outward</em> (coarser precision or more rings) until you gather enough. <strong>One precision does not fit both</strong>; precision is a function of local density.</p>
+
+<div class="callout ok">
+  <div class="label">The boundary tax: a 5&nbsp;km query is never one cell</div>
+  A query is a <em>circle</em>; a cell is a <em>square</em>. A point near a cell edge has neighbors just across the line. So you never query the center cell alone — you query the center plus its <strong>8 surrounding cells</strong> (the Moore neighborhood) so the radius is fully covered. A 5&nbsp;km radius at length-6 (1.2&nbsp;km) cells does not even fit in 9 cells — it needs a coarser precision or a wider ring; the rule is <strong>pick the precision whose cell ≳ radius, then fetch the 3×3 block</strong>. The <em>mechanism</em> for computing those 8 neighbor keys is C22; here the takeaway is that every query fans out to ~9 key lookups, and that fan-out is the unit you cache.</p>
+</div>
+
+<div class="kpi-grid">
+  <div class="kpi"><div class="k">Default precision</div><div class="v">geohash&nbsp;6 (~1.2&nbsp;km)</div></div>
+  <div class="kpi"><div class="k">Dense-urban precision</div><div class="v">geohash&nbsp;7 (~150&nbsp;m)</div></div>
+  <div class="kpi"><div class="k">Cells fetched / query</div><div class="v">9 (center + 8)</div></div>
+  <div class="kpi"><div class="k">Manhattan @len-7</div><div class="v">~45 candidates/cell</div></div>
+</div>
+
+<h2>3. Define the surface area</h2>
+<p>Keep the API small and expressed in product terms — it must not leak the cell, shard, or cache layout.</p>
+<table>
+  <thead><tr><th>API / operation</th><th>Why it exists</th></tr></thead>
+  <tbody>
+    <tr><td><code>GET /nearby?lat&amp;lng&amp;radius&amp;category</code></td><td>The core read. Returns a ranked, filtered list. Note: caller passes a <em>radius</em>, not a cell — the service chooses precision and neighbor expansion internally.</td></tr>
+    <tr><td><code>upsert_place(place)</code></td><td>Write path. Computes the place's cell key(s) at write time and indexes it — precompute, because reads vastly outnumber writes.</td></tr>
+    <tr><td><code>get_place(id)</code></td><td>Hydration: turn a candidate ID into full metadata (name, hours, rating, photos).</td></tr>
+  </tbody>
+</table>
+
+<h2>4. Model the data</h2>
+<p>The data model is the first architecture. The key separation is <strong>index vs. metadata</strong> — the geo-index maps a cell key to a list of place IDs, and the place store maps an ID to its full record. This is DDIA Ch.&nbsp;6's distinction between a <em>local secondary index</em> (the cell→IDs mapping, partitioned by cell) and the primary record store (partitioned by place ID).</p>
+<div class="case-meta">
+<span class="chip">place(id, lat, lng, category, hours, rating)</span><span class="chip">geo_index: cell_key → [place_id]</span><span class="chip">category index</span><span class="chip">ranking signals</span>
+</div>
+<p>Why split them? Because the index is tiny and hot (just IDs, fully cacheable per cell) while metadata is large and changes independently. You can rebuild or re-bin the index without touching place records, and you can update a restaurant's hours without re-indexing its location.</p>
+
+<h2>5. Linearized design</h2>
+<p>Walk a <code>/nearby</code> request through the system; the bottleneck — candidate explosion in dense cells — surfaces naturally.</p>
+<ol class="linear-list">
+<li><strong>1. Pick precision.</strong> From the requested radius (and optionally local density), choose a geohash length whose cell is comparable to the radius.</li>
+<li><strong>2. Compute the 3×3 block.</strong> Geohash the query point, then add its 8 neighbors (see <a href="case_22_geospatial_indexes.html">C22</a> for the neighbor algorithm). These 9 keys cover the radius even at a boundary.</li>
+<li><strong>3. Fetch candidate IDs.</strong> One lookup per cell against the geo-index (cache first — see deep dive). Union the ~9 ID lists.</li>
+<li><strong>4. Hydrate &amp; filter.</strong> Batch-fetch metadata for the candidate IDs; drop those outside the exact radius (the cells over-approximate the circle), wrong category, or closed.</li>
+<li><strong>5. Rank.</strong> Score the bounded set by distance, relevance, quality, business rules. Cheap because the set is already small.</li>
+<li><strong>6. Cache.</strong> Cache the cell→IDs lists (and popular cell+category results) — coordinates never enter the cache key (privacy + hit rate; deep dive below).</li>
+</ol>
+
+<div class="ascii">
+  Query at • sits 10 m inside cell E, near the E|F edge.
+  Radius r straddles the boundary → fetch the 3×3 Moore block, not just E.
+
+        ┌──────┬──────┬──────┐
+        │  A   │  B   │  C   │
+        │      │      │      │
+        ├──────┼──────┼──────┤        ●  query point (10 m from edge)
+        │  D   │  E  •│  F   │        ◇  nearest restaurant — lives in F!
+        │      │  (   ◇)     │        ╲  radius r crosses E│F boundary
+        ├──────┼──────┼──────┤
+        │  G   │  H   │  I   │        center E alone → MISS the ◇
+        └──────┴──────┴──────┘        E + {A..I} → 9 keys → HIT
+                                       (neighbor expansion, mechanism in C22)
+
+  serving pipeline:
+   /nearby ─▶ pick precision ─▶ 9 cell keys ─▶ ┌── cell cache ──┐ ─▶ union IDs
+                                                └ miss ▶ geo-idx ┘
+            ─▶ hydrate metadata ─▶ filter (exact radius / cat / open) ─▶ rank ─▶ top-K
+</div>
+
+<h2>6. Deep dives</h2>
+
+<h3>Cache by cell: why the hit rate is so high</h3>
+<p>The single biggest serving win is that <strong>requests cluster</strong>. Thousands of users in Times Square at lunch issue near-identical "restaurants nearby" queries. If we keyed the cache on raw <code>(lat, lng)</code> every one would be a miss — coordinates are effectively unique. But if we key on the <strong>cell</strong>, all of them collapse onto the same handful of cell keys. The cell is a deliberate <em>quantization</em> of the query: it trades a little precision (the over-approximation we clean up in the filter step) for a massive collision rate. Lesson 06's hit-rate→origin-load math applies directly: if 95% of <code>/nearby</code> traffic concentrates in a few thousand popular cells, a cell cache serving 95% of reads cuts geo-index load 20×. The cached object is the small cell→IDs list, not the hydrated result, so it stays cheap and survives metadata churn (hydration can hit a separate, ID-keyed cache). The corollary in sparse areas: cell caching does little, because each rural query touches different, rarely-repeated cells — but those areas have low QPS anyway, so it does not matter. See <a href="06_caching.html">lesson 06</a>.</p>
+
+<h3>Ranking on a bounded candidate set</h3>
+<p>The architecture buys ranking a gift: by the time we rank, the candidate set is already <em>small and bounded</em> (~tens to low hundreds after the geo-fetch and filter). That means we can afford an expensive per-candidate scoring function — distance decay, rating, sponsored boosts, personalization — without scanning the world. This is the classic <strong>retrieve-then-rank</strong> split: a cheap, recall-oriented geo-retrieval narrows millions of places to a few dozen; an expensive, precision-oriented ranker orders those few. The geo-index does not need to be ranked at all — it only needs to return the right <em>set</em>. Keeping these phases separate is what lets you change the ranking model weekly without touching the index.</p>
+
+<h3>Privacy &amp; freshness of user location</h3>
+<p>The query carries the user's exact position — the most sensitive datum in the system. Two disciplines: <strong>(1) Don't retain it.</strong> The exact <code>(lat, lng)</code> is needed only transiently to compute the cell and do the final exact-radius filter; it should not flow into logs, analytics, or cache keys. Caching on the <em>cell</em> rather than the coordinate is privacy-preserving by construction — the cache never sees a precise location, only a ~1.2&nbsp;km bin. For analytics, coarsen to a low-precision geohash (length 5–6) so you keep aggregate demand signals without re-identifiable trails. <strong>(2) Freshness asymmetry.</strong> Place data is mostly static, so a stale-by-minutes index is fine and serving aggressively from cache is safe. We version place records and, on an <code>upsert</code> that moves a place across a cell boundary, invalidate the affected cells — but we do not chase per-second freshness, because nothing here moves per second. (That assumption is exactly what C20 drops.)</p>
+
+<h2>7. Trade-offs</h2>
+<table>
+  <thead><tr><th>Choice</th><th>Buys</th><th>Costs</th><th>Choose when</th></tr></thead>
+  <tbody>
+<tr><td><strong>Geohash vs quadtree</strong> (mechanics in C22)</td><td>simple prefix keying, trivial sharding</td><td>fixed grid wastes cells in skewed density</td><td>MVP / uniform-ish density</td></tr>
+<tr><td><strong>Cache by cell vs exact coordinate</strong></td><td>huge hit rate; privacy by construction</td><td>cell over-approximates the circle</td><td>popular city queries (the default)</td></tr>
+<tr><td><strong>Precompute place cells vs compute at query</strong></td><td>fast O(1) reads</td><td>extra write work, re-index on move</td><td>mostly-static places (this case)</td></tr>
+<tr><td><strong>Fixed precision vs density-adaptive</strong></td><td>simplicity</td><td>too many candidates downtown, empty rural cells</td><td>tolerable density skew</td></tr>
+  </tbody>
+</table>
+<p>The sharpest trade-off is <strong>fixed precision vs. density-adaptive</strong>, and it is the one that separates a toy from a product. Pick a single global geohash length and you either bury the ranker under thousands of downtown candidates or return nothing in the countryside. Geohash's answer is to <em>vary precision per query</em> (fine downtown, expand rings rurally); a quadtree's answer is to vary it <em>structurally</em> — the tree subdivides only where density is high, so a dense cell becomes four children automatically. That structural adaptivity is exactly why C22 treats the quadtree as the more general index; here we just need to know that uniform precision is the thing that breaks, and density is the variable that breaks it.</p>
+
+<h2>8. Failure modes</h2>
+<table>
+  <thead><tr><th>Failure</th><th>Mitigation</th></tr></thead>
+  <tbody>
+<tr><td><strong>Missing results at cell boundary</strong></td><td>Always fetch the 3×3 neighbor block, never the center cell alone (mechanism: C22).</td></tr>
+<tr><td><strong>Dense-cell candidate explosion</strong></td><td>Increase precision (smaller cells) downtown, or cap + pre-rank candidates before hydration.</td></tr>
+<tr><td><strong>Empty rural cells</strong></td><td>Expand outward — coarsen precision or add neighbor rings until enough candidates gather.</td></tr>
+<tr><td><strong>Hot cell / hot partition</strong></td><td>Popular cells become hot keys (07): serve them from the cell cache; replicate hot cells; never shard so a megacity lands on one node.</td></tr>
+<tr><td><strong>Stale place data</strong></td><td>Version records; on a boundary-crossing upsert, invalidate affected cells.</td></tr>
+<tr><td><strong>Location privacy leak</strong></td><td>Never log/cache exact coords; key cache on cell; coarsen for analytics.</td></tr>
+  </tbody>
+</table>
+
+<h2>9. Interview Q&amp;A</h2>
+<div class="callout">
+  <ol>
+    <li><strong>A user is 10&nbsp;m from a cell edge and the nearest restaurant is just across it. Why does a naïve single-cell geohash miss it, and how do you fix it?</strong> <em>(senior answer)</em> Because a geohash cell is a square and the query is a circle: two points a few meters apart but on opposite sides of a boundary get <em>different</em> cell keys, so they look "far" in keyspace even though they're adjacent in space. Querying only the center cell silently drops everything across the line. The fix is <strong>neighbor-cell expansion</strong> — compute the center cell plus its 8 surrounding cells and union the results, so the radius is fully covered regardless of where in the cell the point sits. The actual algorithm for deriving the 8 neighbor keys (decode, step lat/lng, re-encode, handle wraparound) is the C22 mechanism; the serving-side rule is simply "never one cell — always the 3×3 block."</li>
+    <li><strong>How do you choose geohash precision?</strong> <em>(senior answer)</em> From candidate count = density × cell area. Pick the length whose cell yields a workable set: ~length-6 (1.2&nbsp;km) as a neighborhood default, length-7 (150&nbsp;m) downtown where density would otherwise give thousands per cell, and expand to coarser precision or extra rings in sparse areas. It's per-query, not global — uniform precision is the thing that breaks under density skew.</li>
+    <li><strong>Why does caching work so well here, and what do you key on?</strong> <em>(senior answer)</em> Because queries cluster geographically — thousands of users in one plaza issue the same lookup. Keying on raw coordinates makes every request unique (all misses); keying on the <strong>cell</strong> collapses them onto a few hot keys, so a popular-cell cache serves the bulk of reads and cuts index load ~20× (lesson 06). Bonus: a cell key never contains a precise location, so cell-caching is privacy-preserving by construction.</li>
+    <li><strong>Geohash or quadtree?</strong> <em>(senior answer)</em> Geohash for simplicity and prefix-based sharding when density is roughly uniform; quadtree when density is heavily skewed, because it subdivides structurally — dense regions get finer cells automatically. They solve the same retrieval problem; C22 derives both. The decision variable is density skew vs. implementation simplicity.</li>
+    <li><strong>Where does ranking happen, and why not rank in the index?</strong> <em>(senior answer)</em> Retrieve-then-rank: the geo-index does cheap, recall-oriented retrieval to a small bounded set; an expensive precision ranker then orders just those few dozen. Keeping them separate means the index only has to return the right <em>set</em>, and you can swap ranking models without touching the index.</li>
+    <li><strong>How is this different from a "nearby friends" / live-driver service?</strong> <em>(senior answer)</em> Write rate. Places are static, so we precompute cells and read-optimize aggressively. Moving objects update location every few seconds, so the write path dominates and the precompute-everything assumption collapses — that's the C20 streaming variant, with a different store (in-memory / pub-sub) and freshness contract.</li>
+    <li><strong>How do you handle a hot cell (a megacity downtown)?</strong> <em>(senior answer)</em> It's a hot-partition problem (lesson 07). Serve it from the cell cache so most reads never hit the index; replicate the hot cell across nodes; and ensure the sharding scheme doesn't put an entire metro on one partition. Increasing precision also helps by splitting one giant cell's traffic across many smaller keys.</li>
+  </ol>
+</div>
+
+<h2>Related foundation &amp; cases</h2>
+<p>The geo-index <em>mechanics</em> — geohash bit-interleaving, quadtree subdivision, the neighbor-cell algorithm — are derived once in <a href="case_22_geospatial_indexes.html">C22 (the anchor)</a>; this case links there rather than repeating them. The moving-object variant (live friends / drivers, write-heavy) is <a href="case_20_nearby_friends.html">C20</a>. <a href="06_caching.html">Lesson 06</a> supplies the cache-by-cell hit-rate math, and <a href="07_partitioning.html">lesson 07</a> the hot-cell / sharding reasoning. The multi-dimensional-index framing is DDIA Ch.&nbsp;3; the index-vs-metadata (local secondary index) split is DDIA Ch.&nbsp;6.</p>
+<div class="case-meta">
+<a class="chip" href="case_22_geospatial_indexes.html">C22 · Geo-index anchor</a>
+<a class="chip" href="case_20_nearby_friends.html">C20 · Moving objects</a>
+<a class="chip" href="06_caching.html">06 · Caching</a>
+<a class="chip" href="07_partitioning.html">07 · Partitioning</a>
+<a class="chip" href="02_latency_throughput.html">02 · Latency &amp; throughput</a>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Nearby search is a 2-D range query made tractable by collapsing space into a 1-D, locality-preserving key — so a circle on the map becomes ~9 exact cell lookups. Precision is the load-bearing dial: cell size (length-6 ≈ 1.2&nbsp;km, length-7 ≈ 150&nbsp;m) times density sets candidate count, so you pick it per-query and never trust a single cell — always the 3×3 block, because a circle straddles square boundaries. Then it's a serving problem: cache on the cell (high hit rate + privacy for free), retrieve-then-rank a bounded set, and keep exact coordinates out of everything persistent. The index internals are C22; the product is here.</div>
+
+<footer class="lesson-nav">
+  <a href="case_18_storage_interfaces.html"><span class="dir">Previous</span><span class="ttl">Previous case</span></a>
+  <a class="next" href="case_20_nearby_friends.html"><span class="dir">Next</span><span class="ttl">Next case</span></a>
+</footer>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>46 · Autocomplete &amp; spelling at scale</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">search_ads_recsys</a>
+    <span class="crumb">/</span>
+    <span class="crumb">46 · autocomplete &amp; spelling</span>
+    <span class="step-pill">search · 7 / 10</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Autocomplete, suggestions &amp; spelling at scale</h1>
+<p class="subtitle">The reranker in <a href="45_semantic_reranking.html">lesson 45</a> ran once per query. Autocomplete runs once per <em>keystroke</em> — it is the tightest-latency, highest-QPS surface in all of search, and it quietly authors the query distribution that every downstream stage in this track sees. The design is dominated by two things: the latency budget and the data structure.</p>
+
+<div class="callout">
+  <div class="label">The plan</div>
+  <ul style="margin:6px 0;">
+    <li><strong>Query autocomplete (QAC) as prefix → ranked completions</strong> — the data structure question: trie, compressed trie / FST / marisa-trie, and why a hashmap-of-prefixes blows up. Store top-k at each node vs traverse the subtree.</li>
+    <li><strong>Ranking the completions</strong> — Most-Popular-Completion (MPC) from <a href="40_search_vs_recommendation.html">lesson 40</a>'s query log, then learned ranking adding recency/trending, personalization &amp; context, and demotion of unsafe completions; diversity.</li>
+    <li><strong>The latency &amp; QPS reality</strong> — per-keystroke requests, debouncing, caching the Zipf head (<a href="40_search_vs_recommendation.html">lesson 40</a>), the &lt;~100 ms budget, and the QPS multiplier.</li>
+    <li><strong>Unseen prefixes / cold completions</strong> — n-gram backoff and synthesizing candidates from titles / catalog for the long tail.</li>
+    <li><strong>"Did you mean" / spelling at scale</strong> — extend the noisy-channel model from <a href="41_query_understanding.html">lesson 41</a>: bounded edit distance + keyboard-aware costs, autocorrect vs suggest vs no-results-fallback.</li>
+    <li><strong>Safety &amp; abuse</strong> — blocklists, and why autocomplete is a brand/PR liability surface.</li>
+  </ul>
+</div>
+
+<p>The one engineering line to carry through: <strong>autocomplete is a latency-bounded retrieval problem on a stream of growing prefixes, where the data structure decides whether you can answer in the budget, and the ranking decides whether the answer is good.</strong> Everything below is a consequence of "you have ~100 ms, you get hit on every keystroke, and the corpus is huge."</p>
+
+<h2>QAC as prefix → ranked completions</h2>
+
+<p><strong>Query autocomplete (QAC)</strong> is the box that, as the user types a <em>prefix</em>, proposes a short ranked list of full queries that begin with it. Formally: given prefix <span class="math">p</span>, return the top-<span class="math">k</span> completions <span class="math">c</span> such that <span class="math">p</span> is a prefix of <span class="math">c</span>, ranked by a score <span class="math">s(c \mid p)</span>. The naive store — a hashmap keyed by every prefix → its completion list — is the first thing to reject in an interview, so build up to why.</p>
+
+<h3>Why a hashmap of prefixes blows up</h3>
+
+<p>A query of length <span class="math">L</span> has <span class="math">L</span> prefixes (<code>i</code>, <code>ip</code>, <code>iph</code>, …). If you key a hashmap by prefix and store the candidate list under each, every query contributes to <span class="math">L</span> entries, and the completion lists overlap massively (the list under <code>ip</code> is nearly the list under <code>i</code>). For a log of <span class="math">Q</span> distinct queries of average length <span class="math">\bar{L}</span>, you store <span class="math">O(Q \cdot \bar{L})</span> prefix keys, each pointing at a list that can be hundreds of entries — the same completions copied under every one of their prefixes. At <span class="math">Q = 10^8</span> distinct queries, <span class="math">\bar{L} = 20</span> chars, that is <span class="math">2 \times 10^9</span> prefix keys before you count the duplicated completion payloads. The redundancy is the whole problem, and it is exactly what a tree removes by <em>sharing prefixes</em>.</p>
+
+<h3>The trie</h3>
+
+<p>A <strong>trie</strong> (prefix tree) stores the query set as a tree where each edge is a character and each root-to-node path spells a prefix. Shared prefixes share nodes — <code>ipad</code>, <code>iphone</code>, <code>ip address</code> all share the path <code>i → p</code>. A node can be marked <em>terminal</em> (a complete query ends here) and carry a count.</p>
+
+<div class="ascii">
+  Query log (count):  iphone 900 · iphone 15 220 · ipad 540 · ip address 60
+                      · ipl 30 · ireland 45
+
+                         (root)
+                           │ i
+                          [i]
+                     ┌─────┼───────────┐
+                   p │              r │
+                   [ip]            [ir]
+              ┌──────┼────────┐         │ eland
+            h │   a │      l │ '·'      [ireland]✷45
+          [iph]  [ipa]   [ipl]✷30   [ip address]✷60
+            │ one   │ d
+       [iphone]✷900 [ipad]✷540
+            │ " 15"
+     [iphone 15]✷220
+
+  ✷ = terminal node (a complete query) with its log count
+  Prefix-traversal for "ip":  root --i--> [i] --p--> [ip]   ← 2 hops, lands here
+  then the answer set = all terminals in the SUBTREE rooted at [ip].
+</div>
+
+<p><strong>The lookup cost.</strong> Walking to the node for a prefix of length <span class="math">L</span> is <span class="math">L</span> node hops — one per character — <em>independent of the corpus size <span class="math">N</span></em>. That is the headline property: descending to <code>ip</code> costs 2 hops whether the log has a thousand queries or a billion. Contrast with the cost of then <em>producing ranked completions</em>: the terminals live scattered across the entire subtree under <code>ip</code>, and that subtree can hold a huge number of completions. If you collect-then-sort the subtree, the cost is <span class="math">O(m \log k)</span> for <span class="math">m</span> terminals in the subtree — and for a head prefix like <code>a</code> or <code>i</code>, <span class="math">m</span> can be in the millions. The <span class="math">O(L)</span> descent is free; the subtree traversal is what kills you.</p>
+
+<h3>Store top-k at each node, or traverse the subtree?</h3>
+
+<p>This is the central QAC engineering decision, and it is a precompute-vs-query-time trade.</p>
+
+<table>
+  <thead><tr><th></th><th>Traverse subtree at query time</th><th>Materialize top-k at each node</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Idea</strong></td><td>Walk to the prefix node, DFS the subtree, collect all terminals, sort by score, take top-k.</td><td>At build time, store the precomputed top-k completion list <em>at every node</em> (a "completion cache" on the node).</td></tr>
+    <tr><td><strong>Query cost</strong></td><td><span class="math">O(L + m \log k)</span>, where <span class="math">m</span> = terminals in subtree — unbounded for head prefixes.</td><td><span class="math">O(L + k)</span> — descend, read the list. Flat regardless of subtree size.</td></tr>
+    <tr><td><strong>Memory</strong></td><td>Just the trie.</td><td>Trie + <span class="math">k</span> entries per node. With <span class="math">k=10</span> and pointers, roughly an order of magnitude larger.</td></tr>
+    <tr><td><strong>Update</strong></td><td>Insert is a single path edit.</td><td>A count change can ripple top-k lists up the path to the root; usually batch-rebuilt offline.</td></tr>
+    <tr><td><strong>When</strong></td><td>Small/medium scale, or only the tail (rare prefixes have tiny subtrees).</td><td>The head, where subtrees are enormous and latency is non-negotiable.</td></tr>
+  </tbody>
+</table>
+
+<p>The production answer is usually <em>both</em>: materialize top-k on nodes near the root (short prefixes = giant subtrees = the dangerous ones), and traverse on demand for long, rare prefixes whose subtrees are tiny. Materialization converts an unbounded query-time scan into a bounded <span class="math">O(L+k)</span> read by paying memory and an offline rebuild — exactly the cache-vs-compute pattern you will reuse for head-prefix caching below.</p>
+
+<h3>Compressing the trie: radix tree, FST, marisa-trie</h3>
+
+<p>A plain trie with one node per character is memory-hungry — pointer overhead dominates, and long non-branching chains (the <code>reland</code> in <code>ireland</code>) waste a node per char. Three compressions, in increasing sophistication:</p>
+
+<table>
+  <thead><tr><th>Structure</th><th>What it compresses</th><th>Cost</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Radix / Patricia trie</strong></td><td>Collapse non-branching chains: a single edge holds the whole substring <code>reland</code>. Fewer nodes, less pointer overhead.</td><td>Edges hold strings, not chars; slightly more complex matching. Still pointer-based.</td></tr>
+    <tr><td><strong>FST</strong> (finite-state transducer)</td><td>Share <em>suffixes</em> too, not just prefixes (a minimal DAWG/automaton), and map each accepted string to an output (its rank/id). Lucene's suggester and term dictionary use FSTs.</td><td>Build is a one-shot minimization; the structure is read-only / immutable. Updates ⇒ rebuild.</td></tr>
+    <tr><td><strong>marisa-trie</strong> (LOUDS-based)</td><td>A <em>succinct</em> trie: the tree topology is stored as a bit-vector (LOUDS) with rank/select, approaching the information-theoretic minimum. Often 5–20× smaller than a pointer trie.</td><td>Immutable, build-once; navigation is via rank/select bit-ops rather than pointer chasing.</td></tr>
+  </tbody>
+</table>
+
+<p>The common thread: the dynamic, pointer-based trie is good for prototyping and for the small online layer; the serving layer at scale is an <em>immutable, compressed</em> structure (FST or succinct trie) rebuilt offline, because read-only buys both 5–20× memory savings and cache-friendly traversal — and the query log only changes meaningfully on the timescale of a rebuild anyway.</p>
+
+<h2>Ranking the completions</h2>
+
+<p>Descending the trie gives you the candidate <em>set</em>; ranking decides the <em>order</em> of the 5–10 you actually show. Build it up.</p>
+
+<h3>MPC — the Most-Popular-Completion baseline</h3>
+
+<p><strong>Most-Popular-Completion</strong> ranks the completions of a prefix by how often each was issued as a full query in the log. It is the maximum-likelihood estimate of "what query does someone who typed this prefix most likely want," and it is a shockingly strong baseline because query frequency is enormously skewed (Zipf, lesson 40) — the top completion usually dwarfs the rest.</p>
+
+<p><strong>Worked MPC.</strong> Prefix <code>ip</code>, with this completion-count table from the log:</p>
+
+<table>
+  <thead><tr><th>completion</th><th>log count</th><th>MPC score (= count)</th><th>rank</th></tr></thead>
+  <tbody>
+    <tr><td><code>iphone</code></td><td>900</td><td>900</td><td><strong>1</strong></td></tr>
+    <tr><td><code>ipad</code></td><td>540</td><td>540</td><td><strong>2</strong></td></tr>
+    <tr><td><code>iphone 15</code></td><td>220</td><td>220</td><td><strong>3</strong></td></tr>
+    <tr><td><code>ip address</code></td><td>60</td><td>60</td><td>4</td></tr>
+    <tr><td><code>ipl</code></td><td>30</td><td>30</td><td>5</td></tr>
+  </tbody>
+</table>
+
+<p>Top-3 shown: <code>iphone</code>, <code>ipad</code>, <code>iphone 15</code>. The arithmetic is trivial — that is the point. MPC needs nothing but counts, and it captures most of the value. Note <code>iphone</code> and <code>iphone 15</code> are near-duplicates; hold that thought for diversity.</p>
+
+<h3>Adding recency &amp; trending</h3>
+
+<p>MPC is blind to time: it ranks by all-history popularity, so a query that just started trending today is buried under stale all-time favorites, and a query that was huge last year but is now dead still ranks high. The fix is to blend a <em>recency</em> signal — e.g. counts over a short recent window, or an exponentially-time-decayed count. A simple blend:</p>
+
+<div class="math block">s(c \mid p) = (1-\lambda)\cdot \widehat{P}_{\text{all}}(c) \;+\; \lambda \cdot \widehat{P}_{\text{recent}}(c)</div>
+
+<p><strong>Worked recency reorder.</strong> Suppose a new model just launched and the last-24h window shows a surge for <code>iphone 15</code>. Normalize each column to a share, then blend with <span class="math">\lambda = 0.5</span>:</p>
+
+<table>
+  <thead><tr><th>completion</th><th>all-time share</th><th>recent-24h share</th><th>blend (λ=0.5)</th><th>new rank</th></tr></thead>
+  <tbody>
+    <tr><td><code>iphone</code></td><td>0.52 (900/1750)</td><td>0.30</td><td>0.410</td><td><strong>2</strong></td></tr>
+    <tr><td><code>ipad</code></td><td>0.31 (540/1750)</td><td>0.10</td><td>0.205</td><td>3</td></tr>
+    <tr><td><code>iphone 15</code></td><td>0.13 (220/1750)</td><td>0.55</td><td>0.340</td><td><strong>... → 2</strong></td></tr>
+    <tr><td><code>ip address</code></td><td>0.034</td><td>0.04</td><td>0.037</td><td>4</td></tr>
+    <tr><td><code>ipl</code></td><td>0.017</td><td>0.01</td><td>0.013</td><td>5</td></tr>
+  </tbody>
+</table>
+
+<p>Recomputing cleanly: blend scores are <code>iphone</code> 0.410, <code>iphone 15</code> 0.340, <code>ipad</code> 0.205. So the recency blend lifts <code>iphone 15</code> from rank 3 to rank 2, ahead of <code>ipad</code>, while the all-time leader <code>iphone</code> still holds rank 1. That reorder — trending content surfacing above a stale evergreen — is the entire reason production QAC is not pure MPC. (Trending detection itself is usually a separate signal: flag completions whose recent rate is anomalously high vs their historical baseline, which is how "spiking" queries get a temporary boost.)</p>
+
+<h3>Learned ranking, context &amp; personalization</h3>
+
+<p>Beyond recency, a learned ranker (the LTR machinery from <a href="44_learning_to_rank.html">lesson 44</a>, but on a tiny candidate set under a brutal latency budget) blends features:</p>
+
+<ul>
+  <li><strong>Popularity &amp; recency</strong> — the MPC count and time-decayed count above, plus trending flags.</li>
+  <li><strong>Context</strong> — <em>location</em> (<code>weath…</code> → local weather; restaurant queries near the user), <em>time-of-day</em>, <em>device</em>, and crucially the <em>session prefix</em>: the user's prior query in this session disambiguates (after searching <code>flights</code>, the prefix <code>new…</code> should favor <code>new york</code> over <code>new movies</code>).</li>
+  <li><strong>Personalization</strong> — the user's own history: someone who repeatedly searches a brand should see it float up. Personal completions are a strong signal but must be privacy-scoped and never leak across users (a completion from <em>your</em> history must not appear for someone else).</li>
+  <li><strong>Quality / safety demotion</strong> — demote or remove toxic, unsafe, NSFW, defamatory, or low-quality completions (see safety section). This is a hard gate, not a soft feature, for the worst classes.</li>
+</ul>
+
+<p>Because the candidate set is small (the few hundred terminals under the prefix, or the materialized top-k), the ranker can be richer per-candidate than the millisecond-budget suggests — but the model itself must be tiny (often a GBDT or a small linear/logistic model on cached features), since it runs on every keystroke.</p>
+
+<h3>Diversity among suggestions</h3>
+
+<p>The MPC list above showed <code>iphone</code> and <code>iphone 15</code> adjacent — near-duplicates that waste a slot. Showing 10 variants of the same head query is bad UX; users want a few <em>distinct</em> intents. The fix is the same diversity/MMR idea you saw in reranking (<a href="45_semantic_reranking.html">lesson 45</a>): penalize a candidate that is too similar (token overlap, or same linked entity/category) to one already chosen. Practically, dedupe by stem/entity and cap how many completions share a root, so the list spans <code>iphone</code>, <code>ipad</code>, <code>ip address</code> rather than five flavors of iPhone.</p>
+
+<h2>The latency &amp; QPS reality</h2>
+
+<p>This is the section that makes autocomplete different from every other surface in this track.</p>
+
+<h3>Per-keystroke requests and the QPS multiplier</h3>
+
+<p>If autocomplete fires on every keystroke, a query of length 10 can generate up to ~10 requests (one per character typed). That makes autocomplete QPS a multiple of search QPS.</p>
+
+<div class="callout">
+  <div class="label">Worked QPS math</div>
+  <p style="margin:6px 0;">Say the search backend serves <strong>5,000 queries/sec</strong> (one request per submitted query). The average submitted query is <strong>~20 characters</strong>. If autocomplete fired naively on every keystroke, that is up to <span class="math">5000 \times 20 = 100{,}000</span> autocomplete req/s — a <strong>20×</strong> multiplier. <em>Debouncing</em> (below) collapses bursts of keystrokes into roughly one request per typing pause; realistically you fire on a fraction of keystrokes, landing around <strong>5–10× search QPS</strong>, so ~<strong>25,000–50,000 autocomplete req/s</strong>. Either way: autocomplete is the highest-QPS service in the search stack by a large margin, and it has the <em>tightest</em> latency budget — the suggestions must paint before the user types the next key.</p>
+</div>
+
+<h3>Debouncing &amp; cancellation</h3>
+
+<p><strong>Debouncing</strong> waits a short interval (~100–150 ms) after the last keystroke before firing a request, so a fast typist banging out <code>iphone</code> fires one request (after they pause) instead of six. Pair it with <strong>request cancellation</strong>: when a newer keystroke arrives, cancel the in-flight request for the older, now-stale prefix — you never want to render completions for <code>iph</code> after the user has already typed <code>iphone</code> (out-of-order responses cause flicker). Debouncing is the cheapest single lever on autocomplete load; it is a client-side change that can cut backend QPS several-fold.</p>
+
+<h3>Caching the Zipf head</h3>
+
+<p>Query (and prefix) frequency is Zipf-distributed (lesson 40): a tiny number of head prefixes account for a large fraction of traffic. That makes prefix-level caching extraordinarily effective — cache the completion list for the hottest prefixes (<code>a</code>, <code>fa</code>, <code>face</code>, <code>amazon</code>, …) at the edge / in memory, and most requests never touch the trie service.</p>
+
+<div class="callout">
+  <div class="label">Worked cache-hit math</div>
+  <p style="margin:6px 0;">Suppose prefix popularity follows Zipf with <span class="math">s \approx 1</span>, so the head is steep: empirically, caching the top ~<strong>10,000 prefixes</strong> captures on the order of <strong>80%</strong> of autocomplete requests (the head dominates). Then with 40,000 req/s arriving, a <strong>0.80 hit rate</strong> means only <span class="math">40{,}000 \times (1 - 0.80) = 8{,}000</span> req/s reach the trie backend — a <strong>5× reduction</strong>. Push the cache to a 0.90 hit rate (bigger cache, longer TTL) and the backend sees <span class="math">40{,}000 \times 0.10 = 4{,}000</span> req/s — a <strong>10×</strong> reduction. This is why head-prefix caching, not a faster trie, is the first capacity lever: the head is small and stable, so a small cache absorbs most of the storm. TTLs are short-ish (minutes) so trending completions still propagate.</p>
+</div>
+
+<h3>The latency budget</h3>
+
+<p>The target is to repaint suggestions within roughly <strong>~100 ms</strong> of a keystroke (faster feels instant; slower than ~200 ms feels laggy and users out-type the box). That budget covers network RTT + debounce + backend lookup + render. It leaves the backend only tens of milliseconds, which is exactly why the lookup must be <span class="math">O(L+k)</span> (materialized top-k), why the head is cached, and why the ranker must be tiny. There is no room for a 100 ms LLM call on the keystroke path (contrast <a href="41_query_understanding.html">lesson 41</a>'s LLM-on-the-tail framing — autocomplete is even more latency-constrained than query understanding).</p>
+
+<h2>Coverage of unseen prefixes &amp; cold completions</h2>
+
+<p>MPC/trie can only complete prefixes that exist in the log. But users type prefixes the log has never seen — a brand-new product name, a rare long-tail phrasing, a fresh news entity. If the trie node doesn't exist, you return nothing, and an empty autocomplete is a missed assist. Three coverage mechanisms:</p>
+
+<ul>
+  <li><strong>N-gram backoff.</strong> If the full prefix has no completions, back off to a shorter suffix of the typed words. Borrowing the language-model idea: if <code>cheap iphone cabl…</code> has no logged completion, back off to completing just the last token <code>cabl…</code> → <code>cable</code> using its own popularity, then re-attach the earlier context. This is the same back-off that smooths sparse n-gram LMs — when the specific context is unseen, fall back to a less specific one.</li>
+  <li><strong>Synthesize from document titles / catalog.</strong> The query log is not the only source of legitimate completions. Mine product titles, catalog entries, entity names, and document headings to build <em>candidate completions for queries no one has typed yet</em> — a new SKU's title becomes a completable suggestion the day it is listed, before any log evidence exists. These get a lower prior than log-backed completions (no demonstrated demand) but they cover the cold start.</li>
+  <li><strong>Handling the long tail.</strong> For rare prefixes the materialized-top-k layer doesn't bother caching; you traverse the (tiny) subtree on demand, or fall back to backoff/synthesis. The tail is where coverage techniques matter and where the latency budget is easy (small subtrees); the head is where caching matters and coverage is trivially solved by sheer log volume.</li>
+</ul>
+
+<h2>"Did you mean" / spelling at scale</h2>
+
+<p>Lesson 41 built the <strong>noisy-channel</strong> spelling model: the user intended a correct query <span class="math">c</span> but the channel emitted the observed string <span class="math">w</span>, and we pick</p>
+
+<div class="math block">\hat{c} = \arg\max_{c}\; P(c \mid w) = \arg\max_{c}\; \underbrace{P(w \mid c)}_{\text{channel / typo}}\cdot \underbrace{P(c)}_{\text{prior / query-log LM}}</div>
+
+<p>That lesson worked <code>teh → the</code> by hand (Damerau transposition gives a 1-edit channel; the query-log prior beats <code>tea</code>/<code>ten</code> by ~150×). Here we extend it with the two pieces that make it a <em>scale</em> problem: how candidates are generated efficiently, and how the autocorrect/suggest/fallback decision is actually made.</p>
+
+<h3>Candidate generation via bounded edit distance</h3>
+
+<p>You cannot score <span class="math">P(c \mid w)</span> over the whole vocabulary — you first need a small candidate set of plausible corrections. The standard bound is <strong>edit distance ≤ 2</strong> (Damerau-Levenshtein: insertions, deletions, substitutions, adjacent transpositions), because the overwhelming majority of real typos are within two edits, and the candidate count explodes beyond that. Two ways to enumerate within the bound efficiently: a <strong>BK-tree</strong> (metric tree that prunes by triangle inequality on edit distance) or a <strong>SymSpell deletion index</strong> (precompute deletions of dictionary words; at query time generate only deletions of <span class="math">w</span> and intersect — far fewer candidates to generate than the full edit neighborhood).</p>
+
+<div class="callout warn">
+  <div class="label">Worked: why ≤2, not ≤3 — the candidate explosion</div>
+  <p style="margin:6px 0;">For a word of length <span class="math">L</span> over an alphabet of size <span class="math">a=26</span>, the number of strings at edit distance exactly 1 is roughly: deletions <span class="math">L</span>, transpositions <span class="math">L-1</span>, substitutions <span class="math">L\,(a-1)</span>, insertions <span class="math">(L+1)\,a</span>. For <span class="math">L = 7</span> (e.g. <code>chrgr</code>-ish words): <span class="math">7 + 6 + 7\cdot 25 + 8\cdot 26 = 7 + 6 + 175 + 208 \approx 396</span> strings at distance 1. At distance 2 you compose again — on the order of <span class="math">396^2 / 2 \approx 78{,}000</span> raw strings (many collide), and at distance 3 it is millions. So the candidate <em>generator</em> stays at ≤2 and leans on the dictionary intersection (SymSpell) to keep the surviving candidate set to a handful of real words, not the ~78k raw neighborhood. The bound is an efficiency knob, not just an accuracy one.</p>
+</div>
+
+<h3>Keyboard-aware channel costs</h3>
+
+<p>As lesson 41 noted, not all edits are equal: substituting two physically adjacent keys (<span class="math">s \leftrightarrow d</span>) is a far more probable slip than distant keys (<span class="math">s \leftrightarrow p</span>), so the channel cost of an adjacent substitution is lower, raising <span class="math">P(w \mid c)</span> for keyboard-plausible typos. The channel model is therefore a weighted edit distance whose per-edit costs come from a confusion matrix (learned from query-reformulation logs: pairs where a user typed <span class="math">w</span> then immediately retyped <span class="math">c</span> are gold typo→correction labels). The prior <span class="math">P(c)</span> is still the query-log LM — the domain lives there, exactly as in 41.</p>
+
+<h3>The autocorrect vs suggest vs no-results-fallback decision</h3>
+
+<p>The output is not just a ranked candidate; it is a <em>decision</em> with three actions, gated on the posterior margin and whether the original query has results.</p>
+
+<table>
+  <thead><tr><th>action</th><th>fire when</th><th>UX</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Autocorrect (silent rewrite)</strong></td><td>Posterior margin huge (<span class="math">P(c_1\mid w)/P(c_2\mid w)</span> ≫ 1) <em>and</em> original <span class="math">w</span> has ~zero results. High confidence the typo is unambiguous.</td><td>Search the corrected form; show "Showing results for <em>c</em>. Search instead for <em>w</em>." (always offer the escape hatch).</td></tr>
+    <tr><td><strong>Suggest ("Did you mean <em>c</em>?")</strong></td><td>Moderate margin, or <span class="math">w</span> has <em>some</em> results but a strong correction exists.</td><td>Search the original; offer a one-click suggestion above the results.</td></tr>
+    <tr><td><strong>No-results fallback</strong></td><td>Original returns zero results and no high-confidence correction exists.</td><td>Try the best low-confidence correction, then backoff/relaxation; never a blank page.</td></tr>
+  </tbody>
+</table>
+
+<p>The deciding numbers are the same two from 41: the posterior margin (how dominant is the top candidate) and the original's result count (does the typed form already work). The trap, repeated from 41 because it is the most common spelling-product mistake: a wrong <em>silent</em> autocorrect is infuriating — the user sees results for a word they did not type — so the silent-rewrite gate must be conservative (huge margin + zero original results), and everything else is a suggestion the user can ignore.</p>
+
+<h2>Safety &amp; abuse — autocomplete as a liability surface</h2>
+
+<p>Autocomplete is uniquely dangerous because it <em>puts words in the engine's mouth</em>. A search ranking is a response to what a user typed; a completion is the engine <em>proposing</em> a query. If the engine autocompletes a person's name into a defamatory or false phrase, or a neutral prefix into a slur, hateful, self-harm, or illegal suggestion, that is the engine appearing to author it — a brand and legal/PR liability that has produced real lawsuits and regulatory action. Mechanisms:</p>
+
+<ul>
+  <li><strong>Blocklists &amp; pattern filters.</strong> A curated denylist of completions and substrings (slurs, illegal-content phrasings, named-individual defamation) that are removed regardless of popularity. This is a hard gate applied <em>after</em> ranking, before render.</li>
+  <li><strong>Classifier demotion.</strong> A toxicity/safety classifier scores completions; high-risk ones are demoted or suppressed. Catches what static lists miss, at the cost of a model in the path (kept tiny / precomputed offline per completion).</li>
+  <li><strong>Spam / poisoning defense.</strong> Because completions come from the query log, an attacker who scripts a query millions of times can try to <em>inject</em> a completion (autocomplete poisoning). Defenses: per-user/per-IP rate-limiting in the log aggregation, anomaly detection on suspiciously spiking unique-source-poor queries, and minimum distinct-user thresholds before a query is eligible to be a public completion (one bot typing a phrase a million times should not create a public suggestion).</li>
+  <li><strong>Named-entity protection.</strong> Extra caution around real people, protected classes, and sensitive topics (medical, self-harm) — often a policy of not autocompleting beyond a person's name, or routing sensitive prefixes to vetted suggestions.</li>
+</ul>
+
+<p>The framing: popularity is the <em>default</em> signal, but safety is a <em>veto</em> that overrides popularity. A completion can be the single most popular continuation of a prefix and still be removed — the brand cost of surfacing it dwarfs the relevance gain.</p>
+
+<h2>Interactive · autocomplete trie explorer</h2>
+
+<p>Type a prefix and see the ranked completions from a small built-in query log. Toggle the recency blend to watch trending completions reorder. The KPIs show what the lookup actually cost: trie nodes visited on the descent, candidate completions considered in the subtree, and an approximate latency. The log, counts, and latency model are a toy — the <em>structure</em> (O(L) descent, subtree candidate set, MPC vs recency blend) is the real lesson.</p>
+
+<div class="widget" id="ac-widget">
+  <div class="title">Prefix → ranked completions over a toy query log</div>
+  <div class="hint">Toy log with all-time and last-24h counts. Latency model is illustrative. Try <code>i</code>, <code>ip</code>, <code>iph</code>, <code>fa</code>, <code>new</code>, or a cold prefix like <code>zx</code>. Toggle recency to see <code>iphone 15</code> (trending) jump.</div>
+
+  <div class="controls" style="flex-direction:column; align-items:stretch;">
+    <label class="inline">prefix:
+      <input type="text" id="ac-input" value="ip" style="flex:1; min-width:180px;" autocomplete="off">
+    </label>
+    <div style="margin-top:6px;">
+      <button type="button" class="chip" data-q="i">i</button>
+      <button type="button" class="chip" data-q="ip">ip</button>
+      <button type="button" class="chip" data-q="iph">iph</button>
+      <button type="button" class="chip" data-q="fa">fa</button>
+      <button type="button" class="chip" data-q="new ">new</button>
+      <button type="button" class="chip" data-q="zx">zx (cold)</button>
+    </div>
+    <label class="inline" style="margin-top:6px;">
+      <input type="checkbox" id="ac-recency"> blend recency (λ=0.5) — surface trending
+    </label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">trie nodes visited</div><div class="v" id="ac-nodes">—</div></div>
+    <div class="kpi"><div class="k">candidates considered</div><div class="v" id="ac-cand">—</div></div>
+    <div class="kpi"><div class="k">approx latency</div><div class="v" id="ac-lat">—</div></div>
+    <div class="kpi"><div class="k">top completion</div><div class="v" id="ac-top">—</div></div>
+  </div>
+
+  <div class="callout" id="ac-box">
+    <div class="label" id="ac-label">Completions</div>
+    <div id="ac-body" style="font-family:var(--mono,monospace); font-size:13px; line-height:1.7;">—</div>
+  </div>
+</div>
+
+<h2>Interview prompts you should be ready for</h2>
+
+<div class="callout">
+  <ol style="margin:4px 0;">
+    <li>"Why not just store a hashmap from every prefix to its completion list?" <em>(It blows up: each query of length L contributes to L prefix keys, and the completion lists are massively duplicated across a query's prefixes — O(Q·L̄) keys with redundant payloads. A trie removes the redundancy by sharing prefixes; the descent is O(L) independent of corpus size.)</em></li>
+    <li>"You descend the trie in O(L) — so why is head-prefix autocomplete slow?" <em>(The descent is free; producing ranked completions is not. The subtree under a head prefix like <code>a</code> holds millions of terminals, so collect-then-sort is O(m log k) with m huge. The fix is to materialize top-k at each node — O(L+k) read — paying memory and an offline rebuild. Senior signal: separating descent cost from candidate-set cost.)</em></li>
+    <li>"Estimate autocomplete QPS relative to search QPS, and how you'd keep the backend from melting." <em>(Per-keystroke ⇒ up to ~L× naive; debouncing collapses it to ~5–10× search QPS. Then the Zipf head: cache the top ~10k prefixes for ~80–90% hit rate, cutting backend QPS 5–10×. Debounce + head cache, not a faster trie, are the first capacity levers.)</em></li>
+    <li>"MPC ranks by all-time popularity. What does it miss and how do you fix it?" <em>(It's blind to time — trending queries are buried, dead queries persist. Blend a recency/time-decayed signal; detect spikes vs historical baseline for a trending boost. Worked: a λ=0.5 blend lifts a surging completion above a stale evergreen while the all-time leader holds #1.)</em></li>
+    <li>"A user types a prefix you've never logged. What do you show?" <em>(Coverage: n-gram backoff to a shorter suffix/last token, and synthesize candidates from document titles / catalog so new SKUs are completable before any log evidence — at a lower prior. Empty autocomplete is a missed assist; the tail is exactly where coverage techniques earn their keep.)</em></li>
+    <li>"Walk me through 'did you mean' at scale, and when you'd silently autocorrect." <em>(Noisy channel P(w|c)·P(c) from lesson 41; candidate generation via bounded Damerau distance ≤2 with SymSpell/BK-tree to avoid the ~78k distance-2 explosion; keyboard-aware channel costs; query-log prior. Silent autocorrect only when the posterior margin is huge AND the original has ~zero results — a wrong silent rewrite shows results for a word the user didn't type. Otherwise suggest.)</em></li>
+    <li>"Why is autocomplete a bigger brand/legal liability than the results page?" <em>(A completion is the engine proposing a query, not responding to one — autocompleting a name into a defamatory phrase reads as the engine authoring it. Safety is a veto over popularity: blocklists + classifier demotion applied after ranking, plus poisoning defense (min distinct-user thresholds, rate-limiting) so a bot can't inject a public suggestion.)</em></li>
+  </ol>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Autocomplete is a latency-bounded retrieval problem on a stream of growing prefixes, hit on every keystroke — the highest-QPS, tightest-budget surface in search. The data structure decides feasibility: a trie shares prefixes (O(L) descent, corpus-size-independent), but ranked completions over a head prefix's huge subtree force you to materialize top-k per node (O(L+k)) and serve from an immutable compressed structure (FST / succinct trie). Ranking starts at MPC (pure log counts), then blends recency/trending, context, and personalization, with diversity dedup and a hard safety veto. The QPS storm is tamed by debouncing and caching the Zipf head (5–10× backend reduction), not by a faster trie. Coverage of unseen prefixes comes from n-gram backoff and title/catalog synthesis. Spelling extends lesson 41's noisy channel with bounded-edit-distance candidate generation and keyboard-aware costs, deciding autocorrect vs suggest vs fallback on the posterior margin and the original's result count. And because a completion is the engine proposing words, safety overrides popularity. Next, <a href="47_personalization_ecommerce.html">lesson 47</a> takes the personalization and facet signals introduced here into full personalized and e-commerce/marketplace search.
+</div>
+
+<footer class="lesson-nav">
+  <a href="45_semantic_reranking.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">Multi-stage &amp; semantic reranking</span>
+  </a>
+  <a class="next" href="47_personalization_ecommerce.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">Personalized &amp; e-commerce/marketplace search</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  // ---- toy query log: completion -> {all: all-time count, rec: last-24h count} ----
+  var LOG = {
+    "iphone":      {all:900, rec:300},
+    "iphone 15":   {all:220, rec:550},
+    "ipad":        {all:540, rec:100},
+    "ip address":  {all:60,  rec:40},
+    "ipl":         {all:30,  rec:10},
+    "ireland":     {all:45,  rec:20},
+    "facebook":    {all:1200,rec:400},
+    "facebook login":{all:300,rec:80},
+    "fastly":      {all:40,  rec:15},
+    "fashion nova":{all:90,  rec:200},
+    "new york times":{all:260,rec:120},
+    "new york weather":{all:140,rec:300},
+    "new balance": {all:110, rec:60},
+    "netflix":     {all:800, rec:350}
+  };
+
+  // ---- build a trie (char-level) over the log keys ----
+  function newNode(){ return {ch:{}, term:false, key:null}; }
+  var ROOT = newNode();
+  Object.keys(LOG).forEach(function(q){
+    var n = ROOT;
+    for (var i=0;i<q.length;i++){
+      var c = q[i];
+      if (!n.ch[c]) n.ch[c] = newNode();
+      n = n.ch[c];
+    }
+    n.term = true; n.key = q;
+  });
+
+  function esc(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+
+  // descend to prefix node, counting hops
+  function descend(prefix){
+    var n = ROOT, hops = 0;
+    for (var i=0;i<prefix.length;i++){
+      var c = prefix[i];
+      if (!n.ch[c]) return {node:null, hops:hops};   // dead prefix
+      n = n.ch[c]; hops++;
+    }
+    return {node:n, hops:hops};
+  }
+
+  // collect all terminals in subtree (DFS), counting nodes visited
+  function collect(node){
+    var out = [], visited = 0;
+    (function dfs(n){
+      visited++;
+      if (n.term) out.push(n.key);
+      for (var c in n.ch) dfs(n.ch[c]);
+    })(node);
+    return {terminals:out, visited:visited};
+  }
+
+  function render(){
+    var prefix = (document.getElementById("ac-input").value || "").toLowerCase();
+    var useRec = document.getElementById("ac-recency").checked;
+
+    var d = descend(prefix);
+    var body = document.getElementById("ac-body");
+    var lbl  = document.getElementById("ac-label");
+
+    if (prefix.length === 0){
+      document.getElementById("ac-nodes").textContent = "0";
+      document.getElementById("ac-cand").textContent  = "0";
+      document.getElementById("ac-lat").textContent   = "—";
+      document.getElementById("ac-top").textContent   = "—";
+      lbl.textContent = "Completions";
+      body.innerHTML = '<span style="color:var(--text-mute)">type a prefix…</span>';
+      return;
+    }
+
+    if (!d.node){
+      // cold prefix: backoff demo on last token
+      document.getElementById("ac-nodes").textContent = d.hops + " (dead at " + d.hops + ")";
+      document.getElementById("ac-cand").textContent  = "0";
+      document.getElementById("ac-lat").textContent   = "~" + (0.3 + d.hops*0.05).toFixed(2) + " ms";
+      document.getElementById("ac-top").textContent   = "(none)";
+      lbl.textContent = "Cold prefix — no trie node";
+      body.innerHTML = '<span style="color:var(--bad)">prefix "<strong>'+esc(prefix)+'</strong>" has no node in the trie</span>'
+        + '<br><span style="color:var(--text-mute)">production fallback: n-gram backoff to the last token, or synthesize candidates from catalog/titles (lower prior). Empty autocomplete is a missed assist.</span>';
+      return;
+    }
+
+    var col = collect(d.node);
+    var cands = col.terminals;
+
+    // total counts for normalization
+    var totAll = 0, totRec = 0;
+    cands.forEach(function(k){ totAll += LOG[k].all; totRec += LOG[k].rec; });
+
+    function score(k){
+      if (!useRec) return LOG[k].all;                 // pure MPC
+      var sa = LOG[k].all / (totAll||1);
+      var sr = LOG[k].rec / (totRec||1);
+      return 0.5*sa + 0.5*sr;                          // blend (normalized shares)
+    }
+
+    var ranked = cands.slice().sort(function(a,b){ return score(b) - score(a); });
+
+    // diversity: dedupe completions sharing the same first word root, keep at most 2
+    var rootCount = {}, shown = [];
+    ranked.forEach(function(k){
+      var root = k.split(" ")[0];
+      rootCount[root] = (rootCount[root]||0) + 1;
+      if (rootCount[root] <= 2) shown.push(k);
+    });
+    shown = shown.slice(0, 5);
+
+    // KPIs
+    document.getElementById("ac-nodes").textContent = d.hops;
+    document.getElementById("ac-cand").textContent  = cands.length;
+    // toy latency: descent hops + subtree visited nodes
+    var latMs = 0.3 + d.hops*0.05 + col.visited*0.01;
+    document.getElementById("ac-lat").textContent   = "~" + latMs.toFixed(2) + " ms";
+    document.getElementById("ac-top").textContent   = shown.length ? shown[0] : "(none)";
+
+    lbl.textContent = useRec ? "Completions (recency blend λ=0.5)" : "Completions (MPC — pure popularity)";
+
+    var rows = shown.map(function(k, i){
+      var sc = useRec ? (score(k)).toFixed(3) : LOG[k].all;
+      var trending = useRec && (LOG[k].rec/(totRec||1)) > (LOG[k].all/(totAll||1)) ? ' <span class="tag reward">▲ trending</span>' : '';
+      return '<div>'+(i+1)+'. <strong>'+esc(k)+'</strong> '
+        + '<span style="color:var(--text-mute)">'+(useRec?'blend='+sc:'count='+sc)
+        + ' &nbsp;(all '+LOG[k].all+' / 24h '+LOG[k].rec+')</span>'+trending+'</div>';
+    });
+    var dropped = cands.length - shown.length;
+    var note = dropped>0 ? '<div style="color:var(--text-mute); margin-top:4px;">+'+dropped+' more in subtree (capped to top-5, diversity-deduped by root word)</div>' : '';
+    body.innerHTML = (rows.join("") || '<span style="color:var(--text-mute)">no completions</span>') + note;
+  }
+
+  document.getElementById("ac-input").addEventListener("input", render);
+  document.getElementById("ac-recency").addEventListener("change", render);
+  Array.prototype.forEach.call(document.querySelectorAll("#ac-widget .chip"), function(b){
+    b.addEventListener("click", function(){
+      document.getElementById("ac-input").value = b.getAttribute("data-q");
+      render();
+    });
+  });
+  render();
+})();
+</script>
+
+</body>
+</html>
