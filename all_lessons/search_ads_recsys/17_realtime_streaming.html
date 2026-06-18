@@ -83,6 +83,26 @@
   Push work <em>left</em> (toward offline) as far as the freshness SLA allows — left is cheaper and safer. Pull it <em>right</em> (toward online) only as far as freshness demands. A 90-day CTR aggregate belongs offline. "Likes in the last 60 seconds on this video" belongs nearline. "Which 300 of these 1000 candidates does the model score highest right now" belongs online. Most real-time engineering is moving one feature one plane to the right and paying for it.
 </div>
 
+<h2>Three inference topologies — and when each fits</h2>
+
+<p>The three planes tell you where a <em>feature</em> lives. A separate, easily-conflated question is where the <em>scoring</em> happens: when a request lands, do you compute the model output synchronously, look up a precomputed one, or hand the work to a queue and poll for it later? There are three topologies, and they trade the same currency — freshness against latency against blast radius. The mistake is picking one for the whole system; the senior move is picking one <em>per funnel stage</em>.</p>
+
+<table>
+  <thead><tr><th>Topology</th><th>Mechanism</th><th>Latency</th><th>Buys you</th><th>Failure mode</th></tr></thead>
+  <tbody>
+    <tr><td><strong>(a) Pure online</strong></td><td>Request hits the model service directly; features fetched and the model run synchronously in the request path.</td><td>variable, model-bound (tens–hundreds of ms)</td><td>Freshest possible scores — the live click sequence is in the features the model just read.</td><td>QPS-capped by model compute; a slow or down feature store stalls the <em>whole</em> request — a hard availability dependency with no slack.</td></tr>
+    <tr><td><strong>(b) Precompute + online correction</strong></td><td>Offline produces a <strong>base score</strong> per candidate; online a light model (an LR / logit adjustment on a few live features) <em>corrects</em> it. Score = base + Δ.</td><td><strong>stable &lt; 50ms</strong></td><td>A flat, predictable latency profile — the heavy model ran offline, online does cheap arithmetic on a handful of features.</td><td>Weak long-tail and cold-start coverage: a candidate with no precomputed base has nothing to correct. Real-time feature coverage is limited to whatever the light head consumes.</td></tr>
+    <tr><td><strong>(c) Async-queue (nearline)</strong></td><td>Request → Kafka → Flink computes → writes a result cache; the client <strong>polls</strong> for the finished list.</td><td><strong>second-level</strong> end-to-end</td><td>Smooths traffic spikes — the queue absorbs a burst (削峰填谷, "shave the peak, fill the valley") so the compute tier sees a flat rate. Fits heavy re-ranking that doesn't need to be instant.</td><td>Seconds of end-to-end lag, and the cached result can be <em>stale</em> by the time it is read — you must handle result expiry, not just latency.</td></tr>
+  </tbody>
+</table>
+
+<p>Worked latency, same ranker, three topologies. Say the heavy model is <span class="math">35ms</span> of compute, a feature-store fetch is <span class="math">10ms</span>, and a light LR correction is <span class="math">3ms</span>. <strong>(a)</strong> spends <span class="math">10 + 35 = 45ms</span> synchronously and inherits the full variance of both — a feature-store P99 of 40ms drags the request P99 with it. <strong>(b)</strong> spends <span class="math">10 + 3 = 13ms</span> online (the 35ms ran offline, off the clock), comfortably under the &lt;50ms line and almost flat because there is no heavy compute left to spike. <strong>(c)</strong> returns in milliseconds (just "accepted, poll later") but the <em>answer</em> arrives ~1–3s later when Flink drains the queue — fine for a feed refresh, fatal for the first screen.</p>
+
+<div class="callout ok">
+  <div class="label">The hybrid-by-funnel rule</div>
+  Don't choose one topology — choose per <a href="13_user_behavior_sequences.html">funnel</a> stage. <strong>Fine-rank (精排) → pure online (a):</strong> it scores only a few hundred survivors and the marginal value of fresh signal is highest exactly where the decision is made, so pay the synchronous cost. <strong>Retrieval (召回) → precompute (b):</strong> it touches thousands–millions of candidates where per-item online compute is unaffordable and a slightly stale base score is good enough — precompute embeddings/ANN offline and correct lightly. <strong>Heavy re-rank or non-critical surfaces → async-queue (c)</strong> when second-level latency is acceptable and you want the queue to absorb spikes. The rule rhymes with the placement rule above: the deeper into the funnel (fewer items, higher stakes), the further right you push the <em>scoring</em>, just as you push the freshest <em>features</em> right. Note (b)'s base-score precompute and (c)'s Flink stage are the same nearline machinery this lesson already describes — these are not new systems, just new wiring of the log and store. Where the precomputed scores live and how the embedding tables behind them are swapped without a read stall is engineered in <a href="18_deployment_serving.html">18 · Deployment</a>.
+</div>
+
 <h2>The streaming substrate — log + processor</h2>
 
 <p>The nearline plane is built on two pieces that recur in every design: an <strong>append-only log</strong> (Kafka) and a <strong>stream processor</strong> (Flink, or Kafka Streams / Spark Structured Streaming).</p>
@@ -151,6 +171,38 @@
 <div class="callout warn">
   <div class="label">Online learning does not replace A/B testing — it makes it harder</div>
   Faster updates do not mean faster <em>verdicts</em>. An online-learning model is a moving target, so you still gate it behind an <a href="08_evaluation.html">A/B test</a> with guardrail metrics (diversity, freshness, negative-feedback rate) and a long-running <strong>holdout</strong> to catch slow-burn damage — a feed that is more engaging today but emptier in a month. Speed of adaptation and rigor of evaluation are independent axes; real-time tempts you to trade the second for the first.
+</div>
+
+<h3>Operating the loop — the machinery that keeps it alive</h3>
+
+<p>The dangers above are not arguments against online learning; they are the spec for the operational scaffolding it needs. A production loop has four mechanisms, each answering one of the failure modes directly.</p>
+
+<p><strong>1 · Tiered drift detection → graded action.</strong> Watch the input distribution with a <a href="18_deployment_serving.html">Population Stability Index</a> on a sliding window (per-segment baselines, since "new users" and "power users" drift differently), with a KS test (continuous features) or chi-square (categorical) to confirm the shift is significant rather than sampling noise. The response is <em>graded by severity</em>, not a single tripwire — over-reacting to noise is as costly as missing a real shift:</p>
+
+<table>
+  <thead><tr><th>PSI band</th><th>Reading</th><th>Action</th></tr></thead>
+  <tbody>
+    <tr><td><span class="math">5% ≤ PSI &lt; 10%</span></td><td>mild covariate shift — watch</td><td>Re-evaluate feature importance; log it, no intervention. Most diurnal drift lives here.</td></tr>
+    <tr><td><span class="math">10% ≤ PSI ≤ 20%</span></td><td>meaningful shift — alert</td><td>Trigger an online A/B comparing the drifted model against the last stable one; let the metric decide.</td></tr>
+    <tr><td><span class="math">PSI &gt; 20%</span> + metric drop</td><td>shift is hurting users</td><td><strong>Forced rollback</strong> to the last stable checkpoint. The conjunction matters: PSI alone may be a benign distribution change; PSI <em>and</em> a falling business metric is corruption.</td></tr>
+  </tbody>
+</table>
+
+<p>Recall PSI is <span class="math">Σ (pᵢ − qᵢ) · ln(pᵢ / qᵢ)</span> over bins, where <span class="math">p</span> is the live distribution and <span class="math">q</span> the training baseline. A feature that moved 8% of its mass from one decile into an adjacent one lands around <span class="math">PSI ≈ 0.06</span> — squarely in the "watch" band, exactly the no-op case you want the threshold to absorb so the loud bands stay meaningful.</p>
+
+<p><strong>2 · Swap models by interpolation, not by flip.</strong> An online learner produces a new weight vector continuously, but slamming <span class="math">θ_old → θ_new</span> in one step makes the ranking lurch — yesterday's feed and this second's feed disagree, and the user sees the seam. Ramp it instead, blending the two parameter sets and walking the mix:</p>
+
+<p class="math block">θ = α·θ_new + (1 − α)·θ_old, &nbsp; α: 0 → 1 over the ramp</p>
+
+<p>At <span class="math">α = 0.1</span> the served model is 90% the trusted old weights and 10% the new — a 10% nudge, not a jump — and you step <span class="math">α</span> up (say <span class="math">0.1 → 0.3 → 0.6 → 1.0</span>) only while guardrail metrics hold. If a step degrades them, you walk <span class="math">α</span> back down; the rollback is continuous, not a cliff. (This is the parameter-space cousin of the traffic-ramp canary in <a href="18_deployment_serving.html">18 · Deployment</a> — there you ramp the <em>fraction of users</em>; here you ramp the <em>weights themselves</em>.)</p>
+
+<p><strong>3 · Sync to the parameter server safely.</strong> The online learner doesn't serve directly — it pushes updated parameters to the serving parameter server (PS) on a cadence, typically <strong>~5 minutes</strong>, not per-example (per-example sync would hammer the PS and couple serving latency to training noise). Two guards on every sync: a <strong>double-buffer</strong> so reads never block on the write (serve buffer A, write buffer B, atomic pointer flip — the embedding-table buffering engineering is canonical in <a href="18_deployment_serving.html">18 · Deployment</a>; don't re-derive it), and a <strong>dimension-consistency check</strong> before the flip — if a feature was added or the hash space resized, the new parameter block's shape won't match the serving graph's expectation, and swapping it in would silently corrupt every score. Check shape, then flip; mismatch aborts the swap and keeps the old buffer live.</p>
+
+<p><strong>4 · Periodically retrain from scratch.</strong> An online loop trained only on its own freshly-served traffic drifts into a <strong>local optimum</strong>: it keeps exploiting the slice of the catalog it already favors, the feedback loop ossifies those weights, and it forgets how to value anything it stopped showing. The escape is a <em>periodic full retrain</em> on the broad historical log (the offline plane's job, T+1 or weekly) that re-anchors the weights on the whole distribution, then hands a fresh, unbiased checkpoint back to the online loop to continue from. Online learning tracks the fast-moving present; the full retrain stops it from confusing "what I've been showing" with "what is good."</p>
+
+<div class="callout warn">
+  <div class="label">Freshness is also tiered under a hard latency cap</div>
+  Not every feature earns the same sync urgency. Core signals (the live interaction sequence) target sub-second-to-300ms freshness because the model is acutely sensitive to them; non-core, slow-moving features (long-horizon interest) can tolerate seconds-old values without measurable loss. Spend the tight freshness budget where the gradient is steep — the same "push right only as far as freshness demands" logic, now applied to update <em>cadence</em> rather than plane placement.
 </div>
 
 <h2>The latency budget — arithmetic, not vibes</h2>
@@ -228,6 +280,8 @@
     <li>"Should we do online learning? What goes wrong?" <em>(Adapts in minutes, but: feedback loops tighten popularity bias; one bad batch poisons weights with no overnight checkpoint; labels are delayed and bias toward fast signals. Mitigate with IPS, gradient/LR caps, anomaly detection, instant rollback — and you still A/B + holdout.)</em></li>
     <li>"Your P99 latency just blew the 200ms SLA. How do you diagnose and fix it?" <em>(It is additive and in series: profile per-stage, check tail not mean, suspect fan-out — slowest of N backends. Fixes: distill the ranker, fetch fewer candidates, precompute a feature into the nearline store, hedge requests, add timeout + stale fallback.)</em></li>
     <li>"Why P99 and not mean latency for the budget?" <em>(Fan-out: a request waits on the slowest of many parallel reads. 1 − 0.99¹⁰⁰ ≈ 63% of requests touch a slow backend. The mean hides this; the SLA must be written on the tail.)</em></li>
+    <li>"Pure online, precompute+correct, or async-queue for inference — and would you pick one?" <em>(Never one system-wide. Pure online = freshest, model-bound latency, hard feature-store dependency → fine-rank. Precompute base + light online correction = stable &lt;50ms but weak cold-start → retrieval. Async-queue (Kafka→Flink→poll) = second-level latency, smooths spikes, risks stale results → heavy/non-critical re-rank. State the hybrid-by-funnel rule: push scoring right as the funnel narrows.)</em></li>
+    <li>"You're running online learning. Walk me through what happens between a label landing and the served model changing." <em>(Streaming label → incremental weight update; drift watched by tiered PSI (5–10% watch / &gt;10% A/B / &gt;20% + metric-drop → forced rollback) with KS/chi-square for significance. Sync to PS ~every 5 min — not per-example — behind a double-buffer + dimension-consistency check. Swap by interpolation θ=αθ_new+(1−α)θ_old with α ramped 0→1, walked back if guardrails dip. And a periodic full retrain to escape the feedback-loop local optimum.)</em></li>
   </ol>
 </div>
 

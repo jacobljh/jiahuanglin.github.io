@@ -91,6 +91,22 @@
   Kafka orders messages within a partition only. If "last 20 actions by user" matters, partition by user_id or implement explicit reordering downstream.
 </div>
 
+<h3>4.1 · Size the partition count from throughput, not from a guess</h3>
+
+<p>The partition count is the one Kafka number an interviewer can check arithmetically, so derive it instead of saying "a lot." A single partition has a practical write+consume ceiling of roughly <span class="math">10\ \text{MB/s}</span> (it is one append-only log served by one broker thread and drained by one consumer in the group). So the floor is set by raw throughput and the parallelism you need:</p>
+
+<span class="math block">P \ge \max\!\left(\frac{T_{\text{peak}}}{c_{\text{partition}}},\ N_{\text{consumers}}\right)</span>
+
+<p>Worked example. A click-and-play firehose peaks at <span class="math">50\ \text{MB/s}</span>. Throughput alone needs <span class="math">50 / 10 = 5</span> partitions. But the Flink job that drains it runs at parallelism 8, and a partition can only feed one consumer in a group at a time — so 5 partitions would idle 3 of those 8 slots. Take the max: <strong>8</strong>. Then pre-provision ~20% headroom for a promo spike, so create <strong>10</strong>. Going much higher is not free: every partition is open file handles, replication traffic, and one more entry the controller tracks during a rebalance, so thousands of near-empty partitions slow leader election and lengthen rebalances. Match the count to <span class="math">P = \lceil \tfrac{T_{\text{peak}}}{c_{\text{partition}}} \rceil</span> with consumer-parallelism and a spike buffer, not to a round number.</p>
+
+<p>Three more decisions ride on the same throughput thinking:</p>
+
+<ul>
+  <li><strong>Compression.</strong> Enable <code>compression.type=snappy</code> on the producer. Recommendation event payloads, especially ones carrying serialized video or multimodal feature vectors, are large and compress well; Snappy trades a little CPU for materially less network and disk, which is what actually lifts the per-partition ceiling under bursty traffic.</li>
+  <li><strong>Consumer-group-per-use isolation.</strong> Give each downstream a separate <code>group.id</code> — feature computation, A/B logging, and offline archival read the same topic through independent groups. A slow A/B-logging sink then cannot stall feature computation, and one group's rebalance does not pause the others. Sharing a group across unrelated jobs couples their failure modes.</li>
+  <li><strong>Strong-consistency streams go the other way.</strong> A model-parameter or counter update that must be globally ordered wants a <em>single</em> partition with high replication, not many partitions — you are buying ordering and durability, not parallelism.</li>
+</ul>
+
 <h2>5 · Flink turns events into stateful features</h2>
 
 <p>The book's Flink sections emphasize event time, windows, state, watermarks, joins, and exactly-once semantics. Translate them to recommender features:</p>
@@ -106,9 +122,67 @@
   </tbody>
 </table>
 
-<p>Watermarks answer: how long will the job wait for late events before closing a window? State TTL answers: how long should old behavior remain in memory? Checkpoints answer: how do we recover after failure without losing state or double-processing offsets?</p>
+<p>Watermarks answer: how long will the job wait for late events before closing a window? State TTL answers: how long should old behavior remain in memory? Checkpoints answer: how do we recover after failure without losing state or double-processing offsets? Watermark semantics and the end-to-end exactly-once mechanism live in <a href="17_realtime_streaming.html">17 · real-time streaming</a>; this section is about how the stateful operator is actually built.</p>
 
-<h2>6 · Exactly-once is end to end, not a slogan</h2>
+<h3>5.1 · How a sliding window is actually built in Flink</h3>
+
+<p>"Keyed state and a window" is the headline; the implementation is a <code>KeyedProcessFunction</code> plus a state primitive plus a timer. The shape an interviewer wants to see:</p>
+
+<div class="ascii">stream
+  .keyBy(e -&gt; e.userId)                       // colocate one user's events on one task
+  .process(new ProcessFunction() {
+      // option A: ListState&lt;Event&gt;  -- replay the window each fire
+      // option B: MapState&lt;behaviorType, runningCount&gt; -- keep aggregates, no replay
+
+      processElement(event, ctx, out):
+          state.add(event)                       // or bump the MapState counter
+          ctx.timerService().registerEventTimeTimer(
+              event.ts + WINDOW_MS)              // fire WINDOW_MS after this event time
+
+      onTimer(ts, ctx, out):                     // watermark passed ts -> window closes
+          ctr = clicks(state) / impressions(state)
+          out.collect(userId, ctr)               // emit feature
+          evictOlderThan(ts - WINDOW_MS, state)  // bound the state
+  })</div>
+
+<p>The two state choices trade memory for CPU. <strong>ListState</strong> stores every raw event and recomputes on each timer fire — simple, but a hot user with thousands of events per minute makes every fire <span class="math">O(n)</span> and the state large. <strong>MapState&lt;behaviorType, count&gt;</strong> keeps running aggregates so the timer just reads a handful of counters — <span class="math">O(1)</span> per fire and far smaller — at the cost of not being able to recompute arbitrary windowed statistics later. Default to MapState for count/CTR-style features; reach for ListState only when you genuinely need the raw sequence (e.g. a Transformer behavior encoder).</p>
+
+<table>
+  <thead><tr><th>Need</th><th>Primitive</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Running CTR / counts per type</td><td><code>MapState&lt;type,count&gt;</code></td><td>O(1) update + read, compact</td></tr>
+    <tr><td>Last-N raw actions for a sequence model</td><td><code>ListState&lt;Event&gt;</code></td><td>Order preserved; accept O(n) and larger state</td></tr>
+    <tr><td>Single rolling value (e.g. EMA watch-time)</td><td><code>ValueState&lt;Double&gt;</code></td><td>One slot per key</td></tr>
+    <tr><td>Approximate unique viewers on a hot item</td><td><code>ValueState</code> holding a <strong>HyperLogLog</strong></td><td>Exact UV set explodes; HLL is a few KB at ~1-2% error</td></tr>
+  </tbody>
+</table>
+
+<p><strong>Bound it with TTL.</strong> Keyed state never expires on its own — a user who churns leaves their state resident forever, and across millions of dead keys that is the classic streaming memory leak. Attach a <code>StateTtlConfig</code> (say 24h, updated on write) so idle keys are reclaimed. The event-time timer evicts <em>within</em> a live key's window; TTL reclaims the <em>whole</em> key once it goes quiet. You need both.</p>
+
+<h3>5.2 · RocksDB state backend and the checkpoint cost</h3>
+
+<p>For sessionization or hour-scale windows the total keyed state can run to tens of GB — far past the JVM heap. Switch to the <strong>RocksDB state backend</strong>: state lives in an embedded LSM store on local disk with the hot working set in memory, so the job is bounded by disk, not heap, and dodges GC pauses on large state. The price is per-access serialization (every read/write crosses the JVM↔RocksDB boundary), so for small state the heap backend is faster — pick RocksDB by state size, not reflexively.</p>
+
+<p>Checkpoint cost is the failure mode to name. A full checkpoint snapshots <em>all</em> keyed state to durable storage (HDFS/S3) every interval; as state grows, checkpoint duration grows with it, and a checkpoint that takes longer than its interval starves the next one and stalls progress. Two levers: <strong>incremental checkpoints</strong> (RocksDB ships only the SST files changed since the last checkpoint, turning an O(total-state) snapshot into O(delta)), and aggressive TTL/eviction so total state stays bounded in the first place. Worked intuition: 40 GB of state full-checkpointed every 60 s against a sink writing ~200 MB/s would need ~200 s just to flush — three intervals deep, permanently behind; the same job on incremental checkpoints ships only the ~hundreds of MB that actually changed and finishes in seconds. A jumping <em>checkpoint duration</em> in the Flink UI is therefore an early warning that state is unbounded or the sink is blocking — long before lag is visible.</p>
+
+<h2>6 · Serving a fast-changing encoding: the dynamic encoding store</h2>
+
+<p>One streaming output the lessons gesture at but rarely mechanize is the <em>encoding</em> for fast-changing categoricals — trending hashtags, freshly uploaded items, new creators. The feature definition is owned by <a href="35_feature_engineering_deep_dive.html">35 · feature engineering</a>; here we make the serving side concrete, because a new value appearing every few seconds breaks any static lookup table.</p>
+
+<p><strong>Two-tier store: Redis hot, HBase cold.</strong> Keep the active value→embedding (or value→id) map in a Redis cluster for sub-millisecond reads, and back the long-tail and historical mappings in HBase. An LRU eviction on the Redis tier bounds memory — without it the dictionary grows unbounded as new values arrive, the same leak as un-TTL'd Flink state. A read misses Redis, falls through to HBase, and warms the hot tier.</p>
+
+<p><strong>New-value path.</strong> A value seen for the first time has no trained embedding yet. Assign it a <em>temporary</em> hash code immediately so serving never blocks, and asynchronously train/backfill a dedicated embedding that replaces the placeholder once ready. Use <strong>consistent hashing</strong> for that placeholder so the same new value maps to the same code on every node — otherwise two servers encode "trending tag #X" differently and the model sees noise.</p>
+
+<p><strong>Double-buffer swap.</strong> When a batch job rebuilds the encoding table, do not mutate the live one in place — readers would see half-updated state. Hold two tables, write the refresh into the idle buffer, then atomically flip a pointer. Reads always hit a complete, self-consistent table; the swap is the lookup-table analogue of the embedding-table double-buffer used in serving.</p>
+
+<div class="callout">
+  <div class="label">The online/offline encoding-mismatch trap</div>
+  The classic bug: training encodes value→id with one (offline) dictionary, serving uses a different (online) one, and the model silently reads garbage for any value whose id disagrees — a train–serve skew that no accuracy metric explains. Fix it with <strong>encoding version control</strong>: stamp every encoding table with a version, log which version produced each training row, and have serving assert it is reading the matching version. Same discipline as the feature versioning in section 8's store row.
+</div>
+
+<p><strong>Dynamic numeric normalization, three tiers.</strong> The mirror problem for continuous features whose distribution drifts (watch-time during a holiday, a viral spike): a normalizer fit offline goes stale. Layer it. Offline T+1 computes global <span class="math">P_1/P_{99}</span> as a fallback. Near-line, a Flink job recomputes sliding-window (say 6h) quantiles every ~10 min and writes them into a <strong>Redis Sorted Set</strong>, whose rank operations give fast quantile lookup at serving time. Online, normalize over the user's last ~100 behaviors for personalization. Smooth the published stats with an EMA so a single spike does not jolt every feature, and on a near-line timeout degrade to the offline <span class="math">P_1/P_{99}</span> — the same labeled-fallback principle as the freshness cascade in section 10.</p>
+
+<h2>7 · Exactly-once is end to end, not a slogan</h2>
 
 <p>The book asks how Kafka-to-Flink pipelines achieve exactly-once. The precise answer is that each link must participate:</p>
 
@@ -122,7 +196,7 @@
 
 <p>If your sink is Redis, you may not get textbook exactly-once. You can still get operationally safe behavior with idempotent keys, deterministic window IDs, timestamps, and monotonic writes.</p>
 
-<h2>7 · Optimize throughput and offline storage together</h2>
+<h2>8 · Optimize throughput and offline storage together</h2>
 
 <p>The book's Spark/Hive material matters because real-time systems do not eliminate offline systems. Training, backfill, replay, audits, and daily user portraits still depend on efficient batch storage.</p>
 
@@ -139,7 +213,26 @@
   </tbody>
 </table>
 
-<h2>8 · Debug Kafka backlog and Flink backpressure linearly</h2>
+<p>The batch storage layout is where most teams quietly lose hours of training-pipeline time, so the Hive row deserves its mechanism. See <a href="29_data_engineering.html">29 · data engineering</a> for the columnar / partition-pruning fundamentals; the points below are the feature-table specifics.</p>
+
+<h3>8.1 · Hive feature-table storage tuning</h3>
+
+<p><strong>Two-level partition: date, then a user hash bucket.</strong> Partition by <code>dt=yyyyMMdd</code> at the top level and by <code>user_bucket = hash(user_id) % 50</code> underneath. The date level gives partition pruning for any time-windowed read; the user-bucket level does two things: it spreads load evenly even when a few power users dominate the raw logs (a plain <code>user_id</code> partition would skew badly and blow past partition limits), and it lets a user-level training join read just the matching bucket instead of scanning the whole day. Sizing matters — a too-fine bucket count recreates the small-files problem, a too-coarse one under-prunes. With 50 buckets and a 90-day retention you hold <span class="math">90 \times 50 = 4{,}500</span> partitions, comfortably inside the metastore budget below.</p>
+
+<div class="callout warn">
+  <div class="label">The metastore partition limit is a real failure mode</div>
+  Keep a single table under roughly <span class="math">100{,}000</span> partitions. Each partition is a row (plus file listings) the Hive metastore tracks, and on object storage (S3/OSS) every partition directory is extra metadata to list. Past the limit, query <em>planning</em> — not execution — slows to a crawl and the metastore becomes the bottleneck. A naive <code>dt</code> + <code>city</code> + <code>device</code> + per-hour scheme blows the budget fast; that is why the second level is a bounded hash bucket, not another open-ended dimension.
+</div>
+
+<p><strong>ORC + ZSTD over ORC + Snappy.</strong> Use ORC (columnar, so a feature read touches only the columns it needs) compressed with <code>ZSTD</code>. ZSTD gives a meaningfully better compression ratio than Snappy at a decompression speed close enough that read latency barely moves — so you pay less for storage and less for the IO that dominates a wide feature scan. Push it further per column type: dictionary encoding for sparse high-cardinality categoricals, and Delta+ZSTD double-compression for dense float arrays (embeddings). A ZSTD dictionary <em>trained</em> on your feature distribution can add roughly another <span class="math">30\%</span> over generic ZSTD.</p>
+
+<p><strong>Bloom filters for the point lookup.</strong> Set <code>orc.bloom.filter.columns=user_id</code>. The filter lets a reader skip entire ORC stripes that cannot contain the target user, turning a "find this user's rows" query from a full-partition scan into a few stripe reads — the difference between seconds and sub-second on a large daily partition.</p>
+
+<p><strong>Fight the small-files problem on cold data.</strong> Streaming-style or many-task writes produce thousands of tiny files per partition; each one is a separate open/seek and a metastore listing, so read throughput collapses even though the bytes are small. Set <code>hive.optimize.sort.dynamic.partition=true</code> so dynamic-partition writes are sorted and emit fewer, larger files, and periodically run <code>ALTER TABLE ... COMPACT 'major'</code> on cold partitions to merge the accumulated small files into one. This is the offline analogue of Flink's "bound the state" — left unmanaged, file count grows without limit.</p>
+
+<p><strong>When you need near-real-time partitions, switch table formats.</strong> Plain Hive partitions are append/overwrite only, so an incremental upsert (e.g. correcting a user's daily aggregate as late events land) means rewriting the partition. <strong>Hudi</strong> or <strong>Iceberg</strong> add row-level upsert/merge-on-read and built-in small-file compaction, letting the same table serve both the daily batch and a minute-scale incremental feed — at the cost of operating a more complex table format. Reach for them when the freshness contract from section 1 pushes a batch table toward near-real-time.</p>
+
+<h2>9 · Debug Kafka backlog and Flink backpressure linearly</h2>
 
 <p>The book asks about Kafka message accumulation and Flink backpressure. Use a fixed debugging path:</p>
 
@@ -163,7 +256,18 @@
   </tbody>
 </table>
 
-<h2>9 · Design degradation before the incident</h2>
+<h3>9.1 · The concrete commands and the tripwire</h3>
+
+<p>The ladder above is the reasoning; in the room name the actual instruments. <strong>Measure lag with <code>kafka-consumer-groups.sh</code></strong>: <code>kafka-consumer-groups.sh --describe --group feature-calc</code> prints, per partition, the current offset, the log-end offset, and the <code>LAG</code> between them. That per-partition column is exactly what tells the first two branches of the ladder apart — lag spread evenly across partitions means the consumer side is underprovisioned or the sink is slow; lag piled on one partition means a hot key (one user/item/creator hashing to that partition). For the Flink side, <strong>backpressure surfaces in the Flink Web UI</strong> as a per-operator indicator (the back-pressured operator is the one downstream of the red one), and rising <em>checkpoint duration</em> in the same UI flags the state/sink problem from section 5.2 before lag is even visible.</p>
+
+<div class="callout warn">
+  <div class="label">Tripwire: 5-minute partition lag → fall back to batch</div>
+  Set a hard alert on per-partition lag and treat <strong>lag &gt; 5&nbsp;min</strong> as the line where the real-time path is no longer real-time. Past it, do not let the ranker keep reading features that are silently quarter-hour-old: trip an automatic <strong>degrade to batch / near-real-time mode</strong> — serve the last good minute/hourly aggregate (the cascade in section 10) and page on-call — rather than pretending the stream is current. A stale feature labeled stale is recoverable; a stale feature served as live is a silent quality regression.
+</div>
+
+<p>Two fixes worth naming because they map to specific causes. A <strong>hot key</strong> (lag on one partition, a slow key in the Flink metrics) is fixed by two-stage aggregation (local pre-aggregate then global combine) or by splitting the key with salting / consistent-hash so one viral item no longer monopolizes a single task — the same hot-key remedy as the symptom table, now tied to the metric that revealed it. <strong>Large messages</strong> (video or multimodal feature payloads) inflating throughput are tamed with Snappy compression on the producer, as in section 4.1 — compression is both a throughput lever and a lag remedy.</p>
+
+<h2>10 · Design degradation before the incident</h2>
 
 <p>Realtime features fail. A feed should degrade to less fresh personalization, not fail open with corrupt values.</p>
 
@@ -184,6 +288,9 @@
     <li>"How do Kafka and Flink cooperate?" <em>Kafka buffers and persists streams; Flink consumes, windows, joins, maintains state, checkpoints offsets, and writes results to sinks.</em></li>
     <li>"What does exactly-once mean here?" <em>Checkpointed source offsets + state + transactional/idempotent sink + deterministic feature keys; it is end-to-end.</em></li>
     <li>"How do batch and stream features stay consistent?" <em>Shared definitions, event-time windows, feature versions, point-in-time backfills, daily correction, and train-serve parity checks.</em></li>
+    <li>"How many partitions for a topic carrying a 50 MB/s click firehose, drained by a parallelism-8 Flink job?" <em>Derive it: <span class="math">\max(50/10,\ 8) = 8</span> (per-partition ceiling ~10 MB/s, but a partition feeds only one consumer in a group), then ~20% headroom → 10. Name the cost of going higher — file handles, replication, slower rebalances/leader election — so it is not just "more is better."</em></li>
+    <li>"Your Flink job's keyed state keeps growing and checkpoints are getting slow. What's wrong and how do you fix it?" <em>Keyed state never self-expires, so churned keys leak — add a <code>StateTtlConfig</code> to reclaim idle keys, and evict within the window. Switch large state to the RocksDB backend and turn on incremental checkpoints so a snapshot ships only the changed SST files (O(delta), not O(total)); 40 GB full-checkpointed every 60s against a 200 MB/s sink needs ~200s and falls permanently behind. Prefer <code>MapState</code> aggregates over replaying a <code>ListState</code> on every fire.</em></li>
+    <li>"A user-level training join scans a whole day's Hive partition and takes forever. How do you lay the table out?" <em>Two-level partition: <code>dt</code> then <code>user_bucket = hash(user_id) % 50</code> so the join reads one bucket, not the day, and skew/partition-count stay bounded (keep a table under ~100k partitions or the metastore becomes the bottleneck). ORC+ZSTD over Snappy for ratio at near-equal decompress speed, <code>orc.bloom.filter.columns=user_id</code> to skip stripes, and <code>COMPACT 'major'</code> + sorted dynamic-partition writes to kill the small-files problem; Hudi/Iceberg if it must take incremental upserts.</em></li>
   </ol>
 </div>
 

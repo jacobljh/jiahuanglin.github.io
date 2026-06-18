@@ -50,7 +50,7 @@
                               │
         ══════════ SHUFFLE ═══╪═══  ◄── the expensive part:
         sort by key + move    │       disk write + network + sort,
-        every pair over net   │       all-to-all between map & reduce
+        every pair over net   │       all-to-all between map &amp; reduce
                               ▼
    REDUCE (one call per key)
    itemA → [1,1,1,1] → 4      ◄── a HOT key (viral item) sends a huge
@@ -93,6 +93,34 @@
 <div class="callout warn">
   <div class="label">The straggler is invisible in the averages</div>
   Dashboards that show mean CPU or mean task time will look healthy while one reducer runs 50× longer than the rest and holds the whole job hostage. The skew only shows up in the <em>max</em> (the p99 of per-task duration). If a batch job's runtime suddenly doubles with no data-volume change, suspect a newly-hot key before you suspect the cluster — and look at the slowest task, never the average.</div>
+
+<h3>The named tuning levers — and the failure mode each one fixes</h3>
+
+<p>Everything above is conceptual: shuffle is expensive, skew makes stragglers, salt the hot keys. In an interview the follow-up is always <em>"okay, what do you actually turn?"</em> Each Spark/Hadoop knob below exists to attack one of the failure modes already on the table — shuffle volume, skew, or the small-files problem. Anchor it to a real win: a feature build over <strong>2 TB of daily user-behavior logs (impression × user-stats join) went from 4 hours to 35 minutes</strong> after four changes — none of them touched the algorithm.</p>
+
+<table>
+  <thead><tr><th>Lever</th><th>What it does</th><th>Failure mode it fixes</th></tr></thead>
+  <tbody>
+    <tr><td><code>spark.sql.shuffle.partitions</code></td><td>count of post-shuffle partitions (default 200) — size it to the <em>shuffled</em> bytes, not the cluster core count</td><td>too few → giant partitions spill to disk / OOM; too many → scheduler overhead + tiny files. The default 200 is almost always wrong at TB scale.</td></tr>
+    <tr><td><code>persist(MEMORY_ONLY_SER)</code> vs <code>MEMORY_AND_DISK</code></td><td>cache the reused DataFrame; <code>_SER</code> stores a compact serialized blob in RAM, <code>_AND_DISK</code> spills the overflow instead of recomputing</td><td>re-reading / re-deriving the same dataset every pass (the iterative-ML problem above). <code>_SER</code> when it fits RAM tightly; <code>_AND_DISK</code> when it doesn't and recompute is costlier than a disk read.</td></tr>
+    <tr><td><strong>broadcast join</strong> (<code>broadcast(df)</code>)</td><td>ship the <em>small</em> side to every executor so the join is map-side — <strong>zero shuffle of the big side</strong></td><td>shuffling the skewed big table. This is the cleanest skew fix when the small side fits in executor memory (rule of thumb &lt; ~100 MB / <code>autoBroadcastJoinThreshold</code>).</td></tr>
+    <tr><td><strong>Bloom pre-filter</strong> on hot IDs</td><td>a probabilistic membership test that drops rows whose key can't match before they ever enter the shuffle</td><td>shuffling rows that will never join. Pre-filtering the big side against the join keys cuts shuffle volume directly (and ORC/Parquet bloom indexes do the same at scan time).</td></tr>
+    <tr><td><code>repartition(n)</code> vs <code>coalesce(n)</code></td><td><code>repartition</code> does a full shuffle to <em>n</em> even partitions; <code>coalesce</code> merges existing partitions with no shuffle but can leave them uneven</td><td>the <strong>small-files problem</strong> — thousands of tiny output files choke the next reader and the namenode. <code>coalesce</code> to <em>shrink</em> file count cheaply; <code>repartition</code> when you also need to rebalance skew.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <div class="label">Worked numbers — sizing <code>spark.sql.shuffle.partitions</code></div>
+  <p>The rule: <strong>target ~128 MB of shuffled data per partition</strong> (HDFS-block-aligned — big enough to amortize task launch, small enough to stay in memory and not spill). The arithmetic is just a division:</p>
+  <p class="math block">N<sub>partitions</sub> = shuffled_bytes / 128 MB</p>
+  <p>The trap is using the <em>raw</em> table size. Our join input is 2 TB on disk, so naively:</p>
+  <p class="math block">2 TB / 128 MB = 2,097,152 MB / 128 MB = 16,384 partitions</p>
+  <p>But the shuffle moves only what survives <strong>columnar projection + filtering</strong>, not the whole table. The join needs a handful of columns (<code>user_id</code>, <code>item_id</code>, <code>watch_time</code>, <code>label</code>) out of ~200 — Parquet reads ~1% of the bytes (see the columnar section below) — and an invalid-impression filter drops more. Say that leaves <span class="math">~256 GB</span> actually shuffled:</p>
+  <p class="math block">256 GB / 128 MB = 262,144 MB / 128 MB = 2,048 ≈ <strong>2000 partitions</strong></p>
+  <p>So <code>spark.sql.shuffle.partitions ≈ 2000</code> isn't a magic number — it's <span class="math">256 GB / 128 MB</span> rounded. Leaving the default <strong>200</strong> would have forced <span class="math">256 GB / 200 ≈ 1.3 GB</span> per partition: every reducer spills to disk and the 2 TB job crawls. <em>Always size from the post-shuffle bytes; recompute the divisor whenever the shuffled volume changes by more than ~2×.</em></p>
+</div>
+
+<p>Stacking these on the 2 TB job: a <strong>broadcast join</strong> of the small user-stats dimension table eliminated the big side's shuffle entirely; <code>spark.sql.shuffle.partitions=2000</code> right-sized the remaining shuffle so nothing spilled; <code>persist(MEMORY_AND_DISK)</code> kept the cleaned input resident across the multi-stage feature derivation instead of recomputing it; and <code>repartition(200)</code> on write collapsed thousands of tiny part-files into a clean output. Net: <strong>4 h → 35 min (≈ 7×)</strong>, no model change. On the Hadoop side the same instincts have older names — <code>mapreduce.task.io.sort.mb</code> and <code>mapreduce.reduce.shuffle.parallelcopies</code> tune the shuffle buffers, <strong>speculative execution</strong> relaunches a straggler's task on a second node, and <code>CombineFileInputFormat</code> is the small-files fix at read time. (Skew itself is fixed with <strong>salting</strong> — derived in the section above, not repeated here; broadcast and bloom pre-filter are the levers that let you avoid shuffling the skewed side in the first place. For the streaming-plane equivalents of these knobs — partition sizing, backpressure, state backends — see <a href="36_streaming_pipeline_ops.html">lesson 36</a>; for where these computed features physically land, see the columnar/partitioning section below and the feature deep-dive in <a href="35_feature_engineering_deep_dive.html">lesson 35</a>.)</p>
 
 <h2>Lambda vs Kappa — and the train–serve skew it causes</h2>
 
@@ -263,9 +291,11 @@
     <li>"Walk me through MapReduce and tell me which part is expensive and why." <em>(map → shuffle → reduce. Map and reduce are parallel and local; the shuffle is the only all-to-all step — it serializes intermediates to disk, sorts, and ships every record over the network so all values for a key co-locate. Minimizing shuffle volume — combiners, broadcast joins, columnar pruning — is the top batch optimization.)</em></li>
     <li>"Why did Spark replace Hadoop MapReduce for ML?" <em>(Hadoop materializes every stage to HDFS and re-reads disk each pass; ML is iterative, so that is 10–100× too slow. Spark keeps the working set in memory via RDD/DataFrame, a lazy DAG the optimizer can fuse, and lineage for recovery without replication. Cache the training matrix once, every gradient pass reads RAM.)</em></li>
     <li>"A batch job's runtime suddenly doubled with no extra data. What's your first hypothesis?" <em>(Data skew / a newly-hot key creating a straggler — job time = slowest task, which the averages hide. Look at the max/p99 per-task duration, not the mean. Fix with salting, partition tuning, or isolating hot keys; broadcast-join the small side so the skewed side isn't shuffled.)</em></li>
+    <li>"How would you size <code>spark.sql.shuffle.partitions</code>, and why is the default 200 usually wrong?" <em>(Target ~128 MB of shuffled data per partition: N = shuffled_bytes / 128 MB. Size from the POST-shuffle bytes — after columnar projection and filtering — not the raw table. A 2 TB table that prunes to ~256 GB shuffled wants ~2000 partitions; the default 200 forces ~1.3 GB each, which spills to disk and crawls. Recompute the divisor when shuffled volume changes &gt; ~2×.)</em></li>
+    <li>"Name the concrete Spark levers that took a 2 TB join from 4 h to 35 min, and which failure mode each fixes." <em>(Broadcast-join the small dimension table → zero shuffle of the skewed big side; spark.sql.shuffle.partitions=2000 → right-sized shuffle so nothing spills; persist(MEMORY_AND_DISK) → no recompute across the iterative feature derivation; repartition/coalesce on write → fixes the small-files problem. Bloom pre-filter drops non-matching rows before the shuffle. The point: every lever attacks shuffle volume, skew, or small files — no algorithm change.)</em></li>
     <li>"Lambda vs Kappa — and where does train–serve skew come from?" <em>(Lambda runs batch + speed layers in parallel, so the same feature is implemented twice and the two definitions drift — that gap IS train–serve skew. Kappa is one streaming codepath where 'batch' is just replaying the log from offset 0: one definition, no skew by construction. Principle: one feature, one definition.)</em></li>
     <li>"How do you build a training set without future leakage?" <em>(Point-in-time / as-of join: for each label at time t, attach the most recent feature snapshot with timestamp ≤ t — what we knew then, never what we know now. A naive join to current stats leaks future clicks, inflates offline AUC, and collapses in production. Suspect leakage when offline metrics jump suspiciously.)</em></li>
-    <li>"How do you catch a silently broken feature before it rots the model?" <em>(Assert the contract every run: schema/type, null-rate & range, distribution drift via PSI (>0.25 = significant), and freshness/volume bands. On the stream side, alert on Kafka consumer lag — a job that's alive but 20 min behind serves stale features with no crash. Nothing throwing an exception is the dangerous case.)</em></li>
+    <li>"How do you catch a silently broken feature before it rots the model?" <em>(Assert the contract every run: schema/type, null-rate &amp; range, distribution drift via PSI (>0.25 = significant), and freshness/volume bands. On the stream side, alert on Kafka consumer lag — a job that's alive but 20 min behind serves stale features with no crash. Nothing throwing an exception is the dangerous case.)</em></li>
     <li>"CTR is ~1% positive. How do you handle the imbalance, and why not SMOTE?" <em>(Negative undersampling with recalibration, class weights, or the preferred loss-level fix — focal / weighted BCE (lesson 05). SMOTE assumes a dense continuous space where interpolation is valid; recsys features are sparse, high-cardinality, one-hot/embedding, so synthesized 'between' points are nonsense. Respect the data structure.)</em></li>
   </ol>
 </div>

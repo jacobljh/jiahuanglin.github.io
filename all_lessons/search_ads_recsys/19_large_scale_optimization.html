@@ -38,6 +38,41 @@
   At scale a recommender stops being a model and becomes a memory-and-bandwidth budgeting problem. The embedding table dominates memory, the candidate count dominates latency, and the per-query FLOPs dominate the bill. Optimization is choosing which of the three to relax, and paying for it somewhere else.
 </div>
 
+<h2>The cascade is a compute budget — and why 粗排 exists</h2>
+
+<p><a href="01_funnel.html">01 · The funnel</a> introduces the four stages conceptually; this lesson owns the <em>engineering</em> of the one in the middle that beginners skip. The industrial pipeline is not retrieval → ranker. It is a <strong>four-stage cascade</strong>, and the whole point is that each stage spends compute <em>inversely</em> to how many candidates it sees: a cheap model on many items, an expensive model on few.</p>
+
+<div class="ascii">  召回 (retrieval)   粗排 (coarse-rank)   精排 (fine-rank)   重排 (rerank)
+   10⁸ ───────────▶  10³ ───────────────▶ 10² ────────────▶ 10¹
+   multi-route ANN    twin-tower DNN        heavy DLRM/MMoE   business rules
+   &lt; 50 ms            no cross features     cross + attention  diversity, dedup
+   cost/item: tiny     cost/item: small      cost/item: large   cost/item: n/a
+</div>
+
+<p>The arithmetic forces the shape. Suppose the heavy fine-ranker (精排) costs <span class="math">≈ 2 MFLOPs/candidate</span> (cross layers, attention towers, hundreds of features). Running it on the <span class="math">10³</span> survivors of retrieval is fine: <span class="math">10³ × 2×10⁶ = 2×10⁹ FLOPs/query</span>. Running it on all <span class="math">10⁸</span> retrieved items would be <span class="math">10⁸ × 2×10⁶ = 2×10¹⁴ FLOPs/query</span> — a <strong>100,000× blow-up</strong> that no SLO survives. So a stage <em>must</em> sit between retrieval and the heavy ranker to cut <span class="math">10³ → 10²</span> cheaply. That stage is the <strong>coarse-ranker (粗排)</strong>.</p>
+
+<div class="callout warn">
+  <div class="label">Why a distinct pre-ranker — why not just trust retrieval, or just run the heavy ranker?</div>
+  Two walls, one on each side. <strong>The heavy ranker can't afford 10³ docs</strong> — its per-candidate cost is built for ~10², so handing it a thousand candidates either blows the latency SLO or forces you to gut the model. <strong>Retrieval scores are too coarse to trust for the top-100 cut</strong> — multi-route recall merges ANN dot-products, popularity, and co-occurrence onto incomparable scales; using them to pick the 100 that reach 精排 throws away good items the heavy ranker would have loved. The coarse-ranker is the cheap arbiter that re-scores all 10³ on <em>one</em> consistent model so the 10² it forwards are the right 10².
+</div>
+
+<h3>Twin-tower with distillation — the coarse-ranker's design</h3>
+
+<p>The coarse-ranker's budget (~10–20 ms on <span class="math">10³</span> items) rules out the heavy ranker's trick of <strong>cross features</strong> — features that mix user and item (e.g. <code>user × item_category</code>), which must be recomputed for every (user, item) pair. With <span class="math">10³</span> pairs that is <span class="math">10³</span> fresh feature-crosses + forward passes per query: too slow. So the coarse-ranker is a <strong>twin-tower</strong> (双塔) net — a user tower and an item tower that never interact until a final dot-product:</p>
+
+<p class="math block">score(u, i) = <strong>e</strong>_user(u) · <strong>e</strong>_item(i)</p>
+
+<p>This is what makes it cheap. The item tower is <em>query-independent</em>: every item's vector <span class="math"><strong>e</strong>_item(i)</span> is precomputed offline and cached. At request time you run the user tower <em>once</em>, then score <span class="math">10³</span> items as <span class="math">10³</span> dot-products — <span class="math">10³ × d</span> multiply-adds, not <span class="math">10³</span> forward passes. At <span class="math">d = 64</span> that is <span class="math">10³ × 64 ≈ 6.4×10⁴ FLOPs/query</span> for the scoring, versus the heavy ranker's <span class="math">2×10⁹</span>. Cheap enough to score everything retrieval hands you.</p>
+
+<p>The accuracy cost of dropping cross features is recovered by <strong>distillation</strong> (the same teacher→student trick used later for serving): the heavy fine-ranker is the <em>teacher</em>, the twin-tower coarse-ranker is the <em>student</em>, and the student is trained to reproduce the teacher's <em>scores or ranking order</em> rather than just the raw click label. The coarse-ranker thus learns "what the expensive model would have said" within the limits of a dot-product — far better than training it on clicks alone.</p>
+
+<div class="callout bad">
+  <div class="label">The failure mode: coarse/fine inconsistency (粗排-精排不一致)</div>
+  The coarse and fine rankers can <em>disagree</em> — the coarse stage drops an item the fine ranker would have ranked #1, so the fine ranker never sees it. The expensive model is then optimizing over a candidate set the cheap model already corrupted, and its quality is silently capped by the coarse-ranker's mistakes. The fix is exactly the distillation target: <strong>train the coarse-ranker to mimic the fine-ranker's order</strong>, not the click label. Monitor the leak directly with <em>rank consistency</em> — e.g. how often the fine-ranker's top-K came from the coarse-ranker's top-M (M ≫ K). A collapsing overlap means the pre-ranker is throwing away the ranker's best candidates, and no amount of fine-ranker tuning can recover them.
+</div>
+
+<p>Retrieval itself is <a href="02_candidate_generation.html">02 · Candidate generation</a> (the multi-route 召回 that produces the <span class="math">10³</span>), and its dominant cost — the ANN dot-product — is the next several sections. The 重排 (rerank) stage is business rules and diversity, covered in <a href="20_fairness_diversity.html">20 · Fairness &amp; diversity</a>. From here on, "ranker" means the heavy 精排 model unless stated.</p>
+
 <h2>The embedding table is the elephant</h2>
 
 <p>From <a href="04_ranking_models.html">04 · Ranking models</a>, the headline fact: a modern ranker is an enormous sparse embedding store with a small dense network on top. Every high-cardinality ID — user, item, ad, author, query token — is a learned row in a table. The dense MLP is <em>megabytes</em>. The embedding table is <em>hundreds of gigabytes to terabytes</em>. Its size is pure multiplication:</p>
@@ -60,6 +95,27 @@
 <p>Embedding lookups are independent — a request for item <code>847,221,003</code> touches exactly one row — so the table shards cleanly by ID. Row <span class="math">i</span> lives on machine <span class="math">i mod S</span>. A forward pass gathers each example's IDs, routes each lookup to the shard that owns it, pulls the vectors back, and feeds them to the dense model; gradients scatter back the same way. This is <strong>embedding-table (model) parallelism</strong> — the reason large recommenders are a distributed key-value store of parameters, not a single checkpoint.</p>
 
 <p>The cost it creates is <em>communication</em>. Every step, every worker fetches vectors from every shard (the gather / all-to-all) and pushes gradients back (the scatter). That all-to-all traffic — not the matmuls — is the bottleneck of training a recommender at scale, and it forces the next decision.</p>
+
+<h3>Shrinking the table itself — hashing trick vs full embedding</h3>
+
+<p>Sharding makes the 1 TB table <em>fit</em>, but it does not make it <em>smaller</em> — you still pay for every row. The lever that shrinks the row count is how you map a billion IDs to embedding rows in the first place. Two options sit at opposite ends of a memory/accuracy trade-off:</p>
+
+<table>
+  <thead><tr><th></th><th>Full embedding table</th><th>Hashing trick</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Mapping</strong></td><td>Each ID owns a private row (a stored id→row map)</td><td><span class="math">row = hash(id) mod B</span> — no stored map</td></tr>
+    <tr><td><strong>Memory</strong></td><td><span class="math">cardinality × dim × bytes</span> — grows with every new ID</td><td><span class="math">B × dim × bytes</span> — <strong>fixed</strong>, independent of cardinality</td></tr>
+    <tr><td><strong>Accuracy</strong></td><td>Best — each ID is independently learnable</td><td>Lossy — IDs colliding into one bucket share a row, blurring their distinction</td></tr>
+    <tr><td><strong>Cold start</strong></td><td>New ID has no row → needs special handling</td><td>New ID hashes to an existing bucket → degrades gracefully, can't be fine-tuned alone</td></tr>
+  </tbody>
+</table>
+
+<p>The arithmetic is the whole argument. A full table for <span class="math">10⁹</span> item IDs at 64-dim fp32 is <span class="math">10⁹ × 64 × 4 = 256 GB</span>. Hash the same IDs into <span class="math">B = 10⁷</span> buckets and the table is <span class="math">10⁷ × 64 × 4 = 2.56 GB</span> — a <strong>100× shrink</strong>, flat no matter how many new IDs arrive. The bill is <em>collisions</em>: with <span class="math">10⁹</span> IDs in <span class="math">10⁷</span> buckets, roughly <span class="math">10⁹ / 10⁷ = 100</span> IDs share each row on average, so a hashed bucket is a blurred average of ~100 items that the model can no longer tell apart.</p>
+
+<div class="callout">
+  <div class="label">The head/tail hybrid — the trick everyone actually ships</div>
+  ID frequency is brutally skewed: a small head of popular IDs accounts for most traffic, and a vast tail is seen a handful of times each. So split by frequency. <strong>Head IDs (frequent) get private rows</strong> — they have enough data to learn a good embedding and they dominate impressions, so the collision cost there would be most visible. <strong>Tail IDs (rare) share hashed buckets</strong> — they would learn a noisy embedding anyway and rarely appear, so a collision barely registers. You spend full-table memory only where it pays. Online systems make this dynamic — a <strong>parameter server</strong> (or TFRA-style dynamic embedding) promotes a tail ID to a private row once it crosses a frequency threshold, so the head grows with the platform instead of being fixed at build time.
+</div>
 
 <h2>Two ways to do distributed training</h2>
 
@@ -116,6 +172,36 @@
 <p class="math block">512 bytes/vec → 16 bytes/vec ⇒ 32× compression | 512 GB → 16 GB (now fits on one GPU)</p>
 
 <p>The compression ratio is <span class="math">(d × 4) / m</span> bytes — choose <span class="math">m</span> and the codebook size to slide between memory and recall. Distances are computed against the codebook by table lookup, so PQ is fast <em>and</em> small. The price is reconstruction error — you compare against the centroid, not the original vector — which shaves a few points of recall. At a billion items, that deal is almost always worth taking.</p>
+
+<h2>ItemCF at scale — the O(N²) similarity matrix</h2>
+
+<p>Not every retrieval route is a learned embedding. A workhorse recall source is <strong>item-to-item collaborative filtering (ItemCF)</strong>: "users who interacted with this item also interacted with…", scored by a precomputed item–item similarity. It is a different memory trade-off from the embedding table — here the elephant is a <em>matrix</em>, and its cost is quadratic in the catalog.</p>
+
+<p>The full similarity matrix is <strong>O(N²)</strong>: every item against every other item. At <span class="math">N = 10⁷</span> items that is</p>
+
+<p class="math block">N² = (10⁷)² = 10¹⁴ entries — at 4 bytes each, 4×10¹⁴ B = 400 TB</p>
+
+<p>Infeasible to store, and infeasible to compute densely. But the matrix is mostly worthless: an item is meaningfully similar to only a few hundred others, and the rest of the row is near-zero noise. That observation is the whole optimization. Four moves turn 400 TB into something you can serve:</p>
+
+<table>
+  <thead><tr><th>Move</th><th>Mechanism</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Block by category</strong></td><td>Only compute similarity within a category / popularity bucket, not across the whole catalog</td><td>Splits one <span class="math">N²</span> into many small <span class="math">n²</span>; cross-block pairs (almost all of them) are never formed</td></tr>
+    <tr><td><strong>Top-K truncation</strong></td><td>Store only each item's <span class="math">K</span> most-similar neighbours (<span class="math">K = 100–500</span>), discard the rest of the row</td><td><span class="math">N×N → N×K</span> — see arithmetic below</td></tr>
+    <tr><td><strong>Incremental delta updates</strong></td><td>Recompute only rows touched by new behaviour (co-occurrence deltas), not the whole matrix nightly</td><td>Update cost scales with <em>activity</em>, not with <span class="math">N²</span></td></tr>
+    <tr><td><strong>Serve via ANN</strong></td><td>Treat each item's neighbour list as vectors; online "find similar items" becomes a FAISS lookup</td><td>Reuses the ANN machinery above — no bespoke serving path</td></tr>
+  </tbody>
+</table>
+
+<p>The top-K truncation is the load-bearing step. Keep <span class="math">K = 200</span> neighbours per item instead of the full row of <span class="math">N</span>:</p>
+
+<p class="math block">N × K × (4 + 4) bytes = 10⁷ × 200 × 8 = 1.6×10¹⁰ B ≈ 16 GB</p>
+
+<p>(4 bytes for the neighbour's item-id, 4 for the similarity score.) <strong>400 TB → 16 GB</strong>, a ~25,000× shrink, and it now fits in RAM and serves as a vector lookup. The cost is exactly what truncation always costs: you lose the long-tail similarities below rank <span class="math">K</span> — but those were the near-zero noise you wanted gone, so for ItemCF the deal is almost free. The pattern generalizes to any precomputed co-occurrence matrix: <em>block, truncate to top-K, update by deltas, serve through the ANN index.</em></p>
+
+<h3>Graph importance-pruning for recall</h3>
+
+<p>A graph recall route (user–item bipartite graph, propagate to find candidates — see <a href="24_gnn.html">24 · GNN</a>) has the same disease in edge form: a dense graph has too many edges to propagate over in the latency budget. The fix mirrors top-K truncation but on <em>edges</em>: score each edge's importance — e.g. with <strong>Random-Walk-with-Restart (RWR)</strong> visit probability — and <strong>prune low-weight edges before propagation</strong>, keeping only edges above a threshold (or each node's top-K edges). Production graph-recall systems report pruning on the order of <strong>95% of edges</strong> while preserving the high-importance paths that actually carry signal — turning an intractable propagation into a cheap one, the same precompute-and-truncate trade-off applied to graph structure rather than a matrix.</p>
 
 <h2>Interactive · ANN recall vs latency vs RAM</h2>
 
@@ -220,6 +306,9 @@
     <li>"How does PQ get 32× compression, and what does it cost?" <em>(Split 128-dim vector into m=16 sub-vectors, store the 1-byte index of the nearest of 256 centroids each: 512 → 16 bytes. Cost is reconstruction error — you compare against centroids — losing a few points of recall.)</em></li>
     <li>"Ranking is too slow at 1,000 candidates × 100k QPS. Three things you'd try, with the accuracy cost of each?" <em>(Quantize fp32→int8: 2–4× faster, tiny cost with calibration. Distill teacher→student: 10–100× fewer params, small gap. Prune weights/experts: smaller, low cost if gradual but needs sparse kernels. They stack: distill, then int8, then fuse.)</em></li>
     <li>"You add a 60% cache hit-rate to the heaviest stage. What happens to its cost, and what's the risk?" <em>((1 − h) = 40% of the original bill on that stage. Risk is staleness — TTL trades freshness for cost; too long and you serve stale lists into a fast-moving feed.)</em></li>
+    <li>"Why is there a coarse-ranker (粗排) between retrieval and the heavy ranker — couldn't you just run the good model on all retrieved candidates?" <em>(Heavy ranker is ~2 MFLOPs/candidate, built for ~10²; on 10³ retrieved items that's a 100,000× blow-up vs running it on the survivors, and merged multi-route retrieval scores are on incomparable scales so you can't trust them for the top-100 cut. The coarse-ranker is a cheap twin-tower — item vectors precomputed, score = one user-tower pass + 10³ dot-products, no cross features — distilled from the fine-ranker so it learns "what the expensive model would say." Failure mode: coarse/fine inconsistency — it drops items the fine ranker would have loved, capping quality; fix by training on the fine-ranker's order and monitoring top-K overlap.)</em></li>
+    <li>"ItemCF at 10⁷ items — the similarity matrix is 400 TB. How do you serve it?" <em>(O(N²) is mostly noise; an item is similar to only a few hundred others. Block by category so cross-block pairs never form; truncate to top-K=100–500 neighbours per item → N×K not N×N → ~16 GB at K=200; update incrementally from behaviour deltas not full nightly recompute; serve the neighbour lists through FAISS so it reuses the ANN path. Cost is losing sub-rank-K similarities — exactly the noise you wanted gone.)</em></li>
+    <li>"The embedding table is 256 GB and growing. Beyond sharding, how do you cap its memory?" <em>(Sharding makes it fit, not smaller. Hashing trick: row = hash(id) mod B, fixed B×dim×bytes regardless of cardinality — 100× shrink at B=10⁷ — but ~100 IDs/bucket collide into a blurred shared row, no per-id fine-tuning. So go hybrid: head/frequent IDs get private rows (most traffic, enough data to learn), tail/rare IDs share hashed buckets (noisy anyway, rarely seen). A parameter server promotes a tail ID to a private row once it crosses a frequency threshold.)</em></li>
   </ol>
 </div>
 

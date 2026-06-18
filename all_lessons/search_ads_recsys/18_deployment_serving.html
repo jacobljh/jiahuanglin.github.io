@@ -68,6 +68,73 @@
 
 <p>Two optimizations happen during export and recur in <a href="19_large_scale_optimization.html">19 · Large-scale optimization</a>: <strong>operator fusion</strong> (collapse <code>matmul → bias-add → activation</code> into one kernel, killing memory round-trips) and <strong>quantization</strong> (FP32 → INT8 cuts memory ~4× and speeds up integer math — but is also the first place numerical results drift from training, which is exactly the next section's problem).</p>
 
+<h3>What each optimization actually buys — with numbers</h3>
+
+<p>"Quantize the model" is not one lever; it is a family, and the headline you quote in a design review should be the measured one, not the hopeful one. The numbers below are representative of a multi-head ranker (an MMoE-style model) served on a commodity inference GPU.</p>
+
+<table>
+  <thead><tr><th>Technique</th><th>Mechanism (one line)</th><th>Typical payoff</th><th>What it costs you</th></tr></thead>
+  <tbody>
+    <tr><td><strong>INT8 quantization</strong></td><td><span class="math">Q = round(R / scale) + zero_point</span>; weights stored at 8 bits, integer matmul on Tensor Cores</td><td>≈ <strong>75% VRAM cut</strong> vs FP32; faster integer math</td><td>Truncation error on long-tail embeddings; needs a calibration set</td></tr>
+    <tr><td><strong>TensorRT (fusion + kernel select)</strong></td><td>Fuses ops, picks the fastest kernel per shape, folds constants</td><td>≈ <strong>−40% latency</strong>, <strong>+20% GPU util</strong></td><td>Build step per shape/version; operator-coverage gaps (see ONNX check below)</td></tr>
+    <tr><td><strong>Knowledge distillation</strong></td><td>A small student is trained to match a big teacher's outputs</td><td>keeps ≈ <strong>95% of the effect</strong> while cutting ≈ <strong>70% of params</strong></td><td>Extra training pipeline; student can lag the teacher on rare slices</td></tr>
+    <tr><td><strong>Mixed precision (by module)</strong></td><td>INT8 the body, keep <strong>attention / prediction heads in FP16</strong></td><td><strong>AUC drop &lt; 0.5%</strong> vs full INT8's larger drop</td><td>A mixed graph is fiddlier to export and profile</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <div class="label">Why the heads stay FP16 — and why two-tower recall needs QAT</div>
+  A multi-head ranker's per-task heads emit <em>scores whose absolute scale matters</em> (they feed a weighted blend or a calibrated probability). INT8 rounds the head's outputs coarsely, and a small per-head bias becomes a ranking change — so you spend the bits where they buy AUC and quantize only the wide, redundant body. Separately, a two-tower retrieval model's embeddings are <em>compared by dot product</em>, so INT8 truncation on a cold-start item's vector distorts its similarity to everything — that is the case for <strong>quantization-aware training (QAT)</strong>, which simulates the rounding during training so the model learns weights that survive it. Post-training INT8 is fine for the redundant ranker body; QAT earns its complexity exactly where one vector's small error changes a retrieval result.
+</div>
+
+<h2>Serving a billion-row embedding table</h2>
+
+<p>The ranker's parameters are dominated by one object: the <strong>embedding table</strong> — one learned row per categorical id (every user, item, ad, query token). At industrial scale this table alone is hundreds of GB to terabytes, far past what one box holds in RAM, and it is read on <em>every</em> request and written continuously by online learning. The dense MLP on top is a rounding error by comparison. So "serve the model" is really "serve a TB-scale, constantly-mutating key-value store under a few-ms read SLA" — a storage problem wearing a model's clothes. (The sharding and ANN side of this lives in <a href="19_large_scale_optimization.html">19 · Large-scale optimization</a> and <a href="03_embeddings_ann.html">03 · Embeddings &amp; ANN</a>; here we cover the <em>serving</em> mechanics.)</p>
+
+<div class="callout">
+  <div class="label">Worked numbers — why the naive table doesn't fit, and what shrinks it</div>
+  Take <span class="math">10⁹</span> ids at <span class="math">64-d</span> embeddings in FP32 (<span class="math">4 B</span> each):
+  <div class="math block">10⁹ × 64 × 4 B = 256 GB</div>
+  That is one table, one model version — and you need the <em>old</em> version live during a swap, so double it to <span class="math">512 GB</span> resident. Two levers, multiplicatively:
+  <div class="math block">int8 (1 B not 4 B): 256 GB → 64 GB &nbsp;·&nbsp; feature admission keeping ~20% of ids: 64 GB → ~13 GB</div>
+  A 256 GB elephant becomes a <strong>~13 GB</strong> object that fits in one machine's RAM with headroom — a <strong>~20× </strong> reduction <em>before</em> you shard. The lesson: you attack the table with admission and quantization first; sharding is for what remains.
+</div>
+
+<h3>Hot/cold storage tiering</h3>
+
+<p>Access to embedding rows is brutally Zipfian — a few popular items and active users are read constantly; the long tail almost never. So you tier the storage to match: <strong>hot rows in memory</strong> (or GPU VRAM for the hottest), <strong>cold rows on local SSD</strong>, full table in a distributed KV store (the Angel / BytePS class of system). A read checks RAM first, falls to SSD on a miss. The win is that the few-ms read SLA only has to hold for the <em>hot</em> set; the tail tolerates an SSD hop. Prefetching the embeddings for a user's recent-history items off the critical path hides most of the remaining latency.</p>
+
+<h3>Consistent-hash sharding with locality</h3>
+
+<p>What doesn't fit on one box is sharded across a parameter-server cluster, with each id mapped to a shard by <strong>consistent hashing</strong> — chosen over plain modulo because adding or removing a node remaps only <span class="math">~1/N</span> of keys instead of nearly all of them, so a scale-up doesn't trigger a table-wide reshuffle (and a cold cache stampede) mid-traffic. <strong>Locality-aware scheduling</strong> then co-locates a request's likely ids on as few shards as possible, because a lookup that fans out to 30 shards pays the tail-at-scale penalty from <a href="17_realtime_streaming.html">17 · Real-time &amp; streaming</a>: the request waits on the slowest shard.</p>
+
+<h3>Double-buffer atomic swap — updating a table you're reading</h3>
+
+<p>The table is read on every request <em>and</em> written by retraining/online learning. Lock a row for a write and reads queue behind it; the tail latency blows. The fix is a <strong>double buffer</strong>: keep two copies of the table (or shard), serve all reads from buffer A while the update lands in buffer B, then flip a single pointer <em>atomically</em>. In-flight reads drain on A, new reads hit B — no read ever waits on a write. It is the same atomic-pointer-flip discipline as the model hot-swap below, applied to the parameter store, and it is what makes "update embeddings every few minutes without a latency glitch" possible. The cost is the obvious one: 2× memory for the buffered table (the same factor the worked numbers above already budgeted for).</p>
+
+<h3>Feature admission and eviction — don't store a row you can't learn</h3>
+
+<p>A brand-new id has been seen a handful of times; its embedding is essentially noise, yet a naive table allocates a full row for it the instant it appears. Across a long tail of millions of one-shot ids this is pure waste — memory spent on rows the model can't actually fit. <strong>Feature admission (特征准入)</strong> is the gate: <em>admit an id into the table only after it has accumulated N exposures</em> (e.g. seen ≥ 10 times), so you pay for a row only once there's enough signal to train it. On the other end, <strong>eviction</strong> reclaims the tail — LRU drops embeddings unread for a long window. Together they hold the table at a working set of <em>ids that earn their memory</em>; the worked numbers above used a 20%-admitted figure, and that one policy did more than the quantization did.</p>
+
+<h3>Per-feature 8-bit quantization</h3>
+
+<p>The last lever is to store <strong>low-frequency feature embeddings at int8</strong> (1 byte/dim) rather than FP32 (4 bytes/dim) — a 4× shrink on those rows. It is applied <em>per feature</em>, not globally, on purpose: head features that drive most predictions keep their precision; the long-tail rows, which are noisy anyway, lose little from coarse quantization. This is the storage-side cousin of the model-weight quantization above, and it composes with admission — admit fewer rows, and store the rows you admit more cheaply.</p>
+
+<div class="ascii">  REQUEST
+     │  ids → consistent hash → shard(s)            ┌──────────────────────────┐
+     ▼                                              │  feature ADMISSION gate   │
+  ┌─────────────┐  miss   ┌──────────────┐          │  (seen ≥ N times?) ──no──▶│ skip, use default
+  │  RAM (hot)  │────────▶│  SSD (cold)  │           └──────────┬───────────────┘
+  │  hottest in │◀────────│  full shard  │                      │ yes
+  │  GPU VRAM   │  fetch   └──────┬───────┘                      ▼
+  └──────┬──────┘                 │                       admit row (int8 if long-tail)
+         │ read SLA: few ms       │ tail tolerates hop
+         ▼                        ▼                    ┌─── UPDATE (retrain / online) ───┐
+   serve embedding          (LRU evicts cold,          │  write buffer B, then atomic    │
+                             unread long-tail rows)     │  pointer flip A→B (no read lock)│
+                                                       └─────────────────────────────────┘
+</div>
+
 <h2>Train–serve skew — the silent killer</h2>
 
 <p>This is the single most important idea in the lesson, and the one most likely to cost you a launch. <strong>Train–serve skew</strong> is when a feature is computed one way during training and a subtly different way at serving time. The model was fit to the training distribution; at serving it receives a shifted distribution and silently produces worse predictions. Nothing crashes. No alert fires by default. The offline AUC was great. The online metric is flat or down, and you have no idea why.</p>
@@ -105,6 +172,26 @@
   PSI ≈ <strong>0.14</strong> — in the "watch" band: a real shift worth an alert, not yet an emergency. Notice the structure: a bin that didn't move contributes exactly zero, and the metric is symmetric-ish in the log term, so a feature that <em>gained</em> mass somewhere and <em>lost</em> it elsewhere accumulates from both. This is the same number whether the reference is the training distribution (then it measures <em>skew</em>) or yesterday's live distribution (then it measures <em>drift</em>) — one formula, two baselines.
 </div>
 
+<h3>The consistency toolchain — what to actually wire up</h3>
+
+<p>"One pipeline plus PSI" is the principle; the question an interviewer follows with is "with what tools?" Each tool below targets a <em>specific</em> way the train and serve paths diverge, and the point is the mechanism each one catches, not the brand name.</p>
+
+<table>
+  <thead><tr><th>Tool / check</th><th>Catches which divergence</th><th>How</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Feature store + shared code</strong></td><td>Two implementations of one feature</td><td>The structural cure above: training and serving read the <em>same</em> materialized values via the same transform code</td></tr>
+    <tr><td><strong>Protobuf / Parquet encoding</strong></td><td>Cross-language encoding drift (Spark trainer ↔ Java server)</td><td>A language-neutral wire/columnar format so the bytes mean the same thing on both sides</td></tr>
+    <tr><td><strong>ONNX operator-compatibility check</strong></td><td>An op the serving runtime can't execute (or executes differently)</td><td>Verify at export that every operator in the graph is supported by the target runtime — before, not after, it silently falls back</td></tr>
+    <tr><td><strong>FP16/INT8 consistency test</strong></td><td>GPU float / quantization rounding error</td><td>Run the same inputs FP32 vs FP16/INT8, assert the output delta is within tolerance</td></tr>
+    <tr><td><strong>TFDV distribution diff</strong></td><td>Train-vs-serve feature distributions drifting apart</td><td>Compute and diff per-feature distributions on both pipelines; flags schema/range anomalies automatically</td></tr>
+    <tr><td><strong>KS test in shadow mode</strong></td><td>New-vs-old model <em>output</em> distributions differing</td><td>While shadowing (below), run a Kolmogorov–Smirnov test on the two score distributions — a significant statistic says the export changed behavior</td></tr>
+    <tr><td><strong>Online calibration (per head)</strong></td><td>Multi-head score-scale drift after export</td><td>A thin post-hoc layer re-aligns each head's output scale, because INT8/FP16 export shifts per-head scales unevenly (the "numerical drift" skew above)</td></tr>
+    <tr><td><strong>Feature contract / SLA (特征契约)</strong></td><td>An upstream producer silently changing a feature</td><td>Producers commit to a stability SLA with <em>mandatory change-notification</em>, so a feature redefinition can't ship under you unannounced</td></tr>
+  </tbody>
+</table>
+
+<p>The distance metric these checks lean on — PSI — is the one already derived above; TFDV and the KS test are just two ways of <em>computing</em> a distribution diff (PSI is the recsys default; cross-link, don't re-derive). The KS test answers a slightly different question than PSI: it asks "are these two samples drawn from the same distribution?" and gives a p-value, which is exactly what you want when comparing the <em>new</em> model's scores to the <em>old</em> model's in shadow mode.</p>
+
 <h2>Safe rollout — shadow → canary → ramp → rollback</h2>
 
 <p>You never flip 0% → 100%. The whole point of rollout is to bound the blast radius: at every stage the worst case is that a small, recoverable slice of traffic saw a bad model for a short time. Four stages, each answering a different question.</p>
@@ -140,11 +227,66 @@
 
 <p>A canary at 1% traffic is also a <em>statistical</em> object: with little traffic you can only detect a <em>large</em> regression quickly. The minimum detectable effect scales like <span class="math">MDE ∝ σ / √n</span>, so a 1% slice needs a bigger true regression — or more time — to flag than a 50% ramp does. That is by design: the canary's job is to catch <em>catastrophes</em> fast (large and obvious), and to hand the subtle "is it 0.5% better?" question off to the powered A/B at higher traffic. Don't ask a canary to prove a small win.</p>
 
+<h2>The incident playbook — when it's already on fire</h2>
+
+<p>Auto-rollback handles the cases you pre-registered. Real incidents are messier, and at 2 a.m. you want a <em>decision tree</em>, not improvisation. The discipline is always the same order: <strong>stop the bleeding first, diagnose second</strong> — isolate the bad version and switch to the stable backup <em>before</em> you start root-causing, because every minute spent debugging in production is a minute users see the bad model.</p>
+
+<div class="callout bad">
+  <div class="label">Playbook — CTR drops 30%</div>
+  <strong>1 · Detect (tiered).</strong> A 15% drop fires a <em>warning</em>; 30% fires <em>critical</em>. <strong>2 · Stop the bleed.</strong> Isolate the current model version, switch traffic to the last stable backup. <strong>3 · RCA decision tree</strong> — walk it in this order:
+  <div class="ascii">  CTR −30%
+     │
+     ├─ recent model / feature change shipped?  ──yes──▶  ROLL BACK that change (two-stage, below)
+     │        │ no
+     ├─ feature PSI &gt; 0.25  AND  GAUC down?      ──yes──▶  DATA problem: pipeline broke
+     │        │                                            (lost 埋点 / logging, JOIN failure,
+     │        │                                             real-time feature stale) → fix pipeline, retrain
+     │        │ no
+     ├─ GAUC down but feature distributions OK?  ──yes──▶  MODEL problem: bad version / calibration drift
+     │        │ no
+     └─ external: holiday / hot event / spam?    ──yes──▶  not your bug — confirm with a segment drill-down</div>
+  The branch order matters: a version that shipped right before the drop is the cheapest hypothesis to confirm and reverse, so you test it first. The PSI-vs-GAUC fork is the same data-vs-model localization from the monitoring section — data problems cluster in a segment, model problems are global.
+</div>
+
+<h3>Two-stage rollback — features first, then model</h3>
+
+<p>A model and its feature-engineering version are coupled: the model was fit to features produced a specific way. So a rollback is <em>not</em> one switch — you roll back in two stages, <strong>feature-engineering version first, then the model architecture</strong>. The reason is the partial-rollback trap from the auto-rollback tripwires: revert the model but leave new features (or vice-versa) and you've created a <em>new</em> untested combination — its own outage. Staging features-then-model lets you check after stage one whether the feature change alone caused the regression (often it did — a failure knowledge base will tell you feature issues like leakage are a large share of rollbacks) before you also touch the heavier model artifact.</p>
+
+<h3>Memory-leak diagnosis — the slow-burn incident</h3>
+
+<p>Not every incident is a sharp metric drop; a memory leak is a <em>slow</em> climb in RSS that ends in an OOM kill and a latency cliff. Same discipline, stop-then-diagnose:</p>
+<ul>
+  <li><strong>Stop the bleed.</strong> Use the service mesh to switch traffic off the leaking instance and <strong>circuit-break</strong> it, so the climbing instance stops taking requests before it OOMs. Capacity drops; the service stays up.</li>
+  <li><strong>Collect.</strong> Grab GC logs, RSS over time, thread stacks — the evidence of <em>where</em> the growth is.</li>
+  <li><strong>Diagnose with a profiler, not logs.</strong> Heap-analyze with <code>pprof</code> / Valgrind (native) or <code>jmap</code> (JVM). The recsys-specific prime suspect: <strong>tensor-release logic in the inference path</strong> — a held reference to per-request tensors (or an unbounded feature cache) that never frees. Verify the predict path releases what it allocates.</li>
+  <li><strong>Re-ship safely.</strong> Reproduce in isolation, fix, then re-deploy via the ramp (5 → 20 → 100%) with a memory-watermark alert wired this time. The prevention that would have caught it: a 24 h sustained-peak load test in the pre-launch checklist.</li>
+</ul>
+
 <h2>Model versioning &amp; hot updates</h2>
 
 <p>Three things must version <em>together</em>, because a mismatch between any two is an outage: the <strong>model weights</strong>, the <strong>feature-pipeline code</strong> that produces its inputs, and the <strong>serving/API contract</strong>. A model registry (MLflow Models, TF-Serving's versioned dirs, a custom registry) tracks this triple and is what rollback rewinds to.</p>
 
 <p><strong>Hot-swap</strong> matters because recommenders retrain constantly — sometimes hourly, with online/incremental learning (<a href="17_realtime_streaming.html">17 · Real-time</a>) updating embeddings continuously. You can't take the service down to load a new model. The pattern: load the new version into memory alongside the old, validate it (health check, a few shadow requests), then atomically flip a pointer so in-flight requests drain on the old graph and new ones hit the new graph. Done wrong, the flip causes a latency glitch — a spike while the new graph's caches warm — which is why you warm it up with synthetic requests before flipping, and ramp rather than slam.</p>
+
+<h3>Online / nearline / offline — three update tiers, not one</h3>
+
+<p>"Retrain constantly" hides a real architectural decision: <em>different parts of the model update at different speeds</em>, because freshness and model complexity trade off against each other. You cannot fully retrain a heavy DNN every second, and you don't need to — most of its knowledge is stable. So production splits the update into tiers, each with its own cadence, model class, and transport. The rule of thumb: <strong>the faster the tier, the lighter the model</strong>.</p>
+
+<table>
+  <thead><tr><th>Tier</th><th>Cadence</th><th>Model class</th><th>Transport</th><th>Job it does</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Online</strong></td><td>second-level</td><td>lightweight (LR / FTRL)</td><td>Flink streaming</td><td>React to breaking hotspots — a video going viral <em>now</em></td></tr>
+    <tr><td><strong>Nearline</strong></td><td>hour-level</td><td>deep multi-task (MMoE)</td><td>mini-batch / Spark</td><td>Fuse long- and short-term interest as it shifts through the day</td></tr>
+    <tr><td><strong>Offline</strong></td><td>T+1 (daily)</td><td>full DNN</td><td>batch</td><td>The heavy, stable retrain — the base the faster tiers correct</td></tr>
+  </tbody>
+</table>
+
+<p>Feeding all three is a feature pipeline held to a <strong><span class="math">&lt; 1 s</span></strong> end-to-end SLO (Kafka → Flink → online store), because a second-level model tier is pointless if the features it reads are minutes stale — the same window-alignment discipline as <a href="17_realtime_streaming.html">17 · Real-time &amp; streaming</a>. A concrete real-time feature: the user's short-term interest vector as the mean of their last few interaction embeddings, blended with the long-term vector.</p>
+
+<div class="callout warn">
+  <div class="label">The online tier is the dangerous one — guard it hard</div>
+  A second-level update loop can chase noise into a bad state between human glances, so it carries its own tripwire: <strong>auto-rollback when CTR fluctuates beyond ±2%</strong> — tighter than the 3–5% tripwire for a full model launch, because the online tier moves faster and a runaway has no human in the loop. Two more guards from the online-learning loop: (1) swap new-into-old by <strong>parameter interpolation</strong>, <span class="math">θ = α·θ_new + (1−α)·θ_old</span> with α ramped 0→1, so recommendations don't <em>jump</em> at the swap; and (2) periodically force a <em>full</em> retrain (the offline tier) to escape the local optimum an online loop can settle into from its own feedback. Fast and unsupervised is exactly the combination that needs the tightest rollback.
+</div>
 
 <h2>Monitoring — the metrics that predict an incident</h2>
 
@@ -214,6 +356,8 @@
     <li>"Why can't a 1% canary tell you the new model is 0.5% better?" <em>(MDE ∝ σ/√n — at 1% traffic you can only detect large regressions quickly. The canary catches catastrophes; the small-lift question goes to the powered A/B at higher traffic. Asking a canary to prove a small win is underpowered.)</em></li>
     <li>"A metric dropped. Model problem or data problem?" <em>(Layered localization: PSI > 0.25 and GAUC down → data/feature pipeline broke; GAUC down but features normal → model/calibration; regression at the instant of a version ship, in one segment → deploy bug; gradual global decay → concept drift, retrain. Data problems cluster in a dimension; model problems are global.)</em></li>
     <li>"How do you hot-swap a model without a latency glitch?" <em>(Load new version alongside old, health-check + a few shadow requests, warm the caches with synthetic traffic, then atomically flip a pointer — in-flight requests drain on the old graph, new ones hit the new graph. Skipping the warm-up causes a spike while the new graph's caches fill.)</em></li>
+    <li>"Your embedding table is 256 GB and won't fit in RAM. How do you serve it?" <em>(It's a TB-scale mutating KV store, not "the model." Shrink first: feature admission — admit a row only after N exposures — plus per-feature int8 takes 256 GB → ~13 GB. Tier hot rows in RAM/VRAM, cold on SSD; shard the rest by consistent hashing (only ~1/N keys remap on scale-up) with locality so a lookup doesn't fan out to every shard. Update via double-buffer atomic pointer flip so reads never wait on a write. Evict the unread long tail by LRU.)</em></li>
+    <li>"How does a real-time recommender actually update — surely you don't retrain the DNN every second?" <em>(Three tiers at different speeds: online second-level (lightweight LR/FTRL on Flink) for breaking hotspots; nearline hour-level (deep MMoE) for shifting interest; offline T+1 (full DNN) as the stable base. Faster tier ⇒ lighter model. Feature pipeline held to &lt;1 s. The online tier is guarded hardest: auto-rollback at CTR ±2%, parameter-interpolation swap θ=α·θ_new+(1−α)·θ_old to avoid jumps, and a periodic full retrain to escape feedback-loop local optima.)</em></li>
   </ol>
 </div>
 

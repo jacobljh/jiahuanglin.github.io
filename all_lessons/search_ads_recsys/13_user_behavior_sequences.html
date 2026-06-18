@@ -109,6 +109,66 @@
 
 <p>Both DIN and DIEN live <em>inside</em> the ranker from <a href="04_ranking_models.html">lesson 04</a> — they are the sub-network that consumes the "sparse multi-valued" user-history feature and emits a pooled vector that concatenates with the dense and sparse-ID embeddings before the top MLP.</p>
 
+<h2>Lifelong sequences — why a flat attention over 10k events is dead on arrival</h2>
+
+<p>DIN, DIEN, and a BST-style Transformer all share an unspoken assumption: the history is <strong>short</strong> — last 50, maybe a few hundred events. That cap is not a stylistic choice; it is forced by the serving budget. The deeper the user, the more this hurts: the behavior that explains <em>this</em> click — a phone bought eleven months ago, a recipe saved last spring — is often thousands of events back, exactly where the length cap throws it away. So the question that dominates senior interviews: how do you attend over a <strong>lifelong</strong> sequence of 10,000+ behaviors?</p>
+
+<p>Start with why you cannot just raise the cap. Walk the cost of a single ranking request, batch of B = 1000 candidates, history length n, embedding dim d = 64:</p>
+
+<table>
+  <thead><tr><th>Approach</th><th>Per-candidate cost</th><th>n = 100</th><th>n = 10,000</th></tr></thead>
+  <tbody>
+    <tr><td>DIN target-attention</td><td>O(n·d) — one activation MLP per past item</td><td>100 · 64 ≈ 6.4k MAC</td><td>10,000 · 64 ≈ 640k MAC <strong>· 1000 cand = 6.4×10⁸ per request</strong></td></tr>
+    <tr><td>BST self-attention</td><td>O(n²·d) — every item attends to every other</td><td>100² · 64 ≈ 6.4×10⁵</td><td>10,000² · 64 ≈ 6.4×10⁹ <strong>— ~10⁴× worse, before the ×1000 candidates</strong></td></tr>
+  </tbody>
+</table>
+
+<p>The self-attention row is the killer: <span class="math">n²</span> means going from 100 → 10,000 events is not 100× the cost, it is 100² = <strong>10,000×</strong>. Even the linear DIN row, multiplied across 1000 candidates, blows a 50 ms budget. And it is wasteful: of those 10,000 events, maybe 200 have anything to do with the candidate. <strong>The fix in every production answer is the same shape — retrieve first, attend second.</strong> Three named architectures, each a different bet on <em>where</em> you pay the cost.</p>
+
+<h3>SIM — two-stage GSU → ESU (retrieve, then attend)</h3>
+
+<p><strong>SIM (Search-based Interest Model, Pi et al. 2020)</strong> splits the problem into a cheap <strong>General Search Unit (GSU)</strong> and an expensive <strong>Exact Search Unit (ESU)</strong>. The GSU pre-filters the lifelong sequence down to the few-hundred behaviors <em>relevant to the candidate</em>; the ESU then runs full DIN-style target attention over only that subset. Two flavors of GSU:</p>
+
+<ul>
+  <li><strong>Hard search.</strong> Index the user's lifelong behaviors by category (or a coarse cluster ID). At request time, look up the candidate's category and pull <em>only</em> the history items in that category. No model, just a key lookup against a per-user inverted index — O(1) amortized. A user with 10,000 lifelong events but 300 in the candidate's category hands the ESU a length-300 sequence. This is what ships at scale: the index can live in an offline table, refreshed daily.</li>
+  <li><strong>Soft search.</strong> Pre-compute an embedding per behavior; retrieve the top-K by inner-product with the candidate embedding (the same ANN machinery as retrieval, <a href="04_ranking_models.html">lesson 04</a>). More precise than category match — it catches cross-category affinity — but needs an embedding index kept consistent with the model, which is the operational tax.</li>
+</ul>
+
+<p><strong>Worked saving.</strong> Lifelong n = 10,000, candidate category holds 250 of them, K = 200 retained. The ESU now runs DIN over 200 items, not 10,000: <span class="math">200 · 64 ≈ 1.3×10⁴ MAC</span> per candidate vs 6.4×10⁵ for flat DIN — a <strong>~50× cut</strong> — and the GSU cost is a hash lookup, not a matrix multiply. The bet SIM makes: the candidate's category is a good enough filter that the dropped 9,750 events held no signal for <em>this</em> item. Usually true; the failure mode is a cross-category interest (cooking history predicting a kitchen-gadget purchase) that hard search misses and only soft search recovers.</p>
+
+<h3>MIMN — fold the sequence into a fixed memory, so serving cost stops growing</h3>
+
+<p>SIM still stores the full lifelong sequence and searches it per request. <strong>MIMN (Multi-channel user Interest Memory Network, Pi et al. 2019)</strong> makes a different bet: never store the raw sequence at serve time at all. It keeps a small fixed-size <strong>memory matrix</strong> M — say m = 4 slots × d = 64, one "channel" per coarse interest — and a Neural-Turing-Machine controller that <em>incrementally writes</em> each new behavior into the slots as it streams in:</p>
+
+<p class="math block">Mₜ = (1 − wₜ·eₜ) ⊙ Mₜ₋₁ + wₜ ⊙ aₜ</p>
+
+<p>where wₜ is a write-address (which slot this behavior updates), eₜ an erase gate, aₜ the add vector. The point is the dimensions: <strong>M is 4×64 = 256 numbers no matter whether the user has 100 lifelong events or 100,000.</strong> Serving reads a fixed 256-float state — cost decoupled from sequence length entirely. The write happens <em>once per behavior</em> in the streaming pipeline (below), never at request time. The trade is lossy compression: four slots cannot hold the fidelity of 10,000 raw events, so MIMN is paired with a separate short-term DIN tower for recent precision — memory for the lifelong gist, attention for the fresh detail.</p>
+
+<h3>DSIN — the sessionization the lesson described, made concrete</h3>
+
+<p>Later this lesson sessionizes the stream conceptually. <strong>DSIN (Deep Session Interest Network, Feng et al. 2019)</strong> is the architecture: cut the sequence into sessions at the ~30-min gap, then process <em>within</em> and <em>across</em> sessions separately.</p>
+
+<ul>
+  <li><strong>Intra-session:</strong> a <em>Bias Encoding</em> (a learned position-in-session + session-index offset added to each item) plus multi-head self-attention — within a 20-minute camping burst, every behavior is coherent, so self-attention earns its O(k²) on the <em>small</em> k of one session.</li>
+  <li><strong>Inter-session:</strong> a <strong>Bi-LSTM</strong> over the per-session interest vectors models how intent <em>evolves</em> across sessions (tents this week → sleeping bags next). Bi-directional because a later session can re-interpret an earlier one.</li>
+</ul>
+
+<p>The cost discipline is the same retrieve-then-attend idea wearing different clothes: self-attention is confined to <em>within</em> a session (small k), and the expensive cross-session modeling runs over a handful of session vectors, not thousands of raw events.</p>
+
+<table>
+  <thead><tr><th>Model</th><th>Core trick</th><th>Serving cost scales with</th><th>Best when</th></tr></thead>
+  <tbody>
+    <tr><td><strong>SIM</strong></td><td>GSU hard/soft retrieve → ESU attention</td><td>K retained (~hundreds), not n</td><td>lifelong sequence, candidate-category filter is informative</td></tr>
+    <tr><td><strong>MIMN</strong></td><td>NTM memory, incremental write</td><td>fixed memory (m·d), independent of n</td><td>extreme length + tight serve budget; pair with short-term tower</td></tr>
+    <tr><td><strong>DSIN</strong></td><td>intra-session self-attn + inter-session Bi-LSTM</td><td>#sessions × session length</td><td>strongly session-structured behavior (shopping, search)</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <div class="label">The one sentence that answers "how do you handle a 10k history?"</div>
+  Flat attention is <span class="math">O(n)</span> (DIN) or <span class="math">O(n²)</span> (self-attn) <em>per candidate</em>, so it dies past a few hundred events. <strong>Retrieve, then attend:</strong> SIM hard-searches the candidate's category out of the lifelong log (10k → ~hundreds) then runs DIN on that; MIMN folds the whole sequence into a fixed-size memory so serving cost stops depending on length; DSIN splits into sessions and confines the quadratic cost to one short session. All three move the heavy lifting <em>off</em> the per-request path.
+</div>
+
 <h2>Short- vs long-term interest — two clocks</h2>
 
 <p>Behavior carries two timescales that fight each other. <strong>Long-term interest</strong> is stable taste: someone is, over years, "into" sci-fi and indie music. <strong>Short-term interest</strong> is the session's intent: tonight they're shopping for a tent, and every recommendation should bend toward camping for twenty minutes — then snap back. Collapse the two and you get a recommender that is either too sluggish to react or too jittery to be coherent.</p>
@@ -127,6 +187,35 @@
 
 <p>Two knobs do the work. w_base encodes signal strength — a share weighs more than a click (e.g. share 5, like 3, watch 1). λ sets the half-life: t½ = ln 2 / λ. A short-video feed uses a fast decay (interest turns over in hours); a movie service uses a slow one (taste persists for months). Choosing λ is choosing how long the past gets to vote — one of the most impactful, least-glamorous hyperparameters in the system.</p>
 
+<p><strong>Work the numbers.</strong> Pick a 48-hour half-life, so λ = ln 2 / 48 ≈ 0.01444 per hour. A behavior from Δt = 24 h ago keeps e^(−0.01444·24) = e^(−0.347) ≈ <strong>0.71</strong> of its weight; from 72 h ago, e^(−0.01444·72) = e^(−1.04) ≈ <strong>0.35</strong>; from one week (168 h) ago, e^(−2.42) ≈ <strong>0.089</strong> — under a tenth, effectively forgotten. Halve the half-life to 24 h (λ ≈ 0.0289) and that same 72-hour behavior drops to e^(−2.08) ≈ 0.125 instead of 0.35 — the feed reacts roughly 3× faster to fresh intent but throws away more of yesterday. That single knob is the dial between "jittery" and "sluggish."</p>
+
+<h3>Scalar decay vs learned time embeddings (Time2Vec)</h3>
+
+<p>Exponential decay imposes one assumption: forgetting is <strong>monotonic</strong> — older always matters less. That is wrong for any periodic behavior. A user who opens a cooking feed every Sunday morning has a strong signal at Δt = 7 days that a decay curve actively suppresses, because by then e^(−λ·168h) has crushed it. The fix is to stop hand-coding the time response and let the model learn it.</p>
+
+<ul>
+  <li><strong>Time-bucketing.</strong> Before encoding, slot each behavior into coarse age buckets — e.g. &lt;5 min / &lt;1 h / &lt;24 h / older — and give each bucket its own learnable embedding. Cheap, and it lets "5 minutes ago" and "yesterday" carry qualitatively different meaning rather than just a scaled-down version of the same thing.</li>
+  <li><strong>Time2Vec.</strong> Embed the raw timestamp (or the inter-event gap Δt) as a vector with one linear term and several periodic terms: <span class="math block">t2v(τ)[i] = ω₀·τ + φ₀ &nbsp; (i = 0); &nbsp; sin(ωᵢ·τ + φᵢ) &nbsp; (i ≥ 1)</span> The linear term captures trend (recency); the sin terms, with learned frequencies ωᵢ, capture periodicity — a frequency whose period lands near 24 h or 7 days lets the model represent "same hour daily" or "same day weekly." This vector is concatenated onto each behavior embedding and fed into the attention, so the model <em>learns</em> the time response instead of you imposing e^(−λΔt).</li>
+</ul>
+
+<p>The trade is the usual one: scalar decay is one hyperparameter, robust, and free; Time2Vec adds parameters and needs enough data per user to learn a stable periodicity, so it earns its keep on heavy users and over-fits on sparse ones. Many systems use both — decay as a feature <em>and</em> a small learned time embedding — and let the attention weigh them.</p>
+
+<h2>Behavior denoising — what reaches the sequence in the first place</h2>
+
+<p>Everything above assumes the sequence is clean. It is not. A real click stream is laced with mis-taps, inertial fast-scrolls, and autoplay impressions — behaviors that carry no intent but, if fed to the attention, get a weight and corrupt the user vector. Denoising happens at two stages, and the trade-off between them is concrete.</p>
+
+<ul>
+  <li><strong>Hard pre-filters (before the model).</strong> Drop a play with watch-time &lt; 500 ms, or a slide whose dwell &lt; 300 ms, before the behavior ever enters the sequence. A thumb that flicks past four items in a second generated four "impressions"; none is intent. Measured trade-off from production: direct filtering raises sequence <em>purity</em> ~15–20% (the fraction of behaviors that reflect genuine interest), but mis-kills ~5% of real fast browsing — a power-user who genuinely skims at 400 ms gets some true behaviors dropped. Net positive, and it is the <em>cheap</em> win because every filtered event is one fewer item the attention must score downstream.</li>
+  <li><strong>Attention denoising (inside the model).</strong> Keep the noisy behaviors but let the model learn to down-weight them — the activation unit assigns a near-zero αᵢ to an anomalous event. This retains latent signal a hard filter would have killed (the 5% false-kill recovered), but costs ~30% more attention compute, because you are now scoring the full, un-filtered sequence.</li>
+</ul>
+
+<p>So the recipe is layered: <strong>hard-filter the obvious noise to shrink the sequence (purity + cheaper attention), then let attention soft-denoise the rest.</strong> Two refinements from practice: a <em>noise classifier</em> trained on a user's own positives (their liked/completed videos) scores whether a new behavior is anomalous for <em>that</em> user; and <em>contrastive learning</em> builds augmented views of a behavior sequence (drop/mask/reorder some events) and trains the encoder to map them close, which makes the user vector robust to exactly the noise you could not filter.</p>
+
+<div class="callout warn">
+  <div class="label">Don't filter your way into a bubble</div>
+  Aggressive filtering has a second-order cost the dwell threshold hides: exploratory behavior — a curious tap into a new vertical — often <em>looks</em> like noise (short dwell, no follow-through) and gets dropped. Filter too hard and the sequence becomes a tight loop of the user's existing interests, which is a filter bubble built by your data pipeline rather than your ranker. The standard guard is to keep a fraction of low-confidence exploratory behavior unfiltered, so the model still sees the edges of the user's taste.
+</div>
+
 <h2>Sessionization — cutting the stream into intents</h2>
 
 <p>The raw event log is one unbroken stream per user. But a <em>session</em> — a bounded burst of activity with a coherent intent — is the natural unit of short-term interest. You sessionize by cutting the stream wherever the gap between consecutive events exceeds a threshold (commonly ~30 minutes of inactivity, tuned per product): new session if (tᵢ − tᵢ₋₁) &gt; τ_gap.</p>
@@ -137,6 +226,49 @@
   <div class="label">Interest drift is why a frozen model rots</div>
   Interests evolve mid-session (tents → sleeping bags → hiking boots) and across life (a new parent's feed should change in days, not quarters). A model trained on last month's behavior and never refreshed keeps recommending the user's <em>past</em> self. The value of a behavioral feature decays on the same clock as the interest it encodes, so a "recent-30-clicks" feature computed hourly is, for a fast feed, already an hour stale. Freshness is not a nice-to-have; it is the difference between modeling the user and modeling their ghost.
 </div>
+
+<h2>The real-time behavior pipeline — putting a number on "seconds-fresh"</h2>
+
+<p>The short-term tower is only as good as the freshness of the sequence it reads. "Seconds-fresh" is not a vibe; it is a latency budget with a specific architecture behind it. The path from a thumb-tap to an updated user vector, with the numbers a short-video stack actually targets:</p>
+
+<div class="ascii">
+ [client SDK]   tap / dwell / swipe — pre-aggregate same-type events
+      │         in a 10s window on the edge  →  ~30%+ bandwidth saved,
+      │         (drops mis-taps before the wire);  SDK memory &lt; 50 MB
+      ▼
+ [Kafka]        partition by hash(user_id)  →  all of one user's events
+      │         land on one partition, in order (order matters: the GRU
+      │         and attention read a *sequence*; reordering corrupts it)
+      ▼
+ [Flink]        sliding window: 30s window, 10s slide  →  recompute the
+      │         user's short-term interest vector every 10s
+      ▼
+ ┌──────────────┬──────────────────────────────────────────┐
+ │ Redis        │ HBase                                     │
+ │ online read  │ offline backfill / long-term sequence     │
+ │ &lt; 200 ms     │ store (cheap, durable, not latency-bound) │
+ └──────────────┴──────────────────────────────────────────┘
+      end-to-end tap → usable feature:  &lt; 3 s
+</div>
+
+<p>Read the budget as a chain of constraints. <strong>Edge pre-aggregation</strong> merges a burst of identical events (four fast swipes → one summarized event) so the wire and Kafka see ~30% less traffic and the obvious mis-taps die before they cost anything. <strong>Partition by user-hash</strong> is the load-bearing detail: a sequence model is meaningless if events arrive out of order, so every event for a user must route to the same Kafka partition, which preserves per-user ordering for free. <strong>Flink's 30 s window / 10 s slide</strong> sets the recompute cadence — a fresh short-term vector every 10 seconds. <strong>Dual-write Redis + HBase</strong> splits roles: Redis serves the online read on the request path under ~200 ms; HBase is the durable store for backfill and the lifelong sequence SIM searches. End to end, tap → usable feature lands under <strong>3 s</strong>, and a Douyin-class intent-prediction loop targets <strong>&lt; 200 ms</strong> for the real-time sequence update itself. (This is the streaming machinery of <a href="17_realtime_streaming.html">lesson 17 (real-time streaming)</a> and <a href="36_streaming_pipeline_ops.html">lesson 36 (streaming pipeline ops)</a> — see them for the Kafka/Flink internals; here we only care that it delivers a fresh, ordered sequence on budget.)</p>
+
+<div class="callout warn">
+  <div class="label">The failure mode this pipeline introduces: online/offline skew</div>
+  The short-term vector is computed by Flink in production; the same feature in your training data is computed by a batch job over logs. If the two definitions drift — different window edges, different dedup, a feature available at serve time but leaked from the future at train time — the model trains on one distribution and serves on another. This is the concrete cause behind the lesson's "offline AUC up, online engagement down" puzzle: the sequence the model learned from is not the sequence it gets. The guard is a single shared feature definition and periodic train/serve distribution re-alignment (KL between the two).
+</div>
+
+<h2>Sudden interest shifts — reacting in a session, not a quarter</h2>
+
+<p>Time-decay and sessionization handle <em>gradual</em> drift. They are too slow for a <strong>mutation</strong> — a user who pivots from entertainment to study content tonight, a signal the slow tower won't register for days. Treating this as ordinary drift means the feed keeps serving the old self through the whole pivot. The named recipe:</p>
+
+<ul>
+  <li><strong>Detect.</strong> Track sliding-window statistics — e.g. the variance of CTR or category entropy over the last ~10 behaviors. A sharp jump flags a candidate mutation, via a lightweight CUSUM change-point test or an LSTM anomaly detector.</li>
+  <li><strong>Confirm, don't trust.</strong> Most spikes are noise — one study video then straight back to comedy is not a pivot. Filter false mutations by <em>behavior-chain</em> analysis: a genuine shift sustains across several behaviors and sessions; a blip reverts immediately.</li>
+  <li><strong>Expand &amp; explore.</strong> Extract the new interest (cluster the mutation behaviors), then use a knowledge graph to fan out to related verticals ("study" → programming, language-learning), and launch a bandit that hands the new interest a temporary exposure boost — on the order of ~30% — to gather signal fast. Monitor D7 retention to confirm the pivot was real and the response helped, then let the boost decay back.</li>
+</ul>
+
+<p>This is the sharp, named version of the earlier interest-drift callout: detect the change-point, gate out the false alarms, and buy fast evidence with a bounded exploration budget.</p>
 
 <h2>Interactive · target attention in action</h2>
 
@@ -186,6 +318,23 @@
 
 <p>Two failure modes, both already named: <strong>negative signals are features too</strong> — skips, "not interested," and fast-scrolls are not the absence of data, they are weak-negative labels (treating un-clicked-but-shown items as hard negatives is the cheap version); and <strong>optimizing only immediate behavior is a trap</strong> — clicks and watch-time are the easiest labels to get and the easiest to over-fit, which is precisely how a feed wins every short-term metric while quietly burning long-term retention. That next-click-vs-long-term-value tension is the heart of <a href="12_multi_task.html">multi-task / multi-objective ranking</a>.</p>
 
+<h3>Turning raw signals into a shippable strength score</h3>
+
+<p>The opening table assigned each signal a qualitative "strength." Here is the concrete recipe that turns that into a number the model can consume — every line a guard against a specific pathology:</p>
+
+<ul>
+  <li><strong>Action weights, set by business logic.</strong> A composite implicit score with hand-set (or SHAP-derived) weights, e.g. play = 1, like = 3, share = 5 — a share is worth ~5 plays because it is rarer and far more intentful. These are the same w_base weights from the time-decay formula.</li>
+  <li><strong>Log-transform dwell time.</strong> Dwell is brutally long-tailed — a few sessions run for an hour, most for seconds — and raw dwell lets those few dominate. Use log(dwell): a 600 s watch becomes log(600) ≈ 6.4, a 6 s watch log(6) ≈ 1.8, so the long watch counts ~3.6× the short one, not 100×. The composite becomes <span class="math">score = α·log(dwell) + β·click + γ·engage</span>.</li>
+  <li><strong>Truncate the extremes.</strong> Cap dwell at the 95th percentile before the log so a phone-left-on-the-couch outlier (the idle-time confounder from the opening callout) cannot masquerade as deep engagement.</li>
+  <li><strong>Completion as a hard floor.</strong> An item in the low-completion bucket gets its exposure capped <em>even if</em> its CTR is high — this is the "clickbait, high-CTR-low-completion" trap from the opening callout, made operational. Completion gates, CTR ranks.</li>
+  <li><strong>Second-chance / regret rule.</strong> A behavior that was skipped <em>but</em> had long dwell is ambiguous, not negative — re-recommend it once rather than burying it. The skip might have meant "not now," and the dwell says the interest was real.</li>
+</ul>
+
+<div class="callout">
+  <div class="label">CVR labels and sample-selection bias — the ESMM hook (canonical home: lesson 12)</div>
+  The "second-chance" and "click → long-watch / convert" signals above feed a <strong>CVR</strong> (conversion-rate) head, and that head has a classic trap worth naming here even though we don't re-derive it: a CVR model is <em>trained only on clicked items</em> (you only observe whether a click converts) but <em>served on every impression</em> — a <strong>sample-selection bias</strong> — and conversions are rare, so the data is sparse. <strong>ESMM</strong> fixes both by modeling pCTR and pCTCVR over the <em>entire impression space</em> and deriving pCVR = pCTCVR / pCTR, so CVR is learned without the click-only bias. The mechanism lives in <a href="12_multi_task.html">lesson 12 (multi-task ranking)</a> — follow it there.
+</div>
+
 <h2>Interview prompts you should be ready for</h2>
 
 <div class="callout">
@@ -196,13 +345,16 @@
     <li>"DIN vs DIEN — what does DIEN add and what does it cost?" <em>(DIEN adds a GRU interest-extractor with an auxiliary next-behavior loss, then an AUGRU whose update gate is scaled by attention to model interest evolution toward the candidate. Cost: sequential GRU doesn't parallelize, so it's slower at high QPS — many teams use DIN or a length-capped Transformer instead.)</em></li>
     <li>"Pooling vs RNN vs attention vs self-attention for a 100-item history — pick one for a 50 ms ranker and defend it." <em>(Self-attention is O(n²) and latency-heavy; RNN is sequential. Target-attention is O(n) per candidate and only lights up the relevant slice — usually the production sweet spot. Pooling only if latency is brutal and histories are short/focused.)</em></li>
     <li>"How do you keep short-term intent from being drowned by long-term taste?" <em>(Two encoders — long-term tower refreshed offline, short-term tower on the fresh event stream — fused by a context gate σ(g) that shifts to short-term when session signal is strong. Plus exponential time decay e^(−λΔt) and sessionization at a ~30-min gap.)</em></li>
-    <li>"Your offline AUC went up but online engagement dropped. The new model added a Transformer over user history. What happened?" <em>(Several real causes: training-time position/feedback bias the offline metric rewards but online doesn't; the history feature is stale at serve time (the freshness gap); over-fitting to immediate watch-time at the expense of retention; or train/serve skew in how the sequence is truncated/padded.)</em></li>
+    <li>"Your offline AUC went up but online engagement dropped. The new model added a Transformer over user history. What happened?" <em>(Several real causes: training-time position/feedback bias the offline metric rewards but online doesn't; the history feature is stale at serve time (the freshness gap); over-fitting to immediate watch-time at the expense of retention; or train/serve skew in how the sequence is truncated/padded — the Flink-vs-batch feature-definition skew is the usual culprit.)</em></li>
+    <li>"The user has 10,000 lifelong behaviors. DIN over all of them is O(n)·1000 candidates and self-attention is O(n²) — both blow the latency budget. How do you model it?" <em>(Retrieve, then attend. SIM: a General Search Unit hard-searches the candidate's category (or soft-searches by embedding inner-product) to pull the ~200 relevant behaviors out of the 10k, then the Exact Search Unit runs DIN target-attention over just those — a ~50× cut. MIMN folds the whole stream into a fixed-size NTM memory written incrementally, so serving cost is independent of n. DSIN splits into sessions and confines self-attention to one short session. All move the heavy work off the per-request path.)</em></li>
+    <li>"Why isn't exponential time-decay enough for recency, and what replaces it?" <em>(Decay imposes monotonic forgetting — older always matters less — which suppresses periodic behavior, e.g. a user who opens cooking every Sunday has a real signal at Δt = 7 days that e^(−λ·168h) crushes. Replace/augment with time-bucketing (per-bucket embeddings) and Time2Vec (linear term for trend + sin terms whose learned frequencies capture daily/weekly periodicity), concatenated into the attention so the model learns the time response. Cost: more params, needs data per user, over-fits on sparse users.)</em></li>
+    <li>"Walk me through denoising a behavior sequence and the trade-off at each stage." <em>(Hard pre-filter the obvious noise — drop play &lt; 500 ms / slide-dwell &lt; 300 ms — which lifts purity ~15–20% and shrinks the sequence (cheaper attention) but mis-kills ~5% of genuine fast browsing. Then let attention soft-denoise the rest: keep the noisy events but learn near-zero weights, recovering latent signal at ~30% more compute. Add a per-user noise classifier and contrastive augmentation. Guard against over-filtering into a bubble by leaving some exploratory behavior unfiltered.)</em></li>
   </ol>
 </div>
 
 <div class="callout ok">
   <div class="label">Takeaway</div>
-  The user is latent; behavior is a biased sample of preference. A click = examination × relevance — debias it (position-as-feature or IPW) or you train on the UI. Sequences beat single events, and <strong>target attention (DIN)</strong> is the key idea: weight the user's past by relevance to <em>this</em> candidate, so the same history yields a different user vector per item. DIEN adds interest <em>evolution</em>; a short/long gate plus time-decay handles the two clocks; sessionization scopes intent. These blocks live inside the ranker — and the labels they consume are only as good as your debiasing.
+  The user is latent; behavior is a biased sample of preference. A click = examination × relevance — debias it (position-as-feature or IPW) or you train on the UI. Sequences beat single events, and <strong>target attention (DIN)</strong> is the key idea: weight the user's past by relevance to <em>this</em> candidate, so the same history yields a different user vector per item. DIEN adds interest <em>evolution</em>. Past a few hundred events, flat attention dies — so <strong>retrieve then attend</strong> (SIM's GSU→ESU), or fold the lifelong stream into a fixed memory (MIMN), or split it into sessions (DSIN). A short/long gate plus time-decay (or learned Time2Vec) handles the two clocks; sessionization scopes intent; hard + attention denoising cleans the input; and a sub-3s Kafka→Flink→Redis pipeline keeps the short tower fresh. These blocks live inside the ranker — and the labels they consume are only as good as your debiasing.
 </div>
 
 <footer class="lesson-nav">
