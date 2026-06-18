@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>26 · Matmul backward — the two-GEMM rule</title><link rel="stylesheet" href="../reinforcement_learning/lessons/style.css"><style>main{overflow-wrap:break-word}table{table-layout:fixed}th,td{overflow-wrap:anywhere}input[type="range"]{max-width:min(200px,44vw)}label.inline{flex-wrap:wrap;max-width:100%}</style></head>
+<body><header class="topnav"><div class="inner"><a class="crumb-link" href="../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">gpu_kernels</a><span class="crumb">/</span><span class="crumb">26 · matmul backward</span><span class="step-pill">lesson 26 / 33</span></div></header><main>
+
+<h1>Matmul backward — the two-GEMM rule</h1>
+<p class="subtitle">Every learnable layer is a matmul, so every backward pass is built from <em>matmul backward</em>. One forward GEMM becomes <strong>two</strong> backward GEMMs of different shapes, with transposed operands and a reduction over the batch dimension. Get this kernel's layout and accumulation right and the rest of the backward is variations on it.</p>
+
+<div class="callout">
+  <div class="label">Builds on</div>
+  Lesson 25's claim that "backward is ~2× the forward FLOPs" comes from <em>here</em> — the 2× is literally two GEMMs. This lesson assumes the tiled-matmul (05), tensor cores (09), coalescing (04), and reductions (07) from Part I.
+</div>
+
+<h2>The question this lesson answers</h2>
+<p>Forward is one line: <span class="math">Y = X·W</span>. You profile a training step and see the GEMM time roughly triple versus inference. Where did two extra matmuls come from, what shapes are they, and which one is the troublemaker?</p>
+
+<h2>Deriving the two GEMMs</h2>
+<p>Take <span class="math">Y = X·W</span> with <span class="math">X ∈ ℝ<sup>T×K</sup></span> (T = batch·tokens, K = in-features), <span class="math">W ∈ ℝ<sup>K×N</sup></span>, <span class="math">Y ∈ ℝ<sup>T×N</sup></span>. Given the upstream gradient <span class="math">dY = ∂L/∂Y ∈ ℝ<sup>T×N</sup></span>, the chain rule gives:</p>
+<div class="math block">dX = dY · Wᵀ        (shape T×K, contracts over N)
+dW = Xᵀ · dY        (shape K×N, contracts over T)
+db = Σ<sub>rows</sub> dY  (shape N, a column reduction — if there's a bias)</div>
+
+<p>Three outputs, three kernels. Two of them are full GEMMs the same size as the forward; one is a cheap reduction. Notice what changed:</p>
+<table><thead><tr><th>GEMM</th><th>Shape (M×N×K-contraction)</th><th>Contraction dim</th><th>Transposed operand</th><th>FLOPs</th></tr></thead><tbody>
+<tr><td>forward <span class="math">Y=XW</span></td><td>T × N, contract K</td><td>K (in-features)</td><td>—</td><td>2·T·K·N</td></tr>
+<tr><td><span class="math">dX = dY·Wᵀ</span></td><td>T × K, contract N</td><td>N (out-features)</td><td>W transposed</td><td>2·T·N·K</td></tr>
+<tr><td><span class="math">dW = Xᵀ·dY</span></td><td>K × N, contract T</td><td><strong>T (batch·tokens)</strong></td><td>X transposed</td><td>2·K·T·N</td></tr>
+</tbody></table>
+<p>Same FLOP count three times (2·T·K·N) — that's the 2× of lesson 25. But the two backward GEMMs are <em>not</em> interchangeable, and the difference is the contraction dimension.</p>
+
+<h2>Why dW is the troublemaker: it contracts over the batch</h2>
+<p>The contraction (reduction) dimension is the one you sum over. Forward and <span class="math">dX</span> contract over a feature dimension (K or N) — typically a few thousand. But <span class="math">dW = Xᵀ·dY</span> contracts over <strong>T = batch·tokens</strong>, which at training scale is tens of thousands to millions. Three consequences:</p>
+<ol>
+  <li><strong>It's a long, thin reduction.</strong> The output <span class="math">dW</span> is small (K×N, the weight shape) but each entry sums T products. Each weight gradient is "this weight's contribution summed over every token in the batch" — a giant reduction along the dimension you most want to parallelize over.</li>
+  <li><strong>You want to split the contraction (split-K), which forces a cross-block reduction.</strong> To use all the SMs you tile <span class="math">dW</span>'s small output across few blocks — too few to fill the GPU. The fix is <strong>split-K</strong>: partition the T-contraction across blocks, each computing a partial <span class="math">dW</span>, then sum the partials. That sum is a cross-block reduction → either atomics (fast, <em>non-deterministic</em>) or a second reduction kernel over a workspace buffer (deterministic, one extra pass). Lesson 30 explains why determinism matters for training.</li>
+  <li><strong>fp32 accumulation is mandatory.</strong> Summing tens of thousands of bf16 products in bf16 loses the low bits exactly where it hurts — the same trap as lesson 19's sum-of-squares. Accumulate <span class="math">dW</span> (and <span class="math">db</span>) in fp32 even when X, dY, and the stored gradient are bf16.</li>
+</ol>
+
+<svg viewBox="0 0 860 250" class="diagram" role="img" aria-label="Three GEMMs: forward contracts K, dX contracts N, dW contracts the batch dim T and needs split-K">
+  <defs><marker id="m26" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <g font-size="11">
+    <text x="20" y="24" font-weight="700" fill="var(--text-mute)">FORWARD</text>
+    <rect class="node-bg" x="20" y="36" width="80" height="54" rx="6"/><text x="60" y="58" text-anchor="middle" font-weight="700">X</text><text x="60" y="76" text-anchor="middle" fill="var(--text-mute)">T×K</text>
+    <text x="108" y="68" font-size="16">·</text>
+    <rect class="node-bg" x="120" y="36" width="80" height="54" rx="6"/><text x="160" y="58" text-anchor="middle" font-weight="700">W</text><text x="160" y="76" text-anchor="middle" fill="var(--text-mute)">K×N</text>
+    <text x="208" y="68" font-size="16">=</text>
+    <rect class="node-bg" x="222" y="36" width="80" height="54" rx="6"/><text x="262" y="58" text-anchor="middle" font-weight="700">Y</text><text x="262" y="76" text-anchor="middle" fill="var(--text-mute)">T×N</text>
+    <text x="340" y="60" fill="var(--text-mute)">contract K (features) — fills the GPU fine</text>
+  </g>
+  <g font-size="11">
+    <text x="20" y="128" font-weight="700" fill="var(--text-mute)">dX = dY · Wᵀ</text>
+    <rect class="node-bg" x="20" y="140" width="80" height="54" rx="6"/><text x="60" y="162" text-anchor="middle" font-weight="700">dY</text><text x="60" y="180" text-anchor="middle" fill="var(--text-mute)">T×N</text>
+    <rect class="node-bg" x="120" y="140" width="80" height="54" rx="6"/><text x="160" y="162" text-anchor="middle" font-weight="700">Wᵀ</text><text x="160" y="180" text-anchor="middle" fill="var(--text-mute)">N×K</text>
+    <rect class="node-bg" x="222" y="140" width="80" height="54" rx="6"/><text x="262" y="162" text-anchor="middle" font-weight="700">dX</text><text x="262" y="180" text-anchor="middle" fill="var(--text-mute)">T×K</text>
+    <text x="340" y="164" fill="var(--text-mute)">contract N (features) — like forward, healthy</text>
+  </g>
+  <g font-size="11">
+    <text x="20" y="222" font-weight="700" fill="#b91c1c">dW = Xᵀ · dY</text>
+    <rect class="node-bg" x="20" y="228" width="80" height="20" rx="4"/><text x="60" y="242" text-anchor="middle" font-weight="700">Xᵀ K×T</text>
+    <rect class="node-bg" x="120" y="228" width="80" height="20" rx="4"/><text x="160" y="242" text-anchor="middle" font-weight="700">dY T×N</text>
+    <rect class="node-bg" x="222" y="228" width="80" height="20" rx="4"/><text x="262" y="242" text-anchor="middle" font-weight="700">dW K×N</text>
+    <text x="340" y="242" fill="#b91c1c">contract T (batch·tokens!) — tiny output, huge reduction → split-K + fp32</text>
+  </g>
+</svg>
+
+<h2>The transpose: don't physically transpose, re-stride</h2>
+<p>Both backward GEMMs name a transposed operand (<span class="math">Wᵀ</span>, <span class="math">Xᵀ</span>). The naive move — materialize the transpose in HBM first — costs a full read+write of the tensor and a non-coalesced access pattern (lesson 04). Nobody does that. Instead the GEMM kernel reads the operand with <strong>swapped strides</strong>: a "transpose" is just telling the tile loader that rows and columns trade roles. cuBLAS exposes this as the <code>transA</code>/<code>transB</code> op flags; in Triton it's which stride you multiply <code>tl.arange</code> by when you build the pointer block. The data never moves.</p>
+<p>The catch is on tensor cores (lesson 09): the <code>mma</code> instruction wants its fragments in a specific layout, so one transpose orientation lowers to a clean <code>mma</code> and the other may need an in-SMEM transpose or a layout conversion. This is why a backward GEMM can be measurably slower than the identically-sized forward GEMM even though the FLOPs match — the profiler shows it as extra SMEM traffic or a layout-conversion epilogue, not extra math.</p>
+
+<h2>Accumulate into the existing gradient (+=)</h2>
+<p>Weight gradients are not assigned, they are <strong>accumulated</strong>: <code>W.grad += dW</code>. Two reasons, both structural:</p>
+<ul>
+  <li><strong>Gradient accumulation across micro-batches.</strong> To simulate a large batch on limited memory you run several micro-batch forward/backwards and sum their gradients before one optimizer step. The <span class="math">dW</span> kernel must add into the buffer, not overwrite it.</li>
+  <li><strong>Weight sharing.</strong> A tied embedding/unembedding, or any weight reused at multiple points in the graph, receives a gradient contribution from each use; they sum.</li>
+</ul>
+<p>So the <span class="math">dW</span> epilogue is a read-modify-write of the fp32 grad buffer, and the split-K partials must also add (not assign). This is why the grad buffer is commonly fp32 even in a bf16 model — repeated accumulation into bf16 would drift.</p>
+
+<h2>Worked example: one MLP layer of a 7B model</h2>
+<p>Take the up-projection of a transformer MLP: K = 4096 (d_model), N = 14336 (d_ff), batch·seq T = 8192, bf16.</p>
+<table><thead><tr><th>Kernel</th><th>FLOPs</th><th>HBM traffic (bytes moved)</th><th>Bound</th></tr></thead><tbody>
+<tr><td>forward <span class="math">Y=XW</span></td><td>2·8192·4096·14336 ≈ 0.96 TFLOP</td><td>X 0.067 GB + W 0.117 GB + Y 0.235 GB</td><td>compute (tensor cores)</td></tr>
+<tr><td><span class="math">dX = dY·Wᵀ</span></td><td>0.96 TFLOP</td><td>dY 0.235 + W 0.117 + dX 0.067 GB</td><td>compute</td></tr>
+<tr><td><span class="math">dW = Xᵀ·dY</span></td><td>0.96 TFLOP</td><td>X 0.067 + dY 0.235 + dW (fp32) 0.235 GB</td><td>compute, but under-occupied → split-K</td></tr>
+</tbody></table>
+<p>Three ~0.96 TFLOP GEMMs ≈ 2.9 TFLOP per layer per step. At ~490 TFLOP/s sustained that is ~5.9 ms/layer of GEMM — and the backward two-thirds of it is the reason a training step is ~3× an inference step on the same shape. The <span class="math">dW</span> GEMM, despite identical FLOPs, often clocks slowest because its small K×N output (0.235 GB fp32) under-fills the GPU until split-K spreads the T-contraction across SMs.</p>
+
+<h2>The traps, collected</h2>
+<table><thead><tr><th>Trap</th><th>Symptom</th><th>Fix</th></tr></thead><tbody>
+<tr><td>bf16 dW accumulator</td><td>Loss plateaus higher than fp32 baseline; grads "noisy."</td><td>fp32 accumulate in the GEMM and in the grad buffer.</td></tr>
+<tr><td>Materializing the transpose</td><td>An extra transpose kernel in the trace, doubled HBM on W/X.</td><td>Use op flags / swapped strides; never write a transposed copy.</td></tr>
+<tr><td>dW under-occupied</td><td>dW GEMM is slow despite matching forward FLOPs; low SM%.</td><td>split-K across the T contraction; reduce partials in fp32.</td></tr>
+<tr><td>Atomic split-K reduction</td><td>Bitwise-different loss across runs; failed reproducibility.</td><td>Deterministic split-K (workspace + reduction kernel) when you need it.</td></tr>
+<tr><td>Forgetting +=</td><td>Gradient accumulation silently broken; effective batch wrong.</td><td>Accumulate into the grad buffer; zero it only at the step boundary.</td></tr>
+</tbody></table>
+
+<h2>Interactive · the three GEMMs and where dW chokes</h2>
+<p>Set the layer shape and batch. The widget draws forward, dX, and dW with their FLOPs and shows dW's output-tile count — the measure of how badly it under-fills the GPU before split-K. Watch dW's occupancy collapse as the weight shrinks and the batch grows.</p>
+
+<div class="widget"><div class="title">Forward vs dX vs dW: FLOPs and dW occupancy</div><p class="hint">dW output is K×N; tiled at 128×128 that's ⌈K/128⌉·⌈N/128⌉ output tiles. Fewer tiles than the ~132 SMs on an H100 ⇒ under-occupied ⇒ needs split-K over the T contraction.</p><div class="controls">
+<label class="inline">K (in-features) <input id="mm-K" type="range" min="512" max="16384" step="256" value="4096"><span class="val" id="mm-K-v">4096</span></label>
+<label class="inline">N (out-features) <input id="mm-N" type="range" min="512" max="28672" step="256" value="14336"><span class="val" id="mm-N-v">14336</span></label>
+<label class="inline">T (batch·tokens) <input id="mm-T" type="range" min="1024" max="131072" step="1024" value="8192"><span class="val" id="mm-T-v">8192</span></label>
+</div><canvas id="mm-canvas" class="dist-canvas" height="230"></canvas><p class="hint" id="mm-note"></p></div>
+
+<h2>What this sets up</h2>
+<p>You can now read any backward GEMM: identify the contraction dimension, spot the transpose, and predict whether it needs split-K and fp32 accumulation. Next we apply this to the single biggest tensor in a language model — the logits — where the forward "matmul into a loss" and its backward must be <em>fused</em> or the [B·T, V] softmax and its gradient blow your memory budget.</p>
+
+<script>
+(function(){
+  const ids=['K','N','T'];
+  const e=Object.fromEntries(ids.map(k=>[k,document.getElementById('mm-'+k)]));
+  const c=document.getElementById('mm-canvas'),ctx=c.getContext('2d'),note=document.getElementById('mm-note');
+  const SMS=132, TILE=128;
+  function draw(){
+    ids.forEach(k=>document.getElementById('mm-'+k+'-v').textContent=e[k].value);
+    c.width=c.clientWidth*devicePixelRatio;c.height=230*devicePixelRatio;ctx.setTransform(1,0,0,1,0,0);ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.clearRect(0,0,c.clientWidth,230);
+    const K=+e.K.value,N=+e.N.value,T=+e.T.value;
+    const flop=2*T*K*N;
+    const rows=[
+      ['forward  Y=XW   (contract K)', flop, '#2563eb'],
+      ['dX = dY·Wᵀ      (contract N)', flop, '#7c3aed'],
+      ['dW = Xᵀ·dY      (contract T)', flop, '#dc2626'],
+    ];
+    const max=flop*1.05;
+    rows.forEach(([n,v,col],i)=>{
+      const y=24+i*40,w=(c.clientWidth-300)*v/max;
+      ctx.fillStyle='#eef1f5';ctx.fillRect(290,y,c.clientWidth-300,24);
+      ctx.fillStyle=col;ctx.fillRect(290,y,w,24);
+      ctx.fillStyle='#1f2430';ctx.font='12px monospace';ctx.fillText(n,16,y+16);
+      ctx.fillStyle='#1f2430';ctx.font='12px sans-serif';ctx.fillText((v/1e12).toFixed(2)+' T',296+w+4,y+16);
+    });
+    const dwTiles=Math.ceil(K/TILE)*Math.ceil(N/TILE);
+    const fwdTiles=Math.ceil(T/TILE)*Math.ceil(N/TILE);
+    ctx.fillStyle='#1f2430';ctx.font='12px sans-serif';
+    ctx.fillText('forward output tiles: '+fwdTiles+'   (≫ '+SMS+' SMs → full)',16,168);
+    ctx.fillStyle = dwTiles<SMS ? '#b91c1c' : '#16a34a';
+    ctx.fillText('dW output tiles: '+dwTiles+(dwTiles<SMS?'  < '+SMS+' SMs → UNDER-OCCUPIED, split-K needed':'  ≥ SMs → ok'),16,190);
+    const splitK = dwTiles<SMS ? Math.ceil(SMS/dwTiles) : 1;
+    ctx.fillStyle='#5b6573';
+    ctx.fillText('suggested split-K factor over T: '+splitK+' (each adds a partial dW to reduce in fp32)',16,212);
+    note.textContent = dwTiles<SMS
+      ? 'dW under-fills the GPU: its tiny K×N output makes only '+dwTiles+' tiles for '+SMS+' SMs. Split the T-contraction '+splitK+' ways so every SM has work — then reduce the partials in fp32. This is why dW is the slow GEMM despite matching forward FLOPs.'
+      : 'dW output is large enough to fill the SMs here; split-K is unnecessary. Shrink the weight (K, N) or grow the batch (T) to see dW starve.';
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+<footer class="lesson-nav"><a href="25_backward_as_kernel_chain.html"><span class="dir">Previous</span><span class="ttl">25 · Backward as a kernel chain</span></a><a class="next" href="27_fused_cross_entropy.html"><span class="dir">Next</span><span class="ttl">27 · Fused cross-entropy</span></a></footer>
+<!-- reviewed:v1 -->
+</main></body></html>

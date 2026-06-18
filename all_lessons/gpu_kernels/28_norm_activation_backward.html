@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>28 · Norm &amp; activation backward</title><link rel="stylesheet" href="../reinforcement_learning/lessons/style.css"><style>main{overflow-wrap:break-word}table{table-layout:fixed}th,td{overflow-wrap:anywhere}input[type="range"]{max-width:min(200px,44vw)}label.inline{flex-wrap:wrap;max-width:100%}</style></head>
+<body><header class="topnav"><div class="inner"><a class="crumb-link" href="../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">gpu_kernels</a><span class="crumb">/</span><span class="crumb">28 · norm &amp; activation backward</span><span class="step-pill">lesson 28 / 33</span></div></header><main>
+
+<h1>Norm &amp; activation backward</h1>
+<p class="subtitle">The forward norm (lesson 19's fused RMSNorm) was a clean per-row job. Its backward splits into two halves with opposite kernel personalities: a per-row gradient that recomputes the row statistic instead of storing it, and a per-feature weight gradient that is a reduction across <em>every token in the batch</em>. The second half is where the engineering is.</p>
+
+<div class="callout">
+  <div class="label">Builds on</div>
+  Lesson 19 built the fused RMSNorm forward; lesson 25 flagged "recompute the stat" and "gradients accumulate, so backward has extra reductions"; lesson 07 is the reduction template. This lesson cashes all three in.
+</div>
+
+<h2>The question this lesson answers</h2>
+<p>RMSNorm forward was a streaming per-row kernel that fit on one screen. The backward of the same op is suddenly the kernel people get wrong. Why — and where does the difficulty actually live?</p>
+
+<h2>LayerNorm backward, derived</h2>
+<p>Forward (LayerNorm; RMSNorm drops the mean term): per row <span class="math">x ∈ ℝ<sup>d</sup></span>, with <span class="math">μ = mean(x)</span>, <span class="math">σ = sqrt(var(x)+ε)</span>, <span class="math">x̂ = (x−μ)/σ</span>, output <span class="math">y = γ·x̂ + β</span>. Given <span class="math">dy</span>, let <span class="math">dŷ = dy·γ</span>. Then:</p>
+<div class="math block">dx = (1/σ)·[ dŷ − mean(dŷ) − x̂·mean(dŷ·x̂) ]      (per-row)
+dγ = Σ<sub>tokens</sub> dy·x̂                                (per-feature)
+dβ = Σ<sub>tokens</sub> dy                                   (per-feature)</div>
+<p>The <span class="math">dx</span> formula has two reductions <em>inside the row</em> (<span class="math">mean(dŷ)</span> and <span class="math">mean(dŷ·x̂)</span>) — that is why dx couples every element of a row: a normalized output's gradient depends on the whole row, not just the matching element. But each row is independent, so dx parallelizes one-program-per-row exactly like the forward. The hard part is the other two lines.</p>
+
+<h2>Half one: dx recomputes the statistic, doesn't store it</h2>
+<p>To compute <span class="math">dx</span> you need <span class="math">σ</span> and <span class="math">x̂</span>. You have two choices: <strong>save</strong> them from the forward, or <strong>recompute</strong> them from the saved <span class="math">x</span>. The decision is lesson 25's save-vs-recompute trade, and recompute wins decisively here:</p>
+<table><thead><tr><th>Option</th><th>Extra HBM per row</th><th>Extra compute per row</th></tr></thead><tbody>
+<tr><td>Save x̂ (the full normalized row)</td><td>+ d·2 bytes read (same size as x — <em>doubles</em> the norm's HBM)</td><td>none</td></tr>
+<tr><td>Save σ only (1 scalar/row), recompute x̂ = (x−μ)/σ</td><td>+ a few bytes</td><td>one elementwise pass over x (already loaded)</td></tr>
+<tr><td><strong>Save nothing extra; recompute μ, σ from x</strong></td><td>0</td><td>one extra reduction over x (already loaded for dx anyway)</td></tr>
+</tbody></table>
+<p>Since the backward must read <span class="math">x</span> regardless (it's in the <span class="math">dx</span> formula), recomputing <span class="math">μ, σ</span> is one extra in-register reduction over data already in SMEM — essentially free — and it saves a full <span class="math">d</span>-sized HBM read that storing <span class="math">x̂</span> would cost. A norm is bandwidth-bound, so trading a tiny bit of on-chip compute for a halved HBM footprint is the right call. This is the recompute pattern from FlashAttention applied to the cheapest possible statistic.</p>
+
+<h2>Half two: dγ and dβ reduce across the whole batch</h2>
+<p>Here is the real kernel problem. <span class="math">dγ</span> and <span class="math">dβ</span> are per-<em>feature</em> (shape <span class="math">d</span>), but each feature's gradient sums over <strong>every token</strong>: <span class="math">dγ[j] = Σ<sub>rows</sub> dy[row,j]·x̂[row,j]</span>. The reduction axis is the token axis — the very axis you parallelized <span class="math">dx</span> over. So the blocks that compute <span class="math">dx</span> in parallel each hold a <em>partial</em> contribution to the same <span class="math">d</span>-vector, and those partials must combine. This is exactly the cross-block reduction tension from lesson 07, and there are three ways to resolve it:</p>
+
+<table><thead><tr><th>Strategy</th><th>How</th><th>Cost</th><th>Determinism</th></tr></thead><tbody>
+<tr><td><strong>Atomic add to a [d] buffer</strong></td><td>each block <code>atomicAdd</code>s its partial dγ/dβ</td><td>contention on d slots when many blocks write; fp32 atomics</td><td>❌ non-deterministic order → bitwise-variable</td></tr>
+<tr><td><strong>Partial buffers + reduce kernel</strong></td><td>block <em>g</em> writes a row of a [num_groups, d] workspace; a second kernel sums the groups</td><td>extra HBM = num_groups·d, one extra pass</td><td>✅ deterministic</td></tr>
+<tr><td><strong>Locked accumulation</strong></td><td>per-feature lock (or grouped rows so each block owns disjoint features)</td><td>serialization on hot features</td><td>✅ if order-fixed</td></tr>
+</tbody></table>
+
+<p>The production pattern (PyTorch, Apex, Liger) is the <strong>two-pass partial-buffer</strong> one: assign each program a contiguous group of rows, accumulate that group's partial <span class="math">dγ/dβ</span> in registers, write one partial row per group to a small workspace, then a tiny second kernel reduces the <span class="math">num\_groups × d</span> workspace to <span class="math">d</span>. It is deterministic, and the workspace is small (a few hundred groups × d), so the extra HBM is negligible against the activation. Atomics are faster to write but you give up reproducibility — and lesson 30 explains why a training run that isn't bitwise-reproducible is a debugging nightmare.</p>
+
+<svg viewBox="0 0 840 230" class="diagram" role="img" aria-label="dx is per-row parallel; dgamma/dbeta sum across all rows via partial buffers then a reduce kernel">
+  <defs><marker id="n28" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <text x="20" y="22" font-size="12" font-weight="700" fill="var(--text-mute)">rows of the batch (B·T), each handled by a program</text>
+  <g font-size="10" fill="var(--text-mute)">
+    <rect class="node-bg" x="20"  y="32" width="120" height="40" rx="6"/><text x="80"  y="50" text-anchor="middle" font-weight="700" fill="var(--text)">group 0 rows</text><text x="80"  y="66" text-anchor="middle">dx (out) + partial dγ,dβ</text>
+    <rect class="node-bg" x="160" y="32" width="120" height="40" rx="6"/><text x="220" y="50" text-anchor="middle" font-weight="700" fill="var(--text)">group 1 rows</text><text x="220" y="66" text-anchor="middle">dx (out) + partial dγ,dβ</text>
+    <rect class="node-bg" x="300" y="32" width="120" height="40" rx="6"/><text x="360" y="50" text-anchor="middle" font-weight="700" fill="var(--text)">group 2 rows</text><text x="360" y="66" text-anchor="middle">dx (out) + partial dγ,dβ</text>
+    <text x="440" y="56" fill="var(--text)">…</text>
+  </g>
+  <text x="20" y="108" font-size="11" fill="var(--text-mute)">dx writes straight out (per-row, independent). The partial dγ/dβ go to a workspace:</text>
+  <rect class="node-bg" x="20" y="120" width="400" height="34" rx="6"/><text x="220" y="142" text-anchor="middle" font-size="11" font-weight="700">workspace  [num_groups × d]  (fp32 partials)</text>
+  <path class="edge" d="M80 72 L120 120" marker-end="url(#n28)"/>
+  <path class="edge" d="M220 72 L220 120" marker-end="url(#n28)"/>
+  <path class="edge" d="M360 72 L320 120" marker-end="url(#n28)"/>
+  <rect class="node-bg" x="470" y="120" width="200" height="34" rx="6"/><text x="570" y="142" text-anchor="middle" font-size="11" font-weight="700">reduce kernel → dγ, dβ  [d]</text>
+  <path class="edge" d="M420 137 L470 137" marker-end="url(#n28)"/>
+  <text x="20" y="186" font-size="11" fill="var(--text-mute)">Deterministic: the reduce kernel sums groups in a fixed order. Atomics would skip the workspace but lose that order.</text>
+</svg>
+
+<h2>Activation backward: fuse it into the epilogue</h2>
+<p>GELU/SiLU sit between matmuls in the MLP. Their backward is elementwise — <span class="math">dx = dy · f'(preact)</span> — so the only question is whether <span class="math">dpreact</span> round-trips through HBM. It shouldn't: fuse the activation derivative into the epilogue of the matmul-backward that feeds it, exactly as the forward fused activation into the matmul epilogue (lesson 19, Triton lesson 08). For SiLU, <span class="math">f'(x) = σ(x)·(1 + x·(1−σ(x)))</span>; you recompute <span class="math">σ(x)</span> from the saved pre-activation rather than storing the derivative. One saved tensor (preact, or its sign for ReLU), one fused multiply, no extra HBM pass.</p>
+
+<h2>Worked number</h2>
+<p>RMSNorm backward, B·T = 16384 rows, d = 4096, bf16, on H100.</p>
+<ul>
+  <li><strong>dx</strong>: reads dy + x (2·16384·4096·2 = 0.27 GB), writes dx (0.13 GB), recomputes σ on chip. Bandwidth-bound: ~0.4 GB / 3.35 TB/s ≈ <strong>120 µs</strong>.</li>
+  <li><strong>dγ/dβ</strong>: the same dy and x reads can be folded into the dx pass (one fused kernel does both halves), so the only extra cost is the tiny workspace (say 256 groups × 4096 × 4 B = 4 MB) and a sub-microsecond reduce kernel.</li>
+  <li><strong>If you had stored x̂ instead of recomputing</strong>: + 0.13 GB extra read ≈ +40 µs, a 33% slowdown on a bandwidth-bound kernel — for zero benefit.</li>
+</ul>
+
+<h2>Interactive · dγ/dβ reduction: atomics vs partial buffers</h2>
+<p>Set the batch rows and the group count (how many partial-buffer rows). The widget shows atomic contention (writers per feature slot) against the two-pass workspace cost, and flags the determinism trade.</p>
+
+<div class="widget"><div class="title">Cross-token weight-gradient reduction</div><p class="hint">Atomics: every group adds into the same d slots → contention ∝ groups. Two-pass: groups write disjoint workspace rows (no contention, deterministic) then a reduce kernel sums them → extra HBM = groups·d·4 bytes.</p><div class="controls">
+<label class="inline">batch rows B·T <input id="nb-T" type="range" min="2048" max="131072" step="2048" value="16384"><span class="val" id="nb-T-v">16384</span></label>
+<label class="inline">feature d <input id="nb-d" type="range" min="1024" max="16384" step="256" value="4096"><span class="val" id="nb-d-v">4096</span></label>
+<label class="inline">groups (partials) <input id="nb-g" type="range" min="32" max="2048" step="32" value="256"><span class="val" id="nb-g-v">256</span></label>
+</div><canvas id="nb-canvas" class="dist-canvas" height="210"></canvas><p class="hint" id="nb-note"></p></div>
+
+<h2>What this sets up</h2>
+<p>You now have the two backward personalities — per-row independent (easy) and cross-batch reduction (the work) — and the recompute-the-stat reflex. The next lesson takes both to their hardest form: FlashAttention backward, where you recompute the entire N² score matrix, carry a per-row correction, and run the two-GEMM rule inside a streaming loop.</p>
+
+<script>
+(function(){
+  const ids=['T','d','g'];
+  const e=Object.fromEntries(ids.map(k=>[k,document.getElementById('nb-'+k)]));
+  const c=document.getElementById('nb-canvas'),ctx=c.getContext('2d'),note=document.getElementById('nb-note');
+  function draw(){
+    ids.forEach(k=>document.getElementById('nb-'+k+'-v').textContent=e[k].value);
+    c.width=c.clientWidth*devicePixelRatio;c.height=210*devicePixelRatio;ctx.setTransform(1,0,0,1,0,0);ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.clearRect(0,0,c.clientWidth,210);
+    const T=+e.T.value,d=+e.d.value,g=+e.g.value;
+    // atomic contention: all g groups hammer the same d slots → ~g writers per slot
+    const atomicWriters=g;
+    const wsMB=g*d*4/1e6;
+    const rows=[
+      ['atomic writers per feature slot (contention)', atomicWriters/2048, '#dc2626', atomicWriters+' writers'],
+      ['two-pass workspace HBM', wsMB/40, '#16a34a', wsMB.toFixed(1)+' MB'],
+    ];
+    rows.forEach(([n,frac,col,lbl],i)=>{
+      const y=30+i*52,w=Math.min(1,frac)*(c.clientWidth-360);
+      ctx.fillStyle='#eef1f5';ctx.fillRect(350,y,c.clientWidth-360,26);
+      ctx.fillStyle=col;ctx.fillRect(350,y,w,26);
+      ctx.fillStyle='#1f2430';ctx.font='12px sans-serif';ctx.fillText(n,12,y+17);
+      ctx.fillStyle='#1f2430';ctx.fillText(lbl,356+w+4,y+17);
+    });
+    ctx.fillStyle='#5b6573';ctx.font='12px sans-serif';
+    ctx.fillText('Fewer groups → cheaper reduce + less workspace, but each group reduces more rows serially.',12,150);
+    ctx.fillText('More groups → more parallelism in the dx pass, but bigger workspace / worse atomic contention.',12,170);
+    note.textContent='Two-pass workspace here is '+wsMB.toFixed(1)+' MB — negligible vs the '+(T*d*2/1e9).toFixed(2)+' GB activation — and it is deterministic. Atomics would avoid the '+wsMB.toFixed(1)+' MB but make '+g+' groups contend on the same '+d+' slots and lose bitwise reproducibility (lesson 30).';
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+<footer class="lesson-nav"><a href="27_fused_cross_entropy.html"><span class="dir">Previous</span><span class="ttl">27 · Fused cross-entropy</span></a><a class="next" href="29_flash_attention_backward.html"><span class="dir">Next</span><span class="ttl">29 · FlashAttention backward</span></a></footer>
+<!-- reviewed:v1 -->
+</main></body></html>

@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>25 · The backward pass as a kernel chain</title><link rel="stylesheet" href="../reinforcement_learning/lessons/style.css"><style>main{overflow-wrap:break-word}table{table-layout:fixed}th,td{overflow-wrap:anywhere}input[type="range"]{max-width:min(200px,44vw)}label.inline{flex-wrap:wrap;max-width:100%}</style></head>
+<body><header class="topnav"><div class="inner"><a class="crumb-link" href="../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">gpu_kernels</a><span class="crumb">/</span><span class="crumb">25 · backward as a kernel chain</span><span class="step-pill">lesson 25 / 33</span></div></header><main>
+
+<h1>The backward pass as a kernel chain</h1>
+<p class="subtitle">Parts I–III taught the forward pass: the GEMMs, the attention, the fused norms that turn tokens into logits. Training runs that chain <em>backwards</em>. This lesson is the hinge: what a backward pass actually is at the kernel level, why it costs ~2× the forward in FLOPs but is bottlenecked by <strong>memory</strong>, and what every op must stash on the way forward so its gradient kernel can run on the way back.</p>
+
+<div class="callout">
+  <div class="label">Where this sits</div>
+  Part II showed you a forward pass as "a sequence of GEMMs and an attention." Part III gave you the optimization loop (profile → Triton → compile). Part IV — this lesson and the five after it — is the other half of every model that learns: the <strong>backward pass</strong>. Each lesson here is the gradient kernel of a forward op you already know. Lesson 26 is matmul's; 27 is the loss; 28 is the norms; 29 is FlashAttention's; 30 is the optimizer that consumes every gradient.
+</div>
+
+<h2>The question this lesson answers</h2>
+<p>You can write a fused forward kernel. Now someone hands you a model that has to <em>learn</em>. What new kernels appear, what do they cost, and where does the GPU actually choke? The surprising answer — and the reason training infra is its own discipline — is that the backward pass roughly doubles your FLOPs but can <strong>quadruple or worse</strong> your memory, and the memory is what you run out of first.</p>
+
+<h2>Autograd is a tape, not magic</h2>
+<p>A forward pass is a straight-line program: each op reads tensors, writes a tensor. Reverse-mode autodiff records that program as a <strong>tape</strong> — an ordered list of the ops and the inputs each one will need to compute its gradient. The backward pass walks the tape in reverse. For every forward op <span class="math">y = f(x)</span> there is a <strong>vector-Jacobian product</strong> (vjp): given <span class="math">dy = ∂L/∂y</span> flowing in from downstream, produce <span class="math">dx = ∂L/∂x = Jᵀ · dy</span> to pass upstream.</p>
+
+<p>The whole backward pass is just the forward kernel chain reversed, with each forward kernel replaced by its vjp kernel:</p>
+
+<svg viewBox="0 0 880 230" class="diagram" role="img" aria-label="Forward chain left to right, backward chain right to left, each backward op consuming a saved tensor">
+  <defs><marker id="f25" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <text x="20" y="24" font-size="12" font-weight="700" fill="var(--text-mute)">FORWARD — record the tape</text>
+  <g font-size="11" fill="var(--text-mute)">
+    <rect class="node-bg" x="20"  y="36" width="130" height="46" rx="6"/><text x="85"  y="56" text-anchor="middle" font-weight="700" fill="var(--text)">matmul</text><text x="85"  y="72" text-anchor="middle">save X, W</text>
+    <rect class="node-bg" x="190" y="36" width="130" height="46" rx="6"/><text x="255" y="56" text-anchor="middle" font-weight="700" fill="var(--text)">RMSNorm</text><text x="255" y="72" text-anchor="middle">save x, recompute σ</text>
+    <rect class="node-bg" x="360" y="36" width="130" height="46" rx="6"/><text x="425" y="56" text-anchor="middle" font-weight="700" fill="var(--text)">attention</text><text x="425" y="72" text-anchor="middle">save Q,K,V, m, ℓ</text>
+    <rect class="node-bg" x="530" y="36" width="130" height="46" rx="6"/><text x="595" y="56" text-anchor="middle" font-weight="700" fill="var(--text)">GELU</text><text x="595" y="72" text-anchor="middle">save preact</text>
+    <rect class="node-bg" x="700" y="36" width="150" height="46" rx="6"/><text x="775" y="56" text-anchor="middle" font-weight="700" fill="var(--text)">cross-entropy</text><text x="775" y="72" text-anchor="middle">save logits/labels</text>
+  </g>
+  <path class="edge" d="M150 59 L190 59" marker-end="url(#f25)"/>
+  <path class="edge" d="M320 59 L360 59" marker-end="url(#f25)"/>
+  <path class="edge" d="M490 59 L530 59" marker-end="url(#f25)"/>
+  <path class="edge" d="M660 59 L700 59" marker-end="url(#f25)"/>
+  <text x="20" y="132" font-size="12" font-weight="700" fill="var(--text-mute)">BACKWARD — replay in reverse, consume the saved tensors</text>
+  <g font-size="11" fill="var(--text-mute)">
+    <rect class="node-bg" x="20"  y="144" width="130" height="46" rx="6"/><text x="85"  y="164" text-anchor="middle" font-weight="700" fill="var(--text)">matmul bwd</text><text x="85"  y="180" text-anchor="middle">dX, dW (2 GEMMs)</text>
+    <rect class="node-bg" x="190" y="144" width="130" height="46" rx="6"/><text x="255" y="164" text-anchor="middle" font-weight="700" fill="var(--text)">norm bwd</text><text x="255" y="180" text-anchor="middle">dx, dγ, dβ</text>
+    <rect class="node-bg" x="360" y="144" width="130" height="46" rx="6"/><text x="425" y="164" text-anchor="middle" font-weight="700" fill="var(--text)">attn bwd</text><text x="425" y="180" text-anchor="middle">dQ,dK,dV</text>
+    <rect class="node-bg" x="530" y="144" width="130" height="46" rx="6"/><text x="595" y="164" text-anchor="middle" font-weight="700" fill="var(--text)">GELU bwd</text><text x="595" y="180" text-anchor="middle">elementwise</text>
+    <rect class="node-bg" x="700" y="144" width="150" height="46" rx="6"/><text x="775" y="164" text-anchor="middle" font-weight="700" fill="var(--text)">CE bwd</text><text x="775" y="180" text-anchor="middle">dlogits</text>
+  </g>
+  <path class="edge" d="M190 167 L150 167" marker-end="url(#f25)"/>
+  <path class="edge" d="M360 167 L320 167" marker-end="url(#f25)"/>
+  <path class="edge" d="M530 167 L490 167" marker-end="url(#f25)"/>
+  <path class="edge" d="M700 167 L660 167" marker-end="url(#f25)"/>
+  <path class="edge" d="M775 82 L775 144" marker-end="url(#f25)" stroke-dasharray="4 3"/>
+  <text x="788" y="116" font-size="10" fill="var(--text-mute)">loss starts</text>
+</svg>
+
+<p>Two facts fall out of this picture and they drive everything in Part IV:</p>
+<ol>
+  <li><strong>Backward needs forward's intermediates.</strong> The matmul vjp needs <code>X</code> and <code>W</code>; GELU's needs its pre-activation; attention's needs the softmax statistics. Those tensors are produced early in the forward and consumed late in the backward, so they must <em>live</em> in HBM for the whole step. That is the activation-memory peak.</li>
+  <li><strong>The dependency edges reverse.</strong> A forward op whose output fed three consumers becomes a backward op whose gradient is the <em>sum</em> of three incoming gradients — gradient accumulation is a reduction, and reductions are lesson 07's template all over again.</li>
+</ol>
+
+<h2>The FLOP arithmetic: the 6N rule</h2>
+<p>One linear layer <span class="math">Y = X·W</span> with <span class="math">X ∈ ℝ<sup>T×K</sup></span>, <span class="math">W ∈ ℝ<sup>K×N</sup></span> costs <span class="math">2·T·K·N</span> FLOPs forward (a multiply-add is 2). The backward produces <em>two</em> matmuls of the same size:</p>
+<div class="math block">dX = dY · Wᵀ   (2·T·N·K)        dW = Xᵀ · dY   (2·K·T·N)</div>
+<p>So backward is <strong>2× the forward FLOPs</strong>, and a full training step is forward + backward ≈ <strong>3× a forward-only (inference) pass</strong>. Counted per parameter per token this is the famous rule: <strong>~2 FLOPs forward + ~4 backward = ~6 FLOPs per parameter per token</strong>. For an <span class="math">N</span>-parameter model on <span class="math">D</span> tokens, training is ≈ <span class="math">6·N·D</span> FLOPs — the number behind every compute-budget estimate you have seen.</p>
+
+<div class="callout ok">
+  <div class="label">Worked number</div>
+  A 7B-parameter model, one step on a global batch of 2M tokens: <span class="math">6 × 7×10⁹ × 2×10⁶ ≈ 8.4×10¹⁶</span> FLOPs. On one H100 at ~490 TFLOP/s sustained bf16 that is ~170 s of pure math — which is why you shard it across hundreds of GPUs. Inference on the same batch would be a third of that.
+</div>
+
+<h2>But the bottleneck is memory, not those FLOPs</h2>
+<p>Here is the twist that makes training infra hard. The forward pass of a transformer block produces a stack of activations — the input to every matmul, every norm, every attention — and the backward needs almost all of them. They cannot be freed until their gradient kernel has run. So peak memory is dominated not by weights or gradients but by <strong>stored activations</strong>, and that grows linearly with batch×sequence and with depth.</p>
+
+<table><thead><tr><th>Memory class</th><th>Size (bf16, P params, L layers, tokens B·T, hidden d)</th><th>Lives for</th></tr></thead><tbody>
+<tr><td>Weights</td><td>2P</td><td>whole run</td></tr>
+<tr><td>Gradients</td><td>2P (often fp32 → 4P)</td><td>backward → optimizer</td></tr>
+<tr><td>Optimizer state (Adam m, v)</td><td>8P (fp32 m + v) + 4P master = <strong>12P</strong></td><td>whole run</td></tr>
+<tr><td><strong>Activations</strong></td><td>≈ B·T·d·L · (constant ~10–34 depending on what's saved)</td><td>forward → consumed in backward</td></tr>
+</tbody></table>
+
+<p>The weights/grads/optimizer terms are fixed per model (the "16P+" that Adam mixed-precision training famously needs). The activation term is the one you <em>control</em> at the kernel level, and at long sequence it dwarfs the rest. Two kernel-side levers shrink it, and both are lessons in this Part:</p>
+<ul>
+  <li><strong>Recompute instead of save</strong> (lessons 28–30). If recomputing a tensor in the backward is cheaper than the HBM it would occupy, throw it away on the forward and recompute. FlashAttention does this with the N² score matrix; gradient checkpointing does it for whole blocks.</li>
+  <li><strong>Fuse so intermediates never hit HBM</strong> (lesson 27, and everything from Part III). The fused cross-entropy kernel is the extreme case: the [B·T, V] logits and their gradient are the single largest tensors in the model, and a fused kernel keeps them off HBM entirely.</li>
+</ul>
+
+<h2>What each forward op must save — the "save_for_backward" decision</h2>
+<p>Every op faces the same question: to run my vjp, do I <em>save</em> a forward tensor or <em>recompute</em> it? The answer is a bandwidth-vs-compute trade you can compute, and it is the recurring decision of this whole Part.</p>
+
+<table><thead><tr><th>Forward op</th><th>vjp needs</th><th>Save or recompute?</th><th>Why</th></tr></thead><tbody>
+<tr><td>matmul <span class="math">Y=XW</span></td><td>X, W</td><td>save both</td><td>Both are needed anyway as live tensors; recompute impossible.</td></tr>
+<tr><td>ReLU/GELU</td><td>pre-activation (or sign mask)</td><td>save mask (1 bit) or recompute from input</td><td>A bf16 pre-act is 16×bigger than a sign bit; for ReLU save the bit.</td></tr>
+<tr><td>RMSNorm/LayerNorm</td><td>x and the row stat σ (or μ,σ)</td><td>save x, <strong>recompute σ</strong></td><td>σ is one scalar/row — recomputing it in the backward is far cheaper than the extra read pattern; lesson 28.</td></tr>
+<tr><td>softmax</td><td>output p</td><td>save p (or its stats)</td><td>The vjp <span class="math">dx = p∘(dy − (p·dy))</span> is written in terms of the output, not the input.</td></tr>
+<tr><td>attention</td><td>Q,K,V + softmax stats (m, ℓ)</td><td>save Q,K,V + the per-row stats; <strong>recompute S</strong></td><td>Storing the N² scores is the whole problem FlashAttention avoids; lesson 29.</td></tr>
+<tr><td>dropout</td><td>the mask</td><td>save the RNG seed, regenerate mask</td><td>A seed is 8 bytes vs a full bf16 mask tensor.</td></tr>
+</tbody></table>
+
+<h2>Three kernel-shaped facts about backward kernels</h2>
+<ol>
+  <li><strong>Layouts transpose.</strong> <code>dX = dY·Wᵀ</code> and <code>dW = Xᵀ·dY</code> touch transposed operands. The coalescing trap from lesson 04 and the tiling from lesson 05 reappear — a backward kernel that ignores the transpose tanks its bandwidth. Lesson 26.</li>
+  <li><strong>Gradients accumulate, so backward has extra reductions.</strong> A weight used by every token gets a gradient summed over all B·T rows; a bias gradient is a column reduction. These are lesson 07 reductions, and doing them with cross-block atomics breaks determinism (lesson 30).</li>
+  <li><strong>Accumulate gradients in fp32.</strong> A bf16 grad accumulator loses the low bits exactly when many small contributions sum — the same trap as the RMSNorm sum-of-squares in lesson 19. Every backward reduction upcasts.</li>
+</ol>
+
+<h2>Interactive · the training-step budget</h2>
+<p>Set the model and batch shape. The widget computes forward FLOPs, backward FLOPs (the 2× term), the fixed weight+grad+optimizer memory, and the <strong>activation peak</strong> — then shows how turning on full-block recompute trades the activation peak for extra backward FLOPs. Find the batch×seq where activations, not weights, decide whether the step fits.</p>
+
+<div class="widget"><div class="title">Training step: FLOPs and the memory peak</div><p class="hint">Activation estimate ≈ tokens · d · layers · bytes · factor (factor ~16 saved / ~4 with block recompute). Memory in GB; FLOPs per step.</p><div class="controls">
+<label class="inline">params (B) <input id="tb-P" type="range" min="0.5" max="70" step="0.5" value="7"><span class="val" id="tb-P-v">7</span></label>
+<label class="inline">layers <input id="tb-L" type="range" min="8" max="96" step="1" value="32"><span class="val" id="tb-L-v">32</span></label>
+<label class="inline">hidden d <input id="tb-d" type="range" min="1024" max="16384" step="256" value="4096"><span class="val" id="tb-d-v">4096</span></label>
+<label class="inline">batch·seq (tokens) <input id="tb-T" type="range" min="2048" max="262144" step="2048" value="32768"><span class="val" id="tb-T-v">32768</span></label>
+<label class="inline">recompute blocks <input id="tb-rc" type="checkbox"></label>
+</div><canvas id="tb-canvas" class="dist-canvas" height="240"></canvas><p class="hint" id="tb-note"></p></div>
+
+<h2>What this sets up</h2>
+<p>You now have the map: training is the forward chain reversed, ~2× the FLOPs, bottlenecked by the activations the backward must consume, with every op making a save-vs-recompute call. The next five lessons build the kernels that fill in this map, starting with the atom they are all made of — the matmul backward, which is <em>two</em> GEMMs, not one.</p>
+
+<script>
+(function(){
+  const ids=['P','L','d','T'];
+  const e=Object.fromEntries(ids.map(k=>[k,document.getElementById('tb-'+k)]));
+  const rc=document.getElementById('tb-rc');
+  const c=document.getElementById('tb-canvas'),ctx=c.getContext('2d'),note=document.getElementById('tb-note');
+  function draw(){
+    ids.forEach(k=>document.getElementById('tb-'+k+'-v').textContent=e[k].value);
+    c.width=c.clientWidth*devicePixelRatio;c.height=240*devicePixelRatio;ctx.setTransform(1,0,0,1,0,0);ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.clearRect(0,0,c.clientWidth,240);
+    const P=+e.P.value*1e9, L=+e.L.value, d=+e.d.value, T=+e.T.value;
+    // fixed memory (GB): weights 2P + grad 4P(fp32) + adam 12P  → bytes
+    const fixed = (2*P + 4*P + 12*P)/1e9;
+    const factor = rc.checked ? 4 : 16;
+    const act = (T*d*L*2*factor)/1e9; // bf16 activations
+    const fwdF = 2*P*T, bwdF = 4*P*T, rcF = rc.checked ? 2*P*T : 0;
+    const total = fixed+act;
+    const rows=[
+      ['weights+grad+optimizer (fixed)', fixed, '#2563eb'],
+      ['activation peak', act, rc.checked?'#16a34a':'#dc2626'],
+    ];
+    const max=Math.max(total, 1);
+    rows.forEach(([n,v,col],i)=>{
+      const y=30+i*46,w=(c.clientWidth-260)*v/max;
+      ctx.fillStyle='#eef1f5';ctx.fillRect(250,y,c.clientWidth-260,28);
+      ctx.fillStyle=col;ctx.fillRect(250,y,w,28);
+      ctx.fillStyle='#1f2430';ctx.font='12px sans-serif';ctx.fillText(n,20,y+18);
+      ctx.fillStyle='#1f2430';ctx.fillText(v.toFixed(1)+' GB',256+w+4,y+18);
+    });
+    ctx.fillStyle='#1f2430';ctx.font='13px sans-serif';
+    ctx.fillText('Total HBM/GPU (unsharded): '+total.toFixed(1)+' GB',20,150);
+    ctx.fillStyle='#5b6573';ctx.font='12px sans-serif';
+    ctx.fillText('FLOPs/step: fwd '+(fwdF/1e12).toFixed(1)+' T + bwd '+(bwdF/1e12).toFixed(1)+' T'+(rc.checked?' + recompute '+(rcF/1e12).toFixed(1)+' T':''),20,178);
+    const actShare=100*act/total;
+    ctx.fillText('Activations are '+actShare.toFixed(0)+'% of peak memory.',20,202);
+    note.textContent = actShare>50
+      ? 'Activations dominate — you are activation-bound. This is where recompute (lesson 28–30) and fused CE (lesson 27) buy you the most. Toggle recompute and watch the peak drop while backward FLOPs rise.'
+      : 'Weights+optimizer dominate at this shape — you are parameter-bound, and sharding (ZeRO/FSDP) matters more than activation tricks. Push tokens up and the crossover appears.';
+  }
+  [...Object.values(e),rc].forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+<footer class="lesson-nav"><a href="24_performant_pytorch.html"><span class="dir">Previous</span><span class="ttl">24 · Performant PyTorch</span></a><a class="next" href="26_matmul_backward.html"><span class="dir">Next</span><span class="ttl">26 · Matmul backward</span></a></footer>
+<!-- reviewed:v1 -->
+</main></body></html>

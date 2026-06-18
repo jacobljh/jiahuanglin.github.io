@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>27 · CUDA algorithms and data structures</title>
+<link rel="stylesheet" href="../reinforcement_learning/lessons/style.css">
+<style>.mini-index{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin:16px 0}.mini-index a{border:1px solid var(--border);background:var(--bg-elev);border-radius:8px;padding:12px 14px;text-decoration:none}.mini-index a:hover{border-color:var(--accent);text-decoration:none}.mini-index strong{display:block;color:var(--text)}.mini-index span{display:block;color:var(--text-mute);font-size:13px;margin-top:4px}.linear-step{border-left:3px solid var(--accent-2);padding-left:14px;margin:14px 0}.linear-step .label{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--text-mute)}</style>
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">gpu_kernels</a>
+    <span class="crumb">/</span>
+    <span class="crumb">27 · cuda algorithms & data structures</span>
+    <span class="step-pill">lesson 27 / 27</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Algorithms, data structures, and the line of thinking</h1>
+<p class="subtitle">A GPU algorithm is not a loop. It is a data-ownership plan: who owns which output, where partial results meet, and how expensive that meeting is. Learn to translate any serial algorithm into independent ownership plus a combine step.</p>
+
+<div class="linear-step">
+  <div class="label">Linearized thinking</div>
+  <p>Every kernel you will ever write — and every interview answer about one — collapses to the same five steps. Run them in order, out loud, before you type a single line of CUDA:</p>
+  <ol>
+    <li><strong>Define output ownership.</strong> Pick the unit of the answer and assign exactly one writer to it. Which thread / warp / block produces output element <code>i</code>? If two writers touch one output, you have a combine problem; name it now.</li>
+    <li><strong>Choose a memory layout.</strong> Decide how inputs and outputs sit in memory so that the writers you just assigned read <em>coalesced</em> (adjacent threads touch adjacent addresses) and reuse data through shared memory or registers.</li>
+    <li><strong>Split independent work.</strong> Carve the problem so the vast majority of arithmetic happens with no communication — pure local accumulation in registers or shared memory.</li>
+    <li><strong>Combine partial results.</strong> Name the meeting point and its primitive: none (map), tree (reduction), scan (prefix), atomic (histogram / queue), or a second kernel launch (cross-block sync).</li>
+    <li><strong>Remove the most expensive global-memory or atomic step.</strong> The combine is almost always the bottleneck. Collapse global atomics into shared-memory atomics, replace a launch with a single in-register reduction, or turn a branch into a scan-driven scatter.</li>
+  </ol>
+</div>
+
+<h2>The core reframing</h2>
+<p>A CPU programmer asks one question: <em>"What loop do I write?"</em> Control is implicit and free — the program counter walks the data and the cache hides latency. On a GPU that question is the wrong one. You have tens of thousands of threads in flight and no cheap global ordering, so you instead ask three questions:</p>
+<ul>
+  <li><strong>What work is independent?</strong> Independent work is free parallelism. The more arithmetic a thread does before it has to talk to anyone, the better.</li>
+  <li><strong>Where do partial results meet?</strong> The meeting point is the only place ordering and communication exist. Push it as late and as local as possible.</li>
+  <li><strong>How expensive is that meeting?</strong> A meeting inside a warp is nearly free (shuffles). Inside a block it costs a barrier. Across blocks it costs an atomic or — more often — a whole new kernel launch.</li>
+</ul>
+<p>Reframed this way, "writing the algorithm" becomes "deciding ownership and pricing the combine." The loop is an afterthought the hardware generates for you.</p>
+
+<div class="callout">
+  <div class="label">MENTAL MODEL</div>
+  <p>Serial code interleaves <em>compute</em> and <em>communicate</em> on every iteration. GPU code segregates them: a long phase of embarrassingly parallel local compute, then a short, carefully priced communication phase. Your job is to make the first phase as fat as possible and the second as cheap as possible.</p>
+</div>
+
+<h2>An algorithm pattern map</h2>
+<p>Almost every parallel kernel is one of seven shapes. Memorize the ownership and the combine column — that pairing is the answer to "how would you parallelize X?"</p>
+
+<table>
+<thead>
+<tr><th>Problem</th><th>Ownership (who writes one output)</th><th>Combine step</th><th>Common trap</th></tr>
+</thead>
+<tbody>
+<tr><td>Map / stencil</td><td>One thread per output element</td><td>None — outputs are disjoint</td><td>Uncoalesced reads at stencil halos; redundant boundary loads</td></tr>
+<tr><td>Reduction</td><td>Block owns a partial; grid owns the scalar</td><td>Tree (warp shuffle → shared → 2nd launch)</td><td>Global atomics per element; assuming a grid-wide <code>__syncthreads</code> exists</td></tr>
+<tr><td>Prefix scan</td><td>Thread owns position <code>i</code>; block owns a chunk</td><td>Scan within block, scan block totals, add offset</td><td>Forgetting the inter-block offset; serial dependence killing parallelism</td></tr>
+<tr><td>Histogram</td><td>Thread owns input items; bin is shared output</td><td>Atomic add (shared-mem private bins → global)</td><td>Global atomic contention on hot bins</td></tr>
+<tr><td>CSR SpMV</td><td>Warp (or block) owns one row</td><td>Reduction over the row's nonzeros</td><td>Row-length skew → load imbalance; scalar-per-row → uncoalesced</td></tr>
+<tr><td>Sort</td><td>Pass owns a digit; bucket placement via scan</td><td>Prefix scan of digit counts → scatter</td><td>Hand-rolling instead of using CUB; ignoring stability</td></tr>
+<tr><td>Graph BFS</td><td>Thread owns a frontier vertex's edges</td><td>Atomic claim (CAS) + atomic queue append</td><td>High-degree vertices starve their warp (degree skew)</td></tr>
+</tbody>
+</table>
+
+<p>Notice the pattern: ownership is always "thread / warp / block / grid owns one unit of output," and the combine is always "none / tree / scan / atomic / second launch." Two small vocabularies generate every kernel.</p>
+
+<h2>Reduction: many local accumulators, then a tree</h2>
+<p>Reduction (sum, max, dot product, norm) is the canonical combine. The serial loop <code>for i: acc += x[i]</code> has a single accumulator and a strict dependence chain. The GPU answer inverts that: give every thread its <em>own</em> accumulator, let each chew through many elements with a grid-stride loop (fat independent phase), then fold the thousands of partials with a tree.</p>
+
+<p>The tree has three tiers priced by communication cost:</p>
+<ul>
+  <li><strong>Within a warp</strong> — <code>__shfl_down_sync</code>. No shared memory, no barrier. Nearly free. This is <code>warp_reduce_sum</code> from lesson 02.</li>
+  <li><strong>Within a block</strong> — one partial per warp lands in shared memory, then warp 0 reduces those with another <code>warp_reduce_sum</code>. Costs one <code>__syncthreads</code>.</li>
+  <li><strong>Across blocks</strong> — and here is the catch.</li>
+</ul>
+
+<div class="callout warn">
+  <div class="label">WHY TWO KERNEL LAUNCHES</div>
+  <p>There is <strong>no cross-block barrier inside an ordinary kernel</strong>. <code>__syncthreads()</code> synchronizes one block only. Blocks are scheduled in an arbitrary order, and some may not even have started when others finish — so you cannot wait for "all blocks" mid-kernel. The only guaranteed grid-wide synchronization point in normal CUDA is the <em>kernel launch boundary</em>: when a kernel returns, every block has finished and its writes are visible to the next launch. So a multi-block reduction writes one partial per block, then a <strong>second launch</strong> reduces that small array of partials.</p>
+</div>
+
+<p>Here is the block-level kernel. It produces exactly one partial per block. <code>warp_reduce_sum</code> is defined in lesson 02 — signature shown for context:</p>
+
+<pre><code>// from lesson 02:
+__inline__ __device__ float warp_reduce_sum(float v);   // folds 32 lanes -&gt; lane 0
+
+__global__ void reduce_partials(const float* __restrict__ x, int n,
+                                float* __restrict__ partial) {
+    // 1. fat independent phase: each thread sums many elements
+    float sum = 0.0f;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+         i &lt; n;
+         i += blockDim.x * gridDim.x) {
+        sum += x[i];
+    }
+
+    // 2. warp-level combine (free)
+    sum = warp_reduce_sum(sum);
+
+    // 3. block-level combine: one slot per warp in shared memory
+    __shared__ float warp_sums[32];           // up to 1024 threads = 32 warps
+    int lane = threadIdx.x &amp; 31;
+    int warp = threadIdx.x &gt;&gt; 5;
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+
+    // warp 0 folds the per-warp partials into one block partial
+    if (warp == 0) {
+        int n_warps = (blockDim.x + 31) &gt;&gt; 5;
+        float v = (lane &lt; n_warps) ? warp_sums[lane] : 0.0f;
+        v = warp_reduce_sum(v);
+        if (lane == 0) partial[blockIdx.x] = v;   // one partial per block
+    }
+}
+</code></pre>
+
+<p>The host then launches the same kernel a second time on the <code>partial</code> array (now small enough for one block) to get the final scalar. Two alternatives avoid the second launch:</p>
+<ul>
+  <li><strong><code>atomicAdd</code> to one global accumulator.</strong> Replace the last line with <code>if (...) atomicAdd(out, v);</code>. One atomic per block — cheap because there are few blocks — but the result is nondeterministic in floating point (addition order varies) and you must zero <code>out</code> first.</li>
+  <li><strong>Cooperative-groups grid sync.</strong> Launch with <code>cudaLaunchCooperativeKernel</code> and call <code>grid.sync()</code> from <code>cooperative_groups</code>. This <em>does</em> give a true grid barrier inside one kernel, but it caps occupancy (all blocks must be co-resident) and needs hardware/driver support. Use it only when relaunch overhead dominates.</li>
+</ul>
+
+<h2>Prefix scan (exclusive): "how many valid items came before me?"</h2>
+<p>An exclusive prefix scan turns an array into the running total <em>excluding</em> the current element. It looks academic until you see what it answers: <em>"for element <code>i</code>, how many qualifying items appeared strictly before me?"</em> That number is a write address. Scan is the engine behind stream compaction, radix sort, run-length encoding, sparse-matrix construction, and token packing in LLM pipelines (packing variable-length sequences into a dense buffer).</p>
+
+<pre class="ascii">
+index :   0   1   2   3   4   5   6   7
+flags :   1   0   1   1   0   0   1   1     (keep this element?)
+                |
+                v   exclusive scan (sum of all flags before i)
+scan  :   0   1   1   2   3   3   3   4
+                |
+                v   for each kept element, scan[i] is its output slot
+out   : [ x0 | x2 | x3 | x6 | x7 ]          total kept = scan[7]+flags[7] = 5
+</pre>
+
+<p>Within a single block, the simplest correct scan is <strong>Hillis-Steele</strong>: at step <code>d</code>, each element adds the value <code>2^d</code> positions to its left. After <code>log2(n)</code> steps every element holds its inclusive prefix; shift right by one for exclusive. We double-buffer two shared arrays to avoid a read-after-write race within a step:</p>
+
+<pre><code>// single-block inclusive-&gt;exclusive scan, n &lt;= blockDim.x
+__global__ void scan_block(const int* __restrict__ in, int* __restrict__ out, int n) {
+    extern __shared__ int tmp[];     // size 2*n
+    int t = threadIdx.x;
+    int pin = 0, pout = 1;           // ping-pong buffer indices
+
+    // load shifted right by one -&gt; makes the result EXCLUSIVE
+    tmp[pin * n + t] = (t &gt; 0) ? in[t - 1] : 0;
+    __syncthreads();
+
+    for (int offset = 1; offset &lt; n; offset &lt;&lt;= 1) {
+        // swap buffers each step so reads and writes never alias
+        pout = 1 - pout;
+        pin  = 1 - pin;
+        int v = tmp[pin * n + t];
+        if (t &gt;= offset) v += tmp[pin * n + (t - offset)];
+        tmp[pout * n + t] = v;
+        __syncthreads();
+    }
+    out[t] = tmp[pout * n + t];       // exclusive prefix
+}
+</code></pre>
+
+<p>For arrays larger than one block, the recipe is three passes — and it is exactly the "scan, scan the totals, add the offset back" structure:</p>
+<ol>
+  <li><strong>Scan each block locally</strong> and write each block's total sum to an array <code>block_totals[blockIdx.x]</code>.</li>
+  <li><strong>Scan <code>block_totals</code></strong> (it is small — recurse or use one block). Now <code>block_totals[b]</code> holds the count of everything in blocks <code>0..b-1</code>.</li>
+  <li><strong>Add the scanned offset back:</strong> every element in block <code>b</code> adds <code>block_totals[b]</code>. This stitches the per-block scans into one global scan.</li>
+</ol>
+
+<div class="callout">
+  <div class="label">WORK EFFICIENCY</div>
+  <p>Hillis-Steele does <strong>O(n log n)</strong> total adds — simple but wasteful. <strong>Blelloch</strong> (work-efficient) scan does <strong>O(n)</strong> adds via two phases over a balanced tree: an <em>up-sweep</em> (reduce) building partial sums, then a <em>down-sweep</em> that pushes prefixes back down, clearing the root to zero for an exclusive result. Blelloch wins on large, memory-bound scans; Hillis-Steele can win on tiny scans where its shorter dependency depth matters. In production you call <code>cub::DeviceScan</code> — it is bandwidth-optimal (single-pass "decoupled look-back") and you will not beat it.</p>
+</div>
+
+<h2>Stream compaction: scan builds a write-address table</h2>
+<p>Compaction collects the elements that pass a predicate into a dense output. The naive serial version is <code>if (keep(x[i])) out[j++] = x[i];</code> — but <code>j++</code> is a serial dependency; every thread would fight over <code>j</code>. The fix: precompute all the <code>j</code> values at once with an exclusive scan of the keep-flags. The scan <em>is</em> the table of output addresses.</p>
+
+<pre><code>// flags[i] = 1 if keep, else 0.  pos = exclusive scan of flags.
+__global__ void compact(const float* __restrict__ x,
+                         const int*   __restrict__ flags,
+                         const int*   __restrict__ pos,   // exclusive scan of flags
+                         float* __restrict__ out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n &amp;&amp; flags[i]) {
+        out[pos[i]] = x[i];        // pos[i] is a deterministic, collision-free slot
+    }
+}
+</code></pre>
+
+<p>Every kept element writes to a unique slot — no atomics, no contention, fully deterministic order. This is the key trick: <strong>a scan converts data-dependent branching ("where does this go?") into a precomputed scatter address.</strong> The same idea places elements into radix buckets during sort and writes packed tokens into a contiguous KV buffer.</p>
+
+<h2>CSR sparse matrix-vector multiply (SpMV)</h2>
+<p>Most large matrices are mostly zeros, so we store only the nonzeros in <strong>Compressed Sparse Row (CSR)</strong> format: three arrays where <code>row_ptr</code> marks where each row begins in the flat <code>col_idx</code> / <code>value</code> arrays.</p>
+
+<pre class="ascii">
+dense A (4x4):              CSR:
+  10  0  0  0               row_ptr : [0, 1, 3, 4, 6]   (length rows+1)
+   0 20 30  0               col_idx : [0, 1, 2, 3, 0, 3]
+   0  0  0 40               value   : [10,20,30,40,50,60]
+  50  0  0 60
+                            row r's nonzeros: indices row_ptr[r] .. row_ptr[r+1]-1
+                            e.g. row 1: cols {1,2} vals {20,30}
+</pre>
+
+<p>SpMV computes <code>y[r] = sum over nonzeros in row r of value * x[col]</code>. Ownership choice is the whole game. The <strong>vector (warp-per-row)</strong> kernel assigns one warp to one row: the 32 lanes stride across the row's nonzeros (coalesced loads of <code>value</code> and <code>col_idx</code>), then a warp reduction sums their contributions.</p>
+
+<pre><code>__global__ void spmv_csr_vector(const int*   __restrict__ row_ptr,
+                                const int*   __restrict__ col_idx,
+                                const float* __restrict__ value,
+                                const float* __restrict__ x,
+                                float* __restrict__ y, int rows) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) &gt;&gt; 5;
+    int lane    = threadIdx.x &amp; 31;
+    if (warp_id &gt;= rows) return;
+
+    int start = row_ptr[warp_id];
+    int end   = row_ptr[warp_id + 1];
+
+    float sum = 0.0f;
+    for (int j = start + lane; j &lt; end; j += 32) {     // lanes stride the row
+        sum += value[j] * x[col_idx[j]];
+    }
+    sum = warp_reduce_sum(sum);                        // lesson 02
+    if (lane == 0) y[warp_id] = sum;                   // one writer per row
+}
+</code></pre>
+
+<div class="callout warn">
+  <div class="label">THE OWNERSHIP TRADE</div>
+  <p>Warp-per-row is great for <em>moderate, uniform</em> row lengths (~tens of nonzeros). It breaks on <strong>skew</strong>: if one row has 100k nonzeros and the rest have 5, that warp runs for ages while the rest idle — classic load imbalance. Fixes shift ownership to match the data: assign <strong>one block per long row</strong> (or split a long row into fixed-size chunks reduced separately, then combined), bucketing rows by length and launching a kernel per bucket. The <strong>scalar (thread-per-row)</strong> variant — one thread walks an entire row — avoids the warp reduction but reads <code>col_idx</code>/<code>value</code> <em>uncoalesced</em> (adjacent threads are in different rows, far apart in memory), so it is usually slower despite being simpler.</p>
+</div>
+
+<h2>Top-k per row for small k: a data structure in registers</h2>
+<p>When you need the <code>k</code> largest values per row and <code>k</code> is tiny (say k ≤ 8 — common for attention top-k, beam search, recommendation), a full sort is wasteful. Keep a sorted array of size <code>K</code> in <em>registers</em> and insert each new element with a single insertion step: if it beats the current minimum, shift and drop the loser. That is <strong>O(n·k)</strong> work in fast registers versus <strong>O(n log n)</strong> for a full sort touching memory — and for tiny k the constant is unbeatable.</p>
+
+<pre><code>template &lt;int K&gt;
+__device__ void topk_insert(float (&amp;best)[K], float v) {
+    if (v &lt;= best[K - 1]) return;          // smaller than our worst kept value
+    int i = K - 1;
+    while (i &gt; 0 &amp;&amp; best[i - 1] &lt; v) {       // shift smaller entries right
+        best[i] = best[i - 1];
+        --i;
+    }
+    best[i] = v;                           // insert in sorted position
+}
+
+template &lt;int K&gt;
+__global__ void topk_per_row(const float* __restrict__ a, int rows, int cols,
+                             float* __restrict__ out) {   // out: rows * K
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r &gt;= rows) return;
+
+    float best[K];
+    #pragma unroll
+    for (int i = 0; i &lt; K; ++i) best[i] = -INFINITY;
+
+    const float* row = a + (size_t)r * cols;
+    for (int c = 0; c &lt; cols; ++c) topk_insert&lt;K&gt;(best, row[c]);
+
+    #pragma unroll
+    for (int i = 0; i &lt; K; ++i) out[(size_t)r * K + i] = best[i];
+}
+</code></pre>
+
+<p>The <code>best[]</code> array, because <code>K</code> is a compile-time template parameter, lives entirely in registers — no shared memory, no global traffic until the final write. If instead a <em>warp</em> cooperates on one row (each lane keeps its own top-k), you do a final <strong>merge</strong> of the 32 register heaps via shuffles. The line of thinking: <em>the data structure lives in the fastest memory that fits, and only merges at the very end.</em></p>
+
+<h2>Sorting note</h2>
+<p>You will rarely hand-write a GPU sort, but you must know the two shapes:</p>
+<ul>
+  <li><strong>Radix sort</strong> — the default GPU sort. It is built directly on prefix scan: for each digit, count occurrences, scan the counts to get bucket offsets, then scatter keys to those offsets (the compaction trick generalized to many buckets). Linear work, no comparisons, stable, bandwidth-bound. This is why scan is <em>the</em> foundational primitive.</li>
+  <li><strong>Bitonic sort</strong> — a fixed network of compare-exchange steps, O(n log²n) work but completely data-independent (no branching, perfect for warps/blocks). Ideal for sorting small fixed-size groups (e.g. sorting within a block or a warp) where its predictable pattern beats radix's setup cost.</li>
+</ul>
+<p>In practice: <code>cub::DeviceRadixSort</code> or <code>thrust::sort</code>. They are tuned per architecture and you should not reimplement them.</p>
+
+<h2>Graph BFS: frontier expansion with atomic claims</h2>
+<p>Breadth-first search over a graph stored in CSR adjacency (same <code>row_ptr</code> / <code>col_idx</code> layout, rows = vertices, entries = neighbors) proceeds in levels. Each level expands the current <em>frontier</em>: for every vertex in it, look at its neighbors, claim the unvisited ones, and append them to the next frontier. Two atomics carry the correctness:</p>
+
+<pre><code>__global__ void bfs_expand(const int* __restrict__ row_ptr,
+                           const int* __restrict__ col_idx,
+                           const int* __restrict__ frontier, int frontier_n,
+                           int* __restrict__ visited,
+                           int* __restrict__ next, int* __restrict__ next_n) {
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t &gt;= frontier_n) return;
+
+    int u = frontier[t];
+    for (int e = row_ptr[u]; e &lt; row_ptr[u + 1]; ++e) {
+        int v = col_idx[e];
+        // claim v exactly once: only the thread that flips 0-&gt;1 succeeds
+        if (atomicCAS(&amp;visited[v], 0, 1) == 0) {
+            int slot = atomicAdd(next_n, 1);   // reserve a unique queue slot
+            next[slot] = v;
+        }
+    }
+}
+</code></pre>
+
+<p>The <strong>correctness</strong> comes entirely from <code>atomicCAS(&amp;visited[v], 0, 1)</code>: many threads may reach the same neighbor <code>v</code> in the same level, but the compare-and-swap succeeds for exactly one of them — that one (and only that one) appends <code>v</code> to <code>next</code>. <code>atomicAdd(next_n, 1)</code> hands out collision-free queue slots, the same address-table idea as compaction but computed on the fly.</p>
+
+<div class="callout warn">
+  <div class="label">DEGREE SKEW</div>
+  <p>Performance dies on <strong>high-degree vertices</strong>: with one thread per frontier vertex, the thread owning a million-neighbor hub serializes its whole warp while neighbors idle — the same imbalance as skewed SpMV rows. Fixes, again, shift ownership: assign a <strong>warp or block per high-degree vertex</strong> so many lanes share its edge list, or flip to <strong>one thread per edge</strong> (expand the frontier into an edge list first, via scan, then process edges uniformly). Real BFS engines bucket vertices by degree and route each bucket to the right granularity.</p>
+</div>
+
+<h2>A GPU hash table</h2>
+<p>The same atomic-claim idea builds a concurrent hash table. Use <strong>open addressing with linear probing</strong>: hash the key to a slot; if taken, walk forward until you find an empty slot, claiming it with <code>atomicCAS</code> so concurrent inserters never collide.</p>
+
+<pre><code>__device__ const unsigned EMPTY = 0xffffffffu;
+
+__global__ void hash_insert(unsigned* __restrict__ keys, int capacity,
+                            const unsigned* __restrict__ in, int n) {
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t &gt;= n) return;
+    unsigned k = in[t];
+    unsigned slot = (k * 2654435761u) &amp; (capacity - 1);   // capacity is power of two
+    for (int probe = 0; probe &lt; capacity; ++probe) {
+        unsigned prev = atomicCAS(&amp;keys[slot], EMPTY, k);
+        if (prev == EMPTY || prev == k) return;           // inserted, or already present
+        slot = (slot + 1) &amp; (capacity - 1);               // linear probe to next slot
+    }
+}
+</code></pre>
+
+<div class="callout bad">
+  <div class="label">TRAPS</div>
+  <p><strong>Load factor:</strong> linear probing degrades sharply past ~70% full — keep capacity a power of two and comfortably oversized. <strong>Deletion is the real hazard:</strong> you cannot simply blank a slot, because that breaks probe chains for keys inserted after it. You need <em>tombstones</em> (a deleted-marker that probes skip but inserts may reuse), which complicates concurrency and slowly poisons the table until a rebuild. Most GPU hash tables are therefore insert-and-lookup only, rebuilt rather than mutated.</p>
+</div>
+
+<h2>When to use libraries</h2>
+<p>The honest senior answer is "reach for the library first." But you must understand the kernel underneath to choose, size, and debug it.</p>
+
+<table>
+<thead>
+<tr><th>Task</th><th>Library</th><th>Why still learn the kernel?</th></tr>
+</thead>
+<tbody>
+<tr><td>Dense GEMM / convolution-as-GEMM</td><td>cuBLAS, CUTLASS</td><td>Tiling, shared-mem reuse, and arithmetic intensity explain why a fused kernel sometimes beats a library call</td></tr>
+<tr><td>Reduction / scan / sort</td><td>CUB, Thrust</td><td>You write reductions and scans by hand <em>inside</em> your own fused kernels; CUB only helps at whole-array granularity</td></tr>
+<tr><td>Sparse linear algebra (SpMV, SpGEMM)</td><td>cuSPARSE</td><td>Choosing CSR vs ELL vs blocked, and diagnosing skew, requires knowing the ownership trade-offs above</td></tr>
+<tr><td>Deep-learning ops (conv, norm, attention)</td><td>cuDNN, CUTLASS-based kernels</td><td>Fusing custom ops (a novel activation or attention variant) means writing the kernel the library does not ship</td></tr>
+</tbody>
+</table>
+
+<div class="callout ok">
+  <div class="label">RULE OF THUMB</div>
+  <p>If the operation is a standalone, whole-array primitive, call the library. If it is a <em>fused</em> step inside a larger kernel — a reduction tucked after your custom compute, a scan that feeds your scatter — you write it by hand using exactly the patterns on this page. Libraries own the boundaries; you own the fusion.</p>
+</div>
+
+<h2>Interview answer template</h2>
+<p>When asked "how would you implement / parallelize X on a GPU?", walk this ladder out loud. It signals that you think in ownership and combines, not loops:</p>
+<ol>
+  <li><strong>Start from the data.</strong> What is the layout, and is it dense, sparse, or skewed? Where is the reuse? (This decides everything downstream.)</li>
+  <li><strong>Choose ownership.</strong> Assign one writer per output unit at the right granularity — thread, warp, block, or grid — matched to the work per output and the access pattern (for coalescing).</li>
+  <li><strong>Name the combine primitive.</strong> State it explicitly: none (map), reduction (tree), scan (prefix → scatter), atomic (histogram / queue claim), or a second kernel launch (grid sync).</li>
+  <li><strong>Predict the bottleneck.</strong> Usually the combine: global atomics, the launch boundary, load imbalance from skew, or uncoalesced scatter. Say which one and why.</li>
+  <li><strong>Optimize locally or fall back.</strong> Collapse the expensive step — privatize atomics into shared memory, push the meeting point into the warp, rebalance ownership for skew — or, if it is a standard primitive, call CUB / cuBLAS / cuSPARSE and explain that beating it is rarely worth it.</li>
+</ol>
+
+<div class="callout">
+  <div class="label">ONE SENTENCE TO REMEMBER</div>
+  <p>A GPU algorithm is a data-ownership plan: maximize the independent local phase, name where partial results meet, and pay the smallest possible price for that meeting.</p>
+</div>
+
+<footer class="lesson-nav">
+  <a href="26_cuda_optimized_snippets.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">26 · Optimized CUDA snippets</span>
+  </a>
+  <a class="next" href="index.html">
+    <span class="dir">Done</span>
+    <span class="ttl">Track index</span>
+  </a>
+</footer>
+
+</main>
+
+</body>
+</html>

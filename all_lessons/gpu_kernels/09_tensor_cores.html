@@ -1,0 +1,952 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>09 · Tensor cores</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">gpu_kernels</a>
+    <span class="crumb">/</span>
+    <span class="crumb">09 · tensor cores</span>
+    <span class="step-pill">lesson 9 / 27</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Tensor cores — <code>mma</code> and fragments</h1>
+<p class="subtitle">A single hardware instruction that does a small matrix multiply in one cycle. The reason an H100 has 1 PFLOP of bf16 throughput is that every SM has 4 of these, each doing 16×8×16 multiplies per cycle. Every meaningful matmul on a modern GPU lands here.</p>
+
+<h2>The numbers, again</h2>
+
+<p>From lesson 20: an H100 SM has 4 tensor cores. Each one can do one "small matmul" per cycle. The "size" of that small matmul depends on the data type:</p>
+
+<table>
+  <thead><tr><th>Data type</th><th>Per-instruction shape (m × n × k)</th><th>FLOPs/cycle (per tensor core)</th></tr></thead>
+  <tbody>
+    <tr><td>fp16 / bf16</td><td>16 × 8 × 16</td><td>2 × 2048 = 4096</td></tr>
+    <tr><td>fp8 (E4M3 / E5M2)</td><td>16 × 8 × 32</td><td>2 × 4096 = 8192</td></tr>
+    <tr><td>int8</td><td>16 × 8 × 32</td><td>2 × 4096 = 8192</td></tr>
+    <tr><td>tf32</td><td>16 × 8 × 8</td><td>2 × 1024 = 2048</td></tr>
+    <tr><td>fp64</td><td>8 × 8 × 4</td><td>2 × 256 = 512</td></tr>
+  </tbody>
+</table>
+
+<p>4 tensor cores × 4096 FLOPs/cycle (bf16) × ~1.755 GHz × 132 SMs ≈ <strong>~990 TFLOPS dense bf16</strong> — matching NVIDIA's marketed H100 SXM5 peak. The "tensor cores deliver ~1 PFLOPS" number you see is exactly this product. (With Hopper's structured-sparsity feature, you can claim ~2× of that on the data-dependent path, but most ML workloads don't rely on it.)</p>
+
+<p>Compare to the CUDA-core ALU path: 128 fp32 ALUs/SM × 2 FLOPs/cycle (FMA) × 1.755 GHz × 132 SMs ≈ 67 TFLOPS. <strong>Tensor cores are ~15× faster than CUDA cores</strong> on bf16 matmul. Not using them is leaving most of the GPU on the table.</p>
+
+<h2>Animated · one mma instruction, fragment by fragment</h2>
+
+<p>The canonical visualisation: a 16×16 fragment of A multiplies a 16×16 fragment of B and accumulates into a 16×16 fragment of C, all in a single hardware instruction. Step through to watch one row of A "rake" through B, contributing to the corresponding column of C. The colours show which lanes of the warp contributed to each output element.</p>
+
+<div class="widget" id="mma-widget">
+  <div class="title">mma · 16×16 fragment multiply, one instruction</div>
+  <div class="hint">A · B → C, with each output C[i,j] = Σ_k A[i,k] · B[k,j]. The animation walks the k dimension; the heatmap shows the running accumulator C.</div>
+
+  <div class="controls">
+    <button id="mma-play">▶ play</button>
+    <button id="mma-step">step ▷</button>
+    <button id="mma-reset">⟲ reset</button>
+    <label class="inline">k step: <input type="range" id="mma-k" min="0" max="16" step="1" value="0"> <span class="val" id="mma-k-v">0</span></label>
+  </div>
+
+  <canvas id="mma-canvas" width="760" height="360" style="width:100%; height:360px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">k slice</div><div class="v" id="mma-ks">—</div></div>
+    <div class="kpi"><div class="k">FMAs this step</div><div class="v" id="mma-fma">—</div></div>
+    <div class="kpi"><div class="k">cumulative FMAs</div><div class="v" id="mma-cum">—</div></div>
+    <div class="kpi"><div class="k">issued instructions</div><div class="v" id="mma-iss">—</div></div>
+  </div>
+</div>
+
+<h2>The instruction — <code>mma.sync</code></h2>
+
+<p>The PTX instruction that drives a tensor core is called <code>mma.sync</code> ("matrix multiply accumulate, synchronous"). Its shape (m, n, k) reflects the dimensions of the multiply: an m×k matrix times a k×n matrix, accumulating into an m×n matrix.</p>
+
+<pre><code>// 16 × 8 × 16 bf16 multiply, fp32 accumulate
+mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32  d, a, b, c;</code></pre>
+
+<p>The operands <code>a</code>, <code>b</code>, <code>c</code>, <code>d</code> are <strong>not register arrays</strong> — they're distributed across the threads of the warp. Each thread holds a small slice of each operand. This is the "fragment" concept.</p>
+
+<h2>Fragments — how a 16×16 matrix lives across 32 threads</h2>
+
+<p>The fundamental abstraction: a matrix-multiply operand is split into <strong>fragments</strong>, with each thread of the warp holding a specific subset of the elements. The exact assignment depends on the instruction shape and dtype, but for the canonical 16×16 bf16 matrix:</p>
+
+<ul>
+  <li>32 threads, 16×16 = 256 elements, so 8 elements per thread.</li>
+  <li>Each thread holds a specific subset of the matrix's elements in its registers, in a specific layout the hardware expects.</li>
+</ul>
+
+<p>The PTX <code>ldmatrix</code> instruction is the canonical way to load a fragment from SMEM into the right register layout — it does the "shuffle" needed to assign the right elements to the right threads.</p>
+
+<h2>2D · how 32 threads load one 16×16 fragment</h2>
+
+<p>The hardware expects a specific lane-to-element mapping. Each cell below is one of 256 elements in a 16×16 matrix; click a thread (0..31) to see which 8 elements it loads. This is the layout produced by <code>ldmatrix</code> — it does the cross-lane shuffle so each thread ends up with the right registers.</p>
+
+<div class="widget" id="fl-widget">
+  <div class="title">Fragment load layout · which thread owns which element</div>
+  <div class="hint">Each thread holds 8 elements of the 256-element fragment. Click a thread chip to highlight its elements. The colour gradient shows the canonical row-major bf16 A-fragment layout.</div>
+
+  <div class="controls">
+    <label class="inline">layout:
+      <select id="fl-layout">
+        <option value="a">A-fragment (rowmajor, m16n8k16 bf16)</option>
+        <option value="b">B-fragment (colmajor)</option>
+        <option value="c">C-accumulator (fp32)</option>
+      </select>
+    </label>
+    <button id="fl-cycle">cycle threads ▷</button>
+    <button id="fl-all">show all</button>
+  </div>
+
+  <canvas id="fl-canvas" width="760" height="380" style="width:100%; height:380px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">selected thread</div><div class="v" id="fl-th" style="font-size:14px;">T0</div></div>
+    <div class="kpi"><div class="k">elements held</div><div class="v" id="fl-cnt">—</div></div>
+    <div class="kpi"><div class="k">register count</div><div class="v" id="fl-reg">—</div></div>
+    <div class="kpi"><div class="k">total per warp</div><div class="v" id="fl-tot">256</div></div>
+  </div>
+</div>
+
+<h2>Two interfaces — WMMA (legacy) and <code>mma</code> (modern)</h2>
+
+<p>NVIDIA exposes tensor cores via two C++ APIs:</p>
+
+<h3>WMMA — the high-level wrapper</h3>
+
+<pre><code>#include &lt;mma.h&gt;
+using namespace nvcuda;
+
+wmma::fragment&lt;wmma::matrix_a, 16, 16, 16, __half, wmma::row_major&gt; a_frag;
+wmma::fragment&lt;wmma::matrix_b, 16, 16, 16, __half, wmma::col_major&gt; b_frag;
+wmma::fragment&lt;wmma::accumulator, 16, 16, 16, float&gt; c_frag;
+
+wmma::fill_fragment(c_frag, 0.0f);
+wmma::load_matrix_sync(a_frag, a_smem, 16);
+wmma::load_matrix_sync(b_frag, b_smem, 16);
+wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+wmma::store_matrix_sync(c_global, c_frag, N, wmma::mem_row_major);
+</code></pre>
+
+<p>The "fragment" type is opaque; you don't see the per-thread layout. WMMA is portable across architectures but only supports a fixed set of shapes (16×16×16, 32×8×16, 8×32×16 on Ampere; more shapes on Hopper). The compiler may not produce the most efficient instructions for shapes that don't perfectly match the architecture.</p>
+
+<h3>Direct <code>mma</code> via inline PTX</h3>
+
+<p>For maximum performance, CUTLASS and FlashAttention drop down to inline PTX:</p>
+
+<pre><code>asm volatile(
+    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+    : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+    : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+      "r"(b0), "r"(b1),
+      "f"(c0), "f"(c1), "f"(c2), "f"(c3)
+);
+</code></pre>
+
+<p>Ugly, but exposes every shape and accumulator type the hardware supports. CUTLASS wraps these into nicer C++ templates; user code rarely writes raw PTX.</p>
+
+<h2>The pipeline — a tiled matmul with tensor cores</h2>
+
+<p>Combine lesson 24's tiling with tensor cores: the inner loop's <code>acc += a[k] * b[k]</code> is replaced by an <code>mma.sync</code>. Per warp:</p>
+
+<ol>
+  <li><strong>Load</strong>: <code>ldmatrix</code> from SMEM into A-fragment and B-fragment.</li>
+  <li><strong>Compute</strong>: <code>mma.sync</code> updates the C-fragment.</li>
+  <li><strong>Iterate</strong>: walk K dimension, loading new fragments and accumulating.</li>
+  <li><strong>Store</strong>: write C-fragment from registers back to global memory (or to SMEM for an epilogue).</li>
+</ol>
+
+<p>One warp does a 16×8 output tile per <code>mma.sync</code>. A block with 4 warps doing 4 mma's per cycle does 4 × 16 × 8 = 512 output elements per cycle — multiply by the K depth and you have the throughput.</p>
+
+<h2>Async copies — the Hopper trick</h2>
+
+<p>For tensor cores to stay fed, you need a continuous stream of A and B fragments. On Ampere+, the <code>cp.async</code> PTX instruction issues an asynchronous SMEM load that runs in the background while the SM does math. You can "prefetch" the next tile while computing on the current one — double buffering at the kernel level.</p>
+
+<p>On Hopper, this gets even better: the <code>TMA</code> (Tensor Memory Accelerator) is a dedicated hardware unit that does the async copy without occupying CUDA cores. The warp issues "TMA, please bring tile X from HBM to SMEM" and goes back to crunching the current tile.</p>
+
+<p>For tensor-core-dense kernels (FlashAttention-3, CUTLASS-3, modern cuBLAS), the loop is roughly:</p>
+
+<pre><code>repeat:
+    TMA.issue(next_A_tile, next_B_tile)  // async, no waiting
+    mma.sync(C, A_cur, B_cur)             // tensor-core compute
+    TMA.wait()                             // wait for next tile
+    swap(A_cur, A_next); swap(B_cur, B_next)
+</code></pre>
+
+<p>If TMA finishes before the mma's, you're compute-bound. If mma's finish first, you're HBM-bound. The art of writing peak-throughput kernels is balancing those two so neither idles.</p>
+
+<h2>Precision — what flavours actually exist</h2>
+
+<table>
+  <thead><tr><th>Architecture</th><th>Tensor core formats</th></tr></thead>
+  <tbody>
+    <tr><td>Volta (V100)</td><td>fp16 only</td></tr>
+    <tr><td>Turing (T4)</td><td>fp16, int8, int4, int1</td></tr>
+    <tr><td>Ampere (A100)</td><td>+ bf16, tf32, fp64</td></tr>
+    <tr><td>Hopper (H100)</td><td>+ fp8 (E4M3, E5M2)</td></tr>
+    <tr><td>Blackwell (B100/B200)</td><td>+ fp4 (E2M1), fp6</td></tr>
+  </tbody>
+</table>
+
+<p>The ladder from fp32 → bf16 → fp8 → fp4 roughly halves the bytes per operand and doubles the FLOPs per cycle each step. Marketing numbers (<em>dense</em>; structured-sparsity doubles these): A100 ~312 TF bf16 → H100 ~990 TF bf16, ~1980 TF fp8 → B200 ~1.1 PF bf16, ~2.25 PF fp8, ~4.5 PF fp4. The often-quoted "2.25/4.5/9 PF" Blackwell numbers include 2× sparsity on top.</p>
+
+<p>The <em>accumulator</em> is typically fp32 (for bf16/fp8/fp4 inputs it's fp32; for fp16 inputs both fp16 and fp32 accumulators exist, and the fp16 accumulator is a legacy path). The multiply happens in low precision, the running sum stays in high precision. This is the "accumulate-in-fp32 rule" from lesson 14, made hardware-explicit.</p>
+
+<h2>3D · the precision ladder, stacked isometric</h2>
+
+<p>Each tier is one PTX <code>mma.sync</code> shape: bf16 (m16n8k16), fp16 (same), tf32 (m16n8k8), fp8 (m16n8k32), fp4 (m16n8k64). The volume of each tier represents the FLOPs delivered per cycle. The taller (deeper-k) tiers do more work; the narrower (lower-precision) tiers pay less per operand. Hover or click a tier to see the actual throughput on H100/B200. (Note: the high-level WMMA C++ API exposes a logical 16×16 fragment view, but the underlying hardware instruction is m16n8k.)</p>
+
+<div class="widget" id="lad-widget">
+  <div class="title">Precision ladder · isometric tiers · each doubles the throughput</div>
+  <div class="hint">From top: fp32 (CUDA cores only) → tf32 → fp16/bf16 → fp8 → fp4. Each step down the ladder doubles peak by halving the operand bytes. Accumulator stays fp32.</div>
+
+  <div class="controls">
+    <label class="inline">arch:
+      <select id="lad-arch">
+        <option value="a100">A100 (Ampere)</option>
+        <option value="h100" selected>H100 (Hopper)</option>
+        <option value="b200">B200 (Blackwell)</option>
+      </select>
+    </label>
+    <label class="inline">rotation: <input type="range" id="lad-rot" min="-30" max="30" step="1" value="0"> <span class="val" id="lad-rot-v">0°</span></label>
+    <label class="inline">show sparsity 2×: <input type="checkbox" id="lad-sp"></label>
+  </div>
+
+  <canvas id="lad-canvas" width="760" height="420" style="width:100%; height:420px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">selected dtype</div><div class="v" id="lad-dt" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">instruction shape</div><div class="v" id="lad-shape" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">peak (dense)</div><div class="v" id="lad-peak">—</div></div>
+    <div class="kpi"><div class="k">×fp32 speedup</div><div class="v" id="lad-spd">—</div></div>
+  </div>
+</div>
+
+<h2>Where you'll see this — and where you won't</h2>
+
+<table>
+  <thead><tr><th>Layer</th><th>Tensor cores?</th></tr></thead>
+  <tbody>
+    <tr><td>Linear / matmul</td><td>Yes — cuBLAS gemm, Triton <code>tl.dot</code></td></tr>
+    <tr><td>Attention</td><td>Yes — QK^T and softmax(QK^T)·V both</td></tr>
+    <tr><td>Convolution</td><td>Yes — cuDNN gemm-based or implicit-gemm</td></tr>
+    <tr><td>LayerNorm</td><td>No — reduction, no matmul</td></tr>
+    <tr><td>Activation (GELU, ReLU)</td><td>No — elementwise</td></tr>
+    <tr><td>Embedding lookup</td><td>No — gather</td></tr>
+  </tbody>
+</table>
+
+<p>So a transformer block is roughly: tensor-core (QKV proj) → tensor-core (attention) → tensor-core (output proj) → CUDA-core (residual + norm + activation) → tensor-core (MLP up) → CUDA-core (activation) → tensor-core (MLP down). Most of the FLOPs in tensor cores; most of the bytes still moving through HBM (lesson 21's roofline).</p>
+
+<h2>What you actually need to know — even if you never write PTX</h2>
+
+<p>You're unlikely to write <code>mma.sync</code> by hand unless you're working on a serving stack or a kernel library. But knowing what's there matters:</p>
+
+<ul>
+  <li><strong>Use cuBLAS / Triton <code>tl.dot</code> for matmuls.</strong> They emit the right tensor-core instructions.</li>
+  <li><strong>Choose dtype with tensor-core support.</strong> A bf16 matmul is 15× faster than the fp32 version on H100. If your numerics tolerate it, use it.</li>
+  <li><strong>Check tensor-core utilisation in Nsight.</strong> The metric <code>sm__inst_executed_pipe_tensor</code> tells you how much of compute used tensor cores. If your matmul-heavy kernel shows low tensor-core activity, something is wrong (wrong dtype, wrong shape, fallback to CUDA cores).</li>
+  <li><strong>Match shapes to architecture.</strong> A 16-aligned matmul size keeps the tensor cores fed; a size-15 matmul wastes the last fragment. Pad if needed.</li>
+</ul>
+
+<h2>The closing loop — the whole stack from lesson 01</h2>
+
+<p>Look back at the path we've walked:</p>
+
+<ol>
+  <li><strong>Lessons 01–10:</strong> we built a 70B model and sharded it across 512 GPUs.</li>
+  <li><strong>Lessons 11–12:</strong> we served it from a continuous-batching, KV-cached, prefill/decode-disaggregated stack.</li>
+  <li><strong>Lessons 13–19:</strong> we walked the per-GPU framework — PyTorch dispatcher, allocators, fusion, compilers.</li>
+  <li><strong>Lessons 20–27:</strong> we walked the CUDA execution model — warps, memory, coalescing, tiling, divergence, occupancy.</li>
+  <li><strong>Lesson 28 (here):</strong> we ended where modern matmul lives — at the tensor core, where 4 fp32 operands per cycle become 4096.</li>
+</ol>
+
+<p>The 70B model from lesson 01 hits tensor cores billions of times per training step. Every layer above this lesson is, at some level, in service of <em>keeping those tensor cores fed</em> — coalesced HBM reads to bring tiles to SMEM, SMEM tiles to fragments, fragments to the <code>mma.sync</code>. The whole stack is one optimisation problem.</p>
+
+<h2>Interactive · tensor-core throughput by dtype</h2>
+
+<p>Pick a matrix size and a dtype. The widget computes the theoretical peak time (assuming 100% tensor-core utilisation), the achievable bandwidth-roofline time, and the resulting compute-vs-memory regime.</p>
+
+<div class="widget" id="tc-widget">
+  <div class="title">Tensor-core peak vs HBM roofline</div>
+  <div class="hint">For a square matmul of size N. Tensor-core peak is the FLOPs-bound time. HBM roofline is the memory-bound time. The kernel takes the larger of the two.</div>
+
+  <div class="controls">
+    <label class="inline">N (square matmul): <input type="range" id="tc-n" min="128" max="16384" step="64" value="4096"> <span class="val" id="tc-n-v">4096</span></label>
+    <label class="inline">dtype:
+      <select id="tc-dt">
+        <option value="fp32">fp32 — CUDA cores only (~67 TF)</option>
+        <option value="bf16" selected>bf16 — H100 dense (~990 TF)</option>
+        <option value="fp8">fp8 — H100 dense (~1980 TF)</option>
+        <option value="fp4">fp4 — B200 dense (~4.5 PF)</option>
+      </select>
+    </label>
+  </div>
+
+  <canvas class="dist-canvas" id="tc-canvas" width="760" height="220" style="height: 220px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">compute time</div><div class="v" id="tc-ct">—</div></div>
+    <div class="kpi"><div class="k">HBM time</div><div class="v" id="tc-mt">—</div></div>
+    <div class="kpi"><div class="k">bottleneck</div><div class="v" id="tc-bn">—</div></div>
+    <div class="kpi"><div class="k">arithmetic intensity</div><div class="v" id="tc-ai">—</div></div>
+  </div>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Every matmul-class op on a modern GPU eventually lands on the tensor cores via <code>mma.sync</code>. Each instruction is a small matrix multiply, with operands distributed as <em>fragments</em> across a warp. cuBLAS, cuDNN, CUTLASS, and Triton's <code>tl.dot</code> all emit these. The dtype ladder (fp32 → bf16 → fp8 → fp4) doubles throughput at each step, with the running accumulator staying in fp32. The whole rest of the system — sharding, allocators, compilers, kernels, memory layouts — exists to keep these tensor cores fed.
+</div>
+
+<div class="callout">
+  <div class="label">Where this connects</div>
+  Part V ends here. The full 28-lesson stack — distributed parallelism (01–10) → inference serving (11–12) → framework/kernels/compilers (13–19) → CUDA fundamentals (20–28) — is one continuous descent from "1024 GPUs training a 70B model" to "32 threads launching one <code>mma.sync</code>." The companion series <a href="../../vllm/lessons/index.html"><code>vllm/lessons/</code></a> covers serving-time specifics (KV cache, PagedAttention, continuous batching), and <a href="../../reinforcement_learning/lessons/index.html"><code>reinforcement_learning/lessons/</code></a> covers RL post-training architecture. Same system, different cross-sections.
+</div>
+
+<footer class="lesson-nav">
+  <a href="08_occupancy.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">08 · Occupancy</span>
+  </a>
+  <a class="next" href="10_kernel_first_principles.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">10 · GPU as a bandwidth machine</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  const get = id => document.getElementById(id);
+  const els = {
+    n: get('tc-n'), nv: get('tc-n-v'),
+    dt: get('tc-dt'),
+    canvas: get('tc-canvas'),
+    ct: get('tc-ct'), mt: get('tc-mt'),
+    bn: get('tc-bn'), ai: get('tc-ai')
+  };
+  const ctx = els.canvas.getContext('2d');
+
+  const DT = {
+    fp32: { bytes: 4, peak: 67e12 },
+    bf16: { bytes: 2, peak: 990e12 },
+    fp8:  { bytes: 1, peak: 1980e12 },
+    fp4:  { bytes: 0.5, peak: 4.5e15 },
+  };
+  const HBM = 3.35e12;
+
+  function compute(){
+    const N = parseInt(els.n.value);
+    const dt = els.dt.value;
+    const info = DT[dt];
+    els.nv.textContent = N;
+
+    const flops = 2 * N * N * N;
+    const bytes = 3 * N * N * info.bytes; // 2 inputs + 1 output
+    const t_compute = flops / info.peak;
+    const t_mem = bytes / HBM;
+    const ai = flops / bytes;
+    els.ct.textContent = (t_compute * 1000).toFixed(2) + ' ms';
+    els.mt.textContent = (t_mem * 1000).toFixed(2) + ' ms';
+    els.bn.textContent = t_compute > t_mem ? 'compute-bound' : 'memory-bound';
+    els.ai.textContent = ai.toFixed(1) + ' F/B';
+    return { t_compute, t_mem };
+  }
+
+  function render(){
+    const r = compute();
+    const dpr = window.devicePixelRatio || 1;
+    const W = els.canvas.clientWidth, H = els.canvas.clientHeight;
+    if (els.canvas.width !== Math.round(W*dpr)){
+      els.canvas.width = Math.round(W*dpr); els.canvas.height = Math.round(H*dpr);
+    }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 130, padR = 30, padT = 30, padB = 30;
+    const innerW = W - padL - padR;
+    const max = Math.max(r.t_compute, r.t_mem) * 1.1;
+    const rows = [
+      { name:'compute', v: r.t_compute, c:'#16a34a' },
+      { name:'HBM',     v: r.t_mem,     c:'#dc2626' },
+    ];
+    const rowH = 44;
+    rows.forEach((row, i) => {
+      const y = padT + i*(rowH + 14);
+      ctx.fillStyle = '#1f2430'; ctx.font = '13px monospace';
+      ctx.fillText(row.name, 8, y + 28);
+      const w = (row.v / max) * innerW;
+      ctx.fillStyle = row.c;
+      ctx.fillRect(padL, y, Math.max(1, w), rowH);
+      ctx.fillStyle = '#1f2430'; ctx.font = '12px monospace';
+      ctx.fillText((row.v * 1000).toFixed(2) + ' ms', padL + w + 6, y + 28);
+    });
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('whichever is larger is the kernel’s wall-clock', padL, padT - 8);
+  }
+
+  ['input','change'].forEach(ev=>{
+    [els.n, els.dt].forEach(el=>el.addEventListener(ev,render));
+  });
+  window.addEventListener('resize',render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: animated mma 16×16 multiply ─── */
+(function(){
+  const C = document.getElementById('mma-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    play:$('mma-play'), step:$('mma-step'), reset:$('mma-reset'),
+    k:$('mma-k'), kv:$('mma-k-v'),
+    ks:$('mma-ks'), fma:$('mma-fma'),
+    cum:$('mma-cum'), iss:$('mma-iss'),
+  };
+
+  const M = 16, N = 16, K = 16;
+  let A = [], B = [], Cmat = [];
+  let playing = false;
+  let lastTs = 0;
+
+  function init(){
+    A = []; B = []; Cmat = [];
+    for (let i=0;i<M;i++){
+      const ra = []; for (let j=0;j<K;j++) ra.push(((i*K + j)*1103515245 % 9)/9*0.8 + 0.1);
+      A.push(ra);
+    }
+    for (let i=0;i<K;i++){
+      const rb = []; for (let j=0;j<N;j++) rb.push(((i*N + j+7)*1664525 % 9)/9*0.8 + 0.1);
+      B.push(rb);
+    }
+    for (let i=0;i<M;i++){ const rc=[]; for (let j=0;j<N;j++) rc.push(0); Cmat.push(rc); }
+  }
+
+  function accumulateUpTo(k){
+    for (let i=0;i<M;i++) for (let j=0;j<N;j++) Cmat[i][j] = 0;
+    for (let i=0;i<M;i++)
+      for (let j=0;j<N;j++)
+        for (let kk=0; kk<k; kk++) Cmat[i][j] += A[i][kk] * B[kk][j];
+  }
+
+  function render(){
+    const k = +els.k.value;
+    els.kv.textContent = k;
+    accumulateUpTo(k);
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const cell = 14;
+    const matSize = cell * 16;
+    const gap = 50;
+    const startX = (W - (matSize*3 + gap*2)) / 2;
+    const startY = 60;
+
+    // Title labels
+    ctx.fillStyle = '#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('A · 16×16 bf16', startX + matSize/2 - 36, startY - 18);
+    ctx.fillText('×', startX + matSize + gap/2 - 3, startY + matSize/2 + 4);
+    ctx.fillText('B · 16×16 bf16', startX + matSize + gap + matSize/2 - 36, startY - 18);
+    ctx.fillText('=', startX + matSize*2 + gap*1.5 - 3, startY + matSize/2 + 4);
+    ctx.fillText('C · 16×16 fp32 accum', startX + matSize*2 + gap*2 + matSize/2 - 48, startY - 18);
+
+    // A matrix
+    drawMat(startX, startY, A, '#2563eb', (i,j) => j < k);
+    // B matrix
+    drawMat(startX + matSize + gap, startY, B, '#d97706', (i,j) => i < k);
+    // C matrix - intensity by accumulated value
+    const maxC = Math.max(0.01, ...Cmat.flat());
+    drawMatC(startX + matSize*2 + gap*2, startY, Cmat, '#16a34a', maxC);
+
+    // Highlight the active k-row of A and k-column of B
+    if (k < K){
+      ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 2;
+      // A: column k
+      ctx.strokeRect(startX + k*cell - 0.5, startY - 0.5, cell + 1, matSize + 1);
+      // B: row k
+      ctx.strokeRect(startX + matSize + gap - 0.5, startY + k*cell - 0.5, matSize + 1, cell + 1);
+    }
+
+    // K progress bar
+    const barY = startY + matSize + 30;
+    const barW = matSize*3 + gap*2;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(startX, barY, barW, 14);
+    ctx.fillStyle = '#16a34a';
+    ctx.fillRect(startX, barY, (k/K)*barW, 14);
+    ctx.strokeStyle = '#dde2ea';
+    ctx.strokeRect(startX, barY, barW, 14);
+    ctx.fillStyle = '#1f2430'; ctx.font='11px monospace';
+    ctx.fillText('k progress: '+k+' / '+K, startX, barY + 30);
+    if (k === K){
+      ctx.fillStyle = '#16a34a'; ctx.font='12px monospace';
+      ctx.fillText('✓ mma.sync complete', startX + 150, barY + 30);
+    }
+
+    function drawMat(x0, y0, mat, color, isActive){
+      for (let i=0; i<16; i++){
+        for (let j=0; j<16; j++){
+          const v = mat[i][j];
+          const x = x0 + j*cell, y = y0 + i*cell;
+          ctx.globalAlpha = isActive(i,j) ? 0.85 + 0.15*v : 0.2;
+          ctx.fillStyle = color;
+          ctx.fillRect(x, y, cell-1, cell-1);
+        }
+      }
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = '#dde2ea';
+      ctx.strokeRect(x0-0.5, y0-0.5, matSize+1, matSize+1);
+    }
+    function drawMatC(x0, y0, mat, color, maxV){
+      for (let i=0; i<16; i++){
+        for (let j=0; j<16; j++){
+          const v = mat[i][j] / maxV;
+          const x = x0 + j*cell, y = y0 + i*cell;
+          ctx.fillStyle = color;
+          ctx.globalAlpha = 0.15 + 0.8*v;
+          ctx.fillRect(x, y, cell-1, cell-1);
+        }
+      }
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = '#dde2ea';
+      ctx.strokeRect(x0-0.5, y0-0.5, matSize+1, matSize+1);
+    }
+
+    // KPIs
+    els.ks.textContent = k + ' / ' + K;
+    els.fma.textContent = k < K ? (M*N) : 0;
+    els.cum.textContent = (k * M * N);
+    els.iss.textContent = k === K ? '1 mma.sync' : 'in flight';
+  }
+
+  function tick(ts){
+    if (!playing) return;
+    if (!lastTs) lastTs = ts;
+    if (ts - lastTs > 350){
+      let k = +els.k.value;
+      k = (k + 1) % (K+1);
+      els.k.value = k;
+      render();
+      lastTs = ts;
+      if (k === K){ playing = false; els.play.textContent='▶ play'; return; }
+    }
+    requestAnimationFrame(tick);
+  }
+
+  els.play.addEventListener('click', ()=>{
+    if (+els.k.value >= K) els.k.value = 0;
+    playing = !playing;
+    els.play.textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastTs = 0; requestAnimationFrame(tick); }
+  });
+  els.step.addEventListener('click', ()=>{
+    let k = +els.k.value;
+    if (k >= K) k = 0; else k++;
+    els.k.value = k; render();
+  });
+  els.reset.addEventListener('click', ()=>{ els.k.value = 0; playing = false; els.play.textContent='▶ play'; render(); });
+  els.k.addEventListener('input', render);
+  window.addEventListener('resize', render);
+  init(); render();
+})();
+</script>
+
+<script>
+/* ─── Widget: 2D fragment load layout ─── */
+(function(){
+  const C = document.getElementById('fl-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    layout:$('fl-layout'),
+    cycle:$('fl-cycle'), all:$('fl-all'),
+    th:$('fl-th'), cnt:$('fl-cnt'), reg:$('fl-reg'),
+  };
+
+  let selected = 0;
+  let showAll = false;
+  let cycleTimer = null;
+
+  // For the canonical m16n8k16 bf16 mma A-fragment row-major layout (WMMA's logical 16×16 view),
+  // each thread holds 8 elements arranged as 2 groups of 4 contiguous rows.
+  // Layout: thread t (lane 0..31) maps to (groupRow, groupCol) where group=4
+  // For pedagogy, we use a stylised but representative mapping:
+  //   - threads 0..3 own column-group 0 of rows 0..7 (each thread = 2 elements wide × 4 rows = 8 elts)
+  // This is close enough to the actual mma layout to teach the pattern.
+  function elementsForThread(t, layout){
+    const out = [];
+    // 16 rows × 16 cols. 32 threads. Each thread has 8 elements.
+    // We tile as: 4 row-groups × 8 column-groups, each thread takes 1 cell of 4 rows × 2 cols.
+    // That's 4×8 = 32 cells; each cell is 4*2 = 8 elements. ✓
+    const groupRow = Math.floor(t / 8); // 0..3
+    const groupCol = t % 8;             // 0..7
+    if (layout === 'a' || layout === 'c'){
+      for (let r=0; r<4; r++){
+        for (let c=0; c<2; c++){
+          out.push([groupRow*4 + r, groupCol*2 + c]);
+        }
+      }
+    } else if (layout === 'b'){
+      // B is colmajor; transpose the layout mapping
+      const groupRow2 = t % 8;
+      const groupCol2 = Math.floor(t / 8);
+      for (let c=0; c<4; c++){
+        for (let r=0; r<2; r++){
+          out.push([groupRow2*2 + r, groupCol2*4 + c]);
+        }
+      }
+    }
+    return out;
+  }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 24, padR = 24, padT = 40;
+    const matLeftFrac = 0.55;
+    const matW = (W - padL - padR) * matLeftFrac;
+    const cell = matW / 16;
+    const matH = cell * 16;
+    const matX = padL, matY = padT;
+
+    ctx.fillStyle = '#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('16 × 16 fragment · 256 elements · 32 lanes × 8 elements each', padL, padT - 18);
+
+    const palette = ['#2563eb','#d97706','#16a34a','#7c3aed','#dc2626','#3b82f6','#f59e0b','#16a34a'];
+
+    const layout = els.layout.value;
+
+    // Background grid
+    for (let i=0;i<16;i++) for (let j=0;j<16;j++){
+      const x = matX + j*cell, y = matY + i*cell;
+      ctx.fillStyle = '#eef1f5';
+      ctx.fillRect(x+0.5, y+0.5, cell-1, cell-1);
+    }
+    // Color each element by its owner thread
+    for (let t=0; t<32; t++){
+      const elts = elementsForThread(t, layout);
+      const isSelected = t === selected;
+      const visible = showAll || isSelected;
+      if (!visible) continue;
+      ctx.fillStyle = palette[t % 8];
+      ctx.globalAlpha = isSelected ? 1 : (showAll ? 0.55 : 0.4);
+      for (const [i,j] of elts){
+        const x = matX + j*cell, y = matY + i*cell;
+        ctx.fillRect(x+1, y+1, cell-2, cell-2);
+      }
+      ctx.globalAlpha = 1;
+      // outline the selected thread's tiles
+      if (isSelected){
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
+        for (const [i,j] of elts){
+          const x = matX + j*cell, y = matY + i*cell;
+          ctx.strokeRect(x+0.5, y+0.5, cell-1, cell-1);
+        }
+      }
+    }
+    // Grid outline
+    ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+    ctx.strokeRect(matX-0.5, matY-0.5, matW+1, matH+1);
+    // row & col labels (sparse)
+    ctx.fillStyle = '#94a3b8'; ctx.font='9px monospace';
+    for (let i=0; i<16; i+=4){
+      ctx.fillText(i, matX - 12, matY + i*cell + cell/2 + 3);
+      ctx.fillText(i, matX + i*cell + cell/2 - 2, matY + matH + 12);
+    }
+
+    // Thread chip grid on the right
+    const rightX = matX + matW + 30;
+    const rightW = W - padR - rightX;
+    const chipsPerRow = 8;
+    const chipSize = Math.min(28, (rightW - 24) / chipsPerRow);
+    const chipGap = 4;
+    ctx.fillStyle = '#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('threads · click', rightX, padT - 18);
+    for (let t=0; t<32; t++){
+      const r = Math.floor(t / chipsPerRow), c = t % chipsPerRow;
+      const x = rightX + c*(chipSize + chipGap);
+      const y = matY + r*(chipSize + chipGap);
+      const isSelected = t === selected;
+      ctx.fillStyle = isSelected ? palette[t%8] : '#eef1f5';
+      ctx.strokeStyle = isSelected ? '#fff' : '#dde2ea';
+      ctx.lineWidth = isSelected ? 2 : 1;
+      ctx.fillRect(x, y, chipSize, chipSize);
+      ctx.strokeRect(x+0.5, y+0.5, chipSize-1, chipSize-1);
+      ctx.fillStyle = isSelected ? '#ffffff' : '#5b6573';
+      ctx.font = '10px monospace';
+      ctx.fillText('T'+t, x + chipSize/2 - 7, y + chipSize/2 + 4);
+    }
+    // Legend
+    const lgY = matY + 4*(chipSize+chipGap) + 22;
+    ctx.fillStyle = '#5b6573'; ctx.font='10.5px monospace';
+    ctx.fillText('each thread → 8 elements', rightX, lgY);
+    ctx.fillText('   = 4 fp16 / bf16 registers', rightX, lgY + 14);
+    ctx.fillText('   = 8 fp32 acc registers', rightX, lgY + 28);
+
+    // KPIs
+    els.th.textContent = 'T'+selected;
+    els.cnt.textContent = '8 elements';
+    const layoutInfo = layout === 'c' ? '8 fp32 (8 regs)' : '8 bf16 (4 regs)';
+    els.reg.textContent = layoutInfo;
+
+    // Canvas click handler — set this once via outer setup
+  }
+
+  // Hit-test threads on click
+  C.addEventListener('click', e => {
+    const rect = C.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    const W = C.clientWidth;
+    const padL = 24, padR = 24, padT = 40;
+    const matLeftFrac = 0.55;
+    const matW = (W - padL - padR) * matLeftFrac;
+    const cell = matW / 16;
+    const matH = cell * 16, matX = padL, matY = padT;
+    const rightX = matX + matW + 30;
+    const chipsPerRow = 8;
+    const chipSize = Math.min(28, (W - padR - rightX - 24) / chipsPerRow);
+    const chipGap = 4;
+    for (let t=0; t<32; t++){
+      const r = Math.floor(t / chipsPerRow), c = t % chipsPerRow;
+      const cx = rightX + c*(chipSize + chipGap);
+      const cy = matY + r*(chipSize + chipGap);
+      if (x >= cx && x <= cx+chipSize && y >= cy && y <= cy+chipSize){
+        selected = t; showAll = false; render(); return;
+      }
+    }
+  });
+
+  els.layout.addEventListener('change', render);
+  els.cycle.addEventListener('click', ()=>{
+    if (cycleTimer){ clearInterval(cycleTimer); cycleTimer = null; els.cycle.textContent='cycle threads ▷'; return; }
+    showAll = false;
+    cycleTimer = setInterval(()=>{
+      selected = (selected + 1) % 32;
+      render();
+    }, 250);
+    els.cycle.textContent = '❚❚ stop cycle';
+  });
+  els.all.addEventListener('click', ()=>{
+    showAll = !showAll;
+    els.all.textContent = showAll ? 'hide all' : 'show all';
+    render();
+  });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget: 3D precision ladder ─── */
+(function(){
+  const C = document.getElementById('lad-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    arch:$('lad-arch'), rot:$('lad-rot'), rotv:$('lad-rot-v'),
+    sp:$('lad-sp'),
+    dt:$('lad-dt'), shape:$('lad-shape'),
+    peak:$('lad-peak'), spd:$('lad-spd'),
+  };
+
+  // Peak dense TF for each dtype × arch. fp4 only on Blackwell.
+  const PEAK = {
+    a100: { fp32:19.5, tf32:156, fp16:312, bf16:312, fp8:null, fp4:null },
+    h100: { fp32:67,   tf32:495, fp16:990, bf16:990, fp8:1980, fp4:null },
+    b200: { fp32:80,   tf32:1100, fp16:1100, bf16:1100, fp8:2250, fp4:4500 },
+  };
+  const SHAPE = {
+    fp32:'CUDA cores · 1×1', tf32:'m16n8k8', fp16:'m16n8k16', bf16:'m16n8k16', fp8:'m16n8k32', fp4:'m16n8k64'
+  };
+  const ORDER = ['fp32','tf32','fp16','bf16','fp8','fp4'];
+  const COLORS = {
+    fp32:'#475569', tf32:'#3b82f6', fp16:'#2563eb', bf16:'#16a34a', fp8:'#d97706', fp4:'#dc2626'
+  };
+
+  let selected = 'bf16';
+
+  function proj(x, y, z, cx, cy){
+    const rot = (+els.rot.value) * Math.PI/180;
+    const cosA = Math.cos(Math.PI/7 + rot), sinA = Math.sin(Math.PI/7 + rot);
+    const sx = (x - y) * cosA;
+    const sy = (x + y) * sinA - z;
+    return [cx + sx, cy + sy];
+  }
+
+  function render(){
+    els.rotv.textContent = (+els.rot.value) + '°';
+    const arch = els.arch.value;
+    const peaks = PEAK[arch];
+    const sparsity = els.sp.checked ? 2 : 1;
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    // Center
+    const cx = W*0.45, cy = H - 80;
+
+    // Plot from bottom (fp32, smallest) to top (fp4, largest)
+    // Volume ~ relative peak. We use side length s proportional to sqrt(peak/fp32).
+    const fp32peak = peaks.fp32;
+    const maxPeak = Math.max(...Object.values(peaks).filter(v=>v)) * sparsity;
+
+    let z = 0;
+    const tierBoxes = [];
+    for (let idx=0; idx<ORDER.length; idx++){
+      const dt = ORDER[idx];
+      const peak = peaks[dt];
+      if (peak == null) continue;
+      const effective = peak * (dt === 'fp32' ? 1 : sparsity);
+      const sBase = 60;
+      const scale = Math.sqrt(effective / fp32peak);
+      const s = Math.max(36, Math.min(220, sBase * scale * 0.4));
+      const h = 16 + (dt === 'fp32' ? 18 : 18 + Math.log2(effective/fp32peak) * 5);
+
+      tierBoxes.push({ dt, x: -s/2, y: -s/2, w:s, d:s, z, h, peak: effective });
+      z += h + 6;
+    }
+
+    // Draw back to front
+    const sortedTiers = tierBoxes.slice();
+    for (const tier of sortedTiers){
+      const base = COLORS[tier.dt];
+      const isSel = tier.dt === selected;
+      // 8 corners of box
+      const p000 = proj(tier.x,         tier.y,         tier.z,         cx, cy);
+      const p100 = proj(tier.x+tier.w,  tier.y,         tier.z,         cx, cy);
+      const p110 = proj(tier.x+tier.w,  tier.y+tier.d,  tier.z,         cx, cy);
+      const p010 = proj(tier.x,         tier.y+tier.d,  tier.z,         cx, cy);
+      const p001 = proj(tier.x,         tier.y,         tier.z+tier.h,  cx, cy);
+      const p101 = proj(tier.x+tier.w,  tier.y,         tier.z+tier.h,  cx, cy);
+      const p111 = proj(tier.x+tier.w,  tier.y+tier.d,  tier.z+tier.h,  cx, cy);
+      const p011 = proj(tier.x,         tier.y+tier.d,  tier.z+tier.h,  cx, cy);
+
+      function shade(col, f){
+        const m = col.replace('#','');
+        const r = parseInt(m.substr(0,2),16);
+        const gg = parseInt(m.substr(2,2),16);
+        const bl = parseInt(m.substr(4,2),16);
+        return 'rgb('+Math.round(r*f)+','+Math.round(gg*f)+','+Math.round(bl*f)+')';
+      }
+
+      ctx.globalAlpha = isSel ? 1 : 0.9;
+
+      // top
+      ctx.fillStyle = shade(base, 1.0);
+      ctx.beginPath(); ctx.moveTo(p001[0],p001[1]);
+      ctx.lineTo(p101[0],p101[1]); ctx.lineTo(p111[0],p111[1]); ctx.lineTo(p011[0],p011[1]);
+      ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 0.5; ctx.stroke();
+
+      // left/front
+      ctx.fillStyle = shade(base, 0.65);
+      ctx.beginPath(); ctx.moveTo(p001[0],p001[1]);
+      ctx.lineTo(p011[0],p011[1]); ctx.lineTo(p010[0],p010[1]); ctx.lineTo(p000[0],p000[1]);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+
+      // right face
+      ctx.fillStyle = shade(base, 0.82);
+      ctx.beginPath(); ctx.moveTo(p011[0],p011[1]);
+      ctx.lineTo(p111[0],p111[1]); ctx.lineTo(p110[0],p110[1]); ctx.lineTo(p010[0],p010[1]);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+
+      // selection outline
+      if (isSel){
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(p001[0],p001[1]); ctx.lineTo(p101[0],p101[1]);
+        ctx.lineTo(p111[0],p111[1]); ctx.lineTo(p011[0],p011[1]);
+        ctx.closePath(); ctx.stroke();
+      }
+
+      ctx.globalAlpha = 1;
+
+      // Label on the side
+      const labelP = proj(tier.x + tier.w + 8, tier.y, tier.z + tier.h/2, cx, cy);
+      ctx.fillStyle = '#1f2430'; ctx.font='12px monospace';
+      ctx.fillText(tier.dt, labelP[0] + 10, labelP[1] + 4);
+      ctx.fillStyle = '#5b6573'; ctx.font='10px monospace';
+      ctx.fillText(tier.peak.toFixed(0) + ' TF', labelP[0] + 10, labelP[1] + 18);
+
+      // Store hit area
+      tier._hit = [(p000[0]+p111[0])/2, (p000[1]+p111[1])/2, Math.max(40, tier.w*0.5)];
+    }
+
+    // Caption
+    ctx.fillStyle = '#5b6573'; ctx.font='11px monospace';
+    ctx.fillText('arch: '+arch.toUpperCase()+'  ·  '+(els.sp.checked?'2× sparsity ON':'dense'), 14, 22);
+    ctx.fillText('volume ≈ peak TF · click a tier', 14, 38);
+
+    // Update KPIs
+    const peak = peaks[selected];
+    if (peak != null){
+      const effective = peak * (selected === 'fp32' ? 1 : sparsity);
+      els.dt.textContent = selected;
+      els.shape.textContent = SHAPE[selected];
+      els.peak.textContent = effective >= 1000 ? (effective/1000).toFixed(2)+' PF' : effective.toFixed(0)+' TF';
+      els.spd.textContent = (effective / peaks.fp32).toFixed(1) + '×';
+    } else {
+      els.dt.textContent = selected + ' (n/a)';
+      els.shape.textContent = '—';
+      els.peak.textContent = 'unsupported on '+arch;
+      els.spd.textContent = '—';
+    }
+
+    // Save tier hit data for click handler
+    C._tiers = tierBoxes;
+  }
+
+  C.addEventListener('click', e => {
+    const rect = C.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    let best = null, bestD = 1e9;
+    for (const t of (C._tiers || [])){
+      if (!t._hit) continue;
+      const d = Math.hypot(t._hit[0]-x, t._hit[1]-y);
+      if (d < bestD){ bestD = d; best = t.dt; }
+    }
+    if (best && bestD < 60){ selected = best; render(); }
+  });
+
+  els.arch.addEventListener('change', ()=>{
+    const peaks = PEAK[els.arch.value];
+    if (peaks[selected] == null){
+      // pick the highest-precision available tier as fallback
+      for (const d of ORDER.slice().reverse()){
+        if (peaks[d] != null){ selected = d; break; }
+      }
+    }
+    render();
+  });
+  els.rot.addEventListener('input', render);
+  els.sp.addEventListener('change', render);
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

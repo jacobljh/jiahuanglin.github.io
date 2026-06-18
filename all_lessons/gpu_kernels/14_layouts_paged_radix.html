@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>05 · Prefix reuse: hash caches and radix trees</title><link rel="stylesheet" href="../reinforcement_learning/lessons/style.css"><style>main{overflow-wrap:break-word}table{table-layout:fixed}th,td{overflow-wrap:anywhere}input[type="range"]{max-width:min(200px,44vw)}label.inline{flex-wrap:wrap;max-width:100%}</style></head>
+<body><header class="topnav"><div class="inner"><a class="crumb-link" href="../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">gpu_kernels</a><span class="crumb">/</span><span class="crumb">14 · prefix reuse</span><span class="step-pill">lesson 14 / 27</span></div></header><main>
+
+<h1>Prefix reuse: hash caches and radix trees</h1>
+<p class="subtitle">Paged KV (lesson 04) gave us blocks we can reference by id. The next leverage point is that many real workloads send prompts whose first thousands of tokens are bit-identical. If two requests share a prefix, they should share the KV blocks computed for that prefix — no recomputation, no duplicate storage.</p>
+
+<h2>The question this lesson answers</h2>
+<p>Why does this matter, and why now? Because real workloads <em>do</em> share prefixes:</p>
+<ul>
+  <li>Chat APIs send the same system prompt for every request.</li>
+  <li>RAG sends the same retrieved document with different questions.</li>
+  <li>Multi-turn conversations send the full prior history each turn.</li>
+  <li>RL rollouts and tool-use agents branch from a common context.</li>
+</ul>
+<p>For Llama-3-70B at a 4K shared prefix, recomputing it for every request costs ~4 GB of weight reads × all 80 layers per fresh prefill. If a fleet processes 1000 such requests, that is 1000× wasted prefill. Lesson 02's math told us how expensive this is; this lesson tells us how to skip it.</p>
+
+<h2>Two data structures, one idea</h2>
+<p>"Have I seen this prefix before?" is a string-search problem. Two practical answers dominate production engines:</p>
+
+<table><thead><tr><th>Structure</th><th>How it indexes</th><th>Strengths</th><th>Costs</th></tr></thead><tbody>
+<tr><td><strong>Block-hash cache</strong> (vLLM-style)</td><td>One hash per <em>fixed-size block</em> of tokens; map hash → physical block.</td><td>O(1) lookup per block; cheap to integrate with paged KV; works with any token stream.</td><td>Only block-aligned reuse; a partial block prefix doesn't hit.</td></tr>
+<tr><td><strong>Radix tree</strong> (SGLang-style)</td><td>Tree whose edges hold variable-length token strings; nodes hold KV ranges.</td><td>Arbitrary-length and branch-aware reuse; natural for tree-structured workloads (tools, branching agents).</td><td>More bookkeeping; insert/split operations need careful concurrency control.</td></tr>
+</tbody></table>
+
+<p>Both produce the same kernel-facing artifact: a list of physical block ids the attention kernel can read directly, plus a small suffix that still needs prefill. The kernels from lessons 03 and 04 don't change.</p>
+
+<h2>Block-hash prefix cache</h2>
+<p>Pick a block size <code>bs</code> (the same one paged KV uses). For each prompt, walk it in blocks. Hash the first <code>bs</code> tokens to get <code>h_0</code>. Hash <code>(h_0, next bs tokens)</code> to get <code>h_1</code>. And so on. Hash i depends on hash i-1, so two prefixes collide if and only if they are identical token-by-token (up to hash collisions, which use 128-bit hashes to make negligible).</p>
+
+<pre><code># pseudo-code: prefix lookup, block-hash style
+def lookup_prefix(tokens, bs, cache):
+    h, hits = None, []
+    for k in range(0, len(tokens), bs):
+        chunk = tokens[k:k+bs]
+        if len(chunk) < bs: break          # partial block: no hit
+        h = hash128((h, chunk))            # chained hash
+        entry = cache.get(h)
+        if entry is None: break            # first miss ends the run
+        entry.refcount += 1                # share, don't copy
+        hits.append(entry.physical_block)
+    return hits                            # list of physical block ids</code></pre>
+
+<p>Insertion happens after prefill: every freshly computed block is registered under its hash. Eviction is usually LRU with refcounts — a block can only be evicted if no live request points at it.</p>
+
+<h2>Radix tree, when prompts branch</h2>
+<p>If your workload routinely has <em>k</em> requests sharing a long prefix and then branching, a flat hash table is fine but loses structure. A radix tree (a trie that merges single-child chains into edge labels) represents the branching directly: shared paths are stored once; divergent suffixes are siblings.</p>
+
+<svg viewBox="0 0 820 320" class="diagram" role="img" aria-label="Radix tree growing as four requests with shared system prompt and document then diverge into different tools">
+  <defs><marker id="rx" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <circle cx="120" cy="56" r="22" fill="var(--bg-soft)" stroke="var(--border)"/><text x="120" y="60" text-anchor="middle" font-size="11">root</text>
+  <circle cx="120" cy="138" r="24" fill="var(--bg-soft)" stroke="var(--ok)"/><text x="120" y="142" text-anchor="middle" font-size="11" fill="var(--text)">system</text>
+  <text x="156" y="106" font-size="11" fill="var(--text-mute)">"You are…" [256 tokens]</text>
+  <text x="156" y="120" font-size="11" fill="var(--text-mute)">128 KB KV</text>
+  <circle cx="120" cy="232" r="24" fill="var(--bg-soft)" stroke="var(--ok)"/><text x="120" y="236" text-anchor="middle" font-size="11" fill="var(--text)">doc</text>
+  <text x="156" y="200" font-size="11" fill="var(--text-mute)">[retrieved 3072 tokens]</text>
+  <text x="156" y="214" font-size="11" fill="var(--text-mute)">1.5 MB KV</text>
+  <path class="edge" d="M120 78 L120 114" marker-end="url(#rx)"/>
+  <path class="edge" d="M120 162 L120 208" marker-end="url(#rx)"/>
+
+  <circle cx="320" cy="232" r="22" fill="var(--bg-soft)" stroke="var(--accent)"/><text x="320" y="236" text-anchor="middle" font-size="11" fill="var(--text)">user q1</text>
+  <circle cx="450" cy="232" r="22" fill="var(--bg-soft)" stroke="var(--accent)"/><text x="450" y="236" text-anchor="middle" font-size="11" fill="var(--text)">user q2</text>
+  <circle cx="580" cy="232" r="22" fill="var(--bg-soft)" stroke="var(--accent-2)"/><text x="580" y="236" text-anchor="middle" font-size="11" fill="var(--text)">tool A</text>
+  <circle cx="710" cy="232" r="22" fill="var(--bg-soft)" stroke="var(--accent-2)"/><text x="710" y="236" text-anchor="middle" font-size="11" fill="var(--text)">tool B</text>
+  <path class="edge" d="M144 232 L298 232" marker-end="url(#rx)"/>
+  <path class="edge" d="M144 232 C200 232 380 232 428 232" marker-end="url(#rx)"/>
+  <path class="edge" d="M144 232 C200 232 510 232 558 232" marker-end="url(#rx)"/>
+  <path class="edge" d="M144 232 C200 232 640 232 688 232" marker-end="url(#rx)"/>
+
+  <rect x="20" y="280" width="780" height="30" fill="var(--bg-soft)" stroke="var(--border)" rx="4"/>
+  <text x="30" y="300" font-size="12" fill="var(--text-mute)">four requests share the green stem (system + doc); only the orange/blue leaves recompute. The kernel reads shared blocks once.</text>
+</svg>
+
+<p>Operations on a radix cache fall into four buckets:</p>
+<table><thead><tr><th>Op</th><th>What happens</th></tr></thead><tbody>
+<tr><td><strong>match</strong></td><td>Walk from root following tokens; return matched length and the physical blocks along the path. Increment refcounts.</td></tr>
+<tr><td><strong>insert</strong></td><td>Append new (token, block) pairs at the matched leaf. Split an existing edge if the new path diverges mid-edge.</td></tr>
+<tr><td><strong>evict</strong></td><td>Pick the LRU leaf with zero refcount, free its blocks, remove it. Possibly merge a parent that now has a single child.</td></tr>
+<tr><td><strong>lock</strong></td><td>Pin a path during in-flight read; prevents eviction mid-attention.</td></tr>
+</tbody></table>
+
+<h2>Page alignment and the suffix problem</h2>
+<p>Both schemes can only reuse <em>complete blocks</em>. If your prompt's shared prefix length is 4096 tokens but block size is 16, the engine can reuse 4096/16 = 256 blocks cleanly. If the shared length is 4097, the 257th block has one matching token and 15 fresh ones — that block can <em>not</em> be shared; it has to be recomputed. The engine treats the prefix match length as "shared length rounded down to bs."</p>
+<p>The same constraint applies on the inside of the kernel: an attention backend that requires a particular page size (lesson 04) will only accept matched blocks of that size. This is one of the silent reasons "backend X doesn't support feature Y" — the cache layout and the kernel layout have to agree.</p>
+
+<h2>What the engine actually sends to the kernel</h2>
+<p>After a prefix lookup, the engine produces three things per request for the next forward pass:</p>
+<ol>
+  <li><strong>The block table</strong> (lesson 04), with the prefix entries already pointing at the cached physical blocks.</li>
+  <li><strong>A "fresh tokens" suffix</strong> that still needs prefill (or none, if every block hit).</li>
+  <li><strong>A flag set</strong> telling the attention kernel which positions are "already in KV, just read me" vs "compute and append."</li>
+</ol>
+<p>For the kernel this is the same code path as a fresh request — it walks the block table and the new token positions. The win is purely "fewer fresh tokens to prefill" + "no duplicate KV bytes in HBM."</p>
+
+<h2>Cache-aware routing</h2>
+<p>Prefix reuse only helps if a request reaches a worker that has the right cache. If your router load-balances purely on instantaneous queue depth, the second request of a chat may land on a different worker than the first and miss the cache entirely. Production routers either:</p>
+<ul>
+  <li><strong>Hash the prefix prefix</strong> (first few hundred tokens) and route by hash, so identical prefixes stick to a worker — at the cost of some load imbalance.</li>
+  <li><strong>Track per-worker cache state</strong> and route the request to the worker with the best-matching cache, breaking ties by load.</li>
+</ul>
+<p>SGLang's gateway exposes this directly as "cache-aware routing." vLLM's KV connector and prefix-cache flags expose related primitives. The point is that the cache only pays off when routing helps it.</p>
+
+<h2>Interactive · prefix savings accountant</h2>
+<p>How much prefill compute disappears? Compute it. Move the sliders for shared prefix tokens, unique suffix tokens, and number of requests sharing the prefix. The widget shows total tokens prefilled with and without sharing, plus the percentage saved.</p>
+
+<div class="widget"><div class="title">Prefix reuse savings</div><p class="hint">Without reuse: every request prefills its full prompt. With reuse: the prefix is prefilled once, and each request only prefills its suffix. The gap widens with more sharing requests.</p><div class="controls">
+<label class="inline">requests sharing prefix <input id="rx-req" type="range" min="2" max="256" value="16"><span class="val" id="rx-req-v">16</span></label>
+<label class="inline">shared prefix tokens <input id="rx-prefix" type="range" min="0" max="32768" step="128" value="2048"><span class="val" id="rx-prefix-v">2048</span></label>
+<label class="inline">unique suffix tokens <input id="rx-suffix" type="range" min="0" max="4096" step="32" value="256"><span class="val" id="rx-suffix-v">256</span></label>
+<label class="inline">block size <input id="rx-bs" type="range" min="1" max="64" value="16"><span class="val" id="rx-bs-v">16</span></label>
+</div><canvas id="rx-canvas" class="dist-canvas" height="220"></canvas><p class="hint" id="rx-note"></p></div>
+
+<h2>Limits and failure modes</h2>
+<table><thead><tr><th>Failure mode</th><th>What happens</th><th>What to do</th></tr></thead><tbody>
+<tr><td><em>Cache thrashing</em></td><td>The working set of distinct prefixes exceeds the pool; entries are evicted before reuse.</td><td>Increase KV pool fraction; route by prefix to concentrate working set per worker.</td></tr>
+<tr><td><em>Cold start</em></td><td>First request of a new prefix pays full prefill; subsequent hits are free.</td><td>Pre-warm with anticipated system prompts; share across replicas if your router supports it.</td></tr>
+<tr><td><em>Subtle non-determinism</em></td><td>Identical token sequence produces "slightly different" logits across cache hit vs miss runs (numerical reordering).</td><td>Accept tiny floating-point drift, or pin to a single backend if you need exact reproducibility (RL training pairs are sensitive).</td></tr>
+<tr><td><em>Sensitive prompts</em></td><td>Two users share a system prompt but should not share KV across security boundaries.</td><td>Partition cache by tenant; the runtime can hash a tenant id into the chain.</td></tr>
+</tbody></table>
+
+<h2>What this gives you for the rest of the track</h2>
+<p>We can now compute on every byte exactly zero or one times. The remaining wins are about <em>when</em> work runs, not whether: bundling unrelated requests into one efficient kernel call, splitting long prompts so they don't starve decoders, and removing CPU dispatch overhead from a stable hot path. That is the next lesson — scheduling.</p>
+
+<script>
+(function(){
+  const ids=['req','prefix','suffix','bs'];
+  const e=Object.fromEntries(ids.map(k=>[k,document.getElementById('rx-'+k)]));
+  const c=document.getElementById('rx-canvas'),ctx=c.getContext('2d'),note=document.getElementById('rx-note');
+  function draw(){
+    ids.forEach(k=>document.getElementById('rx-'+k+'-v').textContent=e[k].value);
+    c.width=c.clientWidth*devicePixelRatio;c.height=220*devicePixelRatio;ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.clearRect(0,0,c.clientWidth,220);
+    const R=+e.req.value,P=+e.prefix.value,S=+e.suffix.value,bs=+e.bs.value;
+    const P_aligned = Math.floor(P/bs)*bs;
+    const no_reuse = Math.max(1, R*(P+S));
+    const with_reuse = Math.max(1, P_aligned + R*(P-P_aligned+S));
+    const saved = no_reuse>0 ? 1 - with_reuse/no_reuse : 0;
+    const max = Math.max(no_reuse, with_reuse, 1);
+    const items=[
+      ['no reuse (every request prefills the full prompt)',no_reuse,'#dc2626'],
+      ['with reuse (prefix done once)',with_reuse,'#16a34a']
+    ];
+    items.forEach(([n,v,col],i)=>{
+      const y=46+i*52,w=(c.clientWidth-260)*v/max;
+      ctx.fillStyle='#eef1f5';ctx.fillRect(220,y,c.clientWidth-260,30);
+      ctx.fillStyle=col;ctx.fillRect(220,y,w,30);
+      ctx.fillStyle='#1f2430';ctx.font='12px sans-serif';
+      ctx.fillText(n,30,y+20);
+      ctx.fillText((v/1000).toFixed(1)+'k tokens',226+w+6,y+20);
+    });
+    ctx.fillStyle='#5b6573';ctx.font='12px sans-serif';
+    ctx.fillText('Prefill tokens saved: '+(saved*100).toFixed(1)+'%   (alignment loss: '+(P-P_aligned)+' tokens at the suffix edge)',30,168);
+    let advice;
+    if(saved>0.8) advice='High reuse — prefix routing and large KV pool fraction are the highest-leverage knobs.';
+    else if(saved>0.4) advice='Moderate reuse — already worth a hash cache; consider radix if branching is common.';
+    else advice='Low reuse — paged KV alone is doing most of the work; chase batching/quantization instead.';
+    note.textContent = advice;
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+<footer class="lesson-nav"><a href="13_sglang_kernel_stack.html"><span class="dir">Previous</span><span class="ttl">13 · Paged KV</span></a><a class="next" href="15_quant_sampling_cuda_graphs.html"><span class="dir">Next</span><span class="ttl">15 · Scheduling &amp; graphs</span></a></footer>
+</main></body></html>

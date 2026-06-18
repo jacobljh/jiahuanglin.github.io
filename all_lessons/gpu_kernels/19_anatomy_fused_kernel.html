@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>19 · Anatomy of a fused kernel</title><link rel="stylesheet" href="../reinforcement_learning/lessons/style.css"><style>main{overflow-wrap:break-word}table{table-layout:fixed}th,td{overflow-wrap:anywhere}input[type="range"]{max-width:min(200px,44vw)}label.inline{flex-wrap:wrap;max-width:100%}</style></head>
+<body><header class="topnav"><div class="inner"><a class="crumb-link" href="../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">gpu_kernels</a><span class="crumb">/</span><span class="crumb">19 · fused kernel anatomy</span><span class="step-pill">lesson 19 / 27</span></div></header><main>
+
+<h1>Anatomy of a fused kernel</h1>
+<p class="subtitle">A working fused RMSNorm kernel in ~30 lines of Triton, read line by line: program model, masked loads, on-chip reductions, epilogue, autotune choice. By the end you should be able to read any modern fused kernel and predict its performance class without running it.</p>
+
+<h2>The question this lesson answers</h2>
+<p>You know what kernels look like in the abstract (Part I) and you know what they do for serving (Part II). What does <em>real</em> production kernel code look like, and what are the moving parts? We use a fused RMSNorm because (a) it appears in every transformer block, (b) it touches three habits from lesson 01 (tile, fuse, coalesce), and (c) it's small enough to fit on one screen.</p>
+
+<h2>What RMSNorm computes</h2>
+<p>For each row <code>x ∈ ℝ<sup>D</sup></code> of the input:</p>
+<div class="math block">y = x · w / sqrt(mean(x²) + ε)</div>
+<p>Three operations chained per row: square + sum (reduction over D), divide by sqrt, multiply by per-feature weight. If you express this in PyTorch it dispatches at least 5 kernels (square, mean, add eps, rsqrt, mul) and reads <code>x</code> three or four times from HBM. A fused kernel reads <code>x</code> twice (we'll explain why two, not one, below), keeps the reduction state in registers, and writes <code>y</code> once.</p>
+
+<h2>Triton primitives, in one paragraph (just enough to read the code)</h2>
+<p><code>@triton.jit</code> JIT-compiles a Python function into a kernel. Inside, <code>tl.program_id(axis)</code> returns the current program's id along that grid axis. <code>tl.arange(0, BLOCK)</code> creates a compile-time-sized vector — operations on it are SIMD across the BLOCK lanes. <code>tl.load(ptr, mask, other)</code> performs a coalesced load where masked-off lanes get <code>other</code>. <code>tl.sum</code>, <code>tl.max</code>, <code>tl.rsqrt</code>, <code>tl.exp</code> are vector primitives that compile to warp shuffles or hardware intrinsics. Anything marked <code>tl.constexpr</code> is known at compile time and drives code generation (tile sizes, dtypes). <code>@triton.autotune</code> registers multiple configs and benchmarks them once per <code>key</code>. <code>num_warps</code> is the number of warps each program uses; <code>num_stages</code> is the depth of the software pipeline Triton emits for memory hiding. Lesson 22 expands all of this; the line-by-line table below explains every primitive used here.</p>
+
+<h2>The Triton kernel, annotated</h2>
+<pre><code>import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_D': 256}, num_warps=4),
+        triton.Config({'BLOCK_D': 512}, num_warps=4),
+        triton.Config({'BLOCK_D': 1024}, num_warps=8),
+        triton.Config({'BLOCK_D': 2048}, num_warps=8),
+    ],
+    key=['D'],                       # autotune separately per feature size
+)
+@triton.jit
+def rmsnorm_fwd(
+    x_ptr, w_ptr, y_ptr,             # data pointers
+    N, D,                            # rows, features
+    eps,                             # numerical stability
+    BLOCK_D: tl.constexpr,           # compile-time tile width
+):
+    row = tl.program_id(0)           # one block per row
+    cols = tl.arange(0, BLOCK_D)     # vector of column indices for this block
+
+    # accumulator in fp32 — bf16 would lose precision on the sum
+    sumsq = tl.zeros((1,), dtype=tl.float32)
+
+    # streaming pass 1: read x in chunks, accumulate sum of squares
+    for off in range(0, D, BLOCK_D):
+        idx  = off + cols
+        mask = idx < D
+        x_blk = tl.load(x_ptr + row * D + idx, mask=mask, other=0.0).to(tl.float32)
+        sumsq += tl.sum(x_blk * x_blk, axis=0)
+
+    # one scalar per row — held in a register
+    inv_rms = tl.rsqrt(sumsq / D + eps)
+
+    # streaming pass 2: write y = x * w * inv_rms
+    for off in range(0, D, BLOCK_D):
+        idx  = off + cols
+        mask = idx < D
+        x_blk = tl.load(x_ptr + row * D + idx, mask=mask, other=0.0).to(tl.float32)
+        w_blk = tl.load(w_ptr + idx,           mask=mask, other=0.0).to(tl.float32)
+        y_blk = (x_blk * inv_rms * w_blk).to(tl.bfloat16)
+        tl.store(y_ptr + row * D + idx, y_blk, mask=mask)</code></pre>
+
+<h2>Read it line by line</h2>
+<table><thead><tr><th>Line / concept</th><th>What it does</th><th>Why it matters</th></tr></thead><tbody>
+<tr><td><code>@triton.autotune(configs, key=['D'])</code></td><td>Compile multiple versions; benchmark on first call per <code>D</code>; cache winner.</td><td>The right BLOCK_D depends on D and hardware. You don't pick — the autotuner does.</td></tr>
+<tr><td><code>row = tl.program_id(0)</code></td><td>Each program instance handles one row.</td><td>Decouples problem decomposition from hardware. Triton maps instances onto SMs.</td></tr>
+<tr><td><code>cols = tl.arange(0, BLOCK_D)</code></td><td>Vector of column indices for this tile.</td><td>BLOCK_D is compile-time → can vectorize across the row.</td></tr>
+<tr><td><code>sumsq = tl.zeros(..., dtype=fp32)</code></td><td>Accumulator in fp32.</td><td>Sum of bf16 squares would lose precision. Critical for numerical correctness.</td></tr>
+<tr><td><code>for off in range(0, D, BLOCK_D)</code></td><td>Stream the row in BLOCK_D chunks.</td><td>If D > BLOCK_D, we tile across columns. Trades SMEM for one extra HBM pass.</td></tr>
+<tr><td><code>mask = idx < D</code></td><td>Mask for the last (partial) tile.</td><td>Handles D not a multiple of BLOCK_D without padding.</td></tr>
+<tr><td><code>tl.load(..., mask=mask, other=0.0)</code></td><td>Coalesced bf16 read with predicate.</td><td>Out-of-bounds lanes read 0 — safe for sumsq accumulation.</td></tr>
+<tr><td><code>.to(tl.float32)</code></td><td>Upcast for accumulation.</td><td>Same reason as the fp32 accumulator. The cast is free in registers.</td></tr>
+<tr><td><code>tl.sum(x*x, axis=0)</code></td><td>Tree reduction across the BLOCK_D vector.</td><td>Compiles to warp shuffles (lesson 07).</td></tr>
+<tr><td><code>tl.rsqrt(sumsq/D + eps)</code></td><td>Hardware reciprocal-sqrt.</td><td>One instruction, ~1 cycle. Avoids two divisions.</td></tr>
+<tr><td>Pass 2 reads <code>x</code> again</td><td>Streaming compute of y.</td><td>See "why two passes" callout below — trades one extra HBM read of x for not stashing a 16 KB+ row in SMEM, which would halve occupancy.</td></tr>
+<tr><td><code>y.to(bfloat16)</code></td><td>Downcast for storage.</td><td>Bf16 output keeps memory traffic low downstream.</td></tr>
+<tr><td><code>tl.store(..., mask=mask)</code></td><td>Masked write.</td><td>Last tile may be partial.</td></tr>
+</tbody></table>
+
+<h2>Why two passes, not one (the SMEM trade-off)</h2>
+<p>You might ask: why read <code>x</code> twice? Couldn't we load it into shared memory on the first pass and re-use it on the second? The answer is that <code>x</code> for one row is <code>D · 2</code> bytes — at D=8192 that's <strong>16 KB</strong> per row. SMEM on an SM is 228 KB total, shared across all concurrent blocks. Storing the full row in SMEM means at most ~14 blocks fit per SM, and most realistic kernels target far fewer warps than that anyway. Two passes over <code>x</code> cost one extra HBM round trip (~33 MB at N=1024) — about <strong>10 µs at 3.35 TB/s</strong>. The alternative spends 16 KB of precious SMEM and halves occupancy. The trade goes to the streaming version. (For smaller D — say D=512 = 1 KB per row — the choice flips.)</p>
+
+<h2>The structure that recurs in every fused kernel</h2>
+<svg viewBox="0 0 820 320" class="diagram" role="img" aria-label="Fused kernel template: prologue load, on-chip compute, optional reduction, epilogue store">
+  <defs><marker id="ak19" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <g font-size="11" fill="var(--text-mute)">
+    <rect class="node-bg" x="20"  y="40" width="180" height="68" rx="6"/><text x="110" y="64" text-anchor="middle" font-weight="700" fill="var(--text)">prologue</text><text x="110" y="84" text-anchor="middle">map program → tile</text><text x="110" y="100" text-anchor="middle">compute base addresses</text>
+    <rect class="node-bg" x="220" y="40" width="180" height="68" rx="6"/><text x="310" y="64" text-anchor="middle" font-weight="700" fill="var(--text)">load (HBM → reg)</text><text x="310" y="84" text-anchor="middle">coalesced, masked</text><text x="310" y="100" text-anchor="middle">upcast if accumulating</text>
+    <rect class="node-bg" x="420" y="40" width="180" height="68" rx="6"/><text x="510" y="64" text-anchor="middle" font-weight="700" fill="var(--text)">on-chip math</text><text x="510" y="84" text-anchor="middle">elementwise + reduction</text><text x="510" y="100" text-anchor="middle">no HBM round trips</text>
+    <rect class="node-bg" x="620" y="40" width="180" height="68" rx="6"/><text x="710" y="64" text-anchor="middle" font-weight="700" fill="var(--text)">epilogue (HBM ← reg)</text><text x="710" y="84" text-anchor="middle">downcast if needed</text><text x="710" y="100" text-anchor="middle">masked, coalesced store</text>
+    <path class="edge" d="M200 74 L220 74" marker-end="url(#ak19)"/>
+    <path class="edge" d="M400 74 L420 74" marker-end="url(#ak19)"/>
+    <path class="edge" d="M600 74 L620 74" marker-end="url(#ak19)"/>
+  </g>
+  <rect x="20" y="148" width="780" height="60" rx="6" fill="var(--bg-soft)" stroke="var(--border)"/>
+  <text x="40" y="170" font-size="12" fill="var(--text)" font-weight="700">If a reduction crosses tiles:</text>
+  <text x="40" y="190" font-size="12" fill="var(--text-mute)">two passes (compute reduction, then use it) OR one pass with shared memory holding the row OR an online algorithm (FlashAttention's online softmax is the canonical example — lesson 12).</text>
+
+  <rect x="20" y="232" width="780" height="60" rx="6" fill="var(--bg-soft)" stroke="var(--border)"/>
+  <text x="40" y="254" font-size="12" fill="var(--text)" font-weight="700">Three knobs you tune:</text>
+  <text x="40" y="274" font-size="12" fill="var(--text-mute)">(1) BLOCK / tile size — register &amp; SMEM footprint  ·  (2) num_warps — occupancy vs work-per-warp  ·  (3) num_stages — pipeline depth for memory hiding</text>
+</svg>
+
+<h2>How big are the savings? (worked example)</h2>
+<p>Take RMSNorm at N=1024 (batch·tokens), D=8192, bf16.</p>
+<table><thead><tr><th>Implementation</th><th>HBM reads</th><th>HBM writes</th><th>Launches</th><th>Notes</th></tr></thead><tbody>
+<tr><td>Naive PyTorch (5 ops)</td><td>~3× N·D·2 = 50 MB</td><td>~3× N·D·2 = 50 MB</td><td>5</td><td>Each op materializes its output. Approximate — mean produces one scalar per row, not a full tensor.</td></tr>
+<tr><td>Fused (above kernel)</td><td>2× N·D·2 + D·2 = 33 MB + 16 KB</td><td>N·D·2 = 16 MB</td><td>1</td><td>Two streaming passes over x; weights (size D) are shared across rows and small enough to fit in L2.</td></tr>
+<tr><td>Fused, weights pinned in L2</td><td>2× N·D·2 = 33 MB</td><td>16 MB</td><td>1</td><td>Once the 16 KB weight vector is in L2 it stays — the second pass over x sees it from L2, not HBM.</td></tr>
+</tbody></table>
+<p>Speedup is roughly the ratio of HBM bytes, since RMSNorm is bandwidth-bound at this size: ≈ 2× from 5 kernels → 1 kernel, plus 4× launch reduction. Real benchmarks land in that range.</p>
+
+<h2>What changes for harder kernels</h2>
+<p>The same template (prologue → load → math → epilogue) scales up. The harder kernels just stack more stages:</p>
+<ul>
+  <li><strong>Matmul (lesson 05 + 09):</strong> two nested tiles (M, N) over a K-loop. Inner accumulation in registers; final epilogue writes the tile.</li>
+  <li><strong>FlashAttention (lesson 12):</strong> Q tile (outer) and K/V tile (inner) with an online softmax in the inner loop — state that survives across iterations stays in registers.</li>
+  <li><strong>Producer-consumer kernels (FA3-style):</strong> two warp groups — one issues async copies, the other consumes — using Hopper's TMA. Hides memory latency behind compute.</li>
+</ul>
+
+<h2>Numerical traps the kernel must dodge</h2>
+<table><thead><tr><th>Trap</th><th>Symptom</th><th>Fix</th></tr></thead><tbody>
+<tr><td>Bf16 accumulator</td><td>Tiny drift; sums of large vectors lose lower bits.</td><td>Accumulate in fp32 (as above).</td></tr>
+<tr><td>Catastrophic cancellation in softmax</td><td>NaNs at long context.</td><td>Subtract running max before exp (FlashAttention).</td></tr>
+<tr><td>Division by zero</td><td>NaN/Inf in <code>rsqrt</code>.</td><td>Add eps before rsqrt.</td></tr>
+<tr><td>Mixed dtypes silently downcast</td><td>Loss spikes only at scale.</td><td>Explicit <code>.to(fp32)</code> at the right edges.</td></tr>
+<tr><td>Non-deterministic atomics in reduction</td><td>Reproducibility broken.</td><td>Avoid atomics across blocks; use tree reduction inside a block.</td></tr>
+</tbody></table>
+
+<h2>Interactive · fused vs naive HBM traffic</h2>
+<p>Set N, D, and how many separate kernels the naive path uses. The widget shows HBM bytes for both, the resulting bandwidth-bound time, and the launch-overhead difference.</p>
+
+<div class="widget"><div class="title">Fusion savings: bytes + launches</div><p class="hint">Bandwidth-bound assumption: time ≈ bytes / HBM. Fused does 2 reads of x + 1 read of w + 1 write of y. Naive does ops·(read+write) of full-size intermediates.</p><div class="controls">
+<label class="inline">rows N <input id="fk-N" type="range" min="64" max="16384" step="64" value="1024"><span class="val" id="fk-N-v">1024</span></label>
+<label class="inline">features D <input id="fk-D" type="range" min="512" max="16384" step="64" value="8192"><span class="val" id="fk-D-v">8192</span></label>
+<label class="inline">naive op count <input id="fk-ops" type="range" min="2" max="10" value="5"><span class="val" id="fk-ops-v">5</span></label>
+<label class="inline">launch µs <input id="fk-lat" type="range" min="1" max="20" value="8"><span class="val" id="fk-lat-v">8</span></label>
+<label class="inline">HBM TB/s <input id="fk-bw" type="range" min="0.8" max="8" step="0.05" value="3.35"><span class="val" id="fk-bw-v">3.35</span></label>
+</div><canvas id="fk-canvas" class="dist-canvas" height="220"></canvas><p class="hint" id="fk-note"></p></div>
+
+<h2>What this gives you for the next lessons</h2>
+<p>You can now read a fused kernel and pattern-match it to "I see a prologue, a load, on-chip math, an epilogue, with a reduction phase if applicable." The next lesson teaches the tools that <em>tell you</em> whether your kernel is hitting its potential — three different profilers for three different questions.</p>
+
+<script>
+(function(){
+  const ids=['N','D','ops','lat','bw'];
+  const e=Object.fromEntries(ids.map(k=>[k,document.getElementById('fk-'+k)]));
+  const c=document.getElementById('fk-canvas'),ctx=c.getContext('2d'),note=document.getElementById('fk-note');
+  function draw(){
+    ids.forEach(k=>document.getElementById('fk-'+k+'-v').textContent=e[k].value);
+    c.width=c.clientWidth*devicePixelRatio;c.height=220*devicePixelRatio;ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.clearRect(0,0,c.clientWidth,220);
+    const N=+e.N.value,D=+e.D.value,ops=+e.ops.value,lat=+e.lat.value,bw=+e.bw.value;
+    const b=2; // bf16
+    const naive_hbm = ops*2*N*D*b;     // each op reads + writes the full tensor
+    const fused_hbm = 2*N*D*b + D*b + N*D*b; // x read twice + weights + y write
+    const naive_ms = naive_hbm/(bw*1e12) * 1000 + ops*lat/1000;
+    const fused_ms = fused_hbm/(bw*1e12) * 1000 + lat/1000;
+    const max=Math.max(naive_ms, fused_ms, 0.001);
+    [['naive (ops × full tensor)', naive_ms, '#dc2626'],
+     ['fused (one kernel)', fused_ms, '#16a34a']].forEach(([n,v,col],i)=>{
+      const y=46+i*52,w=(c.clientWidth-240)*v/max;
+      ctx.fillStyle='#eef1f5';ctx.fillRect(220,y,c.clientWidth-240,30);
+      ctx.fillStyle=col;ctx.fillRect(220,y,w,30);
+      ctx.fillStyle='#1f2430';ctx.font='13px sans-serif';
+      ctx.fillText(n,30,y+20);
+      ctx.fillText(v.toFixed(3)+' ms',226+w+6,y+20);
+    });
+    const speedup = naive_ms/fused_ms;
+    ctx.fillStyle='#5b6573';ctx.font='12px sans-serif';
+    ctx.fillText('HBM ratio: '+(naive_hbm/fused_hbm).toFixed(1)+'×   ·   speedup: '+speedup.toFixed(2)+'×',30,168);
+    note.textContent = speedup>2 ?
+      'Strong fusion win: bandwidth-bound op chain collapses to a single streaming kernel.' :
+      'Modest win — either ops are already large, or launch overhead is small relative to math. Profile before committing to fusion (lesson 20).';
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+<footer class="lesson-nav"><a href="18_pytorch_to_kernel.html"><span class="dir">Previous</span><span class="ttl">18 · PyTorch op → kernel</span></a><a class="next" href="20_profiling_toolkit.html"><span class="dir">Next</span><span class="ttl">20 · Profiling toolkit</span></a></footer>
+</main></body></html>

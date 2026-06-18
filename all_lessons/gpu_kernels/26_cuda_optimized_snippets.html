@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>26 · CUDA optimized snippets</title>
+<link rel="stylesheet" href="../reinforcement_learning/lessons/style.css">
+<style>.mini-index{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin:16px 0}.mini-index a{border:1px solid var(--border);background:var(--bg-elev);border-radius:8px;padding:12px 14px;text-decoration:none}.mini-index a:hover{border-color:var(--accent);text-decoration:none}.mini-index strong{display:block;color:var(--text)}.mini-index span{display:block;color:var(--text-mute);font-size:13px;margin-top:4px}.linear-step{border-left:3px solid var(--accent-2);padding-left:14px;margin:14px 0}.linear-step .label{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--text-mute)}</style>
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">gpu_kernels</a>
+    <span class="crumb">/</span>
+    <span class="crumb">26 · cuda optimized snippets</span>
+    <span class="step-pill">lesson 26 / 27</span>
+  </div>
+</header>
+
+<main>
+
+<h1>Highly optimized CUDA snippets</h1>
+<p class="subtitle">Optimization is not a grab-bag of tricks. Every fast kernel is fast for one reason: it stopped wasting the resource that was holding it back. Learn to find that wall, attack it, and re-measure.</p>
+
+<div class="linear-step">
+  <div class="label">Linearized thinking</div>
+  <p>Performance work is a loop, not a checklist:</p>
+  <ol>
+    <li><strong>Identify the binding resource — the wall.</strong> A kernel is limited by exactly one thing at a time: HBM bandwidth, compute throughput, launch/host overhead, atomic contention, memory latency, or serialization (divergence, barriers, bank conflicts). Counting bytes and FLOPs usually tells you which.</li>
+    <li><strong>Reduce traffic or serialization against THAT resource.</strong> If you are bandwidth-bound, every optimization that does not reduce bytes moved is wasted effort. If you are launch-bound, making the kernel faster does nothing. Aim the lever at the wall.</li>
+    <li><strong>Re-measure and re-classify.</strong> Fixing one wall moves the bottleneck somewhere else. The kernel that was bandwidth-bound may now be latency-bound. Confirm the bottleneck moved before you keep optimizing — otherwise you are guessing.</li>
+  </ol>
+  <p>Everything below is an instance of this loop. The snippets are concrete levers; the value is knowing <em>which</em> lever and <em>why</em>.</p>
+</div>
+
+<h2>The roofline mental model</h2>
+
+<p>A GPU can do two things: move bytes (between HBM and the chip) and do arithmetic (FLOPs in the SMs). These have separate ceilings. For a given kernel define its <strong>arithmetic intensity</strong>:</p>
+
+<pre><code>intensity I = total FLOPs / total bytes moved to/from HBM   (FLOP per byte)</code></pre>
+
+<p>The achievable rate is the lower of two limits: what compute can sustain (a flat ceiling, <code>peak FLOP/s</code>) and what bandwidth can feed (a slope, <code>bandwidth &times; intensity</code>). Plot attainable FLOP/s against intensity and you get the roofline:</p>
+
+<div class="ascii">
+attainable
+ FLOP/s
+   ^
+   |                         _______________________  peak FLOP/s  (compute ceiling)
+   |                        /
+   |                       /  &lt;-- compute-bound region (flat roof)
+   |   slope = BW         /
+   |        ___________  /
+   |       /           \/
+   |      /            /\
+   |     /            /  ridge point  I* = peak_FLOPs / peak_BW
+   |    /            /
+   |   /  &lt;-- memory-bound region (slanted roof, rate = BW * I)
+   |  /
+   | /
+   +--------------------------------------------------&gt; arithmetic intensity I (FLOP/byte)
+        low I                       I*                      high I
+</div>
+
+<p>The ridge point <code>I* = peak_FLOPs / peak_BW</code> is the crossover. On a modern data-center GPU peak fp32 might be ~20 TFLOP/s and HBM bandwidth ~2 TB/s, so <code>I* &asymp; 10 FLOP/byte</code>. Read that number carefully:</p>
+
+<ul>
+  <li><strong>I &lt; I*</strong> &rarr; you are on the slope &rarr; <strong>memory-bound</strong>. You will never hit peak FLOP/s no matter how clever your math is. The only thing that helps is moving fewer bytes (or moving them more efficiently).</li>
+  <li><strong>I &gt; I*</strong> &rarr; you are under the flat roof &rarr; <strong>compute-bound</strong>. Bandwidth is not your problem; reducing instructions, raising ILP, or using tensor cores helps.</li>
+</ul>
+
+<p>Classify before you optimize. Count the bytes a kernel must touch and the FLOPs it must do, divide, and compare to <code>I*</code>:</p>
+
+<table>
+  <thead>
+    <tr><th>Kernel</th><th>Bytes (per element, fp32)</th><th>FLOPs</th><th>Intensity</th><th>Verdict</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>y = a*x + y</code> (SAXPY)</td><td>read x, read y, write y = 12 B</td><td>2</td><td>~0.17</td><td>deeply memory-bound</td></tr>
+    <tr><td>vector add <code>c = a + b</code></td><td>4+4+4 = 12 B</td><td>1</td><td>~0.08</td><td>memory-bound</td></tr>
+    <tr><td>dense matmul, naive</td><td>O(N&sup3;) reloads</td><td>2N&sup3;</td><td>low (&asymp; O(1))</td><td>memory-bound until you reuse</td></tr>
+    <tr><td>dense matmul, tiled</td><td>O(N&sup3;/TILE)</td><td>2N&sup3;</td><td>~TILE</td><td>can become compute-bound</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <div class="label">KEY INSIGHT</div>
+  <p>Most everyday kernels (elementwise ops, activations, normalizations, copies) are far to the left of the ridge — they are memory-bound. For these the entire game is bytes: coalesce them, vectorize them, and fuse adjacent kernels so a value is loaded once and reused while it is on-chip. Matmul/convolution are the famous exception, and only because tiling raises their intensity enough to reach the compute roof.</p>
+</div>
+
+<h2>Memory coalescing from first principles</h2>
+
+<p>HBM is not byte-addressable for the SM. The memory system serves <strong>aligned 32-byte sectors</strong>, grouped into <strong>128-byte cache lines</strong>. When a warp's 32 lanes issue a load, the hardware looks at the 32 addresses and figures out the minimum set of sectors that covers them. If the 32 lanes touch one contiguous, aligned 128-byte region, the hardware <em>coalesces</em> the request into a handful of sector transactions and every fetched byte is used. If the addresses are scattered, each lane may drag in its own 32-byte sector of which only 4 bytes are wanted — and you pay for the rest.</p>
+
+<div class="ascii">
+COALESCED (good): warp of 32 lanes, each reads one consecutive float
+  lane:   0    1    2    3   ...  31
+  addr:  [0]  [4]  [8]  [12] ... [124]      &lt;- one aligned 128-byte line
+  result: 1 cache line fetched, 128/128 bytes used  -&gt;  100% efficiency
+
+STRIDED (bad): each lane reads with stride 32 floats (128 bytes apart)
+  lane:   0       1        2          ...
+  addr:  [0]    [128]    [256]        ...
+  result: 32 separate sectors, only 4 of each 32 bytes used
+          -&gt;  32*32 = 1024 bytes moved for 128 useful  -&gt;  ~12.5% efficiency
+</div>
+
+<div class="callout bad">
+  <div class="label">UNCOALESCED</div>
+<pre><code>// Each lane strides by blockDim.x -> neighbouring lanes are far apart.
+// Lane i and lane i+1 are 'blockDim.x' floats apart: scattered access,
+// many sectors fetched, most bytes wasted.
+__global__ void bad_transpose_read(const float* in, float* out, int n) {
+    int t = threadIdx.x;                                  // 0..blockDim-1
+    for (int i = 0; i &lt; n; ++i)
+        out[i * blockDim.x + t] = in[i * blockDim.x + t]; // stride blockDim.x
+}</code></pre>
+</div>
+
+<div class="callout ok">
+  <div class="label">COALESCED</div>
+<pre><code>// Consecutive global thread indices touch consecutive addresses.
+// Lane i and lane i+1 are adjacent floats -> one aligned line per warp.
+__global__ void good_copy(const float* in, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n) out[i] = in[i];
+}</code></pre>
+</div>
+
+<p>The rule reduces to: <strong>index global memory with <code>blockIdx.x * blockDim.x + threadIdx.x</code> so that <code>threadIdx.x</code> (the fastest-varying lane index) maps to the fastest-varying address.</strong> A stride-2 access wastes half your bandwidth; a stride-32 access can waste ~87%. On a memory-bound kernel that is a direct multiplier on runtime.</p>
+
+<h2>The optimization decision table</h2>
+
+<p>This is the table to think through when a kernel is slow. Symptom &rarr; the wall it implies &rarr; the first lever to pull. Profilers (Nsight Compute) report most of these symptoms directly.</p>
+
+<table>
+  <thead>
+    <tr><th>Symptom</th><th>Likely wall</th><th>First lever</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Low arithmetic intensity; high DRAM throughput %; runtime &asymp; bytes / BW</td><td>HBM bandwidth</td><td>Coalesce, vectorize (float4), fuse adjacent kernels, reuse via shared memory</td></tr>
+    <tr><td>Many tiny kernels; GPU mostly idle between launches; gaps in timeline</td><td>Host-side launch overhead (~few &micro;s each)</td><td>Fuse kernels, or capture the sequence as a CUDA Graph</td></tr>
+    <tr><td>Many threads update the same few addresses; serialized atomics</td><td>Atomic contention</td><td>Privatize: accumulate in shared/registers, one atomic per block at the end</td></tr>
+    <tr><td>Low occupancy; profiler shows register spills to local memory</td><td>Register pressure</td><td>Reduce live registers, <code>__launch_bounds__</code>, split the kernel</td></tr>
+    <tr><td>Warp efficiency &lt; 100%; lanes idle inside branches</td><td>Warp divergence</td><td>Restructure so a branch is uniform across a warp; sort/bucket data</td></tr>
+    <tr><td>Shared-memory throughput low; profiler reports bank conflicts</td><td>Bank conflicts (serialized shared access)</td><td>Pad the leading dimension (<code>[N][N+1]</code>), or change access pattern</td></tr>
+    <tr><td>Compute throughput maxed, DRAM low, no spills</td><td>Compute / instruction throughput</td><td>Raise ILP, use intrinsics/tensor cores, cut redundant work</td></tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <div class="label">CAUTION</div>
+  <p>Do not pull a lever for a wall you have not confirmed. Vectorizing a compute-bound kernel buys nothing; raising occupancy on a kernel that is hiding latency through ILP can make it slower. The table tells you where to look; the profiler tells you if you are right.</p>
+</div>
+
+<h2>Snippet 1 — grid-stride loop with vectorized memory</h2>
+
+<p>For a bandwidth-bound elementwise kernel, two things matter: every byte fetched should be used (coalescing) and you should issue the widest load the hardware supports so fewer instructions move the same bytes. A <code>float4</code> load moves 16 bytes per lane in one instruction — a warp then moves 512 bytes in one coalesced transaction set. The <strong>grid-stride loop</strong> makes one launch handle any input size and lets you tune the grid independently of <code>n</code>.</p>
+
+<pre><code>// Bandwidth-bound: y = a*x + y  (SAXPY).
+// Precondition for the vectorized path: x and y are 16-byte aligned and
+// contiguous. reinterpret_cast to float4 is only valid if the base pointer
+// is aligned to alignof(float4) == 16. cudaMalloc guarantees &gt;= 256-byte
+// alignment, so a base pointer is fine; a mid-array offset may not be.
+__global__ void saxpy_vec4(int n, float a, const float* x, float* y) {
+    int gtid   = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    int n4 = n / 4;                                   // number of full float4s
+    const float4* x4 = reinterpret_cast&lt;const float4*&gt;(x);
+    float4*       y4 = reinterpret_cast&lt;float4*&gt;(y);
+
+    // Vectorized body: each iteration moves 4 floats per thread, coalesced.
+    for (int i = gtid; i &lt; n4; i += stride) {
+        float4 xv = x4[i];
+        float4 yv = y4[i];
+        yv.x = a * xv.x + yv.x;
+        yv.y = a * xv.y + yv.y;
+        yv.z = a * xv.z + yv.z;
+        yv.w = a * xv.w + yv.w;
+        y4[i] = yv;
+    }
+
+    // Scalar tail: handle the up-to-3 leftover elements when n % 4 != 0.
+    for (int i = n4 * 4 + gtid; i &lt; n; i += stride)
+        y[i] = a * x[i] + y[i];
+}</code></pre>
+
+<p>The grid-stride loop also means a thread block stays resident and reused rather than launching one thread per element; you size the grid to fill the GPU (e.g. a few blocks per SM) and the loop covers the rest. Vectorization does not increase intensity — it is still <code>~0.17 FLOP/byte</code> — but it reduces instruction overhead and maximizes per-transaction efficiency, which is exactly what a memory-bound kernel needs.</p>
+
+<h2>Snippet 2 — warp reduction via <code>__shfl_down_sync</code></h2>
+
+<p>A reduction (sum, max, &hellip;) collapses many values to one. The naive version writes partial sums to shared memory and barriers between every tree level. But the 32 lanes of a warp can exchange registers <em>directly</em> with shuffle instructions — no shared memory, no <code>__syncthreads</code>. The data lives in 32 lane registers; each step halves the active distance, folding the upper half into the lower half.</p>
+
+<pre><code>// Sum the 32 values held one-per-lane across a warp. Returns the full
+// sum in lane 0 (shfl_down leaves upper lanes stale, so only lane 0's
+// result is meaningful unless you broadcast it afterward).
+// Defined here cleanly: lesson 03 reuses warp_reduce_sum by name.
+__inline__ __device__ float warp_reduce_sum(float v) {
+    // Full warp participates; mask names all 32 lanes.
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1)
+        v += __shfl_down_sync(0xffffffffu, v, offset);
+    return v;   // valid in lane 0
+}</code></pre>
+
+<div class="ascii">
+step offset=16:  lane i gets lane (i+16); lanes 0..15 now hold pair-sums
+step offset=8 :  lanes 0..7  fold in lanes 8..15
+step offset=4 :  lanes 0..3  fold in lanes 4..7
+step offset=2 :  lanes 0..1  fold in lanes 2..3
+step offset=1 :  lane  0     folds in lane  1   -&gt; total in lane 0
+
+5 shuffle steps (log2 32), zero HBM traffic, zero block barriers.
+</div>
+
+<p>The mask <code>0xffffffffu</code> declares all 32 lanes participate; on modern GPUs warps execute independently and the <code>_sync</code> intrinsics require you to name the participating lanes so the compiler can reason about reconvergence. Use a partial mask only when you know some lanes are inactive (e.g. a tail warp), and compute it with <code>__activemask()</code> rather than guessing.</p>
+
+<h2>Snippet 3 — block reduction (two-level tree)</h2>
+
+<p>To reduce a whole block (up to 1024 threads = up to 32 warps) we compose Snippet 2 with one short shared-memory stage. Each warp reduces itself to one value (no barriers), writes that single value to a 32-slot shared array, and then warp 0 reduces those &le;32 partial sums with one more warp-reduce. This minimizes both barriers (exactly one) and shared traffic (32 writes + 32 reads per block).</p>
+
+<pre><code>__inline__ __device__ float block_reduce_sum(float v) {
+    static __shared__ float warp_sums[32];    // one slot per warp (max 32 warps)
+
+    int lane = threadIdx.x &amp; 31;               // lane index within warp (0..31)
+    int wid  = threadIdx.x &gt;&gt; 5;               // warp index within block
+
+    v = warp_reduce_sum(v);                    // level 1: each warp -&gt; its lane 0
+    if (lane == 0) warp_sums[wid] = v;         // each warp publishes its sum
+
+    __syncthreads();                           // the single barrier we need
+
+    // level 2: warp 0 loads the per-warp sums and reduces them.
+    int num_warps = (blockDim.x + 31) / 32;
+    v = (threadIdx.x &lt; num_warps) ? warp_sums[lane] : 0.0f;
+    if (wid == 0) v = warp_reduce_sum(v);      // block total ends up in thread 0
+    return v;                                  // valid in threadIdx.x == 0
+}</code></pre>
+
+<p>Compare to the textbook shared-memory tree, which barriers <code>log2(blockDim)</code> times and reads/writes shared memory at every level. The two-level version does the bulk of the work in registers via shuffles and touches shared memory only at the warp boundary. Thread 0 of each block then does one <code>atomicAdd</code> to a global accumulator (one atomic per block — see Snippet 5 for why that matters).</p>
+
+<h2>Snippet 4 — shared-memory tiled matmul</h2>
+
+<p>Naive matmul reloads a full row of A and column of B from HBM for every output element: <code>O(N&sup3;)</code> bytes for <code>O(N&sup3;)</code> FLOPs &rarr; intensity &asymp; O(1), hopelessly memory-bound. The fix is <strong>reuse</strong>: load a TILE&times;TILE block of A and of B into shared memory once, then every thread in the block reads those tiles many times from on-chip memory. An A tile is reused across all output columns in the tile; a B tile across all output rows. This raises intensity by roughly a factor of TILE, pushing the kernel toward the compute roof.</p>
+
+<pre><code>#define TILE 32
+// C = A * B, all row-major, square N x N for clarity.
+__global__ void matmul_tiled(const float* A, const float* B, float* C, int N) {
+    // +1 padding on the leading dim of As avoids shared-memory bank conflicts
+    // on the column-wise read of As below (see "bank conflicts" section).
+    __shared__ float As[TILE][TILE + 1];
+    __shared__ float Bs[TILE][TILE];
+
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int row = blockIdx.y * TILE + ty;
+    int col = blockIdx.x * TILE + tx;
+
+    float acc = 0.0f;                        // accumulator lives in a register
+
+    for (int t = 0; t &lt; N; t += TILE) {
+        // Coalesced loads: consecutive tx -> consecutive global columns.
+        As[ty][tx] = (row &lt; N &amp;&amp; t + tx &lt; N) ? A[row * N + (t + tx)] : 0.0f;
+        Bs[ty][tx] = (col &lt; N &amp;&amp; t + ty &lt; N) ? B[(t + ty) * N + col] : 0.0f;
+        __syncthreads();                     // tiles fully loaded before use
+
+        #pragma unroll
+        for (int k = 0; k &lt; TILE; ++k)
+            acc += As[ty][k] * Bs[k][tx];    // both reads hit shared memory
+
+        __syncthreads();                     // done with tiles before reload
+    }
+    if (row &lt; N &amp;&amp; col &lt; N) C[row * N + col] = acc;
+}</code></pre>
+
+<p><code>#pragma unroll</code> on the inner loop lets the compiler issue the multiply-adds back to back with no loop overhead and good ILP, while <code>acc</code> stays in a register the whole time. Each output element is touched once in HBM (the final write); every reuse comes from shared memory.</p>
+
+<div class="callout">
+  <div class="label">NEXT STEP — REGISTER BLOCKING</div>
+  <p>Libraries go one level further: each thread computes a small <strong>micro-tile</strong> of outputs (say 4&times;4 or 8&times;8) by holding a strip of A and a strip of B in registers and accumulating 16+ results per loop iteration. This reuses each shared-memory value across many FLOPs, raising intensity again and amortizing shared-memory reads. That, plus double buffering and tensor cores, is roughly how cuBLAS/CUTLASS hit peak. Write the tiled kernel to <em>prove you understand reuse</em>; in production call the library.</p>
+</div>
+
+<h2>Shared-memory bank conflicts</h2>
+
+<p>Shared memory is split into <strong>32 banks</strong>, each 4 bytes wide, interleaved: address <code>a</code> lives in bank <code>(a/4) % 32</code>. A warp can read 32 different banks in one cycle. But if two lanes of a warp hit two different addresses in the <em>same</em> bank, the accesses serialize — an N-way conflict costs N cycles. (All lanes reading the <em>same</em> address is fine; that is a broadcast, not a conflict.)</p>
+
+<p>Consider a <code>__shared__ float tile[32][32]</code>. Reading <code>tile[ty][k]</code> across the warp (varying <code>tx</code>, fixed <code>k</code>) — a column access — means lane <code>i</code> touches address <code>(i*32 + k)*4</code>. The bank is <code>(i*32 + k) % 32 = k % 32</code> for every lane: all 32 lanes land in the <em>same</em> bank &rarr; a 32-way conflict, serialized.</p>
+
+<div class="ascii">
+tile[32][32], reading down a column (stride 32 floats = 128 bytes):
+  lane 0 -> row0,col k -> bank k
+  lane 1 -> row1,col k -> bank (32+k)%32 = k     ALL SAME BANK -> 32x serialized
+  ...
+Pad to tile[32][33]: row stride is now 33 floats.
+  lane i -> bank (i*33 + k) % 32 = (i + k) % 32  ALL DISTINCT -> conflict-free
+</div>
+
+<p>That is the <code>+1</code> in <code>As[TILE][TILE + 1]</code>. Padding the leading dimension by one element makes consecutive rows fall in consecutive banks, so a column read spreads across all 32 banks with no conflict. It costs a few unused bytes of shared memory and removes the serialization entirely.</p>
+
+<h2>Snippet 5 — privatized histogram</h2>
+
+<p>A histogram increments a bin per input element. If every thread does <code>atomicAdd(&amp;global_bins[v], 1)</code> directly, and the data is skewed, thousands of threads serialize on the same hot bin — atomic contention dominates and the kernel crawls. With <code>N</code> elements you issue <code>N</code> global atomics.</p>
+
+<p><strong>Privatize:</strong> give each block its own copy of the bins in shared memory, accumulate there (fast on-chip atomics with far less contention — only the threads of one block compete), then have the block flush its partial histogram to global with one atomic per nonzero bin.</p>
+
+<pre><code>#define NBINS 256
+__global__ void histogram_privatized(const unsigned char* data, int n,
+                                      unsigned int* global_bins) {
+    __shared__ unsigned int local_bins[NBINS];
+
+    // Cooperatively zero the shared bins.
+    for (int b = threadIdx.x; b &lt; NBINS; b += blockDim.x)
+        local_bins[b] = 0u;
+    __syncthreads();
+
+    // Grid-stride over the input; atomics now hit shared memory, not HBM.
+    int gtid   = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = gtid; i &lt; n; i += stride)
+        atomicAdd(&amp;local_bins[data[i]], 1u);
+    __syncthreads();
+
+    // Flush: one global atomic per nonzero bin per block.
+    for (int b = threadIdx.x; b &lt; NBINS; b += blockDim.x) {
+        unsigned int c = local_bins[b];
+        if (c != 0u) atomicAdd(&amp;global_bins[b], c);
+    }
+}</code></pre>
+
+<p>The traffic against the global atomic unit drops from <code>N</code> atomics to at most <code>blocks &times; 256</code>. For a 100M-element image with ~1000 blocks that is ~256k global atomics instead of 100M — a ~400&times; reduction in contention, plus the per-element atomics now run on much faster shared memory. The wall here was contention, not bandwidth; privatization is the lever aimed at it.</p>
+
+<h2>Occupancy and register pressure</h2>
+
+<p><strong>Occupancy</strong> is resident warps / maximum warps the SM can hold. The GPU hides memory latency by switching to another ready warp while one stalls; more resident warps means more latency to hide. Occupancy is capped by whichever per-block resource runs out first:</p>
+
+<ul>
+  <li><strong>Registers:</strong> an SM has a fixed register file. If each thread needs 64 registers and the SM has 65536, at most ~1024 threads fit regardless of other limits. Use too many and either occupancy drops or registers <em>spill</em> to local memory (which is really HBM) — a latency disaster the profiler flags as spills.</li>
+  <li><strong>Shared memory:</strong> a block's shared-memory request is subtracted from the SM's fixed pool; large tiles cap how many blocks co-reside.</li>
+  <li><strong>Block/warp slots:</strong> hard hardware limits on resident blocks and warps per SM.</li>
+</ul>
+
+<pre><code>// Hint the compiler: at most 256 threads/block, aim for &gt;= 4 blocks/SM.
+// The compiler then budgets registers so this occupancy is achievable,
+// trading register count for spills as needed.
+__global__ void __launch_bounds__(256, 4)
+my_kernel(const float* in, float* out, int n) { /* ... */ }</code></pre>
+
+<div class="callout warn">
+  <div class="label">HIGHER OCCUPANCY IS NOT ALWAYS FASTER</div>
+  <p>Occupancy hides latency; instruction-level parallelism (ILP) hides it too. A kernel that keeps many independent operations in flight per thread (like the unrolled matmul accumulating into several registers) can run fast at <em>low</em> occupancy because each thread already has enough work to cover stalls — and the extra registers that enable that ILP are well spent. Treat occupancy as a means (latency hiding), not a target. Measure.</p>
+</div>
+
+<h2>Snippet 6 — pinned memory + CUDA event timing</h2>
+
+<p>Kernel launches are asynchronous, so wrapping a launch in CPU wall-clock timing measures almost nothing — the call returns before the GPU finishes. <strong>CUDA events</strong> are timestamps recorded <em>in the stream</em>; the elapsed time between two events is the actual GPU work done between those two points. <strong>Pinned (page-locked) host memory</strong> additionally lets <code>cudaMemcpyAsync</code> run by DMA concurrently with compute, instead of the slower pageable path.</p>
+
+<pre><code>float* h_buf;
+cudaMallocHost(&amp;h_buf, bytes);           // pinned host memory (page-locked)
+
+cudaEvent_t start, stop;
+cudaEventCreate(&amp;start);
+cudaEventCreate(&amp;stop);
+
+cudaEventRecord(start);                   // timestamp in the (default) stream
+my_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(/* ... */);     // enqueued after start
+cudaEventRecord(stop);                    // timestamp after the kernel
+
+cudaEventSynchronize(stop);               // wait until 'stop' has occurred
+float ms = 0.0f;
+cudaEventElapsedTime(&amp;ms, start, stop);   // GPU time between the two events
+
+cudaEventDestroy(start);
+cudaEventDestroy(stop);
+cudaFreeHost(h_buf);</code></pre>
+
+<p>The key point: <code>cudaEventElapsedTime</code> measures the GPU timeline between two stream points, immune to host-side scheduling. CPU timers around an async launch measure launch overhead, not the kernel. Always synchronize on the stop event before reading the elapsed time.</p>
+
+<h2>Snippet 7 — CUDA Graphs for repeated small-kernel sequences</h2>
+
+<p>Each kernel launch costs a few microseconds of host-side work (argument marshaling, driver bookkeeping). For a few big kernels that is invisible; for a loop that fires dozens of tiny kernels per iteration — an autoregressive decode step, say — those microseconds dominate and the GPU sits idle in the gaps. <strong>CUDA Graphs</strong> let you capture the whole sequence once and replay it with a single launch, collapsing the per-kernel host overhead into one.</p>
+
+<pre><code>cudaStream_t stream;
+cudaStreamCreate(&amp;stream);
+
+cudaGraph_t graph;
+cudaGraphExec_t exec;
+bool captured = false;
+
+for (int step = 0; step &lt; num_steps; ++step) {
+    if (!captured) {
+        // Capture the sequence of small kernels once.
+        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+        decode_attention&lt;&lt;&lt;g1, b1, 0, stream&gt;&gt;&gt;(/* ... */);
+        decode_mlp      &lt;&lt;&lt;g2, b2, 0, stream&gt;&gt;&gt;(/* ... */);
+        decode_sample   &lt;&lt;&lt;g3, b3, 0, stream&gt;&gt;&gt;(/* ... */);
+        cudaStreamEndCapture(stream, &amp;graph);
+        cudaGraphInstantiate(&amp;exec, graph, nullptr, nullptr, 0);
+        captured = true;
+    }
+    cudaGraphLaunch(exec, stream);    // one launch replays all three kernels
+}
+cudaStreamSynchronize(stream);</code></pre>
+
+<p>Graphs attack <strong>launch overhead only</strong>. They do not move fewer bytes or do less math — a bandwidth-bound kernel is exactly as bandwidth-bound inside a graph. Use them when the timeline shows the GPU idling between many short kernels. (Fusing the kernels into one is the other lever for the same wall; graphs are preferred when fusion is impractical or the kernels are heterogeneous.)</p>
+
+<h2>Async copies and double buffering (Ampere+)</h2>
+
+<p>In the tiled matmul, the block loads a tile, barriers, computes, barriers, loads the next tile — load and compute are serialized. On Ampere and later, <code>cp.async</code> (exposed via <code>cuda::memcpy_async</code> / the <code>__pipeline</code> API) issues a global&rarr;shared copy that proceeds in the background without occupying registers as a staging area. Combined with <strong>double buffering</strong> — two shared-memory tile buffers, computing on buffer A while the copy fills buffer B — this overlaps the next tile's load with the current tile's math, hiding memory latency behind compute. It is the modern path to keeping the SMs fed in a tiled kernel and a core ingredient of library-grade matmul.</p>
+
+<h2>Optimization answer template</h2>
+
+<p>When asked "how would you make this kernel faster?", do not list tricks. Walk the loop, aiming each step at the confirmed wall:</p>
+
+<ol>
+  <li><strong>Classify.</strong> Count bytes moved and FLOPs done; compute intensity and compare to the ridge point. Memory-bound or compute-bound? This decides everything that follows.</li>
+  <li><strong>Coalesce.</strong> Ensure <code>threadIdx.x</code> maps to consecutive addresses so the warp's accesses collapse into minimal, fully-used transactions. Vectorize (float4) where alignment allows.</li>
+  <li><strong>Reuse.</strong> If a value is read more than once, stage it on-chip — shared memory tiles, then registers / micro-tiles — to raise intensity and stop re-fetching from HBM.</li>
+  <li><strong>Fuse.</strong> Combine adjacent kernels so an intermediate is produced and consumed while still on-chip, eliminating a full HBM round trip. For many tiny kernels, fuse or capture as a CUDA Graph to kill launch overhead.</li>
+  <li><strong>Reduce contention.</strong> Replace global atomics with privatized accumulation; remove unnecessary barriers and fix bank conflicts (pad the leading dimension); restructure branches to keep warps uniform.</li>
+  <li><strong>Measure.</strong> Time with CUDA events, profile with Nsight, and <em>confirm the bottleneck moved</em>. Re-classify and repeat from step 1. The loop ends when the kernel is bound by a resource you cannot cheaply reduce.</li>
+</ol>
+
+<div class="callout ok">
+  <div class="label">THE ONE-LINER</div>
+  <p>Find the wall, reduce traffic or serialization against that wall, re-measure to see where the wall moved. Every snippet above is one concrete way to push on one specific wall — coalescing and float4 for bandwidth, shuffles and tiling for on-chip reuse, privatization for contention, graphs for launch overhead, events to prove it worked.</p>
+</div>
+
+<footer class="lesson-nav">
+  <a href="25_cuda_common_operations.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">25 · CUDA common operations</span>
+  </a>
+  <a class="next" href="27_cuda_algorithms_data_structures.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">27 · Algorithms & data structures</span>
+  </a>
+</footer>
+
+</main>
+
+</body>
+</html>

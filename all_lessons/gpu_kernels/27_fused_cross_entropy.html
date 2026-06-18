@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>27 · Fused cross-entropy — the memory kernel</title><link rel="stylesheet" href="../reinforcement_learning/lessons/style.css"><style>main{overflow-wrap:break-word}table{table-layout:fixed}th,td{overflow-wrap:anywhere}input[type="range"]{max-width:min(200px,44vw)}label.inline{flex-wrap:wrap;max-width:100%}</style></head>
+<body><header class="topnav"><div class="inner"><a class="crumb-link" href="../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">gpu_kernels</a><span class="crumb">/</span><span class="crumb">27 · fused cross-entropy</span><span class="step-pill">lesson 27 / 33</span></div></header><main>
+
+<h1>Fused cross-entropy — the memory kernel</h1>
+<p class="subtitle">The logits tensor is the single largest tensor a language model ever holds — bigger than any weight, bigger than any activation. Materializing it, its softmax, and its gradient three times over is the most wasteful thing a naive training loop does. The fused cross-entropy kernel makes all three vanish from HBM. It's the biggest single memory win in LLM training, and it's a direct application of lesson 26's GEMM plus lesson 10's online softmax.</p>
+
+<div class="callout">
+  <div class="label">Builds on</div>
+  The lm-head <span class="math">logits = X·Wᵀ</span> is the matmul of lesson 26; its gradient feeds a matmul backward. The numerically-stable streaming reduction is the online softmax of lesson 10/06. This lesson fuses them into one kernel so the giant intermediate never touches HBM.
+</div>
+
+<h2>The question this lesson answers</h2>
+<p>You profile training memory and the peak is dominated by one allocation near the loss — far bigger than you expected from the model size. Why is the <em>output layer</em>, not the 32 transformer blocks, the memory bottleneck, and how does one fused kernel cut it by ~4×?</p>
+
+<h2>Why logits are the biggest tensor in the model</h2>
+<p>The final layer projects each token's hidden state to a score over the whole vocabulary: <span class="math">logits ∈ ℝ<sup>(B·T)×V</sup></span>. Modern vocabularies are large — V = 128k–256k. Compare the shapes:</p>
+<table><thead><tr><th>Tensor</th><th>Shape</th><th>Size (B·T = 8192, V = 128256, d = 4096, bf16)</th></tr></thead><tbody>
+<tr><td>A hidden activation</td><td>(B·T)×d</td><td>8192 · 4096 · 2 = 0.067 GB</td></tr>
+<tr><td><strong>logits</strong></td><td>(B·T)×V</td><td>8192 · 128256 · 2 = <strong>2.10 GB</strong></td></tr>
+<tr><td>softmax probs (same shape)</td><td>(B·T)×V</td><td>2.10 GB</td></tr>
+<tr><td>dlogits (same shape)</td><td>(B·T)×V</td><td>2.10 GB</td></tr>
+</tbody></table>
+<p>The logits are <strong>~31× a hidden activation</strong> because V ≫ d. And a naive loss path holds three of them: the logits, the softmax probabilities, and the gradient <span class="math">dlogits</span> — <strong>~6.3 GB for one tensor's worth of information</strong>, on top of everything else. That is the allocation your profiler is screaming about.</p>
+
+<h2>The gradient that makes fusion trivial</h2>
+<p>Cross-entropy on softmax has the cleanest backward in all of deep learning. With <span class="math">p = softmax(logits)</span> and one-hot label <span class="math">y</span>, over N tokens:</p>
+<div class="math block">loss = −log p[true] = logsumexp(logits) − logits[true]
+dlogits = (p − y) / N</div>
+<p>Read the second line carefully: the gradient is <em>the softmax itself</em>, minus 1 at the true class, scaled by 1/N. You do not need to store <span class="math">p</span> to get <span class="math">dlogits</span> — you compute <span class="math">p</span> and immediately overwrite it with <span class="math">p − y</span>. The "probs" tensor and the "dlogits" tensor are the same buffer at two instants. That collapses three tensors to one, and the next trick removes even that one from HBM.</p>
+
+<h2>Trick 1 · online softmax: never materialize probs</h2>
+<p>logsumexp over V needs the max and the sum of exponentials, both of which you can compute in a single streaming pass with the running-max recurrence from lesson 10 — the same Milakov–Gimelshein update that powers FlashAttention. So one row of logits is read in tiles, reduced online to <span class="math">(m, ℓ)</span>, and the loss is <span class="math">m + log ℓ − logits[true]</span>. No full probs row is ever stored; the gradient <span class="math">(p − y)/N</span> for a tile is recomputed from the saved <span class="math">(m, ℓ)</span> as <span class="math">exp(logits − m)/ℓ</span> on the way out.</p>
+
+<h2>Trick 2 · fuse the lm-head matmul: never materialize logits</h2>
+<p>The bigger win. The logits are produced by a matmul <span class="math">logits = X·Wᵀ</span> (X is (B·T)×d, W is V×d). Instead of computing the whole (B·T)×V logits then reducing, <strong>chunk over the token dimension</strong>: for a chunk of rows <span class="math">X<sub>c</sub></span>,</p>
+<ol>
+  <li>compute that chunk's logits <span class="math">X<sub>c</sub>·Wᵀ</span> (a small GEMM, lesson 26) — lives only in SMEM/registers;</li>
+  <li>online-softmax it to the chunk's loss and the chunk's <span class="math">dlogits<sub>c</sub> = (p<sub>c</sub> − y<sub>c</sub>)/N</span>;</li>
+  <li>immediately push <span class="math">dlogits<sub>c</sub></span> back through the matmul backward: <span class="math">dX<sub>c</sub> = dlogits<sub>c</sub>·W</span> and accumulate <span class="math">dW += dlogits<sub>c</sub>ᵀ·X<sub>c</sub></span> (the two-GEMM rule);</li>
+  <li>discard the chunk's logits and move on.</li>
+</ol>
+<p>At no point does the full (B·T)×V logits tensor exist in HBM — only one chunk does. HBM holds the inputs (X, W), the scalar loss, and the gradients (dX same size as X, dW same size as W). The 2.1 GB tensor is gone; peak drops to the size of <em>one chunk</em> plus the gradients you were going to compute anyway.</p>
+
+<svg viewBox="0 0 860 250" class="diagram" role="img" aria-label="Naive path materializes three full logit-sized tensors; fused path streams chunks and writes only loss and gradients">
+  <defs><marker id="c27" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--text-dim)"/></marker></defs>
+  <text x="20" y="22" font-size="12" font-weight="700" fill="#b91c1c">NAIVE — three full (B·T)×V tensors in HBM</text>
+  <g font-size="11" fill="var(--text-mute)">
+    <rect class="node-bg" x="20" y="32" width="120" height="44" rx="6"/><text x="80" y="52" text-anchor="middle" font-weight="700" fill="var(--text)">matmul</text><text x="80" y="68" text-anchor="middle">→ logits 2.1 GB</text>
+    <rect class="node-bg" x="180" y="32" width="120" height="44" rx="6"/><text x="240" y="52" text-anchor="middle" font-weight="700" fill="var(--text)">softmax</text><text x="240" y="68" text-anchor="middle">→ probs 2.1 GB</text>
+    <rect class="node-bg" x="340" y="32" width="120" height="44" rx="6"/><text x="400" y="52" text-anchor="middle" font-weight="700" fill="var(--text)">CE bwd</text><text x="400" y="68" text-anchor="middle">→ dlogits 2.1 GB</text>
+    <rect class="node-bg" x="500" y="32" width="120" height="44" rx="6"/><text x="560" y="52" text-anchor="middle" font-weight="700" fill="var(--text)">matmul bwd</text><text x="560" y="68" text-anchor="middle">→ dX, dW</text>
+    <path class="edge" d="M140 54 L180 54" marker-end="url(#c27)"/>
+    <path class="edge" d="M300 54 L340 54" marker-end="url(#c27)"/>
+    <path class="edge" d="M460 54 L500 54" marker-end="url(#c27)"/>
+    <text x="640" y="58" fill="#b91c1c">peak ≈ 6.3 GB</text>
+  </g>
+  <text x="20" y="128" font-size="12" font-weight="700" fill="#15803d">FUSED — one chunk of logits at a time, on chip</text>
+  <g font-size="11" fill="var(--text-mute)">
+    <rect class="node-bg" x="20" y="138" width="170" height="64" rx="6"/><text x="105" y="160" text-anchor="middle" font-weight="700" fill="var(--text)">for each token chunk:</text><text x="105" y="178" text-anchor="middle">Xᶜ·Wᵀ → online softmax</text><text x="105" y="194" text-anchor="middle">→ loss += , dlogitsᶜ</text>
+    <rect class="node-bg" x="230" y="138" width="170" height="64" rx="6"/><text x="315" y="160" text-anchor="middle" font-weight="700" fill="var(--text)">same kernel, same chunk:</text><text x="315" y="178" text-anchor="middle">dXᶜ = dlogitsᶜ·W</text><text x="315" y="194" text-anchor="middle">dW += dlogitsᶜᵀ·Xᶜ</text>
+    <rect class="node-bg" x="440" y="138" width="150" height="64" rx="6"/><text x="515" y="164" text-anchor="middle" font-weight="700" fill="var(--text)">HBM out:</text><text x="515" y="182" text-anchor="middle">scalar loss, dX, dW</text>
+    <path class="edge" d="M190 170 L230 170" marker-end="url(#c27)"/>
+    <path class="edge" d="M400 170 L440 170" marker-end="url(#c27)"/>
+    <text x="610" y="174" fill="#15803d">peak ≈ chunk +</text><text x="610" y="190" fill="#15803d">grads only</text>
+  </g>
+</svg>
+
+<h2>Worked number: the headline win</h2>
+<p>B·T = 8192, V = 128256, d = 4096, bf16, chunk = 1024 rows.</p>
+<table><thead><tr><th>Path</th><th>Logit-space HBM peak</th><th>Notes</th></tr></thead><tbody>
+<tr><td>Naive (logits + probs + dlogits)</td><td>3 × 2.10 = <strong>6.3 GB</strong></td><td>Three full (B·T)×V tensors live at once.</td></tr>
+<tr><td>Fused softmax+CE (keep logits, drop probs/dlogits)</td><td>2.10 GB</td><td>Trick 1 only: probs and dlogits reuse the logits buffer.</td></tr>
+<tr><td>Fully fused (chunk the matmul)</td><td>1 chunk = 1024·128256·2 ≈ <strong>0.26 GB</strong> transient</td><td>Trick 1+2: full logits never materialize; ~24× smaller peak.</td></tr>
+</tbody></table>
+<p>On a 7B model that 6 GB → 0.26 GB swing is often the difference between fitting a sequence length and OOM — without changing the math or the result. It is the first optimization any LLM trainer applies, and it ships in libraries (Liger Kernel's "fused linear cross entropy," PyTorch's chunked CE).</p>
+
+<h2>The cost you pay, and why it's nearly free</h2>
+<p>Chunking the matmul means you cannot reuse a single big cuBLAS GEMM call; you issue one small GEMM per chunk, and in the backward you recompute each chunk's logits rather than reading them back (they were never stored). That is extra <em>compute</em> — but the lm-head GEMM is a tiny fraction of total model FLOPs, and you were memory-bound, not compute-bound, at the loss. Trading a few percent more FLOPs for a 24× memory cut is the definition of a good deal when activations decide whether the step fits (lesson 25's widget).</p>
+
+<h2>Numerical traps</h2>
+<table><thead><tr><th>Trap</th><th>Symptom</th><th>Fix</th></tr></thead><tbody>
+<tr><td>exp without max-subtraction</td><td>inf/NaN at large logits</td><td>online running-max (logsumexp), lesson 10</td></tr>
+<tr><td>fp32 loss/grad accumulation skipped</td><td>loss drifts vs reference; grad noise</td><td>accumulate loss and dW in fp32</td></tr>
+<tr><td>label smoothing / ignore_index dropped</td><td>subtly wrong loss; padded tokens contribute</td><td>fold the smoothing term and the mask into the same fused pass</td></tr>
+<tr><td>chunk too large</td><td>still spills to HBM / register spill</td><td>size the chunk so one chunk's logits fit on chip; autotune it</td></tr>
+</tbody></table>
+
+<h2>Interactive · logit-space memory vs chunk size</h2>
+<p>Set vocabulary, tokens, and chunk size. The widget shows the naive 3×|logits| peak against the fused per-chunk transient, and the crossover where chunking stops helping (chunk ≈ full batch ⇒ back to naive).</p>
+
+<div class="widget"><div class="title">Logit-space HBM: naive vs fused</div><p class="hint">Naive holds logits+probs+dlogits = 3·(B·T)·V·2 bytes. Fused holds one chunk = chunk·V·2 bytes (transient) plus the gradients you'd compute anyway.</p><div class="controls">
+<label class="inline">vocab V <input id="ce-V" type="range" min="32000" max="262144" step="2000" value="128256"><span class="val" id="ce-V-v">128256</span></label>
+<label class="inline">tokens B·T <input id="ce-T" type="range" min="2048" max="65536" step="1024" value="8192"><span class="val" id="ce-T-v">8192</span></label>
+<label class="inline">chunk rows <input id="ce-c" type="range" min="256" max="16384" step="256" value="1024"><span class="val" id="ce-c-v">1024</span></label>
+</div><canvas id="ce-canvas" class="dist-canvas" height="210"></canvas><p class="hint" id="ce-note"></p></div>
+
+<h2>What this sets up</h2>
+<p>You've seen the two structural moves of memory-efficient backward kernels: fuse a reduction so the intermediate never lands, and recompute on the way out instead of storing. The next lesson applies the recompute idea to the normalization layers — where the saved statistic is one scalar per row and recomputing it beats reading it back.</p>
+
+<script>
+(function(){
+  const ids=['V','T','c'];
+  const e=Object.fromEntries(ids.map(k=>[k,document.getElementById('ce-'+k)]));
+  const c=document.getElementById('ce-canvas'),ctx=c.getContext('2d'),note=document.getElementById('ce-note');
+  function draw(){
+    ids.forEach(k=>document.getElementById('ce-'+k+'-v').textContent=e[k].value);
+    c.width=c.clientWidth*devicePixelRatio;c.height=210*devicePixelRatio;ctx.setTransform(1,0,0,1,0,0);ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.clearRect(0,0,c.clientWidth,210);
+    const V=+e.V.value,T=+e.T.value;let chunk=Math.min(+e.c.value,T);
+    const naive=3*T*V*2/1e9, fused=chunk*V*2/1e9, full=T*V*2/1e9;
+    const rows=[
+      ['naive  3·(B·T)·V  (logits+probs+dlogits)', naive, '#dc2626'],
+      ['fused softmax+CE  1·(B·T)·V', full, '#d97706'],
+      ['fully fused  one chunk transient', fused, '#16a34a'],
+    ];
+    const max=naive*1.05;
+    rows.forEach(([n,v,col],i)=>{
+      const y=26+i*42,w=(c.clientWidth-330)*v/max;
+      ctx.fillStyle='#eef1f5';ctx.fillRect(320,y,c.clientWidth-330,26);
+      ctx.fillStyle=col;ctx.fillRect(320,y,w,26);
+      ctx.fillStyle='#1f2430';ctx.font='11px monospace';ctx.fillText(n,12,y+17);
+      ctx.fillStyle='#1f2430';ctx.font='12px sans-serif';ctx.fillText(v.toFixed(2)+' GB',326+w+4,y+17);
+    });
+    const cut=naive/fused;
+    ctx.fillStyle='#5b6573';ctx.font='12px sans-serif';
+    ctx.fillText('fully-fused peak is '+cut.toFixed(1)+'× smaller than naive',12,176);
+    note.textContent = chunk>=T
+      ? 'Chunk ≥ batch: you are back to materializing the full logits — no streaming benefit. Shrink the chunk.'
+      : 'One chunk of logits ('+(fused).toFixed(2)+' GB) replaces the 6+ GB naive peak. The lm-head GEMM is recomputed per chunk in the backward — cheap, because you were memory-bound here, not compute-bound.';
+  }
+  Object.values(e).forEach(x=>x.addEventListener('input',draw));draw();
+})();
+</script>
+
+<footer class="lesson-nav"><a href="26_matmul_backward.html"><span class="dir">Previous</span><span class="ttl">26 · Matmul backward</span></a><a class="next" href="28_norm_activation_backward.html"><span class="dir">Next</span><span class="ttl">28 · Norm &amp; activation backward</span></a></footer>
+<!-- reviewed:v1 -->
+</main></body></html>
