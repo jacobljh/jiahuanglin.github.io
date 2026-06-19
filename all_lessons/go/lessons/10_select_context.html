@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>10 · select &amp; context | Go from the Team Up</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">Go</a><span class="crumb">/</span><span class="crumb">10 · select &amp; context</span><span class="step-pill">lesson 11 / 18</span></div></header>
+<main>
+
+<h1>select, pipelines &amp; cancellation: composing and stopping concurrent work</h1>
+<p class="subtitle">A single channel (Lesson 09) lets two goroutines hand off one value. Real systems need more: wait on several channels at once, give up after a deadline, fan work out to many workers and back, and — the hard one — tell a tree of running goroutines to <em>stop</em>. This lesson adds the three tools that turn one channel into a system: <code>select</code>, the pipeline pattern, and <code>context.Context</code>. The team-up payoff is that Go makes the failure mode of all this — the <strong>goroutine leak</strong> — into something visible and preventable rather than a slow memory creep no one can find.</p>
+
+<div class="callout source-note"><div class="label">The thesis, here</div>Concurrency is where complexity hides best: a leaked goroutine doesn't crash, throw, or appear in a stack trace — it just sits blocked forever, holding its ~2&nbsp;KB stack and whatever it captured, while the next engineer wonders why memory climbs under load. Go's bet is that the <em>way you stop</em> work should be as explicit and as visible in the signature as the way you start it. <code>context.Context</code> is that bet made concrete: cancellation becomes an ordinary argument threaded through your call graph, not magic. The complexity Go earns here is small (one interface, one passed value); the complexity it lets you <em>avoid</em> is the unbounded, invisible kind.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Prerequisite:</strong> Lesson 09 — channels as typed conduits that move ownership of a value; unbuffered (synchronization) vs buffered (decoupling); <code>close</code> and the happens-before guarantee. You also need goroutines and the scheduler from Lesson 08.<br><strong>New capability:</strong> wait on multiple channels with <code>select</code>; build a fan-out/fan-in pipeline; cancel a whole tree of goroutines on a deadline or a caller's signal with <code>context.Context</code>; and recognize and prevent the goroutine leak — the canonical Go concurrency bug.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Four moves. (1) The problem: one channel forces you to commit to <em>one</em> conversation — <code>select</code> lets a goroutine wait on several outcomes at once. (2) Compose goroutines into a <strong>pipeline</strong> — stages connected by channels — and fan work out and back. (3) The real problem: how do you make all those goroutines <em>stop</em>? Meet the goroutine leak, then <code>context.Context</code> as the standard answer. (4) The cost — what <code>context</code> buys, what it taxes, and the rules that keep it honest.</div>
+
+<h2>1 · The problem: a blocked channel commits you to one outcome</h2>
+
+<p>A receive on a channel, <code>v := &lt;-ch</code>, blocks the goroutine until a value arrives. That is exactly what you want when there is one thing to wait for. But a server rarely waits for one thing. It waits for "a request <em>or</em> a shutdown signal," for "a result <em>or</em> a timeout," for "work from any of three producers." A plain receive can't express "or" — it picks one channel and parks on it, blind to everything else. If the value it's waiting for never comes, the goroutine is stuck forever.</p>
+
+<p><code>select</code> is the language's answer: it is a <code>switch</code> whose cases are channel operations, and it blocks until <em>one</em> of them can proceed. If several are ready at once, it picks one <strong>uniformly at random</strong> (deliberately — to prevent starvation, so a hot channel can't permanently shut out a quiet one). A <code>default</code> case makes the whole thing non-blocking: if no case is ready, <code>default</code> runs immediately.</p>
+
+<pre><code>// Wait for a result, but give up after 2 seconds.
+select {
+case res := &lt;-results:
+    handle(res)
+case &lt;-time.After(2 * time.Second):  // returns a channel that fires once, later
+    return errTimeout
+}</code></pre>
+
+<p><code>time.After(d)</code> returns a <code>&lt;-chan Time</code> that the runtime sends on once, <code>d</code> later. Composed into a <code>select</code>, it turns "wait forever" into "wait at most <code>d</code>" — the single most common use of <code>select</code> in production code. Two things to internalize about it: the timer fires relative to when <code>select</code> began evaluating its cases, and if the result <em>does</em> arrive first, the timer's goroutine and channel linger until the timer expires (~one timer's worth of memory). In a tight loop that runs millions of times, prefer a reusable <code>time.NewTimer</code> you <code>Stop()</code>; for a once-per-request timeout, <code>time.After</code> is fine.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">several cases ready</div><div class="v">One is chosen <strong>pseudo-randomly</strong>, not top-to-bottom. Never rely on case order for priority.</div></div>
+  <div class="topic-card"><div class="k">no case ready, no <code>default</code></div><div class="v">The goroutine <strong>blocks</strong> until one becomes ready — this is how you wait on "any of N".</div></div>
+  <div class="topic-card"><div class="k">no case ready, with <code>default</code></div><div class="v"><code>default</code> runs immediately — a <strong>non-blocking</strong> try-send or try-receive.</div></div>
+  <div class="topic-card"><div class="k">empty <code>select{}</code></div><div class="v">Blocks forever. Occasionally useful to park <code>main</code>; usually a bug.</div></div>
+</div>
+
+<p>One subtlety worth its own sentence: a receive from a <code>nil</code> channel blocks <em>forever</em>, and so does a send. That sounds like a footgun, but it's a tool — setting a channel variable to <code>nil</code> inside a <code>select</code> loop <em>disables</em> that case, which is the clean idiom for "I'm done reading from this input, keep selecting on the others."</p>
+
+<h2>2 · Composing goroutines: the pipeline, fan-out, fan-in</h2>
+
+<p>Question 2 of the five — <em>who owns this data and how does it move?</em> — has a beautiful answer once you have channels and <code>select</code>: build your computation as a <strong>pipeline</strong> of stages, each a goroutine, connected by channels. Each stage owns its data exclusively while it works, then transfers ownership downstream by sending. No stage touches another's memory, so there is nothing to lock (we'll cover the exception in Lesson 11). A stage signals "no more data" by <code>close</code>-ing its output channel; downstream's <code>for v := range ch</code> ends cleanly when the channel is drained and closed (Lesson 09's close semantics).</p>
+
+<div class="spine">  generate          square (fan-out: 3 copies)        collect (fan-in)
+ +--------+        +--------+                          +---------+
+ | gen()  | --ch--&gt;| sq()   |--+                        |         |
+ +--------+        +--------+  |                        |         |
+                   | sq()   |--+--&gt; merge() --merged--&gt; | range   |
+                   +--------+  |                        |         |
+                   | sq()   |--+                        +---------+
+                   +--------+
+   one producer    N identical workers, each reads      one consumer
+   owns its sends  the SAME input channel               drains merged</div>
+
+<pre><code>// A stage: owns out, closes it when done, returns it as receive-only.
+func gen(nums ...int) &lt;-chan int {
+    out := make(chan int)
+    go func() {
+        defer close(out)            // tell downstream "no more values"
+        for _, n := range nums {
+            out &lt;- n                 // ownership of n moves to the receiver
+        }
+    }()
+    return out
+}
+
+func sq(in &lt;-chan int) &lt;-chan int {
+    out := make(chan int)
+    go func() {
+        defer close(out)
+        for n := range in {         // ends when in is drained AND closed
+            out &lt;- n * n
+        }
+    }()
+    return out
+}</code></pre>
+
+<p>Notice the return types: <code>&lt;-chan int</code> is a <em>receive-only</em> channel. By handing callers a directional channel, the stage encodes in the type system that the caller may only read — they cannot accidentally send into, or close, a channel they don't own. That is the same instinct as value semantics in Lesson 02: make the ownership visible at the boundary.</p>
+
+<p><strong>Fan-out</strong> is just starting several goroutines that read the <em>same</em> input channel — the runtime hands each queued value to whichever worker is ready, giving you parallelism for free (bounded by <code>GOMAXPROCS</code>, by default the number of CPUs). <strong>Fan-in</strong> is the reverse: merge several output channels into one. The merge uses a <code>sync.WaitGroup</code> to know when every input has closed before it closes the merged channel — a first taste of Lesson 11's "channels orchestrate, primitives count."</p>
+
+<pre><code>func merge(cs ...&lt;-chan int) &lt;-chan int {
+    out := make(chan int)
+    var wg sync.WaitGroup
+    wg.Add(len(cs))
+    for _, c := range cs {
+        go func(c &lt;-chan int) {      // pre-Go1.22: pass c as an arg to avoid loop-var capture
+            defer wg.Done()
+            for v := range c {
+                out &lt;- v
+            }
+        }(c)
+    }
+    go func() { wg.Wait(); close(out) }()  // close once, after all inputs drain
+    return out
+}</code></pre>
+
+<h2>3 · The real problem: making it all stop — leaks and <code>context</code></h2>
+
+<p>The pipeline above has a hidden assumption: that the consumer drains <em>every</em> value. Suppose it doesn't — it finds the answer after one result and returns. Now every upstream stage is blocked forever on <code>out &lt;- v</code>, because no one will ever receive. Those goroutines never return, never get garbage collected (a goroutine is a GC root while it's alive or blocked), and never release what they captured. That is a <strong>goroutine leak</strong>: no panic, no error, no log line — just goroutines accumulating until the process is killed for memory. It is the single most common serious bug in concurrent Go.</p>
+
+<div class="callout warn"><div class="label">The leak, precisely</div>A goroutine blocked on a channel send/receive that will never complete is leaked. The runtime cannot prove the channel is dead, so it keeps the goroutine alive — holding its stack (≥2&nbsp;KB) and any heap it references. Leaks don't show up in unit tests with small inputs; they show up as a slow memory climb in production. The fix is a rule: <strong>every goroutine must have a guaranteed path to return.</strong> That guarantee is what cancellation provides.</div>
+
+<p>You could give each stage a private <code>done chan struct{}</code> and <code>select</code> on it. That works, but threading an ad-hoc <code>done</code> channel through every function — plus deadlines, plus request-scoped values — got reinvented incompatibly across the ecosystem. So the standard library blessed one shape: <code>context.Context</code>. A <code>Context</code> is a small interface; the part that matters here is <code>Done() &lt;-chan struct{}</code> — a channel that's <strong>closed</strong> when the work should stop (because a deadline passed, or someone called <code>cancel()</code>). A closed channel makes every receiver unblock at once (Lesson 09), so one <code>cancel()</code> call fans a stop signal out to an entire tree of goroutines.</p>
+
+<pre><code>// Every blocking op in a stage now also selects on ctx.Done().
+func sq(ctx context.Context, in &lt;-chan int) &lt;-chan int {
+    out := make(chan int)
+    go func() {
+        defer close(out)
+        for n := range in {
+            select {
+            case out &lt;- n * n:           // normal path
+            case &lt;-ctx.Done():           // canceled: bail out, deferred close runs
+                return
+            }
+        }
+    }()
+    return out
+}
+
+// Caller controls the lifetime and MUST release it.
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()                          // releasing twice is safe; never releasing leaks
+results := sq(ctx, gen(ctx, 2, 3, 4))
+first := &lt;-results                       // take one and stop
+cancel()                                 // closes ctx.Done() -&gt; every stage returns</code></pre>
+
+<p>The <code>select { case out &lt;- v: case &lt;-ctx.Done(): return }</code> pattern is the whole game: the goroutine is now guaranteed to return — either it sends, or it's told to stop. The leak is structurally impossible. <code>context</code> also gives you the two convenience constructors that cover most needs:</p>
+
+<table>
+<thead><tr><th>Constructor</th><th>Fires <code>Done()</code> when…</th><th>Typical use</th></tr></thead>
+<tbody>
+<tr><td><code>WithCancel(parent)</code></td><td>you call the returned <code>cancel()</code></td><td>manual stop (consumer found its answer)</td></tr>
+<tr><td><code>WithTimeout(parent, d)</code></td><td><code>d</code> elapses <em>or</em> <code>cancel()</code> called</td><td>"this RPC gets 200ms" — the common case</td></tr>
+<tr><td><code>WithDeadline(parent, t)</code></td><td>clock reaches <code>t</code> <em>or</em> <code>cancel()</code> called</td><td>a fixed wall-clock budget shared across calls</td></tr>
+<tr><td><code>Background()</code> / <code>TODO()</code></td><td>never</td><td>the root of a tree; <code>TODO</code> = "wire a real one later"</td></tr>
+</tbody>
+</table>
+
+<p>Contexts form a <strong>tree</strong>: each <code>WithX</code> derives a child from a parent, and canceling a parent cancels all descendants — but never the reverse. This mirrors a request's call graph exactly. An HTTP handler gets a <code>ctx</code> that's canceled when the client disconnects; it passes that <code>ctx</code> to the database call, which passes it to the driver — so a hung-up client tears down the entire in-flight stack automatically. That propagation is the feature: you wire cancellation once, at the boundary, and it reaches everywhere downstream.</p>
+
+<div class="callout"><div class="label">Why <code>chan struct{}</code> and not <code>chan bool</code>?</div>An empty struct <code>struct{}</code> occupies <strong>zero bytes</strong> — all instances share one address. A <code>chan struct{}</code> is a pure signal carrying no data, and <code>close</code>-ing it (rather than sending) broadcasts to <em>all</em> waiters at once. That's why <code>Done()</code> returns <code>&lt;-chan struct{}</code> and is closed, never sent on: the signal is "stop," and it must reach every listener.</div>
+
+<h2>4 · What it costs, and the rules that keep it honest</h2>
+
+<p>Per the bargain, name the bill. <code>context</code> is cheap at runtime — a <code>Context</code> is a few words, derivation allocates one small struct and (for timeouts) one timer, and checking <code>ctx.Done()</code> in a <code>select</code> is a channel-readiness test, nanoseconds. The real cost is in the source: <code>ctx context.Context</code> becomes the first parameter of nearly every function in a server, threaded explicitly down the call graph. Go chose that visible plumbing over an invisible thread-local or ambient cancellation — the same choice it made for errors (Lesson 07): make the cross-cutting concern an ordinary value you can see, not magic you can't.</p>
+
+<div class="two-col">
+<div>
+<div class="mini-label">What context buys</div>
+<ul>
+<li><strong>No leaks by construction.</strong> Every goroutine has a guaranteed exit: it finishes or it's canceled.</li>
+<li><strong>Tree-shaped cancellation.</strong> One <code>cancel()</code> / one expired deadline tears down a whole subgraph.</li>
+<li><strong>Deadlines that compose.</strong> A child can shorten but never extend a parent's budget.</li>
+<li><strong>One ecosystem convention.</strong> Every stdlib and third-party API that does I/O takes a <code>ctx</code> first arg.</li>
+</ul>
+</div>
+<div>
+<div class="mini-label">What it costs / the rules</div>
+<ul>
+<li><strong>Plumbing tax.</strong> <code>ctx</code> as a parameter everywhere; verbose, deliberate, like <code>if err != nil</code>.</li>
+<li><strong>Pass it, don't store it.</strong> A <code>Context</code> is request-scoped — never put one in a struct field; pass it as an argument.</li>
+<li><strong><code>WithValue</code> is for request metadata only</strong> (trace IDs, auth), never for optional function parameters — it's untyped and easily abused.</li>
+<li><strong>Always release.</strong> <code>defer cancel()</code> even on the timeout path, or you leak the timer until it fires.</li>
+</ul>
+</div>
+</div>
+
+<p>Cancellation in Go is <strong>cooperative</strong>, not preemptive: <code>cancel()</code> closes a channel, but a goroutine only stops if it <em>checks</em> <code>ctx.Done()</code>. A stage stuck in a pure CPU loop with no channel op and no context check will run to completion regardless. The runtime won't kill it for you — the discipline of selecting on <code>ctx.Done()</code> at every blocking point (and periodically in long compute loops) is yours to keep. That is the honest cost: <code>context</code> gives you the mechanism, not the guarantee; you supply the guarantee by using it everywhere.</p>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>Take the leaking pipeline from §3 (consumer reads one value, returns) and run it with goroutine-count assertions: print <code>runtime.NumGoroutine()</code> before the pipeline, after taking one result, and after a <code>time.Sleep</code> — watch the count <em>not</em> return to baseline. Now thread a <code>context.WithCancel</code> through every stage, add the <code>select { case out &lt;- v: case &lt;-ctx.Done(): return }</code> guard, and call <code>cancel()</code> after the first result. Confirm the goroutine count returns to baseline. Then answer question 2 of the five for each version: <em>who owns each value, and what happens to that ownership when the consumer walks away?</em> The leaking version has values whose owner is blocked forever; the fixed version gives every owner an exit.</div>
+
+<h2>Where this points next</h2>
+<p>Pipelines and <code>context</code> work because each stage <em>owns</em> its data and transfers it — there is nothing shared, so there is nothing to protect. But some state genuinely is shared: a connection pool, a counter, an in-memory cache that many goroutines read and write at once. Channels are the wrong shape for that — orchestrating access to a single shared map through a channel is slow and awkward. Lesson 11 covers the other half of Go concurrency: <code>sync.Mutex</code>, <code>RWMutex</code>, <code>WaitGroup</code>, <code>Once</code>, and <code>sync/atomic</code>; the <code>-race</code> detector that finds the bugs you'll otherwise ship; and the decision rule that ties this lesson to that one — <em>channels orchestrate work; mutexes protect state</em> — with the judgment for which to reach for.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+One channel waits for one thing; <code>select</code> waits for the first of several — random among ready cases to prevent starvation, non-blocking with a <code>default</code>, and the home of the <code>time.After</code> timeout idiom. Composing goroutines as a <strong>pipeline</strong> of channel-connected stages answers "who owns the data and how does it move?": each stage owns its values, transfers them by sending, and signals end-of-stream by <code>close</code> — fan-out is N workers on one input, fan-in merges many outputs with a <code>WaitGroup</code>. The bug this all invites is the <strong>goroutine leak</strong> — a goroutine blocked forever on a channel that will never proceed, invisible until memory climbs — and the team-up fix is to make stopping as explicit as starting: <code>context.Context</code>, whose <code>Done()</code> channel closes on a <code>cancel()</code> or deadline and fans a stop signal through a tree of derived contexts that mirrors the call graph. The cost is honest and small — <code>ctx</code> threaded as an explicit first argument everywhere, cancellation that is cooperative so you must actually <code>select</code> on it — and the transferable habit is to design every concurrent worker with a guaranteed path to return <em>before</em> you start it.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+<li>If two cases of a <code>select</code> are ready simultaneously, which runs? <em>(§1 — one is chosen pseudo-randomly, by design, to prevent a busy channel from starving a quiet one; never rely on case order for priority.)</em></li>
+<li>How do you make a channel operation non-blocking, and how do you add a timeout? <em>(§1 — a <code>default</code> case makes <code>select</code> non-blocking; a <code>case &lt;-time.After(d)</code> gives up after <code>d</code>, since <code>time.After</code> returns a channel that fires once.)</em></li>
+<li>What is a goroutine leak and why doesn't the GC collect it? <em>(§3 — a goroutine blocked forever on a channel that will never proceed; a live/blocked goroutine is a GC root, so it and everything it references stay alive — no panic, just memory climbing.)</em></li>
+<li>What does <code>context.Context</code> actually do, mechanically, to stop work? <em>(§3 — its <code>Done()</code> returns a <code>&lt;-chan struct{}</code> that is <strong>closed</strong> on cancel/deadline; a closed channel unblocks all receivers at once, so one <code>cancel()</code> fans a stop signal through the whole derived-context tree.)</em></li>
+<li>Why is <code>Done()</code> a <code>chan struct{}</code> that's closed rather than a <code>chan bool</code> you send on? <em>(§3 — <code>struct{}</code> is zero bytes (pure signal), and <code>close</code> broadcasts to every waiter simultaneously, whereas a send reaches only one receiver.)</em></li>
+<li>Is Go's cancellation preemptive? What's the engineer's responsibility? <em>(§4 — no, it's cooperative: <code>cancel()</code> only closes a channel; a goroutine stops only if it <code>select</code>s on <code>ctx.Done()</code>. A pure CPU loop that never checks will run to completion.)</em></li>
+<li>Give the rules for using <code>context</code> correctly. <em>(§4 — pass it as the first argument, never store it in a struct; use <code>WithValue</code> only for request-scoped metadata, not optional params; always <code>defer cancel()</code> to release the timer even on the success path.)</em></li>
+</ul>
+
+<footer class="lesson-nav"><a href="09_channels_csp.html"><span class="dir">Previous</span><span class="ttl">09 · Channels &amp; CSP</span></a><a class="next" href="11_sharing_memory.html"><span class="dir">Next</span><span class="ttl">11 · When to share memory</span></a></footer>
+</main>
+<!-- reviewed:v1 -->
+</body>
+</html>

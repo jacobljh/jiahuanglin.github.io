@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>08 · Goroutines &amp; scheduler | Go from the Team Up</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">Go</a><span class="crumb">/</span><span class="crumb">08 · Goroutines &amp; scheduler</span><span class="step-pill">lesson 9 / 18</span></div></header>
+<main>
+
+<h1>Goroutines and the scheduler: concurrency cheap enough to use freely</h1>
+<p class="subtitle">Concurrency is hard mostly because the unit of concurrency is expensive. An OS thread costs about a megabyte of stack and a kernel trip to switch, so you ration threads, build pools, and contort your design around a scarce resource. Go's bet is that if you make the worker nearly free, ordinary engineers will write correct concurrent code — so it pays for a garbage collector's cousin, a <em>scheduler</em>, to multiplex hundreds of thousands of tiny tasks onto a handful of threads. This lesson is about what a goroutine actually is, what the G-M-P scheduler does on your behalf, and — because this series sells trade-off literacy, not magic — exactly what you pay.</p>
+
+<div class="callout source-note"><div class="label">The thesis, here</div>This is the bargain's second half in its purest form (Lesson 00). C++ refuses a runtime, so its concurrency primitive <em>is</em> the OS thread, with all its weight; you don't pay for what you don't use. Go does the opposite on purpose: it accepts a runtime scheduler so the concurrency primitive can be made small enough to spend without a budget meeting. The complexity Go is trying to <em>remove from the reader</em> is the whole apparatus of thread pools and worker-count tuning that exists only because threads are scarce. The price it pays to remove it — a scheduler, slightly larger goroutine stacks than strictly needed, occasional GC pressure — is the subject of §5. An engineer reads this lesson to learn the price, not to be told it's free.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Prerequisite:</strong> Lesson 03 — pointers, the heap, escape analysis, and the GC as a deliberately accepted runtime cost. The scheduler is the other half of that runtime, and a goroutine's stack lives under the same memory machinery.<br><strong>New capability:</strong> explain why launching a million goroutines is reasonable while launching a million threads is not; sketch the G-M-P model and what work-stealing and preemption buy; and answer "what did one goroutine cost?" with numbers and a mechanism.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Four moves. (1) Name the engineering pain — the OS thread is too expensive to be the everyday unit of concurrency. (2) Show what a goroutine is and the one-keyword syntax that launches it. (3) Open the runtime: the G-M-P scheduler, work-stealing, and preemption — what the runtime does so you don't have to. (4) Account for the cost honestly — stack growth, scheduler overhead, and the bugs cheap concurrency makes <em>easier</em> to write.</div>
+
+<h2>1 · The pain: the OS thread is too expensive to spend freely</h2>
+
+<p>A thread of execution is the obvious unit for "do these two things at once." But the only thread the operating system offers is a heavyweight object. On Linux, a thread is created with a default stack reservation of <strong>8&nbsp;MB</strong> of virtual address space (committed lazily, but still reserved), and the kernel tracks register state, signal masks, and scheduling metadata for each one. Creating a thread is a system call. Switching between two threads is also a kernel operation: it saves and restores register state and crosses the user/kernel boundary, costing on the order of <strong>1–2 microseconds</strong> — small until you do it a million times a second, at which point context-switch overhead dominates your CPU.</p>
+
+<p>Because the thread is expensive, its expense leaks into your design. You cannot have one thread per connection on a server with 100,000 connections — that is 100,000 threads and several hundred gigabytes of reserved stack. So you build a <em>thread pool</em>: a fixed, carefully-tuned number of worker threads pulling tasks off a queue. Now your program is full of machinery — pool sizing, work queues, callbacks, futures, the question "how many workers?" that has no good answer because it depends on the runtime mix of CPU-bound and I/O-bound work. None of that machinery is your actual problem. It exists <em>only</em> because the worker is scarce. This is exactly the kind of reader-facing complexity the Go bargain wants to delete — and the way to delete it is to make the worker cheap.</p>
+
+<div class="principle-grid">
+  <div class="principle-card"><div class="k">OS thread</div><div class="v">Scheduled by the kernel. ~8&nbsp;MB stack reservation. Created and switched via system calls (~1–2&nbsp;µs/switch). Scarce — you ration them with a pool.</div></div>
+  <div class="principle-card"><div class="k">Goroutine</div><div class="v">Scheduled by the Go runtime in user space. Starts with a ~2&nbsp;KB stack that grows on demand. Created and switched without a kernel trip (tens of ns). Abundant — you spawn one per unit of work.</div></div>
+  <div class="principle-card"><div class="k">The consequence</div><div class="v">Because the goroutine is ~4000× cheaper in stack and far cheaper to switch, "one goroutine per connection / per request / per task" becomes a reasonable default. The pool, the worker-count knob, the callback soup — all gone from the reader's view.</div></div>
+</div>
+
+<h2>2 · What a goroutine is, and the one keyword that starts it</h2>
+
+<p>A goroutine is a function call that the runtime runs concurrently with the rest of the program, on a stack the runtime manages. You launch one by writing <code>go</code> before a call. That is the entire syntax — the deliberate smallness is the point: concurrency should be as cheap to <em>write</em> as it is to run.</p>
+
+<pre><code>func main() {
+    go fetch("a.example") // runs concurrently; main does not wait
+    go fetch("b.example")
+    // BUG: main may return before either fetch finishes, killing the program.
+    // We have launched work but said nothing about waiting for it.
+}</code></pre>
+
+<p>The bug above is the first thing cheap concurrency teaches you: <code>go f()</code> answers "start this" but says nothing about "wait for this" or "where does the result go?" Those are separate questions, answered by channels (Lesson 09) or a <code>sync.WaitGroup</code> (Lesson 11). Here is the minimal correct shape using a wait group — count the launched work, and block until it is done:</p>
+
+<pre><code>func main() {
+    var wg sync.WaitGroup
+    for _, host := range []string{"a.example", "b.example"} {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            fetch(host) // Go 1.22+: each iteration's `host` is a fresh variable
+        }()
+    }
+    wg.Wait() // blocks until both Done() calls; the program stays alive
+}</code></pre>
+
+<p>One sharp edge worth naming now: before Go 1.22, the loop variable <code>host</code> was a <em>single</em> variable reused each iteration, so all goroutines often captured the same final value — a classic bug. Go 1.22 (2024) changed the loop semantics so each iteration gets a fresh variable, fixing it. If you read older code, assume the trap is there; the fix was to shadow it explicitly (<code>host := host</code>).</p>
+
+<h2>3 · The runtime: the G-M-P scheduler</h2>
+
+<p>For goroutines to be cheap, something must multiplex many of them onto few OS threads — the runtime cannot afford one kernel thread per goroutine, or we'd be back to the original cost. That something is the Go scheduler, and its design is named after its three entities. (The modern design dates to Go 1.1, 2013; an earlier naïve G-M version had a global lock that throttled multicore scaling — the <strong>P</strong> was added precisely to fix that.)</p>
+
+<div class="spine">  G   a goroutine: a stack + the bookkeeping to resume it (PC, status)
+  M   a "machine": an actual OS thread that executes code
+  P   a "processor": a scheduling context + a local run-queue of Gs.
+      There are GOMAXPROCS of them (default = number of CPU cores).
+
+  To run Go code, an M must hold a P. So at most GOMAXPROCS
+  goroutines run in parallel, but thousands more wait in run-queues.
+
+        P0 [G G G G]      P1 [G G]        &lt;- per-P local run queues
+         |                 |
+        M0 (thread)       M1 (thread)     &lt;- M needs a P to run a G
+         |                 |
+        CPU core 0        CPU core 1
+
+        global run queue: [G G ...]       &lt;- overflow / fairness
+</div>
+
+<p>The split is the whole trick. <strong>Parallelism</strong> — how many goroutines run literally at the same instant — is capped by <code>GOMAXPROCS</code> (the number of <strong>P</strong>s, defaulting to your core count), because a goroutine can only execute on an <strong>M</strong> that holds a <strong>P</strong>. <strong>Concurrency</strong> — how many goroutines exist and are making progress over time — is bounded only by memory. A goroutine that blocks does not block its thread's CPU: the runtime parks it and runs the next runnable G on the same P.</p>
+
+<p>Three runtime behaviors do the heavy lifting:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Cheap context switch</div><div class="v">Switching goroutines means saving ~3 registers (PC, SP, and the goroutine pointer) and picking the next G off a P's queue — all in user space, no kernel trip. It costs on the order of <strong>tens of nanoseconds</strong>, vs ~1–2&nbsp;µs for a thread switch.</div></div>
+  <div class="topic-card"><div class="k">Work-stealing</div><div class="v">When a P's local run-queue empties, its M doesn't idle: it steals half the runnable goroutines from another P's queue (and checks the global queue). This keeps all cores fed without a single global lock — the bottleneck the original G-M design had.</div></div>
+  <div class="topic-card"><div class="k">Blocking syscalls handled</div><div class="v">If a goroutine makes a blocking syscall (e.g. a file read), the runtime detaches the P from that M so another M can grab the P and keep the remaining goroutines running. Network I/O is even better: it goes through the runtime's <em>netpoller</em> (epoll/kqueue), which parks the goroutine and wakes it when the socket is ready — so 100k network goroutines need only a few threads.</div></div>
+  <div class="topic-card"><div class="k">Preemption</div><div class="v">A goroutine that never blocks (a tight CPU loop) used to be able to starve others, because scheduling points were only at function calls. Since Go 1.14 (2020) the runtime uses <em>asynchronous preemption</em>: it signals a long-running goroutine (~10&nbsp;ms time slice) and forces it to yield, so a busy loop can no longer hang the scheduler.</div></div>
+</div>
+
+<p>Notice what the reader of a Go program never writes: no pool size, no event loop, no "register this callback for when the socket is readable." You write straight-line blocking code — <code>n, err := conn.Read(buf)</code> — and the runtime turns the block into a yield. That is the complexity the scheduler absorbs so it doesn't land in your code. It is the same move as the GC in Lesson 03: accept a bounded runtime cost to remove a large, error-prone burden from every engineer.</p>
+
+<h2>4 · The growable stack: why a million goroutines fits</h2>
+
+<p>A goroutine starts with a stack of about <strong>2&nbsp;KB</strong> (the runtime's <code>_StackMin</code>), not the 8&nbsp;MB of an OS thread. That single number is what makes a million goroutines a reasonable thing to say: a million × 2&nbsp;KB is roughly 2&nbsp;GB of stack if they all stayed minimal — large but bounded — whereas a million threads at 8&nbsp;MB would reserve 8&nbsp;<em>terabytes</em>, which the machine cannot do.</p>
+
+<p>The catch a fixed 2&nbsp;KB stack would create is obvious: real call chains need more. Go solves it with <strong>contiguous, growable stacks</strong>. On a function's entry, a tiny prologue checks whether the stack has room; if not, the runtime allocates a new, larger stack (doubling), copies the existing frames over, fixes up pointers into the stack, and resumes. The goroutine never sees it. The stack also shrinks during GC if it's mostly unused. So 2&nbsp;KB is a starting point, not a ceiling — a goroutine that recurses deeply gets the space it needs, and one that does little keeps a tiny footprint.</p>
+
+<div class="callout warn"><div class="label">Cost, named</div>Stack growth is not free: the copy is O(stack size) and happens when you cross a growth boundary. A function called in a hot loop that repeatedly trips the boundary can cause repeated copies. It's rarely a problem in practice, but it's the honest reason the number is "~2&nbsp;KB <em>starting</em>" and not "2&nbsp;KB, period." And every goroutine you launch is memory the GC must scan for pointers — a million live goroutines is a million stacks to mark. Cheap is not zero.</div>
+
+<h2>5 · What it cost, and who pays</h2>
+
+<p>Answering question five of the five (Lesson 00) honestly: a goroutine is cheap, not free, and cheap concurrency moves the difficulty rather than removing it.</p>
+
+<div class="two-col">
+<div>
+<div class="mini-label">What the bargain buys</div>
+<ul>
+<li><strong>One goroutine per task as the default.</strong> The thread pool, worker-count tuning, and callback machinery vanish from the reader's view — the complexity §1 named is gone.</li>
+<li><strong>Blocking code that scales.</strong> You write <code>conn.Read</code> and the runtime turns the block into a yield via the netpoller; 100k connections need a handful of threads.</li>
+<li><strong>Cores used without a global lock.</strong> Work-stealing and per-P queues scale across cores; <code>GOMAXPROCS</code> caps real parallelism at the core count by default.</li>
+</ul>
+</div>
+<div>
+<div class="mini-label">What it costs (named honestly)</div>
+<ul>
+<li><strong>A scheduler in your runtime.</strong> Like the GC, it's a moving part you don't control fully; pathological cases (a syscall-heavy load spinning up many Ms) exist and need profiling (Lesson 15).</li>
+<li><strong>Stack memory and GC scan.</strong> ~2&nbsp;KB each, growable; a million live goroutines is real memory the GC must scan.</li>
+<li><strong>Leaks are easy.</strong> A goroutine blocked forever on a channel with no sender is never collected — it leaks until the process dies. Cheap to start means easy to forget to stop (Lesson 10's <code>context</code>).</li>
+<li><strong>The hard part is still hard.</strong> <code>go f()</code> makes starting trivial; <em>coordinating</em> — who waits, who owns the data, who handles the error — is the actual work, deferred to Lessons 09–11.</li>
+</ul>
+</div>
+</div>
+
+<p>The deepest cost is the last one, and it's why this is a movement and not a single lesson. <code>go</code> answers only "start." The moment you have two goroutines you must answer question two of the five — <em>who owns this data, and how does it move?</em> — because the alternative is a data race: two goroutines touching the same memory with no ordering, producing undefined behavior the compiler won't catch for you. Go's answer to that question is the subject of the next three lessons, and it starts with a slogan that inverts how most languages share state.</p>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>Write a program that launches 100,000 goroutines, each of which sleeps for one second and then sends its index on a shared channel; have <code>main</code> receive all 100,000 and print the count. Run it and watch the resident memory with <code>/usr/bin/time -v</code> (or Activity Monitor) — note that it stays in the tens of MB, not the hundreds of GB a thread-per-task version would need. Then make it leak on purpose: remove the receiver loop so the senders block forever on the unbuffered channel, and observe with <code>runtime.NumGoroutine()</code> that 100,000 goroutines are stuck and never freed. You've now <em>felt</em> both halves of §5: the worker is nearly free to spawn, and a worker with no one to talk to never dies on its own.</div>
+
+<h2>Where this points next</h2>
+<p>We can now create concurrency for almost nothing — but §2's first bug and §5's leak both point at the same hole: starting work is trivial, and everything that matters is <em>coordination</em>. Two goroutines that share a variable race; two that need to hand off a result need a channel. Lesson 09 fills exactly that gap with Go's central concurrency idea — <em>don't communicate by sharing memory; share memory by communicating</em> — and shows the channel as a typed conduit that transfers <strong>ownership</strong> of a value (reaching back to the value semantics of Lesson 02) with a happens-before guarantee the race detector can rely on. Goroutines are the workers; channels are how they talk.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+Concurrency is hard largely because the OS thread — ~8&nbsp;MB of stack, a kernel trip to create and ~1–2&nbsp;µs to switch — is too expensive to spend freely, forcing thread pools and worker-count tuning into every design. Go's bet, the bargain's second half, is to accept a runtime <strong>scheduler</strong> so the worker can be made cheap: a goroutine starts with a ~2&nbsp;KB growable stack and switches in tens of nanoseconds, so "one goroutine per task" is a reasonable default and a million of them fits. The <strong>G-M-P</strong> scheduler does the work you'd otherwise hand-code — Gs (goroutines) run on Ms (OS threads) only while holding one of GOMAXPROCS Ps (scheduling contexts); work-stealing keeps cores fed without a global lock, the netpoller turns blocking I/O into a yield, and asynchronous preemption (Go 1.14) stops a busy loop from starving others. The transferable habit is to separate <em>parallelism</em> (capped by cores) from <em>concurrency</em> (capped by memory) and to remember the bargain's price: cheap to start is not free to run, and the genuinely hard part — who owns the data and how it moves — is the coordination the next lessons handle.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+<li>Why can you run a million goroutines but not a million OS threads? <em>(§1, §4 — a goroutine starts at ~2&nbsp;KB of growable stack vs a thread's ~8&nbsp;MB reservation, so a million goroutines is ~2&nbsp;GB of stack while a million threads would reserve terabytes; the runtime also multiplexes them onto a few threads instead of one kernel thread each.)</em></li>
+<li>Explain the G, M, and P in the scheduler and what each does. <em>(§3 — G is a goroutine (stack + resume state), M is an OS thread that executes code, P is a scheduling context with a local run-queue; an M must hold one of GOMAXPROCS Ps to run a G, so the P count caps real parallelism.)</em></li>
+<li>What's the difference between concurrency and parallelism in Go's model? <em>(§3 — parallelism = goroutines running at the same instant, capped by GOMAXPROCS/core count; concurrency = goroutines existing and making progress over time, bounded only by memory because blocked goroutines yield their thread rather than holding it.)</em></li>
+<li>Why was P added to what used to be a G-M scheduler? <em>(§3 — the original G-M design used a single global run-queue under one lock, which throttled multicore scaling; per-P local queues plus work-stealing removed that global bottleneck while keeping all cores fed.)</em></li>
+<li>What happens when a goroutine makes a blocking syscall vs a blocking network read? <em>(§3 — a blocking syscall causes the runtime to detach the P from that M so another M can keep running the remaining goroutines; network I/O instead goes through the netpoller (epoll/kqueue), parking the goroutine and waking it when the socket is ready, so few threads serve many connections.)</em></li>
+<li>What problem did asynchronous preemption (Go 1.14) solve? <em>(§3 — before it, scheduling points were only at function calls, so a tight CPU loop with no calls could starve other goroutines and stall GC; async preemption signals such a goroutine (~10&nbsp;ms slice) and forces it to yield.)</em></li>
+<li>Is a goroutine free? Name a concrete cost. <em>(§4, §5 — no: ~2&nbsp;KB starting stack that the GC must scan, O(n) stack-copy on growth boundaries, a scheduler as an uncontrolled runtime part, and easy leaks — a goroutine blocked forever on a channel is never collected; the hard part, coordination, remains.)</em></li>
+</ul>
+
+<footer class="lesson-nav"><a href="07_errors_are_values.html"><span class="dir">Previous</span><span class="ttl">07 · Errors are values</span></a><a class="next" href="09_channels_csp.html"><span class="dir">Next</span><span class="ttl">09 · Channels &amp; CSP</span></a></footer>
+</main>
+<!-- reviewed:v1 -->
+</body>
+</html>
