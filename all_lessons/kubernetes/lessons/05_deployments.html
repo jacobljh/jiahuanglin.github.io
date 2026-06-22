@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>05 - Deployments: Changing Desired State Safely | Kubernetes from First Principles</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; }
+  .mini-flow { display: grid; gap: 8px; margin: 18px 0; }
+  .mini-flow .step { border: 1px solid var(--border); background: var(--bg-elev); border-radius: 8px; padding: 10px 12px; }
+  .mini-flow .n { font-family: var(--mono); color: var(--accent); font-size: 12px; margin-right: 6px; }
+  .derive { border-left: 3px solid var(--accent); background: var(--bg-elev); border-radius: 6px; padding: 10px 14px; margin: 16px 0; font-size: 14px; }
+  /* rolling-update sim */
+  #roll .pod-row { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0 2px; min-height: 22px; }
+  #roll .pod { width: 18px; height: 18px; border-radius: 4px; border: 1px solid var(--border); font-size: 9px; line-height: 18px; text-align: center; font-family: var(--mono); color: #fff; }
+  #roll .pod.v1 { background: #475569; }
+  #roll .pod.v2 { background: #16a34a; }
+  #roll .pod.boot { background: #b45309; }
+  #roll .pod.gone { background: transparent; border-style: dashed; color: var(--text-mute); }
+  #roll .lab { font-family: var(--mono); font-size: 11px; color: var(--text-mute); margin-top: 8px; }
+  #roll .slo-note { font-size: 12px; margin-top: 6px; }
+  #roll .slo-bad { color: #dc2626; font-weight: bold; }
+  #roll .slo-ok { color: #16a34a; }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">kubernetes</a><span class="crumb">/</span><span class="crumb">05</span><span class="step-pill">lesson 6 / 14</span></div></header>
+<main>
+
+<p class="kicker">Part II — The control plane and the loop</p>
+<h1>Deployments: Changing Desired State Safely</h1>
+<p class="subtitle">Lesson 04 gave you a <strong>ReplicaSet</strong>: a controller that watches a label selector and keeps exactly N matching Pods alive, level-triggered and idempotent. But a ReplicaSet pins <em>one</em> Pod template — one image, one version. To ship v2 you would have to edit the template in place (the ReplicaSet will not re-roll existing Pods) or delete the v1 set and create a v2 set. The first does nothing; the second tears down every v1 Pod at once — a hard outage — and if v2 crashes on boot, there is no button to bring v1 back. This lesson derives the <strong>Deployment</strong>: a controller <em>of</em> ReplicaSets that changes desired state safely, with bounded capacity loss and one-command undo.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>A ReplicaSet reconciles a Pod <em>count</em> against <em>one frozen template</em>. It has no concept of "the next version," no memory of the previous one, and no strategy for moving from one to the other. Releasing v2 by hand means either an all-at-once delete-and-recreate (downtime for every user during image pull + boot) or a fragile manual dance of scaling two ReplicaSets in lockstep — and either way, a bad v2 leaves you with no recorded prior state to roll back to.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> a ReplicaSet holds one template, so a version change is a destroy-and-replace with no undo.<br><strong>New capability:</strong> a Deployment owns a <em>set</em> of ReplicaSets, creates a new one per version, shifts replicas old→new under a <strong>strategy</strong> (RollingUpdate or Recreate) that bounds capacity loss, and keeps <strong>revision history</strong> for one-command rollback.<br><strong>Forces next:</strong> rolling Pods are deleted and recreated, so they get <em>new IPs every time</em> — a client can never be pointed at a Pod that keeps moving.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Six moves. (1) Why a ReplicaSet alone cannot release safely. (2) The Deployment as a controller of ReplicaSets — the three-level ownership chain. (3) The two strategies: Recreate vs RollingUpdate. (4) The rollout arithmetic — maxSurge / maxUnavailable and the minimum available capacity, worked for replicas=10. (5) Revision history and rollback; readiness gating the roll; how selectors keep traffic flowing. (6) Failure modes, checkpoint, and the IP-churn problem that forces Services.</div>
+
+<h2>1 · Why a ReplicaSet cannot release</h2>
+
+<p>A ReplicaSet's whole job is one equation: <span class="math">observed Pods matching selector == desired count</span>. It does not own the idea of an <em>upgrade</em>. If you change its <code>template</code> (say, bump the image from <code>app:v1</code> to <code>app:v2</code>), the ReplicaSet does <em>not</em> touch the Pods it already has — they still run v1. The new template only applies to Pods it creates from now on. So you would have to manually delete v1 Pods to force replacements, with no control over the rate, no health-gating, and no record of what v1 even was.</p>
+
+<p>The blunt alternative — delete the v1 ReplicaSet, create a v2 ReplicaSet — drops your replica count to 0 the instant the old Pods terminate, then climbs back up only after v2 images pull and boot. For a 10-replica service that is a full outage lasting the pull-plus-boot time (tens of seconds to minutes for a large image). And if v2 segfaults on startup, you are now staring at 10 crash-looping Pods with the v1 template gone from the cluster. <strong>You need a controller that remembers v1, introduces v2 gradually, and can reverse course.</strong> That is a Deployment.</p>
+
+<h2>2 · The Deployment: a controller of ReplicaSets</h2>
+
+<p>A <strong>Deployment</strong> is a higher-level controller whose desired state is "N Pods of <em>this</em> template, reached via <em>this</em> strategy." It does not manage Pods directly. Instead it manages <strong>ReplicaSets</strong>, each of which manages Pods — the same ownership-by-selector idea from lesson 04, stacked one level higher.</p>
+
+<pre class="ascii">
+  Deployment  app=web, replicas=10, strategy=RollingUpdate
+      │   (owns, by template hash)
+      ├── ReplicaSet  app=web,pod-template-hash=v1   desired 0   ← old revision (kept)
+      │       └── (Pods, draining to 0)
+      └── ReplicaSet  app=web,pod-template-hash=v2   desired 10  ← new revision
+              └── Pod  Pod  Pod  Pod  Pod  Pod  Pod  Pod  Pod  Pod
+</pre>
+
+<p>When you change the Pod template, the Deployment controller hashes the new template into a <code>pod-template-hash</code> label, creates a <em>brand-new</em> ReplicaSet for that hash, and then drives a transfer: it scales the new ReplicaSet up and the old one down, a few replicas at a time, until the new set holds all the replicas and the old set holds zero. Crucially, it does <strong>not delete</strong> the old ReplicaSet — it leaves it scaled to 0 as a recorded <em>revision</em>. That retained, scaled-to-zero ReplicaSet is exactly what makes rollback a one-liner (§5).</p>
+
+<div class="derive">The Deployment is the engine from lesson 00 applied to ReplicaSets instead of to Pods: <em>observe</em> (which ReplicaSets exist, at what scale) → <em>diff</em> (do they match the desired template + strategy?) → <em>act</em> (nudge replicas old→new by one allowed step) → repeat. A rollout is not a script that runs once; it is a control loop converging to "all replicas on the new template."</p></div>
+
+<h2>3 · Two strategies: Recreate vs RollingUpdate</h2>
+
+<p>The strategy answers one question: <em>how much capacity may I lose, and how much extra may I spend, while moving from old to new?</em></p>
+
+<table class="trade-table"><thead><tr><th>Strategy</th><th>What it does</th><th>Capacity during roll</th><th>Use when</th></tr></thead><tbody>
+  <tr><td><strong>Recreate</strong></td><td>Scale old ReplicaSet to 0, wait for all old Pods to terminate, <em>then</em> scale new to N.</td><td>Drops to <strong>0</strong> — a deliberate outage window.</td><td>The app cannot run two versions at once (e.g. an exclusive DB schema lock, a singleton). Simplicity over availability.</td></tr>
+  <tr><td><strong>RollingUpdate</strong> (default)</td><td>Incrementally add new Pods and remove old ones, bounded by <code>maxSurge</code> and <code>maxUnavailable</code>, until all replicas are new.</td><td>Stays near N — never below <span class="math">N − maxUnavailable</span>.</td><td>Almost always — any stateless or version-compatible service that must stay up.</td></tr>
+</tbody></table>
+
+<p>RollingUpdate is governed by two knobs, each an absolute count or a percentage of desired replicas (rounded — <code>maxSurge</code> rounds <em>up</em>, <code>maxUnavailable</code> rounds <em>down</em>):</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">maxSurge</div><div class="v">How many Pods <em>above</em> the desired count may exist at once. It bounds the <strong>extra cost</strong> of the roll (transient pods you pay for). <span class="math">maxSurge = 25% of 10 = 3</span> → up to 13 Pods may exist mid-roll.</div></div>
+  <div class="topic-card"><div class="k">maxUnavailable</div><div class="v">How many Pods <em>below</em> the desired count may be unavailable at once. It bounds the <strong>capacity loss</strong>. <span class="math">maxUnavailable = 25% of 10 = 2</span> → at least 8 Pods stay available throughout.</div></div>
+</div>
+
+<p>The two together set the width of the moving window. The controller never lets the live, <em>available</em> count fall below <span class="math">N − maxUnavailable</span>, and never lets the <em>total</em> (old + new) Pod count exceed <span class="math">N + maxSurge</span>. Inside that window it works as fast as new Pods become Ready.</p>
+
+<h2>4 · The rollout arithmetic (replicas = 10)</h2>
+
+<p>Take <span class="math">replicas = 10</span>, <span class="math">maxSurge = 25% → 3</span> (rounded up), <span class="math">maxUnavailable = 25% → 2</span> (rounded down). The floor on available capacity is <span class="math">10 − 2 = 8</span>; the ceiling on total Pods is <span class="math">10 + 3 = 13</span>. Watch one representative step sequence (old = v1, new = v2, "available" = Ready Pods of either version):</p>
+
+<div class="mini-flow">
+<div class="step"><span class="n">start</span><strong>v1=10, v2=0</strong> → available 10. The controller may surge to 13 total and may let availability dip to 8.</div>
+<div class="step"><span class="n">step 1</span><strong>surge up</strong> → create 3 new v2 Pods (booting). Total 13, available still 10 (v2 not Ready yet). When the 3 become Ready: available 13.</div>
+<div class="step"><span class="n">step 2</span><strong>scale old down</strong> → with 13 available and a floor of 8, the controller may delete up to 5 old Pods (13 − 8). It removes v1 Pods → v1=5, v2=3, available 8.</div>
+<div class="step"><span class="n">step 3</span><strong>surge again</strong> → top total back to 13: add 5 v2 Pods → v1=5, v2=8 (5 booting). Available 8 until they pass readiness, then 13.</div>
+<div class="step"><span class="n">step 4</span><strong>finish</strong> → delete remaining 5 v1, the last 2 v2 already Ready → v1=0, v2=10, available 10. Old ReplicaSet kept at 0.</div>
+</div>
+
+<p>The exact ordering depends on how fast new Pods pass readiness, but the invariants are hard: <strong>available never drops below 8, total never exceeds 13.</strong> Now break it: set <span class="math">maxUnavailable = 60% → 6</span>. The floor becomes <span class="math">10 − 6 = 4</span>. If your service needs 7 Pods to hold peak traffic under its SLO, the roll is now <em>allowed</em> to spend a window at 4 available — below the line — and users see errors or latency even though the deploy "succeeded." That dip is invisible in the YAML; the widget below makes it visible.</p>
+
+<div class="widget" id="roll">
+  <div class="title">Rolling-update simulator — watch the available-capacity dip</div>
+  <div class="hint">Set <strong>replicas</strong>, <strong>maxSurge</strong>, and <strong>maxUnavailable</strong>, then press <em>deploy v2</em> to step the rollout. Grey = old v1 (Ready), amber = new v2 booting (not yet available), green = new v2 Ready, dashed = a slot being recreated. The <strong>min available</strong> KPI is the worst capacity reached during the whole roll. The dashed red line is an example SLO (60% of replicas): push <code>maxUnavailable</code> up and you will drive min-available below it.</div>
+
+  <div class="controls" style="margin-top: 12px;">
+    <label class="inline">replicas: <input type="range" id="r-rep" min="2" max="20" step="1" value="10"> <span class="val" id="r-rep-v">10</span></label>
+    <label class="inline">maxSurge %: <input type="range" id="r-surge" min="0" max="100" step="5" value="25"> <span class="val" id="r-surge-v">25</span></label>
+    <label class="inline">maxUnavailable %: <input type="range" id="r-unav" min="0" max="80" step="5" value="25"> <span class="val" id="r-unav-v">25</span></label>
+    <button id="r-deploy" type="button">deploy v2 ▶</button>
+    <button id="r-reset" type="button">reset</button>
+  </div>
+
+  <div class="lab" id="r-step-lab">idle — all v1, available = replicas</div>
+  <div class="pod-row" id="r-row"></div>
+  <div class="slo-note" id="r-slo"></div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">surge / unavail (pods)</div><div class="v" id="r-k-knobs">—</div></div>
+    <div class="kpi"><div class="k">total cap = N + surge</div><div class="v" id="r-k-cap">—</div></div>
+    <div class="kpi"><div class="k">floor = N − unavail</div><div class="v" id="r-k-floor">—</div></div>
+    <div class="kpi"><div class="k">min available reached</div><div class="v" id="r-k-min">—</div></div>
+  </div>
+</div>
+
+<h2>5 · History, rollback, readiness, and how traffic still finds Pods</h2>
+
+<p>Because the Deployment keeps each prior ReplicaSet scaled to 0, the cluster holds a <strong>revision history</strong> (default 10 revisions, set by <code>revisionHistoryLimit</code>). Rolling back is therefore not a redeploy — it is re-running the same scale-transfer in reverse:</p>
+
+<div class="mini-flow">
+<div class="step"><span class="n">→</span><strong>kubectl rollout history deploy/web</strong> → lists revisions 1, 2, 3… each tied to a retained ReplicaSet.</div>
+<div class="step"><span class="n">→</span><strong>kubectl rollout undo deploy/web</strong> → scales the previous revision's ReplicaSet back up and the current one down, under the same RollingUpdate strategy. No image rebuild, no redeploy — the v1 Pod template was never lost.</div>
+<div class="step"><span class="n">→</span><strong>kubectl rollout status deploy/web</strong> → blocks until the new revision reports all replicas updated and available, so CI can gate on a finished, healthy roll.</div>
+</div>
+
+<p>What stops the controller from marching forward into a broken v2? <strong>Readiness.</strong> A new Pod counts as "available" only once it passes its <strong>readiness probe</strong> — a health check that says "this Pod can serve traffic" (covered fully in lesson 11). Until a fresh v2 Pod is Ready, it does <em>not</em> count toward the available total, so the floor (<span class="math">N − maxUnavailable</span>) holds the line: the controller will not delete more old Pods until enough new ones are genuinely serving. If v2 never becomes Ready, the roll stalls at the floor instead of completing — your service stays up on v1 Pods while you investigate, and <code>rollout undo</code> reverses it. (Without good readiness probes this safety net is gone: Kubernetes counts a booting-but-broken Pod as available and rolls right over your last good replicas.)</p>
+
+<p>One more thread from lesson 04 closes here. Throughout the roll, old and new Pods all carry the Deployment's selector labels (e.g. <code>app=web</code>) — the <code>pod-template-hash</code> only distinguishes ReplicaSets, not the app-level selector. So anything that finds Pods by that selector automatically tracks <em>whichever Pods currently exist</em>, v1 or v2, without being told. That label-query indirection is precisely how a stable front end (a Service) will keep routing to a moving set — which is the next lesson.</p>
+
+<h2>Failure modes &amp; checklist</h2>
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+<li><strong>maxUnavailable too high.</strong> A roll allowed to drop well below the capacity your traffic needs. <em>Signal:</em> error rate / latency spikes <em>during</em> every deploy that vanish once it finishes; the Deployment still reports success.</li>
+<li><strong>maxSurge = 0 and maxUnavailable = 0.</strong> The controller can neither add nor remove a Pod — the roll deadlocks forever. <em>Signal:</em> <code>rollout status</code> hangs; both knobs cannot be zero at once.</li>
+<li><strong>No (or fake) readiness probe.</strong> Booting v2 Pods are counted as available, so the floor is meaningless and the roll steamrolls your last good v1 Pods. <em>Signal:</em> brief total outage mid-roll even though "min available" looked safe on paper.</li>
+<li><strong>Editing the ReplicaSet, not the Deployment.</strong> Changes get reverted by the Deployment controller (it owns the set) or create an orphan. <em>Signal:</em> your manual edits silently disappear within seconds.</li>
+<li><strong>Recreate on a multi-replica user-facing service.</strong> Full outage window because capacity hits 0. <em>Signal:</em> every deploy shows a hard gap in availability, not a dip.</li>
+</ul>
+  </div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+<li>Change the <strong>Deployment</strong> template, never a ReplicaSet directly — let the higher controller own the roll.</li>
+<li>Set <code>maxUnavailable</code> from your real capacity floor: <span class="math">N − maxUnavailable ≥ peak-load replica need</span>.</li>
+<li>Set <code>maxSurge</code> from headroom you can afford to pay for transiently (and that the cluster can schedule).</li>
+<li>Ship a <strong>readiness probe</strong> that returns true only when the Pod can actually serve — it is what gates the roll (lesson 11).</li>
+<li>Use <code>kubectl rollout status</code> in CI to gate on a finished, healthy roll; keep <code>revisionHistoryLimit</code> high enough to roll back.</li>
+<li>Choose <strong>Recreate</strong> only when two versions genuinely cannot coexist, and accept the outage window.</li>
+</ul>
+  </div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>In the widget set <span class="math">replicas = 12</span>, <span class="math">maxSurge = 25%</span>, <span class="math">maxUnavailable = 25%</span>. By hand, compute the surge count (round up), the unavailable count (round down), the total ceiling, and the available floor. Press <em>deploy v2</em> and step the roll — does the observed <em>min available</em> match your floor? Now raise <code>maxUnavailable</code> to 50% and redeploy: how far does min-available fall, and does it cross the SLO line? Finally, set both <code>maxSurge</code> and <code>maxUnavailable</code> to 0 and explain in one sentence why the roll can never make progress.</div>
+
+<h2>Where this points next</h2>
+
+<p>A Deployment now lets you change desired state safely: new ReplicaSet per version, bounded capacity loss, one-command rollback. But notice <em>what just happened to every Pod</em>. A rolling update <strong>deletes and recreates</strong> Pods — and from lesson 02 we know a fresh Pod gets a fresh cluster IP. So after a single roll, none of the IPs a client might have cached point at a live Pod; the entire backend set has moved. Worse, this happens on every scale event and every restart, not just deploys. A stable selector lets a controller <em>find</em> the current Pods, but a human or a remote client still has nothing fixed to dial. That is the problem lesson 06, <strong><a href="06_networking_services.html">Networking &amp; Services</a></strong>, solves: a stable virtual IP and name that load-balances across whatever Pods the selector matches right now, no matter how often they churn.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+A ReplicaSet pins one Pod template, so a version change is a destroy-and-replace with no undo. The <strong>Deployment</strong> is the fix: a controller <em>of ReplicaSets</em> that, on every template change, creates a new ReplicaSet (keyed by a <code>pod-template-hash</code>) and runs the lesson-00 loop to transfer replicas old→new under a <strong>strategy</strong> — <code>Recreate</code> (drop to 0, then refill) or the default <code>RollingUpdate</code>, bounded by <code>maxSurge</code> (total ≤ <span class="math">N + maxSurge</span>) and <code>maxUnavailable</code> (available ≥ <span class="math">N − maxUnavailable</span>). For replicas=10 at 25%/25% the roll never exceeds 13 Pods nor drops below 8 available; push <code>maxUnavailable</code> too high and availability dips below your SLO even on a "successful" deploy. Old ReplicaSets are kept scaled to 0 as <strong>revision history</strong>, so <code>rollout undo</code> reverses the same transfer with no rebuild; <strong>readiness</strong> gates each forward step so a broken v2 stalls instead of steamrolling v1; and the shared selector labels let traffic-finding controllers track whichever Pods exist. The catch it leaves: rolled Pods get new IPs every time — which forces a stable Service.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>Why can't a ReplicaSet release a new version on its own? <em>(§1 — it reconciles a Pod count against one frozen template; changing the template doesn't re-roll existing Pods, and delete-and-recreate means a 0-capacity outage with no recorded prior state to undo.)</em></li>
+  <li>What exactly does a Deployment manage, and what makes rollback cheap? <em>(§2, §5 — it manages ReplicaSets (one per template hash), not Pods directly; it keeps the old ReplicaSet scaled to 0 as a revision, so <code>rollout undo</code> just scales it back up — no rebuild or redeploy.)</em></li>
+  <li>Define maxSurge and maxUnavailable and the two invariants they enforce. <em>(§3, §4 — surge bounds extra Pods (total ≤ N + maxSurge, rounds up); unavailable bounds capacity loss (available ≥ N − maxUnavailable, rounds down). The roll moves inside that window.)</em></li>
+  <li>For replicas=10, maxSurge=25%, maxUnavailable=25%, what are the total ceiling and available floor? <em>(§4 — surge = 3 (up), unavailable = 2 (down); total never exceeds 13, available never drops below 8.)</em></li>
+  <li>Recreate vs RollingUpdate — when and why pick Recreate? <em>(§3 — Recreate drops capacity to 0 then refills; pick it only when two versions cannot coexist (exclusive lock, singleton, breaking schema), accepting an outage window. RollingUpdate is the default for staying up.)</em></li>
+  <li>How does readiness gate a rollout, and what breaks without it? <em>(§5 — a new Pod counts as available only after its readiness probe passes, so the floor holds until enough new Pods truly serve; without a real probe, booting/broken Pods count as available and the roll steamrolls the last good replicas.)</em></li>
+  <li>During a roll, how does traffic keep reaching the right Pods, and what problem does the roll then create? <em>(§5, "Where next" — all Pods carry the shared selector labels so a label-query tracks whichever exist; but rolled Pods are recreated with new IPs, so nothing fixed remains to dial — forcing a Service.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="index.html"><span class="dir">Index</span><span class="ttl">Series overview</span></a>
+  <a class="next" href="06_networking_services.html"><span class="dir">Next</span><span class="ttl">06 - Networking &amp; Services</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var row = document.getElementById('r-row');
+  if (!row) return;
+  var repR = document.getElementById('r-rep'), surgeR = document.getElementById('r-surge'), unavR = document.getElementById('r-unav');
+  var repV = document.getElementById('r-rep-v'), surgeV = document.getElementById('r-surge-v'), unavV = document.getElementById('r-unav-v');
+  var deployBtn = document.getElementById('r-deploy'), resetBtn = document.getElementById('r-reset');
+  var stepLab = document.getElementById('r-step-lab'), sloEl = document.getElementById('r-slo');
+  var kKnobs = document.getElementById('r-k-knobs'), kCap = document.getElementById('r-k-cap'),
+      kFloor = document.getElementById('r-k-floor'), kMin = document.getElementById('r-k-min');
+
+  var SLO_FRAC = 0.6;            // example SLO: must keep 60% of replicas available
+  var pods = [];                 // {state:'v1'|'v2'|'boot'|'gone'}
+  var timer = null, minAvail = Infinity, rolling = false;
+
+  function params(){
+    var N = parseInt(repR.value,10);
+    var surge = Math.ceil(N * parseInt(surgeR.value,10)/100);     // rounds up
+    var unav  = Math.floor(N * parseInt(unavR.value,10)/100);     // rounds down
+    return {N:N, surge:surge, unav:unav, cap:N+surge, floor:N-unav};
+  }
+  function avail(){ // Ready pods of either version
+    var c=0; for (var i=0;i<pods.length;i++){ if(pods[i].state==='v1'||pods[i].state==='v2') c++; } return c;
+  }
+  function counts(){
+    var v1=0,v2=0,boot=0; for(var i=0;i<pods.length;i++){var s=pods[i].state; if(s==='v1')v1++; else if(s==='v2')v2++; else if(s==='boot')boot++;}
+    return {v1:v1,v2:v2,boot:boot,total:v1+v2+boot};
+  }
+  function draw(){
+    var p = params();
+    row.innerHTML='';
+    for(var i=0;i<pods.length;i++){
+      var d=document.createElement('div'); var st=pods[i].state;
+      d.className='pod '+st;
+      d.textContent = st==='v1'?'1':(st==='v2'?'2':(st==='boot'?'·':''));
+      row.appendChild(d);
+    }
+    var a = avail();
+    var below = a < Math.ceil(p.N*SLO_FRAC);
+    sloEl.innerHTML = 'available now: <strong>'+a+'</strong> / '+p.N+' · SLO line = '+Math.ceil(p.N*SLO_FRAC)+
+      ' &nbsp; <span class="'+(below?'slo-bad':'slo-ok')+'">'+(below?'BELOW SLO':'within SLO')+'</span>';
+    kKnobs.textContent = p.surge+' / '+p.unav;
+    kCap.textContent   = p.cap+' pods';
+    kFloor.textContent = p.floor+' avail';
+    kMin.textContent   = (minAvail===Infinity? '—' : minAvail+' avail') + (minAvail<Math.ceil(p.N*SLO_FRAC)?'  ✗SLO':'');
+  }
+  function reset(){
+    if(timer){clearInterval(timer);timer=null;} rolling=false;
+    var p=params(); pods=[]; for(var i=0;i<p.N;i++) pods.push({state:'v1'});
+    minAvail=Infinity; stepLab.textContent='idle — all v1, available = '+p.N; deployBtn.disabled=false; draw();
+  }
+  function tick(){
+    var p=params();
+    var c=counts();
+    // 1) promote any booted v2 to Ready
+    var promoted=false;
+    for(var i=0;i<pods.length;i++){ if(pods[i].state==='boot'){ pods[i].state='v2'; promoted=true; } }
+    if(promoted){ minAvail=Math.min(minAvail,avail()); stepLab.textContent='new v2 Pods passed readiness → now counted available'; draw(); return; }
+    c=counts();
+    // 2) done?
+    if(c.v1===0 && c.boot===0 && c.v2===p.N){
+      clearInterval(timer); timer=null; rolling=false; deployBtn.disabled=false;
+      stepLab.textContent='roll complete — v2='+p.N+', old ReplicaSet kept at 0 (revision history)';
+      minAvail=Math.min(minAvail,avail()); draw(); return;
+    }
+    // 3) surge: add boot pods up to cap, never exceeding remaining v2 needed
+    var needNew = p.N - (c.v2 + c.boot);
+    var surgeRoom = p.cap - c.total;
+    if(surgeRoom>0 && needNew>0){
+      var add=Math.min(surgeRoom,needNew);
+      for(var k=0;k<add;k++) pods.push({state:'boot'});
+      minAvail=Math.min(minAvail,avail());
+      stepLab.textContent='surge: +'+add+' new v2 Pods booting (total now '+counts().total+', cap '+p.cap+')';
+      draw(); return;
+    }
+    // 4) retire old: delete v1 down to the floor (using current available)
+    var canDrop = avail() - p.floor;
+    if(canDrop>0 && c.v1>0){
+      var rm=Math.min(canDrop,c.v1);
+      var done=0;
+      for(var j=0;j<pods.length && done<rm;j++){ if(pods[j].state==='v1'){ pods[j].state='gone'; done++; } }
+      minAvail=Math.min(minAvail,avail());
+      stepLab.textContent='retire: −'+rm+' old v1 Pods (available now '+avail()+', floor '+p.floor+')';
+      draw();
+      // sweep gone pods next microtask so the dip is visible one frame
+      setTimeout(function(){ pods=pods.filter(function(x){return x.state!=='gone';}); draw(); },180);
+      return;
+    }
+    // 5) nothing legal to do — deadlock (both knobs 0)
+    clearInterval(timer); timer=null; rolling=false; deployBtn.disabled=false;
+    stepLab.textContent='DEADLOCK — cannot surge (maxSurge=0) nor retire (maxUnavailable=0). Roll cannot progress.';
+    draw();
+  }
+  function deploy(){
+    if(rolling) return;
+    // re-seed to all-v1 at current N before rolling
+    var p=params(); pods=[]; for(var i=0;i<p.N;i++) pods.push({state:'v1'});
+    minAvail=avail(); rolling=true; deployBtn.disabled=true;
+    stepLab.textContent='rolling v1 → v2 …'; draw();
+    timer=setInterval(tick,650);
+  }
+  repR.addEventListener('input',function(){repV.textContent=repR.value; if(!rolling) reset();});
+  surgeR.addEventListener('input',function(){surgeV.textContent=surgeR.value; if(!rolling) draw();});
+  unavR.addEventListener('input',function(){unavV.textContent=unavR.value; if(!rolling) draw();});
+  deployBtn.addEventListener('click',deploy);
+  resetBtn.addEventListener('click',reset);
+  reset();
+})();
+</script>
+
+<!-- draft -->
+</body>
+</html>

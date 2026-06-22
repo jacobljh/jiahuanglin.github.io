@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>11 - Health &amp; Autoscaling | Kubernetes from First Principles</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; }
+  .mini-flow { display: grid; gap: 8px; margin: 18px 0; }
+  .mini-flow .step { border: 1px solid var(--border); background: var(--bg-elev); border-radius: 8px; padding: 10px 12px; }
+  .mini-flow .n { font-family: var(--mono); color: var(--accent); font-size: 12px; margin-right: 6px; }
+
+  /* widget-specific */
+  #hpa-widget .controls { margin-top: 12px; }
+  #hpa-widget .controls button { font-family: var(--mono); font-size: 12px; cursor: pointer; border: 1px solid var(--border); background: var(--bg-elev); color: var(--text); border-radius: 6px; padding: 6px 10px; margin-right: 6px; }
+  #hpa-widget .controls button:hover { border-color: var(--accent); }
+  #hpa-widget .controls button.on { border-color: var(--accent); color: var(--accent); }
+  #hpa-widget .verdict { font-family: var(--mono); font-size: 13px; margin: 8px 0 2px; }
+  #hpa-widget .verdict.smooth { color: var(--ok); }
+  #hpa-widget .verdict.thrash { color: var(--bad); }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">kubernetes</a><span class="crumb">/</span><span class="crumb">11</span><span class="step-pill">lesson 12 / 14</span></div></header>
+<main>
+
+<p class="kicker">Part V — How the cluster decides and defends</p>
+<h1>Health &amp; Autoscaling: Closing the Loop on Reality</h1>
+<p class="subtitle">Lesson 10 gave the scheduler a way to place a Pod well — filter the nodes it fits, score the survivors, bind it to the best one. But notice what the scheduler and the ReplicaSet actually know about a Pod once it lands: only that its process is <em>running</em>. Running is not the same as healthy. A process can be deadlocked, still loading a 40&nbsp;GB model, or wedged because it lost its database connection — alive by the OS's measure, useless by yours. And the replica count the scheduler so carefully placed is itself a guess: three replicas is wasteful at 3&nbsp;a.m. and far too few at the noon peak. This lesson closes both gaps the same way the whole track has closed every gap — with more control loops. Probes give the loop a truth signal beyond "process alive," and autoscaling makes the replica count, and even the node count, things that get reconciled too.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>The scheduler binds a Pod to a node and the kubelet starts its containers; the ReplicaSet (lesson 04) counts how many Pods match its selector. But both reason about <strong>liveness in the crudest sense — is the process still up?</strong> They cannot tell that a "running" Pod is deadlocked, mid-boot, or has lost its dependency, so they will happily route traffic to it and never restart it. And the replica count itself is a fixed number you typed once: it ignores that load is not constant. So we are simultaneously serving from sick Pods and paying for idle ones at night while dropping requests at peak. We need the loop to observe <em>health</em>, not just existence — and to drive the <em>count</em>, not just hold it.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> the scheduler/ReplicaSet only know a process is running, not whether it is healthy or whether the fixed replica count matches current load.<br><strong>New capability:</strong> <strong>probes</strong> (liveness, readiness, startup) give the loop a real health signal — restart the dead, pull the not-ready from Service rotation, grant grace to slow boots; and <strong>autoscaling</strong> (HPA on a metric vs target, VPA on requests, Cluster Autoscaler/Karpenter on nodes) makes the replica count and node count reconciled — three nested control loops.<br><strong>Forces next:</strong> more replicas, more teams, more reach — yet any Pod can still read any Secret and call any API; there are no boundaries.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Six moves. (1) Show why "running" is the wrong truth signal. (2) Derive the three probes — liveness, readiness, startup — and the sharp liveness-vs-readiness distinction. (3) Add restartPolicy, CrashLoopBackOff, and the PodDisruptionBudget that caps voluntary disruption. (4) Derive autoscaling: the HPA reads a metric vs a target and computes a new replica count with a worked formula. (5) Add the stabilization window and tolerance that stop thrash, then VPA and the Cluster Autoscaler as the other two nested loops. (6) Drive the widget — watch replicas track load smoothly, then crank the aggressiveness to make them flap — then failure modes, checklist, and the hand-off to security.</div>
+
+<h2>1 · "Running" is the wrong truth signal</h2>
+
+<p>Recall the engine of the whole track: observe actual state, diff it against desired, act to close the gap, repeat. Every loop is only as good as what it can <em>observe</em>. The ReplicaSet observes "how many Pods match my selector exist and are running," and that is a far cruder signal than it looks. The kubelet starts a container; if the process is up, the Pod is <span class="math">Running</span>. But a great many ways to be broken leave the process up:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Deadlocked</div><div class="v">An event loop is wedged on a lock or an infinite loop. The process exists, accepts no work, and will never recover on its own. The OS sees a healthy process.</div></div>
+  <div class="topic-card"><div class="k">Still warming up</div><div class="v">A server bound its port in 50&nbsp;ms but is still loading weights, filling a cache, or running migrations for two minutes. "Running" since second one; unable to serve until minute two.</div></div>
+  <div class="topic-card"><div class="k">Lost a dependency</div><div class="v">The app is fine but its database connection dropped, or a downstream is unreachable. It cannot serve correct responses right now, but the binary is perfectly alive.</div></div>
+  <div class="topic-card"><div class="k">Degraded, not dead</div><div class="v">A memory leak has it thrashing, latency is 50× normal, but it has not crashed. By a process-up check it is fine; by any user's measure it is broken.</div></div>
+</div>
+
+<p>Two of these want <em>different</em> reactions, and conflating them is the single most common mistake in this whole lesson. A deadlocked Pod should be <strong>killed and restarted</strong> — a fresh process is the cure. A Pod that lost its database should <em>not</em> be killed — restarting it does nothing (the DB is still down), and worse, if the DB blip hit every replica at once you would restart your entire fleet into an outage. It should instead just <strong>stop receiving traffic</strong> until it recovers. So we need not one health signal but (at least) two, asking different questions: "is this process beyond saving — restart it?" and "is this Pod able to serve <em>right now</em> — send it traffic or not?"</p>
+
+<h2>2 · The three probes: liveness, readiness, startup</h2>
+
+<p>A <strong>probe</strong> is a periodic check the kubelet runs against a container — an HTTP GET on a path, a TCP connect, or a command exec that must exit 0. Each probe has a period (e.g. every 10&nbsp;s), a timeout, a success threshold, and a failure threshold (e.g. 3 consecutive failures). Kubernetes defines three probes that ask three different questions, with three different consequences:</p>
+
+<table class="trade-table"><thead><tr><th>Probe</th><th>Question it asks</th><th>On failure</th><th>The crucial point</th></tr></thead><tbody>
+  <tr><td><strong>Liveness</strong></td><td>Is this process beyond saving?</td><td>The <em>kubelet restarts the container</em> (per restartPolicy).</td><td>For unrecoverable states only — deadlock, wedged loop. Restart is the cure.</td></tr>
+  <tr><td><strong>Readiness</strong></td><td>Can this Pod serve traffic right now?</td><td>The Pod's IP is <em>pulled from its Service's EndpointSlice</em> — no restart, no kill.</td><td>For transient/dependency states. Traffic stops; the Pod lives and can rejoin.</td></tr>
+  <tr><td><strong>Startup</strong></td><td>Has the app finished booting yet?</td><td>Nothing destructive — it just <em>holds off liveness/readiness</em> until it passes.</td><td>A grace period so a slow boot is not mistaken for a deadlock.</td></tr>
+</tbody></table>
+
+<p>Readiness is the direct payoff of lesson 06. There you saw the Service is a stable virtual IP over the live, label-selected set of Pod IPs recorded in the <strong>EndpointSlice</strong>, and that a Pod only joins that set once it is <em>Ready</em>. Readiness is exactly that gate. When a readiness probe fails, the EndpointSlice controller removes the Pod's IP, kube-proxy stops routing to it on every node, and traffic drains away — <strong>but the Pod is not killed</strong>. It keeps running, keeps being probed, and the instant readiness passes again its IP is added back. That is the right behavior for a lost dependency: quarantine, do not euthanize.</p>
+
+<p>The <strong>startup probe</strong> exists to resolve a real conflict. Suppose a model server takes 90&nbsp;s to load weights, and you also want a liveness probe that fails after 30&nbsp;s of unresponsiveness to catch deadlocks. Without a startup probe, liveness fires at 30&nbsp;s during the legitimate boot, the kubelet kills the container, it boots for 30&nbsp;s again, dies again — a boot loop you created yourself. The startup probe says "until I pass, ignore liveness and readiness entirely," with its own generous budget (e.g. 30 failures × 10&nbsp;s = 5&nbsp;minutes of grace). Once it succeeds, the fast liveness/readiness probes take over. Slow to boot, then strict — exactly what you want.</p>
+
+<div class="mini-flow">
+<div class="step"><span class="n">→</span><strong>startup probe</strong> → from container start, gets a long grace budget; liveness &amp; readiness are suppressed until it passes once.</div>
+<div class="step"><span class="n">→</span><strong>readiness probe</strong> → now runs every period; pass → IP in EndpointSlice (gets traffic); fail → IP removed (no traffic), Pod stays alive.</div>
+<div class="step"><span class="n">→</span><strong>liveness probe</strong> → also runs every period; fail past threshold → kubelet restarts the container in place.</div>
+</div>
+
+<div class="callout"><div class="label">The classic mistake</div>Putting a dependency check (e.g. "can I reach the database?") in the <strong>liveness</strong> probe. When the database has a hiccup, every replica's liveness fails at once, the kubelet restarts the entire fleet, and the restarts hammer the recovering database — you have converted a brief blip into a self-inflicted outage. Dependency checks belong in <strong>readiness</strong> (stop traffic, stay alive); liveness is only for "this specific process is wedged and a restart of <em>it alone</em> will fix it."</div>
+
+<h2>3 · restartPolicy, CrashLoopBackOff, and PodDisruptionBudget</h2>
+
+<p>When a liveness probe fails — or a container simply exits — what the kubelet does next is governed by the Pod's <strong>restartPolicy</strong>: <span class="math">Always</span> (the default for long-running servers; restart on any exit), <span class="math">OnFailure</span> (restart only on a non-zero exit — used by Jobs from lesson 09), or <span class="math">Never</span>. Crucially the restart is <em>in place</em> on the same node — the kubelet re-runs the container; it does not reschedule the Pod or change its IP.</p>
+
+<p>But a container that crashes immediately on start would, under <span class="math">Always</span>, restart in a tight loop and burn the node. So the kubelet applies <strong>exponential backoff</strong>: after each crash it waits longer before the next restart — roughly 10&nbsp;s, 20&nbsp;s, 40&nbsp;s, … doubling up to a 5&nbsp;-minute cap. A Pod stuck in this cycle shows the status <strong>CrashLoopBackOff</strong> — one of the most common things you will ever see. It does not mean Kubernetes gave up; it means "this keeps dying, so I am restarting it more slowly." The backoff is the diagnostic: read the previous container's logs (<span class="math">kubectl logs --previous</span>), because the loop is telling you the process cannot stay up.</p>
+
+<p>There is a second kind of "going away" that is not a crash at all: <strong>voluntary disruption</strong> — you draining a node for maintenance, the Cluster Autoscaler removing an under-used node, a rolling update evicting Pods. These are deliberate, and Kubernetes will gladly evict Pods to do them — which can take down too many replicas at once if it is greedy. A <strong>PodDisruptionBudget (PDB)</strong> caps that: it declares, for a label-selected set, either <span class="math">minAvailable: 4</span> or <span class="math">maxUnavailable: 1</span>. When something tries to voluntarily evict a Pod, the eviction API checks the PDB and <em>refuses</em> if it would breach the budget — so a node drain that would drop you below your floor simply blocks until enough replacement Pods are Ready elsewhere. (A PDB only governs <em>voluntary</em> disruptions; a node crashing is involuntary and no budget can stop physics.)</p>
+
+<h2>4 · Autoscaling: make the replica count reconciled</h2>
+
+<p>Probes fixed health. The other half of the gap is the count. A fixed <span class="math">replicas: 3</span> is the same anti-pattern the whole track exists to kill — a static number a human typed, pretending the world is constant. The fix is the same move once more: make the desired count itself the output of a control loop. That is the <strong>Horizontal Pod Autoscaler (HPA)</strong>. It is a controller that, every ~15&nbsp;s, reads a <em>metric</em> for the Pods, compares it to a <em>target</em> you declared, and adjusts the Deployment's replica count to bring the metric back to target. The arithmetic is one line:</p>
+
+<pre class="ascii">
+  desiredReplicas = ceil( currentReplicas × ( currentMetric / targetMetric ) )
+</pre>
+
+<p>Work it. You run a Deployment at <span class="math">currentReplicas = 4</span>, target CPU utilization <span class="math">targetMetric = 50%</span> (utilization = actual usage ÷ the <em>request</em> from lesson 10 — so the request you set is the denominator the HPA scales against). A traffic spike pushes average CPU to <span class="math">currentMetric = 90%</span>. Then:</p>
+
+<pre class="ascii">
+  desiredReplicas = ceil( 4 × (90 / 50) ) = ceil( 4 × 1.8 ) = ceil(7.2) = 8
+</pre>
+
+<p>The HPA scales 4 → 8. With twice the Pods sharing the same load, per-Pod CPU should fall back toward <span class="math">90 / 2 = 45%</span> — just under target, and the loop settles. When the spike passes and CPU drops to <span class="math">20%</span>, the same formula gives <span class="math">ceil(8 × 20/50) = ceil(3.2) = 4</span>, and it scales back down. The metric need not be CPU: the HPA also reads memory, <strong>custom</strong> metrics (requests-per-second, queue depth) via the custom-metrics API, or <strong>external</strong> metrics (a cloud queue's length). For the GenAI workloads in the sibling track, CPU is the wrong signal entirely — you scale on tokens-in-flight or KV-cache utilization, exactly the lesson the <a href="../../kubernetes_genai/lessons/index.html">GenAI-on-Kubernetes track</a> builds on top of this one.</p>
+
+<h2>5 · Stabilization, then the other two nested loops</h2>
+
+<p>Run that formula naively and you get a pathology: <strong>thrash</strong> (flapping). Load wobbles a little, the metric crosses target, the HPA scales up; the extra Pods drop the metric below target, it scales down; the load wobble pushes it over again — replicas oscillate every cycle, each change churning Pods, evicting work, and re-warming caches for no benefit. Two dampers prevent it. A <strong>tolerance</strong> (default 10%) means the HPA ignores a metric within 10% of target — no action for trivial deviations. And a <strong>stabilization window</strong> (default 300&nbsp;s for scale-<em>down</em>, 0 for scale-up) makes the HPA, when deciding to shrink, look back over the window and pick the <em>highest</em> recommendation in it — so it scales up fast (responsive to spikes) but scales down slowly (immune to brief dips). Aggressive tuning — a short or zero stabilization window, a tiny tolerance — buys faster reaction at the cost of flapping. That trade-off is exactly what the widget below lets you feel.</p>
+
+<p>The HPA reconciles the replica count, but it sits between two other loops, giving <strong>three nested control loops</strong>, each closing the gap the inner one cannot:</p>
+
+<div class="mini-flow">
+<div class="step"><span class="n">→</span><strong>Pod health</strong> (probes + kubelet) → keeps each <em>individual Pod</em> healthy: restart the dead, drain traffic from the not-ready. Inner loop, per Pod.</div>
+<div class="step"><span class="n">→</span><strong>Replica count</strong> (HPA) → keeps the <em>number of Pods</em> matched to load via the metric-vs-target formula. Middle loop, per workload.</div>
+<div class="step"><span class="n">→</span><strong>Node count</strong> (Cluster Autoscaler / Karpenter) → keeps the <em>number of nodes</em> matched to demand: when the HPA asks for Pods that cannot be scheduled, add nodes. Outer loop, per cluster.</div>
+</div>
+
+<p>That outer loop ties straight back to lesson 10. When the HPA raises replicas but the scheduler can find no node with room, those Pods sit <span class="math">Pending</span>. The <strong>Cluster Autoscaler</strong> watches for exactly that — unschedulable Pods — and provisions new nodes from a node group; when nodes later sit under-used, it drains them (subject to your PDBs from §3) and removes them. <strong>Karpenter</strong> is a newer, faster variant that provisions right-sized nodes directly rather than scaling fixed groups. Note the HPA and the Cluster Autoscaler are complementary: the HPA changes Pods, the Cluster Autoscaler changes the nodes those Pods need.</p>
+
+<p>One more autoscaler, on a different axis. The <strong>Vertical Pod Autoscaler (VPA)</strong> does not change the count — it right-sizes each Pod's <span class="math">resources.requests</span> (the value the scheduler packs against and the HPA divides by), recommending, say, that a Pod requesting 2&nbsp;CPU only ever uses 0.4 and should request less. The catch worth knowing for interviews: <strong>the VPA and HPA conflict if pointed at the same metric.</strong> If the HPA scales on CPU and the VPA also adjusts CPU requests, the VPA keeps moving the very denominator the HPA's utilization is computed against, and they fight. Run them on different signals (e.g. HPA on a custom RPS metric, VPA on memory) or not together on the same resource.</p>
+
+<h2>6 · Widget: track load smoothly, or make it flap</h2>
+
+<div class="widget" id="hpa-widget">
+  <div class="title">HPA control loop — smooth tracking vs. thrash</div>
+  <div class="hint">The blue line is incoming <strong>load</strong> (use the slider to push it, or leave "auto curve" on for a day/night wave with noise). The green line is the HPA's <strong>replica count</strong>, recomputed each tick from <span class="math">ceil(current × util / target)</span>. Drag the <strong>target utilization</strong> to move where it settles. Then flip the <strong>aggressiveness</strong> knob from <em>Stable</em> (long stabilization window, 10% tolerance) to <em>Aggressive</em> (zero window, no tolerance) and watch the green line stop tracking and start <strong>flapping</strong> — replicas churning every tick. Same load, same formula; only the dampers changed.</div>
+
+  <canvas class="dist-canvas" id="hpa-canvas" width="760" height="220" style="height:220px;"></canvas>
+
+  <div class="verdict" id="hpa-verdict">—</div>
+
+  <div class="controls">
+    <button id="hpa-mode-stable" class="on">Stable (300&nbsp;s window, 10% tol)</button>
+    <button id="hpa-mode-aggro">Aggressive (0&nbsp;s window, 0% tol)</button>
+    <button id="hpa-auto" class="on">auto curve: on</button>
+  </div>
+  <div class="controls" style="margin-top:10px;">
+    <label class="inline">manual load: <input type="range" id="hpa-load" min="10" max="100" step="1" value="50"> <span class="val" id="hpa-load-v">50</span></label>
+    <label class="inline">target util %: <input type="range" id="hpa-target" min="30" max="90" step="5" value="50"> <span class="val" id="hpa-target-v">50</span></label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">Current load</div><div class="v" id="hpa-k-load">—</div></div>
+    <div class="kpi"><div class="k">Per-Pod util %</div><div class="v" id="hpa-k-util">—</div></div>
+    <div class="kpi"><div class="k">Desired → current replicas</div><div class="v" id="hpa-k-rep">—</div></div>
+    <div class="kpi"><div class="k">Scale changes (last 30 ticks)</div><div class="v" id="hpa-k-flap">—</div></div>
+  </div>
+</div>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+<li><strong>Dependency check in the liveness probe.</strong> A DB blip fails liveness on every replica and the kubelet restarts the whole fleet, hammering the recovering dependency. <em>Signal:</em> a downstream hiccup turns into mass restarts and a far longer outage than the original blip.</li>
+<li><strong>No startup probe on a slow-booting app.</strong> A liveness probe tuned for deadlocks fires during the legitimate 90&nbsp;s model load, killing the container mid-boot, forever. <em>Signal:</em> a Pod that never reaches Ready, restart count climbing, logs cut off mid-initialization.</li>
+<li><strong>No readiness probe behind a Service.</strong> Pods join the EndpointSlice the instant they are running, before they can serve. <em>Signal:</em> a burst of 5xx right after every scale-up or rollout (the lesson-06 failure mode, here is its cause).</li>
+<li><strong>HPA scaling on CPU for an I/O- or memory-bound app.</strong> CPU stays flat while the real bottleneck saturates, so the HPA never fires. <em>Signal:</em> latency climbing and queues growing while replica count sits stubbornly still.</li>
+<li><strong>Thrash from an aggressive HPA.</strong> Tiny tolerance / short stabilization window makes replicas oscillate on noise. <em>Signal:</em> replica count sawtoothing in the dashboard, constant Pod churn, caches never staying warm.</li>
+<li><strong>HPA and VPA on the same resource.</strong> The VPA moves the request the HPA computes utilization against; they fight. <em>Signal:</em> replica count and request size both oscillating, neither converging.</li>
+<li><strong>No PodDisruptionBudget.</strong> A node drain or autoscaler scale-down evicts too many replicas at once. <em>Signal:</em> availability dips during routine maintenance even though "nothing crashed."</li>
+</ul>
+  </div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+<li><strong>Liveness = "restart fixes it" only</strong> (deadlock, wedge). Never put a dependency check here.</li>
+<li><strong>Readiness = "can serve right now"</strong>, including dependency checks — failure drains traffic without killing the Pod.</li>
+<li><strong>Add a startup probe</strong> to any app whose boot is slower than your liveness threshold; give it a generous budget.</li>
+<li><strong>Set requests honestly</strong> — they are both the scheduler's packing unit (lesson 10) and the HPA's utilization denominator.</li>
+<li><strong>Scale the HPA on the metric that actually binds</strong> (RPS, queue depth, KV-cache util), not reflexively on CPU.</li>
+<li><strong>Keep the scale-down stabilization window long</strong> (default 300&nbsp;s) so brief dips do not trigger flapping.</li>
+<li><strong>Never run HPA and VPA on the same resource</strong>; split them across different signals.</li>
+<li><strong>Define a PodDisruptionBudget</strong> for every Service-backing workload so drains and node scale-downs respect a floor.</li>
+</ul>
+  </div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>Open the widget in <em>Stable</em> mode with target 50% and watch the green replica line track the blue load wave with only a few step changes. Now switch to <em>Aggressive</em> and watch the same wave produce a flapping replica count — read the "scale changes (last 30 ticks)" KPI climb. Then, by hand: a Deployment runs at 6 replicas, target CPU 60%, and current average CPU is 80%. Compute desiredReplicas with the §4 formula and check it against the widget's behavior. Finally, name which probe you would add to a server that takes 2&nbsp;minutes to load weights but should be restarted if it deadlocks after boot — and explain in one sentence why putting its "is the database reachable?" check in the liveness probe instead of readiness would be dangerous.</div>
+
+<h2>Where this points next</h2>
+
+<p>We have closed the loop on reality: probes give the kubelet a real health signal (restart the dead via liveness, drain the not-ready via readiness, grace the slow via startup), CrashLoopBackOff and the PDB tame restart storms and greedy evictions, and three nested control loops — Pod health, replica count, node count — keep health, capacity, and infrastructure all reconciled instead of hand-set. But every loop we just built makes the cluster <em>bigger</em>: more replicas, more teams onboarding workloads, more reach. And we have been quietly assuming a friendly world. Right now <em>any</em> Pod can mount and read <em>any</em> Secret (which, recall from lesson 08, is only base64-encoded, not encrypted), call <em>any</em> verb on the powerful API server, and open a connection to <em>any</em> other Pod on the flat network from lesson 06. There are no boundaries at all. Lesson 12, <strong><a href="12_security.html">Security &amp; Multi-Tenancy: Who Can Do What, What Can Reach What</a></strong>, draws those boundaries: authentication, RBAC and ServiceAccounts on the API plane, admission control and Pod Security Standards, and NetworkPolicy turning the flat any-to-any network into default-deny segmentation.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+The scheduler and ReplicaSet only know a process is <em>running</em> — and running is not healthy, while a fixed replica count is wrong as load moves. Both gaps are closed with more control loops. <strong>Probes</strong> give the kubelet a real truth signal: <strong>liveness</strong> failure restarts the container (for unrecoverable wedges — restart is the cure), <strong>readiness</strong> failure pulls the Pod's IP from its Service's EndpointSlice so traffic drains but the Pod lives (for transient/dependency states — the direct payoff of lesson 06), and a <strong>startup</strong> probe grants slow boots grace so liveness does not kill them mid-load. restartPolicy governs restarts; repeated crashes back off exponentially into <strong>CrashLoopBackOff</strong>; a <strong>PodDisruptionBudget</strong> caps voluntary disruptions during drains and rollouts. Then <strong>autoscaling</strong> reconciles the count itself: the <strong>HPA</strong> computes <span class="math">desiredReplicas = ceil(current × currentMetric / targetMetric)</span>, with a tolerance and a (long, for scale-down) stabilization window to prevent <strong>thrash</strong>; the <strong>VPA</strong> right-sizes requests (and conflicts with the HPA on the same metric); the <strong>Cluster Autoscaler / Karpenter</strong> adds nodes when Pods can't be scheduled (lesson 10's <span class="math">Pending</span>). Three nested loops — Pod health, replica count, node count — each closing the gap the inner one can't. The classic mistake to never make: a dependency check belongs in readiness, never liveness.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Liveness vs. readiness — what is each for and what happens on failure? <em>(§2 — liveness asks "is this process beyond saving?"; failure → kubelet restarts the container. Readiness asks "can it serve right now?"; failure → Pod's IP pulled from the Service EndpointSlice, traffic drains, but the Pod is not killed. Liveness for unrecoverable wedges, readiness for transient/dependency states.)</em></li>
+  <li>Why is a dependency check in the liveness probe dangerous? <em>(§2 — a DB blip fails liveness on every replica at once, the kubelet restarts the whole fleet, and the restarts hammer the recovering dependency, converting a brief blip into a self-inflicted outage. Dependency checks belong in readiness.)</em></li>
+  <li>What problem does the startup probe solve? <em>(§2 — a liveness probe tuned to catch deadlocks would fire during a legitimate slow boot (e.g. 90&nbsp;s weight load) and kill the container in a boot loop; the startup probe suppresses liveness/readiness with a generous budget until the app finishes booting, then the strict probes take over.)</em></li>
+  <li>What is CrashLoopBackOff and what causes the backoff? <em>(§3 — a container repeatedly crashing on start under restartPolicy: Always; the kubelet applies exponential backoff (~10s, 20s, 40s … capped ~5&nbsp;min) between restarts. The status is a diagnostic that the process can't stay up — read the previous container's logs.)</em></li>
+  <li>Walk the HPA formula with numbers. <em>(§4 — desiredReplicas = ceil(currentReplicas × currentMetric / targetMetric). At 4 replicas, target 50%, current 90%: ceil(4 × 1.8) = 8; per-Pod load then halves toward 45% and settles. Utilization = usage ÷ the request you set, so the request is the denominator.)</em></li>
+  <li>What causes HPA thrash and what prevents it? <em>(§5 — naive recompute on noisy metrics oscillates the replica count. A tolerance (default 10%) ignores small deviations and a stabilization window (default 300&nbsp;s for scale-down, 0 for scale-up) makes scale-down pick the highest recent recommendation — fast up, slow down.)</em></li>
+  <li>Describe the three nested autoscaling loops and how HPA/VPA can conflict. <em>(§5 — Pod health (probes), replica count (HPA), node count (Cluster Autoscaler/Karpenter, which adds nodes when Pods are Pending). HPA and VPA conflict on the same metric because the VPA moves the request the HPA computes utilization against — split them across different signals.)</em></li>
+  <li>What does a PodDisruptionBudget protect against, and what can't it stop? <em>(§3 — it caps voluntary disruptions (drains, rollouts, autoscaler scale-down) via minAvailable/maxUnavailable, blocking evictions that would breach the floor. It cannot stop involuntary disruption like a node crashing.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="index.html"><span class="dir">Index</span><span class="ttl">Series overview</span></a>
+  <a class="next" href="12_security.html"><span class="dir">Next</span><span class="ttl">12 - Security &amp; Multi-Tenancy</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var canvas = document.getElementById('hpa-canvas');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+
+  // sliders / buttons
+  var loadR  = document.getElementById('hpa-load');
+  var targR  = document.getElementById('hpa-target');
+  var loadV  = document.getElementById('hpa-load-v');
+  var targV  = document.getElementById('hpa-target-v');
+  var bStable= document.getElementById('hpa-mode-stable');
+  var bAggro = document.getElementById('hpa-mode-aggro');
+  var bAuto  = document.getElementById('hpa-auto');
+  var verdict= document.getElementById('hpa-verdict');
+  var kLoad  = document.getElementById('hpa-k-load');
+  var kUtil  = document.getElementById('hpa-k-util');
+  var kRep   = document.getElementById('hpa-k-rep');
+  var kFlap  = document.getElementById('hpa-k-flap');
+
+  // model state
+  var MINR = 1, MAXR = 20;
+  var replicas = 4;                 // current replica count
+  var aggressive = false;           // damper mode
+  var auto = true;                  // auto load curve on
+  var t = 0;                        // tick counter (for the curve)
+  // per-replica "capacity" in load units at 100% util: each replica handles ~14 load units fully
+  var CAP_PER_REPLICA = 14;
+  // stabilization memory for scale-down: remember recent desired values
+  var WINDOW = 20;                  // ticks ~ stand-in for 300s window (each tick ~15s)
+  var recentDesired = [];
+  // histories for plotting
+  var loadHist = [], repHist = [];
+  var HIST = 80;
+  // flap tracking: count replica changes in last 30 ticks
+  var changeHist = [];
+
+  function curLoad(){
+    if (auto){
+      // day/night sine wave (period ~ 60 ticks) + noise, scaled 10..100
+      var base = 55 + 38 * Math.sin(t * 2 * Math.PI / 60);
+      var noise = (Math.random() - 0.5) * 16;
+      var L = base + noise;
+      return Math.max(10, Math.min(100, L));
+    }
+    return parseInt(loadR.value, 10);
+  }
+
+  function step(){
+    t++;
+    var target = parseInt(targR.value, 10);     // target util %
+    var load = curLoad();
+
+    // current per-pod utilization: load spread over replicas' capacity
+    var util = (load / (replicas * CAP_PER_REPLICA)) * 100;
+
+    // HPA formula: desired = ceil(current * util/target)
+    var raw = replicas * (util / target);
+    var desired = Math.ceil(raw - 1e-9);
+
+    // tolerance: stable mode ignores within 10% of target
+    var ratio = util / target;
+    var tol = aggressive ? 0 : 0.10;
+    if (Math.abs(ratio - 1) <= tol) desired = replicas;   // no action inside tolerance
+    desired = Math.max(MINR, Math.min(MAXR, desired));
+
+    // stabilization window: stable mode, when scaling DOWN, takes the max desired
+    // over the recent window (so brief dips don't shrink the fleet); scale-up is immediate.
+    recentDesired.push(desired);
+    if (recentDesired.length > WINDOW) recentDesired.shift();
+    var applied = desired;
+    if (!aggressive && desired < replicas){
+      var maxRecent = recentDesired[0];
+      for (var i=1;i<recentDesired.length;i++) if (recentDesired[i] > maxRecent) maxRecent = recentDesired[i];
+      applied = Math.max(desired, Math.min(replicas, maxRecent));
+    }
+
+    var changed = (applied !== replicas) ? 1 : 0;
+    replicas = applied;
+
+    // record histories
+    loadHist.push(load); if (loadHist.length > HIST) loadHist.shift();
+    repHist.push(replicas); if (repHist.length > HIST) repHist.shift();
+    changeHist.push(changed); if (changeHist.length > 30) changeHist.shift();
+
+    // KPIs
+    var flaps = 0; for (var j=0;j<changeHist.length;j++) flaps += changeHist[j];
+    kLoad.textContent = load.toFixed(0) + ' / 100';
+    kUtil.textContent = util.toFixed(0) + '%  (target ' + target + '%)';
+    kRep.textContent  = desired + ' → ' + replicas + ' pods';
+    kFlap.textContent = flaps + ' changes';
+
+    if (aggressive && flaps >= 10){
+      verdict.className = 'verdict thrash';
+      verdict.textContent = 'THRASH — replicas flapping; no window/tolerance to damp noise';
+    } else if (!aggressive){
+      verdict.className = 'verdict smooth';
+      verdict.textContent = 'SMOOTH — stabilization window + tolerance absorb the wobble';
+    } else {
+      verdict.className = 'verdict';
+      verdict.textContent = 'aggressive mode — watch the change counter climb';
+    }
+
+    draw();
+  }
+
+  function draw(){
+    var dpr = window.devicePixelRatio || 1;
+    var W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== Math.round(W*dpr)){ canvas.width = Math.round(W*dpr); canvas.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    var padL = 36, padR = 44, padT = 14, padB = 18;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+
+    // axes
+    ctx.strokeStyle = '#94a3b8'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT+plotH); ctx.lineTo(padL+plotW, padT+plotH); ctx.stroke();
+
+    ctx.fillStyle = '#5b6573'; ctx.font = '10px monospace';
+    ctx.fillText('load',  4, padT + 8);
+    ctx.fillText('reps', padL+plotW+6, padT + 8);
+    ctx.fillText('0', 26, padT+plotH);
+
+    var n = loadHist.length;
+    if (n < 2) return;
+
+    function lx(i){ return padL + (i/(HIST-1)) * plotW; }
+    function lyLoad(v){ return padT + plotH - (v/100) * plotH; }
+    function lyRep(v){ return padT + plotH - (v/MAXR) * plotH; }
+
+    // load line (blue)
+    ctx.strokeStyle = '#3b82f6'; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (var i=0;i<n;i++){ var x=lx(i), y=lyLoad(loadHist[i]); if(i===0)ctx.moveTo(x,y); else ctx.lineTo(x,y); }
+    ctx.stroke();
+
+    // replica step line (green)
+    ctx.strokeStyle = '#16a34a'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (var k=0;k<n;k++){
+      var xx=lx(k), yy=lyRep(repHist[k]);
+      if(k===0){ ctx.moveTo(xx,yy); }
+      else { ctx.lineTo(lx(k), lyRep(repHist[k-1])); ctx.lineTo(xx,yy); } // stepped
+    }
+    ctx.stroke();
+
+    // current replica label
+    ctx.fillStyle = '#16a34a'; ctx.font = 'bold 12px monospace';
+    ctx.fillText(replicas + ' rep', padL+plotW+6, lyRep(repHist[n-1]) + 4);
+  }
+
+  // wiring
+  function setMode(aggr){
+    aggressive = aggr;
+    bAggro.classList.toggle('on', aggr);
+    bStable.classList.toggle('on', !aggr);
+  }
+  bStable.addEventListener('click', function(){ setMode(false); });
+  bAggro.addEventListener('click', function(){ setMode(true); });
+  bAuto.addEventListener('click', function(){
+    auto = !auto;
+    bAuto.classList.toggle('on', auto);
+    bAuto.textContent = 'auto curve: ' + (auto ? 'on' : 'off');
+  });
+  loadR.addEventListener('input', function(){ loadV.textContent = loadR.value; });
+  targR.addEventListener('input', function(){ targV.textContent = targR.value; });
+
+  // seed history flat, then run the loop
+  for (var s=0;s<HIST;s++){ loadHist.push(50); repHist.push(replicas); }
+  setInterval(step, 350);
+  draw();
+})();
+</script>
+
+<!-- draft -->
+</body>
+</html>

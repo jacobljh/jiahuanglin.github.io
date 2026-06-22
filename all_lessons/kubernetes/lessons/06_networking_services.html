@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>06 - Networking &amp; Services | Kubernetes from First Principles</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; }
+  .mini-flow { display: grid; gap: 8px; margin: 18px 0; }
+  .mini-flow .step { border: 1px solid var(--border); background: var(--bg-elev); border-radius: 8px; padding: 10px 12px; }
+  .mini-flow .n { font-family: var(--mono); color: var(--accent); font-size: 12px; margin-right: 6px; }
+
+  /* widget-specific */
+  #svc-widget .vip-box { border: 2px solid var(--accent); border-radius: 8px; padding: 10px 14px; margin: 10px 0; background: var(--bg-elev); }
+  #svc-widget .vip-box .vip-ip { font-family: var(--mono); font-size: 18px; color: var(--accent); }
+  #svc-widget .ep-grid { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+  #svc-widget .ep { font-family: var(--mono); font-size: 12px; border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; background: var(--bg-elev); transition: background .15s, border-color .15s; }
+  #svc-widget .ep.live { border-color: var(--ok); }
+  #svc-widget .ep.dead { opacity: 0.4; border-color: var(--bad); text-decoration: line-through; }
+  #svc-widget .ep.hit { background: var(--accent); color: #0b0f14; border-color: var(--accent); }
+  #svc-widget .controls button { font-family: var(--mono); font-size: 12px; cursor: pointer; border: 1px solid var(--border); background: var(--bg-elev); color: var(--text); border-radius: 6px; padding: 6px 10px; margin-right: 6px; }
+  #svc-widget .controls button:hover { border-color: var(--accent); }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">kubernetes</a><span class="crumb">/</span><span class="crumb">06</span><span class="step-pill">lesson 7 / 14</span></div></header>
+<main>
+
+<p class="kicker">Part III — Reaching the workload</p>
+<h1>Networking &amp; Services: Flat IPs and a Stable Front</h1>
+<p class="subtitle">Lesson 05 made change safe: a Deployment ships v2 by spinning up a new ReplicaSet and shifting replicas across under a rolling strategy, so capacity never dips below your floor and a bad release rolls back in one command. But that safety has a cost we waved past — every rollout, scale event, and crash <em>replaces</em> Pods, and a fresh Pod gets a fresh IP. The IP a client connected to a minute ago now belongs to nothing. Worse, two Pods on two different machines have no agreed way to even find each other. This lesson builds the two layers that make a Pod reachable despite all that churn: a flat network where every Pod is routable, and a stable virtual front that hides the moving set behind one address.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>A Deployment's whole job is to keep replacing Pods — that is how a rolling update, a self-heal, or a scale-down works. So a Pod IP is <strong>ephemeral</strong>: it lives and dies with that one Pod and can never be the thing a caller holds. Point a client at <span class="math">10.1.4.7</span> and the next roll leaves it talking to an address that points to no process. And before we even get to "which IP," there is a deeper gap: a Pod on node A and a Pod on node B share no network — the Docker-era reflex of mapping container port 8080 to host port 8080 does not compose (who gets host 8080 when ten Pods want it?), and NAT between nodes makes addresses lie. We need both a way for any Pod to reach any Pod, and a way for a client to reach a service without ever naming a Pod.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> rolling Deployments make Pod IPs ephemeral, so no client can hold one; and Pods on different nodes have no shared, composable network.<br><strong>New capability:</strong> a flat cluster network (every Pod gets a routable IP, any-to-any with no NAT, implemented by a CNI plugin) plus the Service — a stable virtual IP that load-balances across the live, label-selected set of Pod IPs, programmed into every node by kube-proxy.<br><strong>Forces next:</strong> a ClusterIP is stable but still an opaque number you would hardcode, and external users need one named, L7, TLS-terminating door — not a cloud load balancer per Service.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Five moves. (1) State the two networking problems rolling Pods leave behind. (2) Derive the Kubernetes network model — one routable IP per Pod, no NAT — and how a CNI plugin makes it real (overlay vs routed). (3) Derive the Service: a stable ClusterIP backed by the label-selected EndpointSlice, with kube-proxy doing the packet rewriting on every node. (4) The four Service types — ClusterIP, NodePort, LoadBalancer, headless — and when each fits. (5) Drive the widget: watch the VIP stay constant while endpoints churn, then failure modes, checklist, and the hand-off to DNS and Ingress.</div>
+
+<h2>1 · The two problems rolling Pods leave behind</h2>
+
+<p>Lesson 05 gave us safe change, but change <em>is</em> replacement. Picture a 3-replica Deployment behind nothing. The Pods get IPs <span class="math">10.1.4.7</span>, <span class="math">10.1.5.2</span>, <span class="math">10.1.6.9</span>. A client caches one. You ship v2: the rolling update deletes those three Pods and creates three new ones, which land on whatever nodes have room and get whatever IPs the network hands out — say <span class="math">10.1.4.11</span>, <span class="math">10.1.5.8</span>, <span class="math">10.1.7.3</span>. The client's cached address now routes to a Pod that no longer exists. This is not an edge case; it is the <em>normal operation</em> of every primitive we have built. A Pod IP is a fact about one mortal Pod, never a contract.</p>
+
+<p>The second problem is more primitive and easy to miss because Docker hid it. On a single Docker host you reach a container by mapping its port onto a host port: <span class="math">-p 8080:8080</span>. That trick does not survive a cluster. There is exactly one host port 8080 per node, so ten Pods that all want it cannot coexist; and if Pod A on node-1 wants to call Pod B on node-2, host-port mapping plus NAT (network address translation — rewriting source/destination addresses at a boundary) means B sees the connection coming from <em>node-1's</em> address, not A's. Identities get smeared, return paths break, and policy can't tell who is really calling whom. Host port-mapping does not <strong>compose</strong>. We need a model where addresses are honest and abundant.</p>
+
+<h2>2 · The Kubernetes network model: a flat, routable fabric</h2>
+
+<p>Kubernetes refuses the host-port mess by stating three rules every conforming cluster must satisfy. They are deliberately strong:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">One IP per Pod</div><div class="v">Every Pod gets its <em>own</em> cluster-routable IP address — not a shared host IP with port juggling. All containers in the Pod share that one IP (recall lesson 02: a Pod is one network namespace), and talk to each other over <span class="math">localhost</span>.</div></div>
+  <div class="topic-card"><div class="k">Any Pod reaches any Pod</div><div class="v">A Pod on any node can open a connection to a Pod on any other node using that Pod's IP directly — across the whole cluster, flat, no gateways to hop.</div></div>
+  <div class="topic-card"><div class="k">No NAT between Pods</div><div class="v">The destination sees the <em>real</em> source Pod IP, not a node's rewritten address. The address a Pod sends from is the address its peer sees. Identity is preserved end to end.</div></div>
+  <div class="topic-card"><div class="k">Pods see their own IP</div><div class="v">A Pod's view of its own address matches what others use to reach it. No surprises from a hidden translation layer — what you bind is what peers dial.</div></div>
+</div>
+
+<p>This is the <strong>flat network</strong>: conceptually one giant L3 (layer-3, IP-routing) space where Pod IPs are first-class and globally meaningful inside the cluster. Kubernetes itself does not implement this — it specifies it, then delegates to a <strong>CNI plugin</strong> (Container Network Interface — the pluggable contract the kubelet calls when a Pod is created, to attach it to the network and hand it an IP). Picking a CNI plugin (Calico, Cilium, Flannel, the cloud's own) is how a cluster meets the model, and there are two broad strategies:</p>
+
+<table class="trade-table"><thead><tr><th>Strategy</th><th>How a packet crosses nodes</th><th>Trade-off</th></tr></thead><tbody>
+  <tr><td><strong>Overlay</strong> (e.g. VXLAN)</td><td>The source node wraps the Pod-to-Pod packet inside an outer packet addressed node-to-node (encapsulation), ships it over whatever underlying network exists, and the destination node unwraps it.</td><td>Works on any network with no router changes — easy, portable. Costs a little per-packet overhead and a few bytes of MTU for the wrapper.</td></tr>
+  <tr><td><strong>Routed</strong> (e.g. BGP)</td><td>No wrapping. The network is taught real routes to each node's Pod IP range (often by advertising them with BGP), so Pod IPs are natively routable.</td><td>Native speed, real IPs on the wire, easier to debug. Needs control of the underlying routers/fabric — harder in arbitrary environments.</td></tr>
+</tbody></table>
+
+<p>Either way, the result the rest of Kubernetes assumes is identical: a Pod IP you can dial from anywhere in the cluster with no NAT. That solves "Pods on different nodes can talk." It does <em>not</em> solve "the IP keeps changing." For that we need a stable thing in front of the moving set.</p>
+
+<h2>3 · The Service: a stable VIP over a live endpoint set</h2>
+
+<p>A <strong>Service</strong> is a named, stable address for a <em>set</em> of Pods, decoupled from any individual Pod's life. You define it with the exact tool from lesson 04 — a <strong>label selector</strong>. The Service says "I front every Pod matching <span class="math">app=web</span>," and Kubernetes maintains the rest. Three objects cooperate:</p>
+
+<div class="mini-flow">
+<div class="step"><span class="n">→</span><strong>Service</strong> → you create it with a selector (<span class="math">app=web</span>) and a port. Kubernetes assigns it a <strong>ClusterIP</strong> — a stable virtual IP from a reserved range (e.g. <span class="math">10.96.0.0/12</span>) that lasts the Service's whole life, immune to Pod churn.</div>
+<div class="step"><span class="n">→</span><strong>EndpointSlice</strong> → a controller continuously watches which Pods match the selector <em>and are Ready</em>, and writes their real Pod IPs into one or more EndpointSlice objects. This is the live membership list: scale up, an IP is added; a Pod dies or goes un-Ready, its IP is removed.</div>
+<div class="step"><span class="n">→</span><strong>kube-proxy</strong> → an agent on every node that watches Services and EndpointSlices and programs the node's kernel so that any packet sent to the ClusterIP is rewritten to one of the live endpoint Pod IPs, load-balanced across them.</div>
+</div>
+
+<p>The crucial, counter-intuitive fact: <strong>the ClusterIP is virtual — no process anywhere listens on it.</strong> There is no box at <span class="math">10.96.0.10</span>. When a Pod sends a packet to the ClusterIP, kube-proxy's rules (installed in the kernel's packet path) catch it and <em>rewrite the destination</em> to a randomly-or-round-robin-chosen live endpoint, e.g. <span class="math">10.1.5.8:8080</span>. The Service is a load-balancing rule baked into every node, not a server. That is why it has zero startup cost and no single point to crash: it is the same kernel doing the routing the packet was already going through.</p>
+
+<pre class="ascii">
+  client Pod                Service (virtual)            live endpoints (EndpointSlice)
+  10.1.9.4  ── dial ──►  ClusterIP 10.96.0.10  ──►   10.1.4.11:8080   (Ready)
+                          (no process here;            10.1.5.8 :8080   (Ready)
+                           kube-proxy rewrites          10.1.7.3 :8080   (Ready)
+                           dest to a live Pod)          10.1.6.2 :8080   (NotReady — excluded)
+
+  Pods come and go below; ClusterIP 10.96.0.10 never changes.
+</pre>
+
+<p>kube-proxy has two common backends. <strong>iptables</strong> mode installs Linux netfilter rules — simple and ubiquitous, but rule evaluation is roughly linear, so very large Services (thousands of endpoints) get slow to update. <strong>IPVS</strong> mode uses the kernel's in-built load balancer with hash-table lookups — near-constant time and real LB algorithms (round-robin, least-conn), better at large scale. Both achieve the same contract; IPVS just scales the data path further.</p>
+
+<h2>4 · The four Service types — internal to external</h2>
+
+<p>Every Service is, underneath, a ClusterIP. The types layer reachability outward from there:</p>
+
+<table class="trade-table"><thead><tr><th>Type</th><th>What it exposes</th><th>Reach</th><th>Use when</th></tr></thead><tbody>
+  <tr><td><strong>ClusterIP</strong> (default)</td><td>One stable virtual IP, in-cluster only.</td><td>Pod → Pod inside the cluster.</td><td>Service-to-service traffic. The other types build on it.</td></tr>
+  <tr><td><strong>NodePort</strong></td><td>The same ClusterIP, plus a fixed port (e.g. <span class="math">30000–32767</span>) opened on <em>every</em> node's IP.</td><td>Anything that can reach a node IP:port.</td><td>Quick external access, on-prem, or as the target a real load balancer points at.</td></tr>
+  <tr><td><strong>LoadBalancer</strong></td><td>A NodePort plus a cloud LB the cloud-controller provisions, with one external IP fronting the nodes.</td><td>The public internet, one external IP per Service.</td><td>Exposing a Service externally on a cloud. Costs one cloud LB <em>each</em> — the pain that motivates lesson 07.</td></tr>
+  <tr><td><strong>Headless</strong> (<span class="math">clusterIP: None</span>)</td><td>No VIP at all; DNS returns the Pod IPs directly, one record per Ready endpoint.</td><td>Client picks/addresses individual Pods.</td><td>Stateful sets and clients that must reach a <em>specific</em> Pod (e.g. a database replica) — covered in lesson 09.</td></tr>
+</tbody></table>
+
+<p>Notice the headless case turns the load balancer <em>off</em> on purpose: when each Pod has a distinct identity (a primary database vs. a replica), you do not want a VIP scrambling you to a random one — you want to address <span class="math">db-0</span> by name. Everything else (ClusterIP, NodePort, LoadBalancer) shares the same VIP-over-EndpointSlice machinery from §3; only the outer edge differs. And note one tie-back to lesson 11: a Pod only joins the EndpointSlice once its <em>readiness probe</em> passes — readiness is precisely the signal that gates Service membership, which is why a still-warming Pod does not get traffic.</p>
+
+<h2>5 · Widget: the VIP stays put while endpoints churn</h2>
+
+<div class="widget" id="svc-widget">
+  <div class="title">Service VIP → live EndpointSlice</div>
+  <div class="hint">The ClusterIP box is fixed — it is the address a client holds forever. Scale Pods up/down or kill one, and watch the <strong>EndpointSlice</strong> (the live membership) change underneath while the VIP never moves. Hit "Send 8 requests" to watch kube-proxy round-robin across only the <em>live</em> endpoints; a killed Pod drops out of rotation immediately. This is exactly why a client can hold the VIP through any rollout.</div>
+
+  <div class="vip-box">
+    <div>Service <strong>web</strong> &nbsp; selector <span class="math">app=web</span></div>
+    <div>ClusterIP <span class="vip-ip" id="svc-vip">10.96.0.10</span> : 80 &nbsp; <span style="color:var(--text-mute);font-size:12px;">(virtual — no process listens here)</span></div>
+  </div>
+
+  <div style="font-size:12px;color:var(--text-mute);font-family:var(--mono);">EndpointSlice (live, Ready Pods only):</div>
+  <div class="ep-grid" id="svc-eps"></div>
+
+  <div class="controls" style="margin-top: 10px;">
+    <button id="svc-add">+ scale up</button>
+    <button id="svc-remove">− scale down</button>
+    <button id="svc-kill">kill a random Pod</button>
+    <button id="svc-send">Send 8 requests</button>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">ClusterIP (constant)</div><div class="v" id="svc-k-vip">10.96.0.10</div></div>
+    <div class="kpi"><div class="k">Live endpoints</div><div class="v" id="svc-k-live">—</div></div>
+    <div class="kpi"><div class="k">Last request landed on</div><div class="v" id="svc-k-last">—</div></div>
+    <div class="kpi"><div class="k">Dropped (dead Pod)</div><div class="v" id="svc-k-drop">0</div></div>
+  </div>
+</div>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+<li><strong>Hardcoding a Pod IP.</strong> Caching <span class="math">10.1.4.7</span> in a client or config. The next rollout replaces that Pod and the address points to nothing. <em>Signal:</em> connections that worked yesterday now time out right after a deploy or scale event.</li>
+<li><strong>Selector / label mismatch.</strong> The Service selector is <span class="math">app=web</span> but the Pods are labeled <span class="math">app=webserver</span>. The EndpointSlice is empty, the VIP exists but routes to no one. <em>Signal:</em> the Service has a ClusterIP but every request gets "connection refused"; <span class="math">kubectl get endpointslices</span> shows zero addresses.</li>
+<li><strong>No readiness probe (or a lying one).</strong> Pods join the EndpointSlice the instant they are "running," before they can actually serve. <em>Signal:</em> a burst of 5xx right after each scale-up, traffic hitting a Pod whose app is still booting.</li>
+<li><strong>LoadBalancer per Service.</strong> Giving every microservice <span class="math">type: LoadBalancer</span> — each provisions its own cloud LB and external IP. <em>Signal:</em> a surprising cloud bill and a sprawl of public IPs; this is the exact pain lesson 07 fixes.</li>
+<li><strong>Expecting something to listen on the ClusterIP.</strong> Trying to ping or bind the VIP, debugging "why is nothing on 10.96.0.10." <em>Signal:</em> ping fails yet curl works — because the VIP is a rewrite rule, not a host.</li>
+</ul>
+  </div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+<li><strong>Talk to Services, never to Pod IPs</strong> — let the VIP absorb all Pod churn.</li>
+<li><strong>Verify the selector matches the Pod labels</strong> and that <span class="math">kubectl get endpointslices</span> lists the IPs you expect.</li>
+<li><strong>Define a readiness probe</strong> on every Pod that backs a Service, so only serving Pods enter rotation (deep dive in lesson 11).</li>
+<li><strong>Default to ClusterIP</strong>; reach for NodePort/LoadBalancer only at the real edge, and prefer one shared edge (lesson 07) over a LoadBalancer per Service.</li>
+<li><strong>Use headless</strong> only when clients must address individual, identity-bearing Pods (StatefulSets, lesson 09).</li>
+<li><strong>Pick a CNI plugin</strong> that meets the flat-network model and matches your environment (overlay for portability, routed/BGP for native performance).</li>
+</ul>
+  </div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>Open the widget with 4 live Pods. Send 8 requests and note the round-robin spread (each live Pod should take roughly 2). Now kill one Pod and immediately send 8 more — confirm (a) the ClusterIP in the KPI never changed, (b) the killed Pod takes zero requests, and (c) the other three now split the 8. Then scale down to 0 endpoints and send a request: what happens, and what does that tell you about a Service whose selector matches no Ready Pods? Finally, in words: explain why a client that held the ClusterIP through all of this never had to change anything, while a client holding a Pod IP would have broken at the first kill.</div>
+
+<h2>Where this points next</h2>
+
+<p>The Service fixed the churn problem: a stable VIP over a live, self-healing endpoint set, with no NAT thanks to the flat network beneath it. But it left two new gaps. First, a ClusterIP like <span class="math">10.96.0.10</span> is stable yet still an <em>opaque number</em> — hardcoding it is only marginally better than hardcoding a Pod IP, and it does not survive recreating the Service. Workloads should discover each other by <em>name</em>. Second, the only built-in way to expose many Services to the outside world is a LoadBalancer per Service — one cloud LB, one external IP, one bill, each — with no shared hostname, path routing, or TLS termination. External users need a single, named, L7 front door. Lesson 07, <strong><a href="07_dns_ingress.html">DNS, Ingress &amp; the Front Door</a></strong>, gives Services names with CoreDNS and puts one L7 reverse proxy at the edge (Ingress / the Gateway API) so many Services share one external entry point with host/path routing and TLS.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+Rolling Deployments make Pod IPs ephemeral, so a client can never hold one; and Pods on different nodes have no composable shared network. Kubernetes answers in two layers. The <strong>network model</strong> demands every Pod get its own cluster-routable IP and that any Pod reach any Pod with no NAT — a flat fabric the <strong>CNI plugin</strong> implements via an overlay (VXLAN, encapsulate node-to-node) or a routed approach (BGP, native routes). On top of that, the <strong>Service</strong> gives a stable virtual IP — the <strong>ClusterIP</strong> — over the live, label-selected set of Pod IPs recorded in the <strong>EndpointSlice</strong>, and <strong>kube-proxy</strong> programs every node's kernel (iptables or IPVS) to rewrite a packet sent to the VIP onto a live endpoint. The VIP is virtual: no process listens on it; it is a load-balancing rule, which is why it is stable and free. Types layer outward — ClusterIP (internal), NodePort (per-node port), LoadBalancer (a cloud LB each, the cost that forces lesson 07), and headless (DNS straight to Pods). The selector is the same label query from lesson 04, and readiness (lesson 11) gates membership — so the moving set churns underneath while the one address out front never moves.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why can't a client just connect to a Pod IP? <em>(§1 — Pod IPs are ephemeral; rolling updates, self-heal, and scaling all replace Pods and reassign IPs, so a held Pod IP routes to nothing after the next change.)</em></li>
+  <li>State the Kubernetes network model in one breath. <em>(§2 — every Pod gets its own cluster-routable IP; any Pod can reach any Pod by that IP with no NAT; a Pod sees the same IP others use for it. Kubernetes specifies it; a CNI plugin implements it.)</em></li>
+  <li>Overlay vs. routed CNI — what's the trade-off? <em>(§2 — overlay (VXLAN) encapsulates Pod packets node-to-node so it works on any network but adds per-packet/MTU overhead; routed (BGP) advertises real routes for native speed and real on-wire IPs but needs control of the underlying fabric.)</em></li>
+  <li>What is a ClusterIP and what actually listens on it? <em>(§3 — a stable virtual IP for a Service; nothing listens on it. kube-proxy installs kernel rules on every node that rewrite a packet destined for the VIP onto a live endpoint Pod IP — it is a load-balancing rule, not a server.)</em></li>
+  <li>How does a Service know which Pods to send to, and what keeps it current? <em>(§3 — a label selector (same model as lesson 04) plus the EndpointSlice controller, which continuously writes the IPs of matching, Ready Pods; un-Ready or deleted Pods drop out so the VIP only fans out to live endpoints.)</em></li>
+  <li>Name the four Service types and when each fits. <em>(§4 — ClusterIP for internal traffic; NodePort opens a fixed port on every node; LoadBalancer provisions a cloud LB + external IP (one per Service — costly); headless (clusterIP: None) returns Pod IPs via DNS for addressing individual identity-bearing Pods.)</em></li>
+  <li>iptables vs. IPVS kube-proxy mode — why does it matter at scale? <em>(§3 — iptables evaluates netfilter rules roughly linearly, so large Services get slow to update; IPVS uses the kernel LB with hash-table lookups (near-constant time, real LB algorithms), scaling the data path to thousands of endpoints.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="index.html"><span class="dir">Index</span><span class="ttl">Series overview</span></a>
+  <a class="next" href="07_dns_ingress.html"><span class="dir">Next</span><span class="ttl">07 - DNS, Ingress &amp; the Front Door</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var root = document.getElementById('svc-widget');
+  if (!root) return;
+
+  var VIP = '10.96.0.10';
+  var nextId = 0;
+  var pods = [];      // { id, ip, alive }
+  var dropped = 0;
+  var rr = 0;         // round-robin cursor
+
+  var epWrap = document.getElementById('svc-eps');
+  var kLive  = document.getElementById('svc-k-live');
+  var kLast  = document.getElementById('svc-k-last');
+  var kDrop  = document.getElementById('svc-k-drop');
+
+  function mkIp(){ return '10.1.' + (4 + (nextId % 6)) + '.' + (3 + nextId * 5 % 250); }
+
+  function addPod(){
+    var id = nextId++;
+    pods.push({ id: id, name: 'web-' + id, ip: mkIp(), alive: true });
+    render();
+  }
+  function removePod(){
+    if (!pods.length) return;
+    pods.pop();
+    render();
+  }
+  function killPod(){
+    var live = pods.filter(function(p){ return p.alive; });
+    if (!live.length) return;
+    var victim = live[Math.floor(Math.random() * live.length)];
+    victim.alive = false;
+    render();
+    // a dead Pod is shown crossed-out briefly, then the controller removes it
+    setTimeout(function(){
+      pods = pods.filter(function(p){ return p.id !== victim.id; });
+      render();
+    }, 1100);
+  }
+  function liveEndpoints(){ return pods.filter(function(p){ return p.alive; }); }
+
+  function render(highlightIp){
+    epWrap.innerHTML = '';
+    if (!pods.length){
+      var none = document.createElement('div');
+      none.className = 'ep';
+      none.style.opacity = '0.6';
+      none.textContent = '(empty — VIP routes to no one)';
+      epWrap.appendChild(none);
+    }
+    pods.forEach(function(p){
+      var d = document.createElement('div');
+      d.className = 'ep ' + (p.alive ? 'live' : 'dead');
+      if (highlightIp && p.ip === highlightIp && p.alive) d.className += ' hit';
+      d.textContent = p.name + '  ' + p.ip + ':80';
+      epWrap.appendChild(d);
+    });
+    kLive.textContent = liveEndpoints().length + ' Pods';
+    kDrop.textContent = dropped;
+  }
+
+  function sendRequests(){
+    var live = liveEndpoints();
+    if (!live.length){
+      kLast.textContent = 'no endpoints — refused';
+      return;
+    }
+    var i = 0;
+    var counts = {};
+    var timer = setInterval(function(){
+      if (i >= 8){ clearInterval(timer); render(); return; }
+      var target = live[rr % live.length];
+      rr++;
+      // if the target died mid-batch it would be dropped; here all are live
+      counts[target.ip] = (counts[target.ip] || 0) + 1;
+      kLast.textContent = target.name + ' (' + target.ip + ')';
+      render(target.ip);
+      i++;
+    }, 180);
+  }
+
+  document.getElementById('svc-add').addEventListener('click', addPod);
+  document.getElementById('svc-remove').addEventListener('click', removePod);
+  document.getElementById('svc-kill').addEventListener('click', killPod);
+  document.getElementById('svc-send').addEventListener('click', sendRequests);
+
+  // start with 4 Pods; VIP is fixed forever
+  addPod(); addPod(); addPod(); addPod();
+})();
+</script>
+
+<!-- draft -->
+</body>
+</html>
