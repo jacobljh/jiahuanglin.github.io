@@ -33,7 +33,7 @@
 <h1>Model parallelism — tensor, pipeline, the 3D mesh</h1>
 <p class="subtitle">Lesson 08 sharded the <em>storage</em>: ZeRO-3 / FSDP cut the 16-bytes/param training state by the data-parallel degree, so a 7B that overflowed one 80 GB GPU now fits across eight. But every FSDP rank still <em>executes the whole model</em> on its own slice of the batch — it gathers each layer's params just-in-time, runs the full forward, then frees them. That breaks the moment a single layer is too big to compute on one device, the activations for one layer overflow, or the model is simply larger than any GPU even after gathering. Data parallelism can shrink where weights <em>live</em>; it can never split where the math <em>runs</em>. This lesson splits the model itself.</p>
 
-<div class="callout source-note"><div class="label">The previous step left this broken</div>FSDP's trick is "shard the parameters, but gather each layer back to full size right before you compute it." That gather is the catch: at the instant of the matmul, one rank holds the <em>entire</em> layer and runs the <em>entire</em> forward for its batch shard. So the peak compute footprint of a single layer — its full weight matrix plus its activations for B·T tokens — must still fit on one device. A 70B's individual MLP weight (≈8d² ≈ 8·8192² ≈ 537M params, ~1 GB in bf16) is fine; but push d, the batch, or the context far enough and one layer's transient footprint alone overflows the 80 GB HBM, and FSDP has no answer because it never splits the computation, only the resident bytes between computations. You need to cut the matmul across devices, and cut the layer stack across devices.</div>
+<div class="callout source-note"><div class="label">The previous step left this broken</div>FSDP's trick is "shard the parameters, but gather each layer back to full size right before you compute it." That gather is the catch: at the instant of the matmul, one rank holds the <em>entire</em> layer and runs the <em>entire</em> forward for its batch shard. So the peak compute footprint of a single layer — its full weight matrix plus its activations for B·T tokens — must still fit on one device. A 70B's SwiGLU MLP block (3 matrices, intermediate ≈3.5d → ≈705M params, ~1.4 GB in bf16) is fine; but push d, the batch, or the context far enough and one layer's transient footprint alone overflows the 80 GB HBM, and FSDP has no answer because it never splits the computation, only the resident bytes between computations. You need to cut the matmul across devices, and cut the layer stack across devices.</div>
 
 <div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> the per-layer compute and activations exceed one device, and the model can be larger than any single GPU — DP/FSDP shard storage but never split the computation itself.<br><strong>New idea:</strong> split the model along two axes — <strong>tensor parallelism</strong> (cut each matmul across GPUs; one all-reduce per attention/MLP block per forward and per backward; so bandwidth-hungry it must stay <em>inside</em> a node on NVLink) and <strong>pipeline parallelism</strong> (cut the layer stack into stages across nodes; feed micro-batches with a 1F1B schedule to shrink the idle bubble), plus <strong>sequence/context parallelism</strong> (cut along T with ring attention for long context) — composed with DP into a <strong>3D mesh</strong> DP × TP × PP.<br><strong>Forces next:</strong> this lets you train an arbitrarily large <em>dense</em> model, but capability tracks total parameters while you pay <span class="math">6ND</span> FLOPs through <em>every</em> one of them — can you add parameters without paying the FLOPs? (MoE, lesson 10.)</div>
 
@@ -76,7 +76,7 @@
 
 <div class="math block">bubble fraction &nbsp;≈&nbsp; (p − 1) / (m + p − 1)</div>
 
-<p>The intuition: there are <span class="math">p−1</span> stage-times of fill and <span class="math">p−1</span> of drain spread over a schedule of <span class="math">m + p − 1</span> stage-times of length — so the wasted fraction shrinks as you raise <span class="math">m</span>. With <span class="math">p = 4</span> stages and <span class="math">m = 4</span> micro-batches the bubble is <span class="math">3/7 ≈ 43%</span> — brutal. Raise to <span class="math">m = 32</span> and it falls to <span class="math">3/35 ≈ 8.6%</span>; at <span class="math">m = 64</span>, <span class="math">3/67 ≈ 4.5%</span>. The rule of thumb is <span class="math">m ≳ 4p</span> to keep the bubble under ~15%. The cost of more micro-batches is more in-flight activations to store, so the bubble trades against activation memory — another instance of the course's spend-the-cheap-resource move.</p>
+<p>The intuition: there are <span class="math">p−1</span> stage-times of fill and <span class="math">p−1</span> of drain spread over a schedule of <span class="math">m + p − 1</span> stage-times of length — so the wasted fraction shrinks as you raise <span class="math">m</span>. With <span class="math">p = 4</span> stages and <span class="math">m = 4</span> micro-batches the bubble is <span class="math">3/7 ≈ 43%</span> — brutal. Raise to <span class="math">m = 32</span> and it falls to <span class="math">3/35 ≈ 8.6%</span>; at <span class="math">m = 64</span>, <span class="math">3/67 ≈ 4.5%</span>. The rule of thumb is <span class="math">m ≳ 4p</span> to keep the bubble in the ~15–20% range; for under ~10% you need <span class="math">m ≳ 8–10p</span>. The cost of more micro-batches is more in-flight activations to store, so the bubble trades against activation memory — another instance of the course's spend-the-cheap-resource move.</p>
 
 <div class="lesson-flow">
   <div><strong>naive 1-batch</strong><span>one stage busy at a time → (p−1)/p of the machine idle. For p=4 that's 75% waste.</span></div>
@@ -187,7 +187,7 @@
   <div class="lesson-card"><h3>Checklist</h3><ul>
     <li><strong>Cap TP at GPUs/node</strong> (≤8) so every TP all-reduce rides NVLink, never the inter-node fabric.</li>
     <li><strong>Run PP across nodes</strong> — its only comm is a point-to-point activation hand-off, which tolerates the slow link.</li>
-    <li><strong>Keep m ≳ 4·PP</strong> micro-batches and use 1F1B to push the bubble under ~15% without blowing up activation memory.</li>
+    <li><strong>Keep m ≳ 4·PP</strong> micro-batches and use 1F1B to hold the bubble in the ~15–20% range without blowing up activation memory; push to m ≳ 8–10·PP for under ~10%.</li>
     <li><strong>Make DP the outermost, widest axis</strong> and fold FSDP/ZeRO into it to shard the 16-bytes/param state.</li>
     <li><strong>Add SP for free with TP, and ring attention</strong> when T is what overflows, not d or L.</li>
   </ul></div>
@@ -320,6 +320,6 @@
 })();
 </script>
 
-<!-- reviewed:v1 -->
+<!-- reviewed:v2 -->
 </body>
 </html>
