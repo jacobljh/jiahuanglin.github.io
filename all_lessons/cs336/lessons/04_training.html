@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>04 · Training — AdamW, schedule, stability</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local layout only — lesson-grid/card aren't in the shared sheet */
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; font-size: 15px; }
+  .lesson-card ul { margin: 8px 0 0; padding-left: 18px; }
+  .lesson-card li { margin: 7px 0; font-size: 13.5px; }
+  #sched-canvas { width: 100%; height: 230px; display: block; background: var(--code-bg);
+                  border: 1px solid var(--border); border-radius: 8px; }
+  .verdict { font-family: var(--mono); font-size: 12px; padding: 2px 8px; border-radius: 5px; }
+  .verdict.ok  { background: rgba(22,163,74,0.16);  color: #16a34a; }
+  .verdict.bad { background: rgba(220,38,38,0.16);   color: #dc2626; }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="index.html">cs336 / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">04 · training</span>
+    <span class="step-pill">lesson 5 / 18</span>
+  </div>
+</header>
+
+<main>
+
+<p class="kicker">Part I — Basics</p>
+<h1>Training — AdamW, schedule, stability</h1>
+<p class="subtitle">Lesson 03 left you with a clean, modern architecture: pre-norm + RMSNorm, RoPE, SwiGLU, GQA, no biases. It is a differentiable function with a cross-entropy loss — and nothing more. Nothing in it says how to move the parameters <span class="math">θ</span> downhill without the run blowing up, and nothing tells you how to spend a fixed compute budget so the loss actually bottoms out instead of stalling or diverging. This lesson is the optimizer recipe that every frontier run uses, derived one forced choice at a time: AdamW, warmup→cosine, careful init, gradient clipping, and bf16 mixed precision.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>You have a model and a loss; you do not have a procedure to minimize it. Plain gradient descent on a Transformer diverges or crawls: the loss surface is wildly anisotropic (the gradient for an embedding row and for an attention projection differ by orders of magnitude), the gradients are <em>heavy-tailed</em> (rare huge values from rare tokens or a bad batch), and at the depth and learning rates needed to finish a billion-token run inside budget, a single bad step can spike the loss to NaN and torch the GPU-hours you have already spent. You need an optimizer that is both stable and budget-efficient, plus the scaffolding (schedule, init, clipping, precision) that keeps it stable.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> a defined model + a fixed loss still need an optimizer that converges fast and never diverges, on a budget with no do-overs.<br><strong>New idea:</strong> the standard recipe — <strong>AdamW</strong> (per-parameter adaptive step from the 1st/2nd gradient moments, with <em>decoupled</em> weight decay), a linear <strong>warmup → cosine</strong> learning-rate schedule, careful <strong>init</strong>, global-norm <strong>gradient clipping</strong>, and <strong>bf16</strong> mixed precision over fp32 master weights.<br><strong>Forces next:</strong> before you launch this you must predict whether it <em>fits in memory</em> and <em>finishes in budget</em> — the optimizer state alone is 12 bytes/param, which lesson 05 turns into the memory wall.</div>
+
+<div class="callout"><div class="label">The plan</div>
+Eight moves. (1) Why plain SGD fails on a Transformer. (2) The AdamW update equations, with the standard constants. (3) The warmup→cosine schedule and why each half exists. (4) Batch size, gradient accumulation, and the critical batch size. (5) Init that survives depth. (6) Gradient clipping as the spike fuse. (7) bf16 mixed precision and why it beats fp16. (8) Reading a loss curve and what to do when it spikes. Then a widget where you set warmup, peak LR, clip, and β₂ and watch a toy run converge — or diverge.</div>
+
+<h2>1 · Why not plain SGD</h2>
+
+<p>SGD takes the same step size in every coordinate: <span class="math">θ ← θ − η·g</span>. That is fine when the loss surface is roughly spherical. A Transformer's is not. Different parameter groups see gradients that differ by orders of magnitude — an embedding row touched by one rare token gets a tiny, sparse gradient; an attention output projection gets a dense, large one. A single global <span class="math">η</span> that is safe for the large-gradient group is far too small for the small-gradient group, so most of the network barely moves while you wait. Pick <span class="math">η</span> for the small group instead and the large group overshoots and the loss explodes.</p>
+
+<p>On top of that, language-model gradients are <strong>heavy-tailed</strong>: across steps, the gradient norm is usually moderate but occasionally enormous — a batch with a pathological document, a long run of repeated tokens, a numerically awkward attention pattern. SGD has no memory of "how big are gradients usually here," so a rare 50× spike becomes a 50× step and the run is gone. The fix is to normalize each coordinate by <em>its own</em> recent gradient magnitude, so every parameter takes a step of comparable, well-scaled size, and to keep a running estimate that a single outlier cannot dominate. That is exactly what Adam does.</p>
+
+<h2>2 · AdamW, the update equations</h2>
+
+<p>Adam keeps two exponential moving averages per parameter: <span class="math">m</span> (the mean gradient, "momentum") and <span class="math">v</span> (the mean squared gradient, "variance/scale"). At step <span class="math">t</span>, with gradient <span class="math">g<sub>t</sub></span>:</p>
+
+<div class="math block">
+  m<sub>t</sub> = β₁·m<sub>t−1</sub> + (1 − β₁)·g<sub>t</sub><br>
+  v<sub>t</sub> = β₂·v<sub>t−1</sub> + (1 − β₂)·g<sub>t</sub>²
+</div>
+
+<p>Because both averages start at 0, they are biased toward 0 for the first steps. Divide out that bias:</p>
+
+<div class="math block">
+  m̂<sub>t</sub> = m<sub>t</sub> / (1 − β₁<sup>t</sup>) &nbsp;&nbsp;&nbsp; v̂<sub>t</sub> = v<sub>t</sub> / (1 − β₂<sup>t</sup>)
+</div>
+
+<p>The update divides the smoothed gradient by the smoothed magnitude — a per-coordinate normalized step:</p>
+
+<div class="math block">
+  θ<sub>t</sub> = θ<sub>t−1</sub> − η · m̂<sub>t</sub> / (√v̂<sub>t</sub> + ε) &nbsp; − &nbsp; η · λ · θ<sub>t−1</sub>
+</div>
+
+<p>The second term is <strong>decoupled weight decay</strong> — the "W" in AdamW. The original Adam folded decay into the gradient (<span class="math">g ← g + λθ</span>), which means the decay also got divided by <span class="math">√v̂</span>: parameters with large gradients got decayed <em>less</em>, which is backwards. AdamW applies <span class="math">−η·λ·θ</span> directly to the weights, outside the adaptive normalization, so every parameter shrinks toward 0 at the same proportional rate regardless of its gradient scale. For Transformers this is strictly the right behavior and is now universal.</p>
+
+<table class="trade-table"><thead><tr><th>hyperparameter</th><th>typical value</th><th>what it controls</th></tr></thead><tbody>
+  <tr><td><span class="math">β₁</span></td><td>0.9</td><td>momentum horizon — averages ≈ last 10 gradients</td></tr>
+  <tr><td><span class="math">β₂</span></td><td>0.95</td><td>scale horizon — LMs use 0.95, lower than the 0.999 vision default, so the variance estimate reacts faster to spikes</td></tr>
+  <tr><td><span class="math">ε</span></td><td>≈ 1e−8</td><td>floor on the denominator — stops a near-zero <span class="math">v̂</span> from blowing up the step</td></tr>
+  <tr><td><span class="math">λ</span> (weight decay)</td><td>≈ 0.1</td><td>decoupled L2 pull toward 0; regularizes, kept off norm/bias params</td></tr>
+</tbody></table>
+
+<p>The β₂ = 0.95 choice is worth dwelling on: with 0.999, <span class="math">v</span> averages over the last ≈1,000 gradients, so a sudden burst of large gradients barely moves the denominator and the step stays huge — straight into a spike. With 0.95 the denominator inflates within ≈20 steps of a gradient burst, automatically shrinking the step and damping the spike. Lower β₂ is the LM community's quiet stability lever; you will feel it in the widget.</p>
+
+<pre><code># AdamW, one step, the whole thing (per parameter tensor p)
+m = b1*m + (1-b1)*g
+v = b2*v + (1-b2)*g*g
+mhat = m / (1 - b1**t)
+vhat = v / (1 - b2**t)
+p -= lr * (mhat / (vhat.sqrt() + eps) + wd * p)   # decay decoupled</code></pre>
+
+<h2>3 · The learning-rate schedule: warmup → cosine</h2>
+
+<p>A constant LR is wrong at both ends of training. The schedule has two halves, each forced by a specific failure.</p>
+
+<p><strong>Linear warmup.</strong> For the first few hundred steps, <span class="math">v̂</span> is built from almost no data — its estimate of each coordinate's gradient scale is garbage. Adam's normalized step <span class="math">m̂/√v̂</span> is therefore unreliable exactly when the weights are most fragile (random init, every gradient large). Starting at the peak LR here reliably produces an early loss spike or divergence. So you ramp <span class="math">η</span> linearly from 0 to the peak over <span class="math">W</span> steps — typically a few hundred to a few thousand, often ≈1–2% of total steps. By the time you hit peak LR, <span class="math">v̂</span> is a trustworthy scale estimate and the big steps are safe.</p>
+
+<p><strong>Cosine decay.</strong> After the peak, anneal <span class="math">η</span> down a cosine from peak to a floor of about <strong>10% of peak</strong> over the remaining steps:</p>
+
+<div class="math block">
+  η(t) = η<sub>min</sub> + ½(η<sub>peak</sub> − η<sub>min</sub>)·(1 + cos(π · (t − W) / (T<sub>total</sub> − W)))
+</div>
+
+<p>Early on you want large steps to cover ground; late on you want small steps to settle into a sharp minimum without bouncing out. Cosine spends most of its time near the peak and only decays hard at the end — empirically it beats linear or step decay for LMs. The 10% floor (not 0) keeps the optimizer making progress to the very last step rather than freezing prematurely. One sharp consequence: cosine must be told the <em>total</em> step count up front, because the shape depends on <span class="math">T<sub>total</sub></span> — you cannot honestly resume a cosine run for "a few more steps."</p>
+
+<p><strong>Peak-LR scaling.</strong> The peak is not arbitrary. As you widen the model, the right peak LR <em>shrinks</em> (a common rule of thumb ties it to <span class="math">1/√d</span>, the spirit of μP); as you grow the batch, it can <em>rise</em> (larger batches give lower-variance gradients that tolerate bigger steps, up to a point — see §4). Typical peaks land around <span class="math">1e−3</span> for small models down to <span class="math">≈1.5–3e−4</span> for multi-billion-parameter models. The widget's "peak LR" knob is in these units.</p>
+
+<h2>4 · Batch size, gradient accumulation, critical batch size</h2>
+
+<p>The gradient you step on is an average over <span class="math">B</span> sequences. Larger <span class="math">B</span> → lower-variance gradient → you can take a larger, more confident step, and you get more parallelism per optimizer step. But two walls appear. First, a large batch may not fit in GPU memory. The fix is <strong>gradient accumulation</strong>: run <span class="math">k</span> micro-batches of size <span class="math">b</span>, sum their gradients, and step once — an effective batch of <span class="math">B = k·b</span> at the cost of <span class="math">k</span>× the time per step but <span class="math">1</span>× the memory of one micro-batch. A run might use micro-batch 8, accumulate 32, for an effective batch of 256 sequences (× sequence length = the tokens-per-step that matters).</p>
+
+<p>Second, and deeper: there is a <strong>critical batch size</strong>. Below it, doubling the batch roughly halves the steps to a target loss — perfect data-parallel scaling, free speedup. Above it, the gradient is already low-variance enough that extra examples buy diminishing returns: you burn 2× the compute for far less than 2× the progress. The critical batch size <em>grows as the loss falls</em> (later in training you can afford bigger batches), and it is what tells you how far you can scale data parallelism before you are wasting FLOPs. Picking a batch far above critical is the most common way to silently waste a budget — the loss curve looks fine, but you paid double for it.</p>
+
+<h2>5 · Initialization that survives depth</h2>
+
+<p>Init sets the scale of the residual stream at step 0, before the optimizer has done anything. Two rules, both from §03's architecture:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Base init</div><div class="v">Most weights drawn from <span class="math">N(0, σ²)</span> with σ ≈ 0.02, or more principled σ = <span class="math">1/√d</span> (≈0.028 at d=1280). Small enough that <span class="math">L</span> stacked residual additions don't blow up the stream's variance at step 0; the optimizer finds the true scale from there.</div></div>
+  <div class="topic-card"><div class="k">Residual-projection downscale</div><div class="v">GPT-2's trick: scale the init of the <em>output</em> projection of each block (attn proj, MLP down-proj) by <span class="math">1/√(2L)</span>. With <span class="math">2L</span> residual branches feeding the stream, this keeps its variance ≈ constant with depth instead of growing ∝ L — so a 48-layer model starts as calm as a 4-layer one.</div></div>
+</div>
+
+<p>Worked: at <span class="math">L = 24</span>, the downscale factor is <span class="math">1/√48 ≈ 0.144</span> — the residual projections start ~7× smaller than the other matrices. Without it, the stream variance at the final layer is ≈ 2L times the input variance and the first forward pass already produces saturated norms; the warmup then has to dig you out of a worse hole. Init and warmup are partners: good init makes the warmup's job small.</p>
+
+<h2>6 · Gradient clipping: the spike fuse</h2>
+
+<p>Even with Adam and warmup, heavy-tailed gradients mean an occasional step will see a gradient norm far above normal. <strong>Global-norm clipping</strong> caps it: compute the L2 norm of the <em>entire</em> gradient (all tensors concatenated), and if it exceeds a threshold <span class="math">c</span> (almost always <span class="math">c = 1.0</span>), rescale every gradient by <span class="math">c / ‖g‖</span> so the norm is exactly <span class="math">c</span> and the direction is unchanged.</p>
+
+<div class="math block">
+  if ‖g‖ &gt; c:&nbsp;&nbsp; g ← g · c / ‖g‖
+</div>
+
+<p>This is what lets a run <em>survive</em> a loss spike instead of dying on it. A pathological batch produces a 30× gradient; un-clipped, Adam takes a wildly oversized step and the loss jumps from 2.1 to 8.0 (or NaN). Clipped to norm 1.0, the same batch nudges the weights a normal amount, the loss ticks up slightly, and the next clean batch recovers it. Global-norm (not per-parameter) clipping preserves the relative scale across parameters, so the step direction is still meaningful. You will watch this knob save or sink the run in the widget — turning clipping off is one of the three ways to make the toy run diverge.</p>
+
+<h2>7 · Mixed precision: bf16 over fp16</h2>
+
+<p>Training in fp32 everywhere wastes half the memory bandwidth and tensor-core throughput. Mixed precision keeps a single fp32 <strong>master copy</strong> of the weights and the optimizer state, but does the forward/backward compute in 16-bit. The split that matters:</p>
+
+<div class="lesson-flow">
+  <div><strong>bf16 compute</strong><span>Forward and backward run in bf16; activations and the gradient are bf16. ~2× the throughput and half the activation memory of fp32.</span></div>
+  <div><strong>fp32 master weights</strong><span>The authoritative weights live in fp32. The bf16 step is applied to them, so tiny updates (LR · small gradient) aren't rounded away — a bf16-only weight would stop moving once the update fell below its precision.</span></div>
+  <div><strong>fp32 optimizer state</strong><span>Adam's <span class="math">m</span> and <span class="math">v</span> are fp32 — these accumulate over thousands of steps and need the precision.</span></div>
+</div>
+
+<p><strong>Why bf16 and not fp16?</strong> Both are 16-bit, but they split the bits differently. fp16 has 5 exponent bits → max value ≈ 65,504 and a narrow dynamic range; gradients routinely underflow or a large activation overflows to <span class="math">∞</span>. fp16 training therefore needs <em>loss scaling</em> — multiply the loss by a large factor before backward to push gradients into fp16's representable range, then unscale — a fiddly, failure-prone dance. bf16 keeps fp32's full <strong>8 exponent bits</strong> (same ≈1e38 dynamic range) and sacrifices mantissa precision instead. It almost never overflows or underflows, so <em>no loss scaling is needed</em> — you just compute. The cost is coarser rounding (7 mantissa bits vs fp16's 10), which the fp32 master weights absorb. On any Ampere-or-newer GPU, bf16 is the default and fp16 is legacy.</p>
+
+<div class="callout"><div class="label">Preview — the 16 bytes/param wall (lesson 05)</div>Tally the bytes per parameter that mixed-precision AdamW must hold: <strong>fp32 master weight = 4</strong>, <strong>Adam m = 4</strong>, <strong>Adam v = 4</strong>, plus the bf16 working weight = 2 and bf16 gradient = 2. The optimizer state alone (master + m + v) is <strong>12 bytes/param</strong>; with the working copies it is ≈16. For a 7B model that is ≈112 GB of <em>training state</em> before a single activation — which overflows an 80 GB H100. That arithmetic is the hinge of <a href="05_accounting.html">lesson 05</a> and the reason the whole systems half of the course exists.</div>
+
+<h2>8 · Reading a loss curve</h2>
+
+<p>The loss curve is your only real-time instrument. Learn to read its three signatures.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">Warmup bump</div><div class="v">Loss may plateau or wobble during warmup while <span class="math">v̂</span> stabilizes, then drop fast once peak LR engages. Normal — not a problem to fix.</div></div>
+  <div class="topic-card"><div class="k">Spike</div><div class="v">A sudden vertical jump (2 → 6), usually from a bad batch or too-high LR. If clipping catches it, the curve recovers within tens of steps. If not, it goes to NaN and the run is dead.</div></div>
+  <div class="topic-card"><div class="k">Divergence</div><div class="v">Loss climbs and does not come back. Cause: peak LR too high, warmup too short, or no clipping. The run is unrecoverable from here.</div></div>
+</div>
+
+<p>When a real run spikes and you have checkpoints, the standard playbook — in order of cost — is: <strong>rewind</strong> to the last good checkpoint and <strong>skip the offending data batches</strong> (a specific document often causes it); if it recurs, <strong>lower the peak LR</strong> (or tighten clipping / lower β₂) and resume. Frontier teams checkpoint frequently precisely so a spike costs hours, not the whole run. The lesson: stability is not luck — it is warmup + clipping + a sane LR + frequent checkpoints, and you tune them by reading this curve.</p>
+
+<h2>9 · Drive a run yourself</h2>
+
+<p>The widget below is a toy SGD-on-a-bowl simulation dressed as a training run. The optimizer descends a noisy quadratic loss; the noise is heavy-tailed (occasional large gradients = the bad-batch spikes from §1). The knobs are the four levers from this lesson. Watch the curve and the verdict: a sane configuration (warmup &gt; 0, moderate peak LR, clip on, β₂ = 0.95) glides to a low final loss with zero spikes. Now break it — there are three ways, and the headline one is <strong>peak LR high with warmup = 0</strong>: the first unreliable-<span class="math">v̂</span> step lands at full LR and the run diverges immediately. Turning <strong>clipping off</strong> lets the heavy-tailed spikes through; pushing <strong>peak LR</strong> past the stability edge diverges even with warmup. Lowering <strong>β₂</strong> toward 0.9 visibly damps spikes (faster-reacting denominator); raising it toward 0.999 makes them worse.</p>
+
+<div class="widget" id="sched-widget">
+  <div class="title">Schedule + spike sim — set the knobs, run the training</div>
+  <div class="hint">The four levers from this lesson drive a toy noisy descent. <strong>Set warmup = 0 with a high peak LR and the run diverges on step 1</strong> — that is Adam stepping at full size on a garbage variance estimate. Clip off lets heavy-tailed spikes through; lower β₂ damps them. Hit <strong>run</strong> to animate; KPIs report the final loss, the spike count, and whether it diverged.</div>
+
+  <canvas id="sched-canvas" width="860" height="230"></canvas>
+
+  <div class="controls" style="margin-top: 12px;">
+    <label class="inline">warmup steps: <input type="range" id="sl-warm" min="0" max="120" step="2" value="40"> <span class="val" id="v-warm">40</span></label>
+    <label class="inline">peak LR (×1e−3): <input type="range" id="sl-lr" min="1" max="60" step="1" value="14"> <span class="val" id="v-lr">14</span></label>
+    <label class="inline">grad clip: <select id="sl-clip"><option value="1">on (norm 1.0)</option><option value="0">off</option></select></label>
+    <label class="inline">β₂: <input type="range" id="sl-b2" min="900" max="999" step="1" value="950"> <span class="val" id="v-b2">0.950</span></label>
+    <button id="sl-run" type="button">run</button>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">Final loss</div><div class="v" id="k-final">—</div></div>
+    <div class="kpi"><div class="k"># spikes</div><div class="v" id="k-spikes">—</div></div>
+    <div class="kpi"><div class="k">Diverged?</div><div class="v" id="k-div">—</div></div>
+    <div class="kpi"><div class="k">Peak LR reached</div><div class="v" id="k-peak">—</div></div>
+  </div>
+</div>
+
+<p>Notice the asymmetry the widget makes physical: warmup and clipping cost you almost nothing when the run is healthy, but they are the only things standing between a heavy-tailed gradient and a dead run. That is why every production recipe ships all four levers on by default.</p>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>No warmup at full peak LR.</strong> The first steps use a garbage <span class="math">v̂</span> and a full-size step. <em>Signal:</em> loss spikes or NaNs within the first few dozen steps, before any real learning.</li>
+    <li><strong>Coupled weight decay (plain Adam).</strong> Decay gets divided by <span class="math">√v̂</span>, so high-gradient params decay less. <em>Signal:</em> regularization "doesn't work like the paper said"; embedding/output norms drift.</li>
+    <li><strong>Clipping off.</strong> A heavy-tailed batch produces a 30× gradient and a 30× step. <em>Signal:</em> isolated vertical spikes in the loss that don't recover; sudden NaN.</li>
+    <li><strong>β₂ = 0.999 on an LM.</strong> The variance denominator reacts too slowly to gradient bursts. <em>Signal:</em> more frequent, larger spikes than the same run at 0.95.</li>
+    <li><strong>fp16 without loss scaling (or bf16 assumed where only fp16 exists).</strong> <em>Signal:</em> gradients silently underflow to 0 → loss flatlines; or activations overflow to inf → instant NaN.</li>
+    <li><strong>Batch above the critical batch size.</strong> <em>Signal:</em> loss curve looks normal but you used ≈2× the FLOPs to reach the same loss as a smaller batch would.</li>
+    <li><strong>Resuming a cosine schedule for "a few more steps."</strong> The shape depended on the original <span class="math">T<sub>total</sub></span>. <em>Signal:</em> LR is already near the floor; the extra steps barely move the loss.</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><strong>AdamW</strong> with β₁=0.9, β₂=0.95, ε≈1e−8, wd≈0.1 — decay <em>decoupled</em>, and off norm/bias params.</li>
+    <li><strong>Warmup</strong> a few hundred–few thousand steps, then <strong>cosine</strong> to ≈10% of peak; set <span class="math">T<sub>total</sub></span> up front.</li>
+    <li><strong>Scale peak LR</strong> down with width (≈1/√d), up with batch (up to the critical batch size).</li>
+    <li><strong>Init</strong> ≈N(0, 0.02) or 1/√d, with residual projections downscaled by <span class="math">1/√(2L)</span>.</li>
+    <li><strong>Global-norm gradient clip at 1.0</strong>, always on.</li>
+    <li><strong>bf16</strong> compute + <strong>fp32</strong> master weights &amp; optimizer state; no loss scaling needed.</li>
+    <li><strong>Checkpoint often</strong> so a spike costs hours, not the run; keep a rewind/skip-batch/lower-LR playbook ready.</li>
+  </ul></div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the widget and reproduce each failure deliberately. (1) Set warmup = 0 and push peak LR to ≈40e−3: confirm it diverges on the first steps, and explain in one sentence why warmup would have saved it (what is <span class="math">v̂</span> doing at step 1?). (2) Restore warmup = 40, set a peak LR that converges, then toggle clip <strong>off</strong> and re-run several times: count how often a heavy-tailed spike now kills the run that clipping had been absorbing. (3) With everything healthy, slide β₂ from 0.999 down to 0.90 and watch the spike count fall — relate that to the §2 claim that lower β₂ makes the variance denominator react faster. Then, by hand: for a 7B model, tally the mixed-precision AdamW bytes/param from §7 and confirm the ≈112 GB training-state figure that lesson 05 opens with.</div>
+
+<h2>Where this points next</h2>
+
+<p>You can now train a model that converges instead of diverging, and spend the budget without wasting it. But this lesson quietly assumed the run <em>fits</em> — that the weights, gradients, optimizer state, and activations all sit in GPU memory, and that <span class="math">D</span> tokens finish in the GPU-hours you have. The preview in §7 already cracked that assumption: mixed-precision AdamW costs ≈16 bytes/param, so a 7B model's training state is ≈112 GB — and an H100 has 80. You cannot launch what you cannot fit, and you cannot promise a deadline you cannot estimate. Before spending a single GPU-hour you need the two back-of-envelope models — compute (the <span class="math">6ND</span> rule) and memory (the bytes-per-param ledger) — that tell you fit and runtime. That is <a href="05_accounting.html"><strong>05 · Resource accounting — FLOPs and the memory wall</strong></a>, and its punchline (a 7B doesn't fit on one GPU) is what forces the entire systems half of the course.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+A modern LM trains on one recipe, each piece forced by a concrete failure of the simpler choice. Plain SGD can't handle a Transformer's anisotropic, heavy-tailed gradients, so you use <strong>AdamW</strong> — per-coordinate normalization by the 1st/2nd moments (β₁=0.9, β₂=0.95, ε≈1e−8) with <em>decoupled</em> weight decay (λ≈0.1) so decay isn't distorted by the adaptive scaling. Adam's variance estimate is unreliable for the first hundreds of steps, so you <strong>linearly warm up</strong> the LR before <strong>cosine-decaying</strong> it to ≈10% of a peak that scales ∝1/√d with width and rises with batch (up to the critical batch size, past which extra batch wastes FLOPs). <strong>Init</strong> ≈N(0,0.02) with residual projections downscaled by 1/√(2L) keeps the stream calm at depth; <strong>global-norm clipping at 1.0</strong> is the fuse that lets a run survive heavy-tailed spikes instead of dying on them. Compute runs in <strong>bf16</strong> — chosen over fp16 for its full fp32 exponent range, which removes the need for loss scaling — over <strong>fp32 master weights and optimizer state</strong>. That fp32 state is 12 bytes/param (≈16 with the working copies), the number that, applied to a 7B model, overflows one GPU and hands the course to resource accounting.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why does plain SGD fail on a Transformer where Adam succeeds? <em>(§1 — the loss is anisotropic and gradients are heavy-tailed; a single global step size is wrong for most coordinates and a rare gradient spike becomes a divergent step. Adam normalizes each coordinate by its own running gradient magnitude.)</em></li>
+  <li>What does the "W" in AdamW change, and why does it matter? <em>(§2 — decoupled weight decay: <span class="math">−η·λ·θ</span> applied to the weights directly, not folded into the gradient, so it isn't divided by <span class="math">√v̂</span> and every parameter decays at the same proportional rate regardless of gradient scale.)</em></li>
+  <li>Why warm up the learning rate, and why for only a few hundred steps? <em>(§3 — Adam's <span class="math">v̂</span> is built from too few gradients early on, so the normalized step is unreliable exactly when the weights are fragile; once <span class="math">v̂</span> stabilizes (a few hundred steps) the peak LR is safe.)</em></li>
+  <li>Why bf16 over fp16 for LM training? <em>(§7 — bf16 keeps fp32's 8 exponent bits → ≈1e38 dynamic range, so gradients don't under/overflow and no loss scaling is needed; it trades mantissa precision, which the fp32 master weights absorb.)</em></li>
+  <li>What is the critical batch size and why should you care about your budget? <em>(§4 — below it, doubling batch ≈ halves steps to target loss (free speedup); above it, extra batch buys diminishing returns, so you burn ≈2× compute for ≈1× progress. It rises as the loss falls.)</em></li>
+  <li>A run spikes to loss 8 at step 50,000. What do you do, in order? <em>(§8 — rewind to the last good checkpoint and skip the offending batches; if it recurs, lower peak LR / tighten clipping / lower β₂ and resume. Frequent checkpoints make this cost hours, not the run.)</em></li>
+  <li>Why is β₂ = 0.95 standard for LMs instead of 0.999? <em>(§2 — 0.999 averages <span class="math">v</span> over ≈1,000 gradients, so the denominator barely reacts to a gradient burst and the step stays huge; 0.95 inflates the denominator within ≈20 steps, automatically damping spikes.)</em></li>
+  <li>Why scale residual-projection init by 1/√(2L)? <em>(§5 — with 2L residual branches the stream variance grows ∝L at step 0; downscaling each output projection by 1/√(2L) holds the variance ≈constant with depth, so a deep model starts as calm as a shallow one.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="03_modern_recipe.html"><span class="dir">← Back</span><span class="ttl">03 · The modern recipe</span></a>
+  <a class="next" href="05_accounting.html"><span class="dir">Next →</span><span class="ttl">05 · Resource accounting</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var cv = document.getElementById('sched-canvas');
+  if (!cv) return;
+  var ctx = cv.getContext('2d');
+
+  var slWarm = document.getElementById('sl-warm');
+  var slLr   = document.getElementById('sl-lr');
+  var slClip = document.getElementById('sl-clip');
+  var slB2   = document.getElementById('sl-b2');
+  var runBtn = document.getElementById('sl-run');
+  var vWarm = document.getElementById('v-warm');
+  var vLr   = document.getElementById('v-lr');
+  var vB2   = document.getElementById('v-b2');
+
+  var kFinal = document.getElementById('k-final');
+  var kSpk   = document.getElementById('k-spikes');
+  var kDiv   = document.getElementById('k-div');
+  var kPeak  = document.getElementById('k-peak');
+
+  var STEPS = 360;
+  var anim = null;
+
+  function css(name){ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+  // deterministic-ish heavy-tailed noise: mostly small, occasional large
+  function heavyNoise(rng){
+    var u = rng();
+    var base = (rng() - 0.5) * 2;          // uniform small
+    if (u > 0.94) return base * 14;        // rare big spike (heavy tail)
+    return base;
+  }
+  // tiny LCG so each run is reproducible per-config but varied across runs
+  function makeRng(seed){
+    var s = seed >>> 0;
+    return function(){ s = (1664525 * s + 1013904223) >>> 0; return s / 4294967296; };
+  }
+
+  function lrAt(step, warm, peak){
+    if (warm > 0 && step < warm) return peak * (step / warm);  // linear warmup
+    var prog = (step - warm) / (STEPS - warm);
+    prog = Math.max(0, Math.min(1, prog));
+    var floor = 0.10 * peak;                                   // cosine to 10%
+    return floor + 0.5 * (peak - floor) * (1 + Math.cos(Math.PI * prog));
+  }
+
+  function simulate(){
+    var warm = +slWarm.value;
+    var peak = (+slLr.value) * 1e-3;
+    var clip = slClip.value === '1';
+    var b2   = (+slB2.value) / 1000;
+
+    var rng = makeRng(Math.floor(Math.random() * 1e6) + 1);
+    // toy 1-D bowl: loss = 0.5*x^2 (+ irreducible floor); grad = x + heavy noise
+    var x = 3.4;                       // start far from optimum
+    var v = 0;                         // Adam-style second moment
+    var b2t = 1, eps = 1e-6;
+    var losses = [], lrs = [];
+    var spikes = 0, diverged = false, prevLoss = 0.5 * x * x + 0.25;
+
+    for (var t = 0; t < STEPS; t++){
+      var lr = lrAt(t, warm, peak);
+      var g = x + heavyNoise(rng);
+      if (clip){ var gn = Math.abs(g); if (gn > 1.0) g = g / gn; }   // global-norm clip to 1
+      v = b2 * v + (1 - b2) * g * g;
+      b2t *= b2;
+      var vhat = v / (1 - b2t);
+      // Adam step, scaled so peak LR ~1e-2 region is the stability edge of this toy
+      x = x - (lr * 320) * (g / (Math.sqrt(vhat) + eps));
+      var loss = 0.5 * x * x + 0.25;
+      if (!isFinite(loss) || loss > 1e4){ diverged = true; losses.push(loss); lrs.push(lr); break; }
+      if (loss > prevLoss * 1.6 && t > 2) spikes++;
+      prevLoss = loss;
+      losses.push(loss); lrs.push(lr);
+    }
+    return { losses: losses, lrs: lrs, spikes: spikes, diverged: diverged,
+             peakReached: Math.max.apply(null, lrs) };
+  }
+
+  function draw(res, upto){
+    var W = cv.width, H = cv.height, padL = 46, padR = 54, padT = 16, padB = 26;
+    ctx.clearRect(0,0,W,H);
+    var n = res.losses.length;
+    var maxL = 0;
+    for (var i=0;i<upto;i++){ var l = res.losses[i]; if (isFinite(l) && l>maxL) maxL=l; }
+    maxL = Math.min(Math.max(maxL, 6), 30);            // clamp y-axis for readability
+    var x0 = padL, x1 = W - padR, y0 = H - padB, y1 = padT;
+    function px(i){ return x0 + (x1 - x0) * (i / (STEPS - 1)); }
+    function py(l){ return y0 + (y1 - y0) * (Math.min(l, maxL) / maxL); }
+
+    // axes
+    ctx.strokeStyle = css('--border'); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y0); ctx.moveTo(x0, y0); ctx.lineTo(x0, y1); ctx.stroke();
+    ctx.fillStyle = css('--text-mute'); ctx.font = '11px ' + css('--mono');
+    ctx.fillText('loss', x0 - 38, y1 + 8);
+    ctx.fillText(maxL.toFixed(0), x0 - 26, y1 + 6);
+    ctx.fillText('0', x0 - 12, y0);
+    ctx.fillText('step', (x0+x1)/2 - 12, H - 6);
+
+    // LR schedule (faint, right axis)
+    ctx.strokeStyle = css('--accent-2'); ctx.globalAlpha = 0.5; ctx.lineWidth = 1.5;
+    var maxLr = Math.max.apply(null, res.lrs) || 1;
+    ctx.beginPath();
+    for (var j=0;j<upto;j++){
+      var yy = y0 + (y1 - y0) * (res.lrs[j] / maxLr);
+      if (j===0) ctx.moveTo(px(j), yy); else ctx.lineTo(px(j), yy);
+    }
+    ctx.stroke(); ctx.globalAlpha = 1;
+    ctx.fillStyle = css('--accent-2'); ctx.fillText('LR', x1 + 6, y1 + 8);
+
+    // loss curve
+    ctx.strokeStyle = res.diverged ? css('--bad') : css('--accent'); ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (var k=0;k<upto;k++){
+      var l = res.losses[k];
+      var yv = isFinite(l) ? py(l) : y1;
+      if (k===0) ctx.moveTo(px(k), yv); else ctx.lineTo(px(k), yv);
+    }
+    ctx.stroke();
+  }
+
+  function runSim(){
+    if (anim) cancelAnimationFrame(anim);
+    var res = simulate();
+    var frame = 0;
+    function step(){
+      frame += 6;
+      var upto = Math.min(frame, res.losses.length);
+      draw(res, upto);
+      if (upto < res.losses.length){ anim = requestAnimationFrame(step); }
+      else {
+        var fin = res.losses[res.losses.length - 1];
+        kFinal.textContent = res.diverged ? '∞ (NaN)' : fin.toFixed(3);
+        kSpk.textContent   = res.spikes;
+        kDiv.innerHTML     = res.diverged
+          ? '<span class="verdict bad">DIVERGED</span>'
+          : '<span class="verdict ok">stable</span>';
+        kPeak.textContent  = (res.peakReached * 1e3).toFixed(1) + 'e−3';
+      }
+    }
+    step();
+  }
+
+  function syncLabels(){
+    vWarm.textContent = slWarm.value;
+    vLr.textContent   = slLr.value;
+    vB2.textContent   = ((+slB2.value)/1000).toFixed(3);
+  }
+
+  [slWarm, slLr, slB2].forEach(function(s){ s.addEventListener('input', syncLabels); });
+  runBtn.addEventListener('click', runSim);
+
+  syncLabels();
+  // initial healthy run
+  var seed0 = simulate();
+  draw(seed0, seed0.losses.length);
+  kFinal.textContent = seed0.diverged ? '∞ (NaN)' : seed0.losses[seed0.losses.length-1].toFixed(3);
+  kSpk.textContent   = seed0.spikes;
+  kDiv.innerHTML     = seed0.diverged ? '<span class="verdict bad">DIVERGED</span>' : '<span class="verdict ok">stable</span>';
+  kPeak.textContent  = (seed0.peakReached * 1e3).toFixed(1) + 'e−3';
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

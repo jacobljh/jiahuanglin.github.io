@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>05 · Resource accounting — FLOPs and the memory wall</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local layout only — failure/checklist columns + the meter labels */
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; font-size: 15px; }
+  .lesson-card ul { margin: 0; padding-left: 18px; }
+  .lesson-card li { margin: 7px 0; font-size: 13.5px; line-height: 1.5; }
+  .meter-wrap { position: relative; margin: 16px 0 30px; }
+  .meter-line { position: absolute; top: -6px; bottom: -22px; width: 0; border-left: 2px dashed var(--bad); }
+  .meter-line .cap { position: absolute; bottom: -20px; left: 4px; font-family: var(--mono); font-size: 11px; color: var(--bad); white-space: nowrap; }
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; margin: 6px 0 2px; font-family: var(--mono); font-size: 11px; color: var(--text-mute); }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .legend i { width: 11px; height: 11px; border-radius: 2px; display: inline-block; }
+  .kpi.over .v { color: var(--bad); }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="index.html">cs336 / lessons</a><span class="crumb">/</span><span class="crumb">05 · accounting</span><span class="step-pill">lesson 6 / 18</span></div></header>
+
+<main>
+
+<p class="kicker">Part I — Basics</p>
+<h1>Resource accounting — FLOPs and the memory wall</h1>
+<p class="subtitle">Lesson 04 handed you a model and a stable optimizer: AdamW, warmup→cosine, bf16, gradient clipping. You can now train <em>a</em> model on <em>a</em> GPU. What you cannot yet do is answer the only two questions that decide whether a run is even launchable: will this fit, and how long will it take? This lesson builds the two back-of-envelope models — compute (6ND) and memory (16 bytes/param) — and then runs them on a 7B model against one 80 GB H100. The answer is no. That single "no" is the hinge into the entire systems half of this course.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>Lesson 04 made the training step <em>correct and stable</em> — but it quietly assumed the step fits in the box. It does not. AdamW keeps a first moment, a second moment, and an fp32 master copy of every parameter; bf16 keeps gradients; the forward pass leaves a mountain of activations for the backward to consume. None of that was priced. Before you rent a single GPU-hour you must be able to predict, on paper, the bytes resident on each device and the wall-clock to burn through D tokens. Get this wrong and you discover it as an out-of-memory crash forty minutes into a multi-day run, or as a budget that runs dry at 60% of the planned tokens.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> you must predict fit and runtime <em>before</em> spending GPU-hours — a stable optimizer is worthless if its state overflows the device or the run can't finish in budget.<br><strong>New idea:</strong> two arithmetic models — <strong>compute</strong> (forward ≈ 2N/token, backward ≈ 4N/token ⇒ <span class="math">C = 6ND</span>) and <strong>memory</strong> (the 16-bytes/param mixed-precision AdamW ledger + an activation term), plus <strong>gradient checkpointing</strong> as the dial that trades compute for activation memory.<br><strong>Forces next:</strong> the ledger shows a 7B model's <em>training state alone</em> blows past one 80 GB GPU before a single activation is stored — so the work must be split across many GPUs, which is the systems half (starting with the hardware itself, lesson 06).</div>
+
+<div class="callout"><div class="label">The plan</div>Five moves. (1) Derive 2N/token forward from a single matmul, then 6N/token for training, recovering <span class="math">C = 6ND</span> from lesson 00. (2) Define MFU — what fraction of the peak you actually get, and what "good" looks like. (3) Build the mixed-precision AdamW memory ledger to ≈16 bytes/param and run it on 7B. (4) Add the activation term and show gradient checkpointing buying it back. (5) Assemble a fit/no-fit table and the runtime estimate, then drive the calculator until 7B overflows one GPU.</div>
+
+<h2>1 · Where the FLOPs go: 2N forward, 6N to train</h2>
+
+<p>Everything starts from one fact about matrix multiplication. A linear layer that maps an <span class="math">in</span>-vector to an <span class="math">out</span>-vector multiplies by a weight matrix of shape <span class="math">(in, out)</span>. Each of the <span class="math">out</span> outputs is a dot product of length <span class="math">in</span>: that is <span class="math">in</span> multiplies and <span class="math">in</span> adds, so <span class="math">2·in</span> floating-point operations. Over all <span class="math">out</span> outputs, one token costs <span class="math">2·in·out</span> FLOPs — and <span class="math">in·out</span> is exactly the number of parameters in that weight matrix.</p>
+
+<div class="math block">one matmul, one token: &nbsp; FLOPs ≈ 2 · in · out &nbsp; = &nbsp; 2 · (params in this matrix)</div>
+
+<p>That "2× the parameters" relationship is not special to one layer — it holds for <em>every</em> weight matrix in the network: QKV projections, the attention output projection, both MLP matrices, the un-embedding. Sum over all of them and the forward pass costs, per token,</p>
+
+<div class="math block">forward ≈ Σ<sub>matrices</sub> 2 · (params) &nbsp; = &nbsp; 2N &nbsp;&nbsp; FLOPs / token</div>
+
+<p>where <span class="math">N</span> is the total parameter count. (Embedding lookups are gathers, not matmuls, so they cost ≈0 FLOPs; the attention score and value matmuls add an <span class="math">O(T²)</span> term we treat separately — see the caveat at the end of this section.)</p>
+
+<p>Now the backward pass. For each weight matrix the backward computes two things: the gradient with respect to the <em>input</em> (to keep propagating the chain rule down the stack) and the gradient with respect to the <em>weight</em> (to update it). Each is a matmul of the same shape class as the forward, so each costs ≈2N. Backward is therefore ≈<strong>4N</strong>/token — twice the forward. Add them:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">forward</div><div class="v">2N FLOPs/token — one matmul per weight matrix, <span class="math">2·in·out</span> each.</div></div>
+  <div class="topic-card"><div class="k">backward</div><div class="v">4N FLOPs/token — grad-w.r.t.-input plus grad-w.r.t.-weight, each ≈2N.</div></div>
+  <div class="topic-card"><div class="k">train step</div><div class="v">6N FLOPs/token — the optimizer update is O(N) and rounds away.</div></div>
+</div>
+
+<div class="math block">C &nbsp;≈&nbsp; 6 · N · D &nbsp;&nbsp; total training FLOPs &nbsp; (D = tokens seen)</div>
+
+<p>This is the budget identity from lesson 00, now <em>derived</em> rather than asserted. A worked instance: GPT-3 has <span class="math">N ≈ 175×10⁹</span> and trained on <span class="math">D ≈ 300×10⁹</span> tokens, so <span class="math">C ≈ 6 · 175×10⁹ · 300×10⁹ ≈ 3.15×10²³</span> FLOPs — matching the widely quoted ~3.14×10²³. A 7B model trained Chinchilla-style on <span class="math">D ≈ 1.4×10¹²</span> tokens (≈200 tokens/param, over-trained for cheap serving) costs <span class="math">6 · 7×10⁹ · 1.4×10¹² ≈ 5.9×10²²</span> FLOPs. Hold that number; section 5 turns it into days.</p>
+
+<div class="callout warn"><div class="label">When 6N under-counts</div>The 6N rule prices the dense linear layers and ignores attention's <span class="math">O(T²)</span> score and value matmuls, which add roughly <span class="math">12 · L · T · d</span> FLOPs/token. For short context this is a rounding error; once <span class="math">T</span> grows comparable to <span class="math">d</span> (long-context training) the attention term becomes a real fraction of the total. Use 6ND for planning; keep the attention term when <span class="math">T ≳ d</span>.</div>
+
+<h2>2 · MFU: the FLOPs you paid for vs the FLOPs you got</h2>
+
+<p>The 6ND number is FLOPs <em>required</em>. What the hardware <em>delivers</em> is the per-GPU peak (an H100 does ≈990 TFLOP/s of bf16 tensor-core math, ~1 PFLOP/s, with FP8 about double) times however many GPUs, times the fraction you actually achieve. That fraction is <strong>Model FLOPs Utilization</strong>:</p>
+
+<div class="math block">MFU &nbsp;=&nbsp; (achieved model FLOP/s) / (GPUs · peak FLOP/s per GPU)</div>
+
+<p>MFU is below 1 for unavoidable reasons you will spend the systems half attacking: memory-bound ops that can't saturate the tensor cores (lesson 06), kernel-launch and HBM round-trip overhead (lesson 07), communication stalls when work is split across devices (lessons 08–09), and pipeline bubbles. A well-tuned dense Transformer training run lands at roughly <strong>40–55% MFU</strong>; 50% is a healthy planning assumption, and anything under ~35% is a signal something is wrong (too-small batch, un-fused kernels, comm not overlapped). MFU is the single honesty knob that turns "FLOPs required" into "wall-clock" — it appears in the runtime estimate in section 5 and is the reason the rest of Part II exists.</p>
+
+<h2>3 · The memory ledger: why "16 bytes per parameter"</h2>
+
+<p>Now the question that breaks the single GPU. Training state is not "the model"; it is everything AdamW + mixed precision must keep resident for one step. Walk the ledger one entry at a time, per parameter, for the standard bf16 + fp32-master AdamW recipe from lesson 04:</p>
+
+<table class="trade-table"><thead><tr><th>what's resident</th><th>precision</th><th>bytes / param</th><th>why it must exist</th></tr></thead><tbody>
+  <tr><td>bf16 parameters</td><td>16-bit</td><td>2</td><td>the weights the forward/backward actually compute with</td></tr>
+  <tr><td>fp32 master parameters</td><td>32-bit</td><td>4</td><td>the precise copy the optimizer updates — bf16 has too few mantissa bits to accumulate tiny steps</td></tr>
+  <tr><td>Adam first moment <span class="math">m</span></td><td>fp32</td><td>4</td><td>running mean of the gradient</td></tr>
+  <tr><td>Adam second moment <span class="math">v</span></td><td>fp32</td><td>4</td><td>running mean of the squared gradient</td></tr>
+  <tr><td><strong>subtotal (optimizer + weights)</strong></td><td></td><td><strong>14</strong></td><td>the "always resident" core</td></tr>
+  <tr><td>bf16 gradients</td><td>16-bit</td><td>2</td><td>produced in backward, consumed by the optimizer</td></tr>
+  <tr><td><strong>total with gradients</strong></td><td></td><td><strong>≈16</strong></td><td>the planning number</td></tr>
+</tbody></table>
+
+<p>So the model's <em>training state</em> costs about <strong>16 bytes per parameter</strong> — and some accountings reach ≈18 when fp32 gradients or extra buffers are held. Note how counterintuitive this is: the bf16 weights you think of as "the model" are only 2 of those 16 bytes. The optimizer state and the fp32 master copy are <strong>7× larger than the weights themselves</strong>. This is the single fact most people get wrong when they reason about whether a model "fits."</p>
+
+<div class="math block">training-state bytes &nbsp;≈&nbsp; 16 · N &nbsp;&nbsp; (2 bf16 w + 4 fp32 master + 4 m + 4 v + 2 grad)</div>
+
+<p>Run it on 7B, <em>before any activations</em>:</p>
+
+<div class="lesson-flow">
+  <div><strong>7B · core</strong><span>14 bytes × 7×10⁹ = 98 GB just for weights + fp32 master + Adam m,v.</span></div>
+  <div><strong>7B · +grads</strong><span>16 bytes × 7×10⁹ ≈ 112 GB resident training state.</span></div>
+  <div><strong>7B · ≈18</strong><span>18 bytes × 7×10⁹ ≈ 126 GB with fp32 grads / buffers — the upper end of the ~112–130 GB range.</span></div>
+  <div><strong>one H100</strong><span>80 GB of HBM. 112 GB &gt; 80 GB. The optimizer state alone overflows the device.</span></div>
+</div>
+
+<p>A 7B model — small by frontier standards — cannot train on a single 80 GB H100 even if you store <em>zero</em> activations. The naive intuition "7 billion params × 2 bytes = 14 GB, plenty of room" is off by 8×, because it prices only one of the six things that must be resident. This is the memory wall.</p>
+
+<h2>4 · Activations — often the real ceiling — and checkpointing</h2>
+
+<p>The ledger above is the per-step <em>state</em>. On top of it sits <strong>activation memory</strong>: every intermediate tensor the forward pass produces and the backward pass needs to recompute its gradients. Activations scale with how much data is in flight, not with N:</p>
+
+<div class="math block">activation bytes &nbsp;∝&nbsp; B · T · d · L &nbsp; (+ an attention term ∝ B · h · T² when scores are materialized)</div>
+
+<p>The dependence on batch <span class="math">B</span> and sequence length <span class="math">T</span> is what makes activations dangerous: state is fixed once you pick N, but activations balloon the moment you raise B·T for throughput or stretch T for long context. For a large batch on a deep model, activation memory can <em>exceed</em> the 16N training state and become the dominant term — which is why FlashAttention (lesson 07) exists to kill the <span class="math">O(T²)</span> attention activations specifically.</p>
+
+<p>The dial that buys this back is <strong>gradient (activation) checkpointing</strong>. Normally you store every activation on the way forward so the backward can read them. Instead, store only a handful of checkpoints (typically one per layer boundary) and discard the rest; in the backward, <em>recompute</em> the discarded activations on demand from the nearest checkpoint. You trade memory for compute:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">memory</div><div class="v">activation memory drops from ∝L down to ∝√L (or to one layer's worth) — often a 5–10× cut.</div></div>
+  <div class="topic-card"><div class="k">compute</div><div class="v">the forward is effectively run again inside the backward → roughly +30% FLOPs (one extra forward over the 6N step).</div></div>
+  <div class="topic-card"><div class="k">verdict</div><div class="v">turn it on when activations, not state, are what's pushing you over; it lowers MFU slightly but unlocks larger B·T or longer T.</div></div>
+</div>
+
+<p>Checkpointing is the first appearance of the course's central move: <em>spend the cheaper resource to relieve the scarcer one.</em> Here compute is cheap and memory is the wall, so you pay ~30% compute to reclaim memory. The systems half is a catalog of trades exactly like this. Note the limit, though: checkpointing only attacks the activation term — it does nothing for the 112 GB of optimizer state, which is why even with aggressive checkpointing the 7B still does not fit, and why lesson 08 must shard that state across devices.</p>
+
+<h2>5 · Putting it together: fit/no-fit and runtime</h2>
+
+<p>Combine the two models. Per GPU you need <span class="math">16N/G</span> bytes if state is sharded across <span class="math">G</span> data-parallel ranks (the ZeRO/FSDP story, lesson 08 — for now, on one GPU, <span class="math">G=1</span>), plus the activation term. A model fits when that total is under 80 GB. Here is the picture across sizes on single 80 GB H100s with no sharding, modest activations:</p>
+
+<table class="trade-table"><thead><tr><th>model N</th><th>16N state</th><th>fits 1× H100 (80 GB)?</th><th>min H100s (state only, ÷G)</th></tr></thead><tbody>
+  <tr><td>1.3B</td><td>≈21 GB</td><td>yes — room for activations</td><td>1</td></tr>
+  <tr><td>7B</td><td>≈112 GB</td><td><strong>no</strong> — overflows before activations</td><td>2</td></tr>
+  <tr><td>13B</td><td>≈208 GB</td><td>no</td><td>3</td></tr>
+  <tr><td>70B</td><td>≈1,120 GB</td><td>no</td><td>14+</td></tr>
+</tbody></table>
+
+<p>The 7B "no" is the hinge of the whole course. And runtime falls straight out of section 1 and 2 — total FLOPs over delivered FLOP/s:</p>
+
+<div class="math block">time &nbsp;≈&nbsp; 6 · N · D / (GPUs · peak FLOP/s · MFU)</div>
+
+<p>Worked, for the 7B at <span class="math">D = 1.4×10¹²</span> tokens (<span class="math">C ≈ 5.9×10²²</span> FLOPs from section 1), on 8 H100s at 50% MFU: denominator <span class="math">= 8 · 990×10¹² · 0.5 ≈ 3.96×10¹⁵</span> FLOP/s, so <span class="math">time ≈ 5.9×10²² / 3.96×10¹⁵ ≈ 1.49×10⁷ s ≈ 172 days</span>. Halve the MFU and you double the calendar; double the GPUs and you halve it. This one formula is how you turn a dollar budget (GPU-hours) into a feasible model size — the planning loop that lesson 11 formalizes into scaling laws. The deeper accounting of the fused training step and its peak memory lives in <a href="../../gpu_kernels/30_fused_optimizers_training_step.html">gpu_kernels · 30 (the training step &amp; peak memory)</a>.</p>
+
+<h2>6 · Drive the calculator</h2>
+
+<p>Set the model size, batch, context, precision, checkpointing, and GPU count. The stacked meter shows per-GPU bytes split into params / grads / optimizer / activations against the 80 GB H100 line — when the bar would cross it, the bar and the "fits?" KPI turn red. Start at the defaults (7B, 1 GPU) and watch it overflow with the optimizer state alone. Then prove three things to yourself: (a) checkpointing shrinks only the activation segment, never the optimizer one; (b) raising context T inflates activations fast; (c) you need at least 2 GPUs (sharding the state) before 7B even fits, and far more before it trains in reasonable time.</p>
+
+<div class="widget" id="acct-widget">
+  <div class="title">Memory &amp; runtime calculator — does it fit, and how long?</div>
+  <div class="hint">The meter is per-GPU bytes vs the 80 GB H100 wall. It proves the hinge: at 7B on one GPU the optimizer state alone (params+grads+optim ≈ 112 GB) crosses the line <em>before</em> a single activation is added. Checkpointing only trims the activation segment. State is assumed evenly sharded across the GPUs (the lesson-08 preview); raise GPUs to make 7B fit at all.</div>
+
+  <div class="controls">
+    <label class="inline">N (params):
+      <select id="acct-N">
+        <option value="1.3">1.3B</option>
+        <option value="7" selected>7B</option>
+        <option value="13">13B</option>
+        <option value="70">70B</option>
+      </select>
+    </label>
+    <label class="inline">B (batch/GPU): <input type="range" id="acct-B" min="1" max="32" step="1" value="4"> <span class="val" id="acct-B-v">4</span></label>
+    <label class="inline">T (context): <input type="range" id="acct-T" min="512" max="16384" step="512" value="2048"> <span class="val" id="acct-T-v">2048</span></label>
+    <label class="inline">precision:
+      <select id="acct-prec">
+        <option value="bf16" selected>bf16 + fp32 AdamW (16 B/param)</option>
+        <option value="fp32">fp32 everything (16 B/param, no master)</option>
+      </select>
+    </label>
+    <label class="inline"><input type="checkbox" id="acct-ckpt"> gradient checkpointing</label>
+    <label class="inline">#GPUs (G): <input type="range" id="acct-G" min="1" max="64" step="1" value="1"> <span class="val" id="acct-G-v">1</span></label>
+  </div>
+
+  <div class="legend">
+    <span><i style="background:var(--accent)"></i>params</span>
+    <span><i style="background:var(--accent-2)"></i>grads</span>
+    <span><i style="background:var(--ok)"></i>optimizer (m,v + master)</span>
+    <span><i style="background:#7c3aed"></i>activations</span>
+  </div>
+  <div class="meter-wrap">
+    <div class="budget-meter" id="acct-meter" style="height:30px;"></div>
+    <div class="meter-line" id="acct-line"><span class="cap">80 GB · 1× H100</span></div>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">Total GB / GPU</div><div class="v" id="acct-k-gb">—</div></div>
+    <div class="kpi" id="acct-k-fits-box"><div class="k">Fits 80 GB?</div><div class="v" id="acct-k-fits">—</div></div>
+    <div class="kpi"><div class="k">Train FLOPs (6ND)</div><div class="v" id="acct-k-flops">—</div></div>
+    <div class="kpi"><div class="k">Est. days · D=1.4T · 50% MFU</div><div class="v" id="acct-k-days">—</div></div>
+  </div>
+</div>
+
+<p>The widget makes the course's spine visible in one screen: the optimizer-state segment alone is what pushes 7B over the 80 GB line, checkpointing can't touch it, and the only remedy is more devices — which is precisely what forces the systems half.</p>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Pricing only the weights.</strong> "7B × 2 bytes = 14 GB, fits easily." <em>Signal:</em> instant OOM the moment the optimizer allocates m, v, and the fp32 master — you under-counted by 8×.</li>
+    <li><strong>Forgetting activations exist.</strong> State fits, then a big B·T OOMs mid-step. <em>Signal:</em> training survives a few steps at small batch then crashes when you raise it for throughput.</li>
+    <li><strong>Expecting checkpointing to fix everything.</strong> Turning it on and still OOMing. <em>Signal:</em> the optimizer-state segment was the overflow, not activations — checkpointing only trims activations and adds ~30% compute.</li>
+    <li><strong>Planning runtime off peak FLOP/s.</strong> Quoting "it'll take X days" using 100% utilization. <em>Signal:</em> the real run is ~2× longer because actual MFU is ~50%, not 100%.</li>
+    <li><strong>Ignoring the attention FLOP term at long T.</strong> Using 6ND for a 32k-context run. <em>Signal:</em> measured step time far exceeds the 6ND estimate because the <span class="math">O(T²)</span> term is now material.</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><strong>Price the full 16 bytes/param</strong> before claiming a model fits — weights are 2 of them.</li>
+    <li><strong>Add the activation term</strong> (∝ B·T·d·L) on top of state, and check it against your real batch and context.</li>
+    <li><strong>Use 6ND for the FLOP budget</strong>, and keep the <span class="math">O(T²)</span> attention term when T approaches d.</li>
+    <li><strong>Apply MFU (~50%)</strong> to peak FLOP/s for any runtime estimate; never quote peak.</li>
+    <li><strong>Reach for checkpointing</strong> only when activations are the bottleneck; reach for sharding (lesson 08) when state is.</li>
+  </ul></div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the calculator at 7B, 1 GPU, bf16, T=2048, checkpointing off. Read the total (~112 GB resident state) and confirm the bar is red and "Fits?" says no — the optimizer state alone crossed 80 GB before activations were even meaningful. Now (a) toggle checkpointing on and confirm the bar barely moves: which segment shrank, and why didn't it save you? (b) Drag #GPUs up until "Fits?" flips to yes — what's the minimum, and what does the bar tell you each GPU is holding? (c) With that GPU count, read off the estimated days, then halve the assumed MFU in your head and state the new figure. Finally, by hand: a 13B model on bf16 AdamW — how many bytes of resident state, and how many 80 GB GPUs just to hold it?</div>
+
+<h2>Where this points next</h2>
+
+<p>The accounting just proved that a 7B model — let alone a 70B — cannot train on one 80 GB GPU, because 16 bytes/param of training state overflows the device before activations are even counted. The forced consequence is that the work must be split across many GPUs. But you cannot reason about splitting it well — about MFU, about which ops stall, about the cost of moving bytes between devices — without first understanding the machine you are renting: its memory hierarchy, its tensor cores, and the gap between its TFLOP/s and its TB/s. That is the hardware foundation the rest of accounting silently assumed. Next: <a href="06_gpus.html"><strong>06 · GPUs — the hardware you're renting</strong></a>.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>Two pieces of arithmetic decide whether a training run is launchable. <strong>Compute:</strong> a matmul costs <span class="math">2·in·out</span> FLOPs, summing to ≈2N/token forward; backward is ≈2× that, so a training step is <strong>6N/token</strong> and a whole run is <span class="math">C ≈ 6ND</span> — the budget identity of lesson 00, now derived. Wall-clock is <span class="math">6ND / (GPUs · peak · MFU)</span>, where MFU (~40–55%, plan 50%) is the honest fraction of peak you actually get. <strong>Memory:</strong> mixed-precision AdamW keeps 2 bytes of bf16 weights, 4 of fp32 master, 4+4 of Adam m,v, and 2 of grads — <strong>≈16 bytes/param</strong>, of which the weights are only 2. For 7B that is ≈112 GB of resident state, which overflows one 80 GB H100 <em>before a single activation</em>. Activation memory (∝ B·T·d·L) is often the dominant term on top, and gradient checkpointing buys it back at ~30% extra compute — the course's recurring move of spending the cheap resource to relieve the scarce one. Checkpointing cannot touch the optimizer state, so the only fix for the 112 GB wall is more devices. That "no" is the hinge: it forces the entire systems half of CS336.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>Derive the 6ND training-FLOP rule from a single matmul. <em>(§1 — a <span class="math">(in,out)</span> matmul costs <span class="math">2·in·out = 2·params</span> per token; summed over all weights the forward is 2N, backward is ≈2× forward (grad-w.r.t.-input + grad-w.r.t.-weight) ≈4N, so a step is 6N/token and a run is 6ND.)</em></li>
+  <li>Why is training state ≈16 bytes/param when bf16 weights are only 2? <em>(§3 — add the fp32 master (4), Adam m and v (4+4), and bf16 grads (2): 2+4+4+4+2 ≈ 16. The optimizer state + master dominate; the weights are the smallest piece.)</em></li>
+  <li>Walk the memory math for a 7B model on one 80 GB H100. <em>(§3 — 16 × 7×10⁹ ≈ 112 GB of state, before any activations, &gt; 80 GB. It cannot fit; you must shard state across GPUs.)</em></li>
+  <li>What is MFU, what's a good value, and why is it below 1? <em>(§2 — achieved ÷ (GPUs·peak) FLOP/s; ~40–55% is healthy; below 1 due to memory-bound ops, kernel/HBM overhead, comm stalls, pipeline bubbles — the targets of Part II.)</em></li>
+  <li>What does gradient checkpointing trade, and what can't it fix? <em>(§4 — it discards most activations and recomputes them in backward: ~30% extra compute to cut activation memory (often 5–10×). It does nothing for optimizer state, so it won't make 7B fit one GPU.)</em></li>
+  <li>Estimate the wall-clock to train 7B on 1.4T tokens on 8 H100s. <em>(§5 — C ≈ 6·7×10⁹·1.4×10¹² ≈ 5.9×10²² FLOPs; ÷ (8·990×10¹²·0.5 MFU) ≈ 1.5×10⁷ s ≈ ~170 days.)</em></li>
+  <li>When does the 6ND rule under-count, and by how much? <em>(§1 caveat — it ignores attention's <span class="math">O(T²)</span> term (≈12·L·T·d/token); negligible for short context, material once T approaches d, e.g. long-context training.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="04_training.html"><span class="dir">← Back</span><span class="ttl">04 · Training</span></a>
+  <a class="next" href="06_gpus.html"><span class="dir">Next →</span><span class="ttl">06 · GPUs</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var elN = document.getElementById('acct-N');
+  var elB = document.getElementById('acct-B'), elBv = document.getElementById('acct-B-v');
+  var elT = document.getElementById('acct-T'), elTv = document.getElementById('acct-T-v');
+  var elPrec = document.getElementById('acct-prec');
+  var elCkpt = document.getElementById('acct-ckpt');
+  var elG = document.getElementById('acct-G'), elGv = document.getElementById('acct-G-v');
+  var meter = document.getElementById('acct-meter');
+  var line  = document.getElementById('acct-line');
+  var kGB = document.getElementById('acct-k-gb');
+  var kFits = document.getElementById('acct-k-fits');
+  var kFitsBox = document.getElementById('acct-k-fits-box');
+  var kFlops = document.getElementById('acct-k-flops');
+  var kDays = document.getElementById('acct-k-days');
+  if (!meter) return;
+
+  var GB = 1024*1024*1024;       // bytes per GiB (we display GB ~ GiB for planning)
+  var CAP = 80;                  // GB, H100 HBM
+  var PEAK = 990e12;             // bf16 TFLOP/s, ~1 PFLOP/s
+  var MFU = 0.5;                 // planning utilization
+  var D = 1.4e12;                // tokens for the days estimate
+
+  // model geometry (approximate d, L per size — for the activation term only)
+  var GEO = {
+    '1.3': { d: 2048, L: 24 },
+    '7':   { d: 4096, L: 32 },
+    '13':  { d: 5120, L: 40 },
+    '70':  { d: 8192, L: 80 }
+  };
+
+  function billions(){ return parseFloat(elN.value); }
+
+  function compute(){
+    var Nb = billions();
+    var N = Nb * 1e9;
+    var geo = GEO[elN.value];
+    var B = +elB.value, T = +elT.value, G = +elG.value;
+    var ckpt = elCkpt.checked;
+
+    // per-param byte ledger (GB), sharded evenly across G ranks (lesson-08 preview)
+    // bf16 path: params 2, grads 2, optimizer (fp32 master 4 + m 4 + v 4) = 12
+    var bParams = 2, bGrads = 2, bOptim = 12;
+    if (elPrec.value === 'fp32') { bParams = 4; bGrads = 4; bOptim = 8; } // fp32 weights, no master, fp32 m,v
+    var paramsGB = (bParams * N) / GB / G;
+    var gradsGB  = (bGrads  * N) / GB / G;
+    var optimGB  = (bOptim  * N) / GB / G;
+
+    // activation term: ~ bytes * B * T * d * L (bf16, ~ a handful of buffers per layer),
+    // sharded over G ranks; checkpointing keeps ~ one layer's worth instead of all L.
+    var actBytesPerLayer = 14 * B * T * geo.d * 2; // ~14 buffers/layer * 2 bytes (bf16)
+    var actFull = actBytesPerLayer * geo.L;
+    var act = ckpt ? actBytesPerLayer * Math.sqrt(geo.L) : actFull;
+    var actGB = act / GB / G;
+
+    var total = paramsGB + gradsGB + optimGB + actGB;
+
+    // ---- meter ----
+    // scale so the 80 GB line sits at a fixed fraction of the bar width; overflow extends past it.
+    var SCALE = Math.max(total, CAP) * 1.04; // a little headroom
+    function seg(cls, gb){
+      var pct = (gb / SCALE) * 100;
+      var lbl = gb >= 4 ? (Math.round(gb) + '') : '';
+      return '<span class="' + cls + '" style="width:' + pct.toFixed(2) + '%">' + lbl + '</span>';
+    }
+    var over = total > CAP;
+    meter.innerHTML =
+      seg('seg-a', paramsGB) + seg('seg-b', gradsGB) +
+      seg('seg-c', optimGB)  + seg('seg-d', actGB);
+    // dim everything red-ish on overflow by tinting the optimizer/activation excess via the line marker
+    line.style.left = ((CAP / SCALE) * 100).toFixed(2) + '%';
+
+    // ---- KPIs ----
+    kGB.textContent = total.toFixed(1) + ' GB';
+    if (over){
+      kFits.textContent = 'NO — over by ' + (total - CAP).toFixed(0) + ' GB';
+      kFitsBox.classList.add('over');
+      meter.style.boxShadow = 'inset 0 0 0 2px var(--bad)';
+    } else {
+      kFits.textContent = 'yes (' + (CAP - total).toFixed(0) + ' GB free)';
+      kFitsBox.classList.remove('over');
+      meter.style.boxShadow = 'none';
+    }
+
+    var flops = 6 * N * D * (ckpt ? 1.3 : 1.0); // checkpointing adds ~30% compute
+    kFlops.textContent = (flops / 1e21).toFixed(1) + 'e21';
+
+    var secs = flops / (G * PEAK * MFU);
+    var days = secs / 86400;
+    kDays.textContent = days >= 1 ? days.toFixed(1) + ' d' : (days*24).toFixed(1) + ' h';
+  }
+
+  function sync(){
+    elBv.textContent = elB.value;
+    elTv.textContent = elT.value;
+    elGv.textContent = elG.value;
+    compute();
+  }
+
+  [elN, elB, elT, elPrec, elCkpt, elG].forEach(function(e){
+    e.addEventListener('input', sync);
+    e.addEventListener('change', sync);
+  });
+  sync();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

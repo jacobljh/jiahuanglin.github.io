@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>08 · Data parallelism — DDP → ZeRO → FSDP</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local layout only — failure/checklist columns + meter labels */
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; font-size: 15px; }
+  .lesson-card ul { margin: 0; padding-left: 18px; }
+  .lesson-card li { margin: 7px 0; font-size: 13.5px; line-height: 1.5; }
+  .meter-wrap { position: relative; margin: 16px 0 30px; }
+  .meter-line { position: absolute; top: -6px; bottom: -22px; width: 0; border-left: 2px dashed var(--bad); }
+  .meter-line .cap { position: absolute; bottom: -20px; left: 4px; font-family: var(--mono); font-size: 11px; color: var(--bad); white-space: nowrap; }
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; margin: 6px 0 2px; font-family: var(--mono); font-size: 11px; color: var(--text-mute); }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .legend i { width: 11px; height: 11px; border-radius: 2px; display: inline-block; }
+  .kpi.over .v { color: var(--bad); }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="index.html">cs336 / lessons</a><span class="crumb">/</span><span class="crumb">08 · data parallel</span><span class="step-pill">lesson 9 / 18</span></div></header>
+
+<main>
+
+<p class="kicker">Part II — Systems</p>
+<h1>Data parallelism — DDP → ZeRO → FSDP</h1>
+<p class="subtitle">Lesson 07 made one GPU as fast as it can be: kernels fused, FlashAttention killing the <span class="math">O(T²)</span> attention activations, the chip running near its roofline. But a fast GPU is still one GPU, and lesson 05 already proved the verdict — a 7B model's training state is ≈112 GB, and an H100 holds 80. No amount of kernel cleverness fits 112 into 80. The only move left is more devices. This lesson takes the obvious first step (replicate the model and split the batch), shows it scales speed but not memory, and then shows the idea that actually breaks the memory wall: stop replicating the redundant state and shard it.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>The memory ledger from lesson 05 is unmoved by anything in lesson 06 or 07. Fusion and FlashAttention shrink the <em>activation</em> term; they do nothing to the 112 GB of <em>training state</em> — 2 bytes of bf16 weights, 4 of fp32 master, 4+4 of Adam <span class="math">m,v</span>, 2 of grads, ≈16 bytes/param. That state still overflows one 80 GB H100 before a single activation is stored. We can now make a GPU efficient; we still cannot make the model <em>fit</em> on it. The work must cross device boundaries — and the cheapest way to cross a boundary, the one every framework reaches for first, is to put a whole copy of the model on each GPU and feed each copy a different slice of the batch.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> a model's training state (≈16N bytes) exceeds one GPU's memory, and lesson 07 has already spent every single-device trick.<br><strong>New idea (two steps):</strong> <strong>DDP</strong> — replicate the model on <span class="math">G</span> GPUs, split the global batch <span class="math">G</span> ways, run local forward/backward, then <strong>all-reduce</strong> the gradients so every replica steps identically (this scales <em>throughput</em>, not memory); then <strong>ZeRO / FSDP</strong> — notice params, grads, and optimizer state are <em>identical</em> across replicas, so shard each of the three across the <span class="math">G</span> ranks and gather just-in-time (all-gather in forward, reduce-scatter in backward), cutting per-GPU state ≈<span class="math">G×</span>.<br><strong>Forces next:</strong> even fully sharded, a <em>single</em> layer too big to compute on one device, or a sequence too long to hold its activations, still won't fit — and DP can never shrink the per-step <em>compute</em> below one whole model; you must split the model itself (lesson 09).</div>
+
+<div class="callout"><div class="label">The plan</div>Five moves. (1) Build DDP: replicate, scatter the batch, local fwd/bwd, all-reduce gradients — and price the all-reduce at ≈<span class="math">2(G−1)/G·N</span> bytes, overlapped with backward. (2) Name the limitation: every rank still holds the full ≈16N state, so memory is unchanged. (3) The ZeRO insight: that state is redundant across replicas → shard it. ZeRO-1 (optimizer) / ZeRO-2 (+grads) / ZeRO-3 = FSDP (+params, gathered per layer then freed). (4) Plot per-GPU memory ≈16N/G and price ZeRO-3's extra comm (~1.5× DDP). (5) Drive the meter: set ZeRO-3 and watch a model DDP can't hold drop under 80 GB.</div>
+
+<h2>1 · DDP: replicate the model, split the batch</h2>
+
+<p>The first multi-GPU idea is the one that needs the least new machinery, because it leaves the model untouched. Put a full, identical copy of the model on each of <span class="math">G</span> GPUs. Take the global batch <span class="math">B</span> and hand each GPU a disjoint slice of size <span class="math">B/G</span> (the "data" the parallelism is named for). Every GPU runs its own forward and backward on its own slice, producing its own gradient. The four steps of one training step:</p>
+
+<div class="lesson-flow">
+  <div><strong>replicate</strong><span>at startup, broadcast one copy of the weights to all <span class="math">G</span> ranks so every GPU holds identical parameters.</span></div>
+  <div><strong>scatter batch</strong><span>split the global batch <span class="math">B</span> into <span class="math">G</span> micro-batches of <span class="math">B/G</span>; rank <span class="math">i</span> sees only its slice.</span></div>
+  <div><strong>local fwd / bwd</strong><span>each rank computes loss and gradients on its slice — no communication yet, pure local compute.</span></div>
+  <div><strong>all-reduce grads</strong><span>average the gradients across all ranks so every rank gets the same global-batch gradient, then every rank applies the <em>identical</em> AdamW step.</span></div>
+</div>
+
+<p>The all-reduce is the whole trick and the whole cost. Mathematically, a sum over the global batch equals the sum of the per-rank sums, so averaging each rank's local gradient gives exactly the gradient you would have computed on the full batch on one (impossibly large) GPU. Because every rank ends the step with the same averaged gradient and started with the same weights, they apply the same update and stay bit-identical replicas forever — no parameter sync is ever needed, only the gradient sync.</p>
+
+<h3>What the all-reduce costs</h3>
+
+<p>A naive all-reduce — every rank sends its full gradient to one rank to be summed and broadcast back — costs <span class="math">O(G·N)</span> and bottlenecks on one link. The algorithm everyone actually uses is the <strong>ring all-reduce</strong>: arrange the <span class="math">G</span> ranks in a ring, split each gradient into <span class="math">G</span> chunks, and run <span class="math">G−1</span> reduce-scatter steps (each rank accumulates one chunk) followed by <span class="math">G−1</span> all-gather steps (each rank receives the final value of every chunk). Each GPU sends and receives</p>
+
+<div class="math block">all-reduce bytes / GPU &nbsp;≈&nbsp; 2 · (G−1)/G · N · (bytes per grad element)</div>
+
+<p>The key feature: the <span class="math">(G−1)/G</span> factor tends to 1 as <span class="math">G</span> grows, so the per-GPU communication is ≈<span class="math">2N</span> bytes regardless of how many GPUs you add. Doubling the cluster does <em>not</em> double each GPU's comm — that bandwidth-independence of <span class="math">G</span> is why ring all-reduce scales. For a 7B model in bf16 (2 bytes/grad), per-GPU traffic is <span class="math">≈ 2 · 7×10⁹ · 2 ≈ 28 GB</span> per step, moved over NVLink/InfiniBand.</p>
+
+<h3>Overlap: hide the comm behind the backward</h3>
+
+<p>You do not wait for the backward to finish and <em>then</em> all-reduce — that would serialize comm after compute and tank MFU. Gradients become ready layer-by-layer, from the top of the network down, as the backward sweeps. DDP fires the all-reduce for a <strong>bucket</strong> of gradients the instant that bucket is complete, while the backward keeps computing the lower layers. Done right, almost all of the ≈28 GB of comm overlaps the backward compute and is nearly free in wall-clock. This is the same recurring move from lesson 05 — spend the resource you have spare (here, the backward's compute time) to hide the one you're short on (interconnect latency).</p>
+
+<div class="callout warn"><div class="label">What DDP actually buys</div>DDP multiplies <em>throughput</em>: <span class="math">G</span> GPUs chew through <span class="math">G×</span> the tokens per second (minus a few % for un-overlapped comm), so a fixed <span class="math">D</span> tokens finishes ≈<span class="math">G×</span> faster — exactly the <span class="math">time ≈ 6ND/(G·peak·MFU)</span> speedup from lesson 05. What it does <strong>not</strong> buy is memory. Read on.</div>
+
+<h2>2 · The limitation: every rank still holds the whole model</h2>
+
+<p>Look back at the four DDP steps and ask what each GPU has resident. A <em>full</em> copy of the parameters. A <em>full</em> set of gradients. A <em>full</em> optimizer state (fp32 master, Adam <span class="math">m</span>, Adam <span class="math">v</span>). That is the entire ≈16N ledger from lesson 05, sitting on <em>every single rank</em>. DDP replicated the model; it replicated the memory problem along with it.</p>
+
+<div class="math block">DDP per-GPU state &nbsp;=&nbsp; 16 · N &nbsp;&nbsp; (unchanged — independent of G)</div>
+
+<p>So a 7B model is still ≈112 GB on each of your 64 GPUs, and 112 &gt; 80 on every one of them. DDP can make a model that <em>already fits</em> train <span class="math">G×</span> faster, but it cannot make a model that <em>doesn't</em> fit fit at all. Splitting the batch was the wrong axis to split on: the batch was never the thing overflowing the device — the <em>state</em> was, and DDP keeps a whole copy of it per GPU. We need to split the state.</p>
+
+<h2>3 · The ZeRO insight: that state is redundant — shard it</h2>
+
+<p>Here is the observation that breaks the wall, from the ZeRO paper (Rajbhandari et al., 2019). Across all <span class="math">G</span> DDP replicas, the parameters are <em>identical</em>. The optimizer states are <em>identical</em>. After the all-reduce, even the gradients are <em>identical</em>. We are storing the same ≈16N bytes <span class="math">G</span> times over. That redundancy is pure waste — and the fix is to keep only <span class="math">1/G</span> of each on each rank, and fetch the missing pieces over the (fast, otherwise-idle) interconnect exactly when a given step needs them. <strong>ZeRO</strong> ("Zero Redundancy Optimizer") shards the three pieces in three increasingly aggressive stages:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">ZeRO-1 — shard optimizer state</div><div class="v">Each rank keeps only <span class="math">1/G</span> of the fp32 master + Adam <span class="math">m,v</span> (the 12 fp32 bytes). Params and grads still replicated. The optimizer is the biggest piece (12 of 16 bytes), so this alone is the largest single drop. Comm ≈ unchanged from DDP.</div></div>
+  <div class="topic-card"><div class="k">ZeRO-2 — also shard gradients</div><div class="v">On top of ZeRO-1, each rank keeps only the gradient slice for the params it optimizes. The all-reduce becomes a <strong>reduce-scatter</strong> (each rank ends up with just its averaged slice), which moves the same bytes — no extra comm. Params still replicated.</div></div>
+  <div class="topic-card"><div class="k">ZeRO-3 = FSDP — also shard parameters</div><div class="v">The full step: params too are sharded <span class="math">1/G</span>. A layer's full weights exist on no single rank, so before you can compute a layer you must <strong>all-gather</strong> its shards, use them, then <strong>free</strong> them. This is what PyTorch ships as Fully Sharded Data Parallel. It costs extra comm (§4) but cuts per-GPU state to ≈16N/G.</div></div>
+</div>
+
+<h3>How FSDP runs a forward and backward</h3>
+
+<p>The mechanics of ZeRO-3 are the part worth holding precisely, because the comm pattern follows directly. Each rank permanently owns only its <span class="math">1/G</span> shard of every layer's parameters. To execute the model:</p>
+
+<div class="lesson-flow">
+  <div><strong>forward, per layer</strong><span><strong>all-gather</strong> this layer's parameter shards from all ranks → every rank briefly holds the layer's full weights → compute the layer's output → immediately <strong>free</strong> the gathered weights, keeping only your shard. Peak param memory is one layer's worth, not the whole model's.</span></div>
+  <div><strong>backward, per layer</strong><span><strong>all-gather</strong> the layer's weights again (they were freed) → compute gradients → <strong>reduce-scatter</strong> the gradients so each rank receives only the averaged slice for the params it owns → free the gathered weights.</span></div>
+  <div><strong>optimizer step</strong><span>each rank updates only its <span class="math">1/G</span> of params using its <span class="math">1/G</span> of optimizer state and its reduce-scattered gradient slice. No rank ever materializes the full model state.</span></div>
+</div>
+
+<p>So the model is sharded at rest and gathered just-in-time, one layer at a time, and the gathered copy is thrown away the moment that layer is done. The all-gather in forward and the reduce-scatter in backward are the new communications ZeRO-3 adds over DDP. ZeRO-1/2 keep params replicated, so they only ever do the gradient reduce-scatter (the same bytes as DDP's all-reduce) — that is why they add memory savings at essentially zero extra comm.</p>
+
+<h2>4 · Per-GPU memory ≈ 16N/G — and the cost of ZeRO-3</h2>
+
+<p>The payoff is a clean curve. Sharding the parts each stage owns divides that part's bytes by <span class="math">G</span>; the unsharded parts stay full. Per parameter (the 2/2/12 bf16 ledger from lesson 05), per GPU:</p>
+
+<table class="trade-table"><thead><tr><th>stage</th><th>params (2)</th><th>grads (2)</th><th>optim (12)</th><th>bytes/param @ G</th><th>per-GPU at large G</th></tr></thead><tbody>
+  <tr><td>DDP (ZeRO-0)</td><td>2</td><td>2</td><td>12</td><td>16 (constant)</td><td>16N — never shrinks</td></tr>
+  <tr><td>ZeRO-1</td><td>2</td><td>2</td><td>12/G</td><td>4 + 12/G</td><td>→ 4N</td></tr>
+  <tr><td>ZeRO-2</td><td>2</td><td>2/G</td><td>12/G</td><td>2 + 14/G</td><td>→ 2N</td></tr>
+  <tr><td>ZeRO-3 (FSDP)</td><td>2/G</td><td>2/G</td><td>12/G</td><td>16/G</td><td>→ 0 (≈16N/G)</td></tr>
+</tbody></table>
+
+<p>Read the limits. ZeRO-1 floors at <span class="math">4N</span> bytes/GPU (the still-replicated params+grads); ZeRO-2 floors at <span class="math">2N</span> (the still-replicated params); only <strong>ZeRO-3 keeps falling</strong> as <span class="math">≈16N/G</span> with no floor, because <em>all three</em> pieces shard. Worked on the 7B: DDP is 112 GB/GPU on any cluster size; ZeRO-3 on 16 GPUs is <span class="math">≈ 112/16 = 7 GB/GPU</span> of state — trivially under 80 GB, with the rest of the budget free for activations. That is the model DDP can't fit, fitting.</p>
+
+<p>Nothing is free. ZeRO-3 trades that memory for communication volume:</p>
+
+<table class="trade-table"><thead><tr><th>scheme</th><th>comm pattern / step</th><th>volume vs DDP</th></tr></thead><tbody>
+  <tr><td>DDP / ZeRO-1 / ZeRO-2</td><td>gradient all-reduce (or reduce-scatter) ≈ 2N</td><td>1.0× (baseline)</td></tr>
+  <tr><td>ZeRO-3 / FSDP</td><td>all-gather params (fwd) + all-gather params (bwd) + reduce-scatter grads</td><td>≈ 1.5× DDP</td></tr>
+</tbody></table>
+
+<p>The intuition: DDP moves the gradient once (≈2N). FSDP additionally moves the parameters twice (once to gather for forward, once to re-gather for backward), and a reduce-scatter is half an all-reduce — adding up to roughly <strong>1.5× the DDP communication volume</strong>. As long as that extra comm overlaps compute (gather layer <span class="math">i+1</span> while computing layer <span class="math">i</span>, the same prefetch trick as DDP's bucketed overlap), the wall-clock hit is small — but it is real, and it is why you do not jump to ZeRO-3 when a lower stage already fits.</p>
+
+<h2>5 · Practical: which stage, and the overlap that makes it cheap</h2>
+
+<p>The decision rule is a memory-vs-comm trade, read straight off the table above. Pick the <em>least</em> aggressive stage that fits, because each stage up adds communication:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">params replicated (DDP / ZeRO-1/2)</div><div class="v">Use when the model's <em>params</em> already fit per GPU and you only need to claw back optimizer/grad memory. Lowest comm; the params never move. Common for ≤~few-B dense models on 80 GB cards.</div></div>
+  <div class="topic-card"><div class="k">params sharded (ZeRO-3 / FSDP)</div><div class="v">Required when the params themselves don't fit per GPU (7B+ on one node, or you want huge per-GPU activation/batch headroom). Pays ~1.5× comm; the default for training large dense models on a DP-only mesh.</div></div>
+  <div class="topic-card"><div class="k">+ mixed precision (always)</div><div class="v">FSDP keeps a sharded fp32 master and runs bf16 compute (lesson 04). Gather/compute in bf16 → half the all-gather bytes vs fp32; the fp32 master is the 4 of the 12 sharded optimizer bytes. The two ideas compose directly.</div></div>
+</div>
+
+<p>Two practical levers decide whether ZeRO-3's extra comm actually hurts. First, <strong>overlap</strong>: prefetch the next layer's all-gather during the current layer's compute, so communication hides behind the GEMMs instead of stalling them — exactly DDP's bucketed-overlap idea, applied per layer. Second, <strong>topology</strong>: the all-gathers are bandwidth-hungry, so on a multi-node cluster you keep the heavy collectives on fast intra-node NVLink where you can and let the slower inter-node InfiniBand carry the less frequent traffic — which is precisely the composition with tensor/pipeline parallelism that lesson 09 builds, and the cluster-topology reasoning post-training also relies on (see the <a href="../../reinforcement_learning/lessons/index.html">reinforcement_learning</a> track's topology lessons, and the orchestration view in <a href="../../ray/lessons/index.html">ray</a>). The fused optimizer step that consumes the sharded gradient and master copy — and its peak-memory accounting — is the subject of <a href="../../gpu_kernels/30_fused_optimizers_training_step.html">gpu_kernels · 30 (the training step &amp; peak memory)</a>.</p>
+
+<h2>6 · Drive the meter</h2>
+
+<p>Set the model size and the data-parallel degree <span class="math">G</span>, then sweep the ZeRO stage 0→3. The stacked meter shows per-GPU bytes split into sharded params / grads / optimizer against the 80 GB H100 line; when the bar would cross it, the bar and the "fits?" KPI turn red. Start at 7B, ZeRO-0 (DDP), <span class="math">G=8</span> — and watch it overflow no matter how high you push <span class="math">G</span>, because DDP's 16 bytes/param is constant in <span class="math">G</span>. Then step to ZeRO-3 and watch the same 7B drop to ≈16N/G and slide under the line. Prove three things: (a) ZeRO-1 only shrinks the optimizer segment; (b) ZeRO-0's total never moves when you change <span class="math">G</span>, while ZeRO-3's falls as 1/G; (c) the comm-per-step KPI ticks up ~1.5× the moment you reach ZeRO-3.</p>
+
+<div class="widget" id="zero-widget">
+  <div class="title">ZeRO stage memory — what each stage shards, and what it costs</div>
+  <div class="hint">Per-GPU bytes vs the 80 GB H100 wall. The hinge: ZeRO-0 (DDP) holds the full ≈16N state on every GPU regardless of <span class="math">G</span>, so 7B is red on a cluster of any size. ZeRO-1 shards only the optimizer (12→12/G), ZeRO-2 also grads, ZeRO-3/FSDP also params → per-GPU state ≈16N/G with no floor. Watch ZeRO-3 fit a model DDP can't, and watch comm/step jump to ~1.5× DDP when params start being all-gathered.</div>
+
+  <div class="controls">
+    <label class="inline">N (params):
+      <select id="z-N">
+        <option value="1.3">1.3B</option>
+        <option value="7" selected>7B</option>
+        <option value="13">13B</option>
+        <option value="70">70B</option>
+      </select>
+    </label>
+    <label class="inline">#GPUs (G): <input type="range" id="z-G" min="1" max="64" step="1" value="8"> <span class="val" id="z-G-v">8</span></label>
+    <label class="inline">ZeRO stage:
+      <select id="z-stage">
+        <option value="0">0 — DDP (nothing sharded)</option>
+        <option value="1">1 — shard optimizer</option>
+        <option value="2">2 — + shard gradients</option>
+        <option value="3" selected>3 — FSDP (+ shard params)</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="legend">
+    <span><i style="background:var(--accent)"></i>params (2 B)</span>
+    <span><i style="background:var(--accent-2)"></i>grads (2 B)</span>
+    <span><i style="background:var(--ok)"></i>optimizer · master+m+v (12 B)</span>
+  </div>
+  <div class="meter-wrap">
+    <div class="budget-meter" id="z-meter" style="height:30px;"></div>
+    <div class="meter-line" id="z-line"><span class="cap">80 GB · 1× H100</span></div>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">State GB / GPU</div><div class="v" id="z-k-gb">—</div></div>
+    <div class="kpi" id="z-k-fits-box"><div class="k">Fits 80 GB?</div><div class="v" id="z-k-fits">—</div></div>
+    <div class="kpi"><div class="k">Comm / GPU / step</div><div class="v" id="z-k-comm">—</div></div>
+    <div class="kpi"><div class="k">bytes / param</div><div class="v" id="z-k-bpp">—</div></div>
+  </div>
+</div>
+
+<p>The widget is the lesson in one screen: DDP's bar is pinned at 16 bytes/param and goes red on 7B for every <span class="math">G</span>; only when params themselves shard (ZeRO-3) does the bar fall as 1/G and clear the wall — at the price of the comm-per-step KPI rising to ~1.5× DDP.</p>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Expecting DDP to save memory.</strong> Adding GPUs and still OOMing at the same per-GPU number. <em>Signal:</em> the OOM byte count is independent of <span class="math">G</span> — DDP replicates the full 16N state; you needed to shard (ZeRO), not replicate.</li>
+    <li><strong>Jumping straight to ZeRO-3.</strong> Using FSDP when the params already fit per GPU. <em>Signal:</em> MFU dips and step time rises vs a lower stage for no memory reason — you paid ~1.5× comm to shard params you didn't need to.</li>
+    <li><strong>Not overlapping the collectives.</strong> All-reduce/all-gather running after compute instead of behind it. <em>Signal:</em> a comm-shaped gap in every step's timeline and MFU well under ~40% — buckets/prefetch aren't firing.</li>
+    <li><strong>Forgetting comm scales with N, not batch.</strong> Assuming bigger batch makes the all-reduce relatively cheaper. <em>Signal:</em> comm-bound at small batch because per-GPU gradient bytes are ≈2N regardless of batch size.</li>
+    <li><strong>Sharding across a slow link.</strong> Running FSDP's all-gathers over inter-node InfiniBand when they should stay on NVLink. <em>Signal:</em> step time dominated by parameter gather; collectives are crossing node boundaries (a lesson-09 mesh problem).</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><strong>Diagnose the wall first.</strong> If params fit but optimizer/grads don't, use ZeRO-1/2; if params don't fit, use ZeRO-3/FSDP.</li>
+    <li><strong>Pick the lowest stage that fits</strong> — each stage up adds communication; don't pay for sharding you don't need.</li>
+    <li><strong>Verify the comm overlaps compute</strong> (bucketed all-reduce, prefetched all-gather) before blaming the network.</li>
+    <li><strong>Price the all-reduce as ≈2(G−1)/G·N bytes</strong> per GPU, and ZeRO-3 at ~1.5× that — both ≈ independent of <span class="math">G</span>.</li>
+    <li><strong>Keep heavy collectives intra-node</strong> (NVLink) and compose mixed precision with FSDP to halve gather bytes.</li>
+  </ul></div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the meter at 7B, ZeRO-0 (DDP), <span class="math">G=8</span>. Confirm the bar is red at ≈112 GB and "Fits?" says no. Now (a) drag <span class="math">G</span> from 8 to 64 and confirm the total does <em>not</em> move — explain in one sentence why DDP's per-GPU memory is independent of <span class="math">G</span>. (b) Switch to ZeRO-1: which single segment shrank, and why is it the biggest first win? (c) Switch to ZeRO-3 and confirm 7B now fits; read off the state GB/GPU and check it against <span class="math">112/8 ≈ 14</span> GB. (d) Note the comm/step KPI before and after step (c): by what factor did it rise, and what new collective caused it? Finally, by hand: a 70B model in bf16 AdamW — how many GPUs of ZeRO-3 sharding (state only) before per-GPU state drops under 80 GB?</div>
+
+<h2>Where this points next</h2>
+
+<p>FSDP just dissolved the memory wall: shard params, grads, and optimizer across <span class="math">G</span> ranks and per-GPU state falls as ≈16N/G with no floor, so a 7B — or, with enough ranks, a 70B — fits. But notice what is still true on every rank. Each GPU still <em>executes the whole model</em> on its batch shard; it just gathers the weights one layer at a time to do so. That leaves two things data parallelism structurally cannot fix. First, a <em>single layer</em> whose weights or activations are too big to compute on one device even momentarily — gather it and you OOM on the gathered copy. Second, a sequence so long that one layer's activations won't fit. And more fundamentally, DP can never reduce the per-step compute below one full model forward+backward — it only splits the batch. The forced next move is to stop sharding only the <em>storage</em> and start splitting the <em>computation</em>: cut each matmul across GPUs (tensor parallelism), cut the layer stack into stages (pipeline parallelism), cut the sequence (context parallelism), and compose all of it with DP into a 3D mesh. Next: <a href="09_model_parallel.html"><strong>09 · Model parallelism — tensor, pipeline, the 3D mesh</strong></a>.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>Lesson 05 left a 7B model's ≈112 GB of training state overflowing an 80 GB GPU; lesson 07 made the GPU fast but not bigger. <strong>DDP</strong> is the first repair: replicate the model on <span class="math">G</span> GPUs, split the batch, run local fwd/bwd, and <strong>all-reduce</strong> the gradients (ring all-reduce, ≈<span class="math">2(G−1)/G·N</span> bytes/GPU — nearly independent of <span class="math">G</span>, overlapped behind the backward). That multiplies <em>throughput</em> by <span class="math">G</span> but leaves per-GPU memory at the full <strong>16N</strong>, because every rank still holds a complete copy of params, grads, and optimizer state — DDP replicated the memory problem. The <strong>ZeRO</strong> insight is that those three are <em>identical</em> across replicas, hence redundant: shard them. <strong>ZeRO-1</strong> shards the optimizer (the biggest piece, 12 of 16 bytes), <strong>ZeRO-2</strong> also gradients, <strong>ZeRO-3 = FSDP</strong> also parameters — all-gathered per layer in forward, freed, re-gathered and reduce-scattered in backward. Per-GPU state then falls to <strong>≈16N/G</strong>, the only stage with no floor, at the cost of ≈<strong>1.5× DDP</strong> communication (params moved twice plus a reduce-scatter), which overlap and intra-node topology keep cheap. That is how a model DDP cannot hold fits. But every rank still runs the whole model on its batch shard, so a single oversized layer, a too-long sequence, or the irreducible one-model-per-step compute still breaks DP — forcing model parallelism in lesson 09.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>What does DDP scale, and what does it leave untouched? <em>(§1–2 — it scales throughput ≈G× by splitting the batch and all-reducing gradients; it leaves per-GPU memory at the full 16N because every rank holds a complete copy of params, grads, and optimizer state.)</em></li>
+  <li>Derive the per-GPU cost of a ring all-reduce. <em>(§1 — split the gradient into G chunks; G−1 reduce-scatter + G−1 all-gather steps, each GPU sends/receives ≈2(G−1)/G·N elements → ≈2N bytes, nearly independent of G, which is why it scales.)</em></li>
+  <li>How is comm overlapped with the backward in DDP? <em>(§1 — gradients become ready top-down; DDP fires the all-reduce per bucket the moment that bucket completes, while the backward keeps computing lower layers, so most comm hides behind compute.)</em></li>
+  <li>What is the ZeRO insight, and what do stages 1/2/3 each shard? <em>(§3 — params/grads/optimizer are identical across replicas, hence redundant; ZeRO-1 shards optimizer state, ZeRO-2 also gradients, ZeRO-3/FSDP also parameters (all-gathered per layer, then freed).)</em></li>
+  <li>Walk an FSDP forward and backward. <em>(§3 — forward: all-gather a layer's param shards, compute, free; backward: re-all-gather, compute grads, reduce-scatter grads to owners, free; optimizer updates only the local 1/G shard.)</em></li>
+  <li>Why does only ZeRO-3 keep shrinking with G? <em>(§4 — ZeRO-1 floors at 4N (replicated params+grads), ZeRO-2 at 2N (replicated params); only ZeRO-3 shards all three, so per-GPU state is ≈16N/G with no floor.)</em></li>
+  <li>What extra communication does ZeRO-3 add over DDP, and why ~1.5×? <em>(§4 — DDP moves the gradient once (≈2N); FSDP also all-gathers params twice (fwd + bwd) and reduce-scatters grads (half an all-reduce), summing to ≈1.5× DDP volume; overlap keeps the wall-clock hit small.)</em></li>
+  <li>When would you stay on ZeRO-1/2 instead of ZeRO-3? <em>(§5 — when the parameters already fit per GPU; you only need to reclaim optimizer/grad memory, so you avoid ZeRO-3's ~1.5× comm by keeping params replicated.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="07_kernels.html"><span class="dir">← Back</span><span class="ttl">07 · Kernels</span></a>
+  <a class="next" href="09_model_parallel.html"><span class="dir">Next →</span><span class="ttl">09 · Model parallelism</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var elN = document.getElementById('z-N');
+  var elG = document.getElementById('z-G'), elGv = document.getElementById('z-G-v');
+  var elStage = document.getElementById('z-stage');
+  var meter = document.getElementById('z-meter');
+  var line  = document.getElementById('z-line');
+  var kGB = document.getElementById('z-k-gb');
+  var kFits = document.getElementById('z-k-fits');
+  var kFitsBox = document.getElementById('z-k-fits-box');
+  var kComm = document.getElementById('z-k-comm');
+  var kBpp = document.getElementById('z-k-bpp');
+  if (!meter) return;
+
+  var GB  = 1e9;              // decimal GB, to match the prose's 16N-byte ledger (7B → 112 GB)
+  var CAP = 80;               // GB, H100 HBM
+
+  function compute(){
+    var N = parseFloat(elN.value) * 1e9;
+    var G = +elG.value;
+    var stage = +elStage.value;
+
+    // bf16 + fp32-AdamW ledger, bytes/param: params 2, grads 2, optimizer 12 (master 4 + m 4 + v 4)
+    // sharding divides the owned piece by G; replicated pieces stay full.
+    var pParams = 2, pGrads = 2, pOptim = 12;
+    if (stage >= 1) pOptim = 12 / G;          // ZeRO-1: optimizer sharded
+    if (stage >= 2) pGrads = 2 / G;           // ZeRO-2: + grads sharded
+    if (stage >= 3) pParams = 2 / G;          // ZeRO-3/FSDP: + params sharded
+
+    var paramsGB = (pParams * N) / GB;
+    var gradsGB  = (pGrads  * N) / GB;
+    var optimGB  = (pOptim  * N) / GB;
+    var total    = paramsGB + gradsGB + optimGB;
+    var bpp      = pParams + pGrads + pOptim;
+
+    // ---- meter: 80 GB line at a fixed fraction; overflow extends past it ----
+    var SCALE = Math.max(total, CAP) * 1.04;
+    function seg(cls, gb){
+      var pct = (gb / SCALE) * 100;
+      var lbl = gb >= 4 ? (Math.round(gb) + '') : '';
+      return '<span class="' + cls + '" style="width:' + pct.toFixed(2) + '%">' + lbl + '</span>';
+    }
+    meter.innerHTML = seg('seg-a', paramsGB) + seg('seg-b', gradsGB) + seg('seg-c', optimGB);
+    line.style.left = ((CAP / SCALE) * 100).toFixed(2) + '%';
+
+    // ---- KPIs ----
+    var over = total > CAP;
+    kGB.textContent = total.toFixed(1) + ' GB';
+    if (over){
+      kFits.textContent = 'NO — over by ' + (total - CAP).toFixed(0) + ' GB';
+      kFitsBox.classList.add('over');
+      meter.style.boxShadow = 'inset 0 0 0 2px var(--bad)';
+    } else {
+      kFits.textContent = 'yes (' + (CAP - total).toFixed(0) + ' GB free)';
+      kFitsBox.classList.remove('over');
+      meter.style.boxShadow = 'none';
+    }
+
+    // comm/GPU/step: DDP/ZeRO-1/2 ~ 2N bytes (grad all-reduce / reduce-scatter, bf16 2 B/elem);
+    // ZeRO-3 ~ 1.5x (params all-gathered twice + grad reduce-scatter).
+    var baseBytes = 2 * N * 2;                       // ≈ 2 * N elements * 2 bytes
+    var commBytes = (stage >= 3) ? baseBytes * 1.5 : baseBytes;
+    kComm.textContent = (commBytes / GB).toFixed(0) + ' GB' + (stage >= 3 ? ' (~1.5× DDP)' : ' (~DDP)');
+
+    kBpp.textContent = (bpp >= 1 ? bpp.toFixed(1) : bpp.toFixed(2)) + ' B/param';
+  }
+
+  function sync(){ elGv.textContent = elG.value; compute(); }
+  [elN, elG, elStage].forEach(function(e){
+    e.addEventListener('input', sync);
+    e.addEventListener('change', sync);
+  });
+  sync();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

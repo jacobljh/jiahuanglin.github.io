@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>09 · Model parallelism — tensor, pipeline, the 3D mesh</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local layout only — failure/checklist columns, mesh planner readouts */
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; font-size: 15px; }
+  .lesson-card ul { margin: 0; padding-left: 18px; }
+  .lesson-card li { margin: 7px 0; font-size: 13.5px; line-height: 1.5; }
+  .factor-row { display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-end; }
+  .factor-row label { display: flex; flex-direction: column; gap: 4px; font-family: var(--mono); font-size: 12px; color: var(--text-mute); }
+  .factor-row select, .factor-row input { font-family: var(--mono); }
+  .flag { font-family: var(--mono); font-size: 12px; padding: 3px 8px; border-radius: 5px; display: inline-block; }
+  .flag.ok   { background: rgba(22,163,74,0.16); color: var(--ok); border: 1px solid #2f7d4f; }
+  .flag.warn { background: rgba(234,179,8,0.16); color: #b08900; border: 1px solid #8a6d00; }
+  .flag.bad  { background: rgba(220,38,38,0.16); color: var(--bad); border: 1px solid #7a2230; }
+  .kpi.bad .v { color: var(--bad); }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="index.html">cs336 / lessons</a><span class="crumb">/</span><span class="crumb">09 · model parallel</span><span class="step-pill">lesson 10 / 18</span></div></header>
+
+<main>
+
+<p class="kicker">Part II — Systems</p>
+<h1>Model parallelism — tensor, pipeline, the 3D mesh</h1>
+<p class="subtitle">Lesson 08 sharded the <em>storage</em>: ZeRO-3 / FSDP cut the 16-bytes/param training state by the data-parallel degree, so a 7B that overflowed one 80 GB GPU now fits across eight. But every FSDP rank still <em>executes the whole model</em> on its own slice of the batch — it gathers each layer's params just-in-time, runs the full forward, then frees them. That breaks the moment a single layer is too big to compute on one device, the activations for one layer overflow, or the model is simply larger than any GPU even after gathering. Data parallelism can shrink where weights <em>live</em>; it can never split where the math <em>runs</em>. This lesson splits the model itself.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>FSDP's trick is "shard the parameters, but gather each layer back to full size right before you compute it." That gather is the catch: at the instant of the matmul, one rank holds the <em>entire</em> layer and runs the <em>entire</em> forward for its batch shard. So the peak compute footprint of a single layer — its full weight matrix plus its activations for B·T tokens — must still fit on one device. A 70B's individual MLP weight (≈8d² ≈ 8·8192² ≈ 537M params, ~1 GB in bf16) is fine; but push d, the batch, or the context far enough and one layer's transient footprint alone overflows the 80 GB HBM, and FSDP has no answer because it never splits the computation, only the resident bytes between computations. You need to cut the matmul across devices, and cut the layer stack across devices.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> the per-layer compute and activations exceed one device, and the model can be larger than any single GPU — DP/FSDP shard storage but never split the computation itself.<br><strong>New idea:</strong> split the model along two axes — <strong>tensor parallelism</strong> (cut each matmul across GPUs; one all-reduce per attention/MLP block per forward and per backward; so bandwidth-hungry it must stay <em>inside</em> a node on NVLink) and <strong>pipeline parallelism</strong> (cut the layer stack into stages across nodes; feed micro-batches with a 1F1B schedule to shrink the idle bubble), plus <strong>sequence/context parallelism</strong> (cut along T with ring attention for long context) — composed with DP into a <strong>3D mesh</strong> DP × TP × PP.<br><strong>Forces next:</strong> this lets you train an arbitrarily large <em>dense</em> model, but capability tracks total parameters while you pay <span class="math">6ND</span> FLOPs through <em>every</em> one of them — can you add parameters without paying the FLOPs? (MoE, lesson 10.)</div>
+
+<div class="callout"><div class="label">The plan</div>Five moves. (1) Tensor parallelism the Megatron way — column-parallel then row-parallel so one all-reduce covers a whole MLP/attention block; split heads; price the comm and prove it must stay intra-node. (2) Pipeline parallelism — stages, micro-batches, the bubble fraction <span class="math">(p−1)/(m+p−1)</span>, the 1F1B schedule, and why PP rides cheap point-to-point links across nodes. (3) Sequence/context parallelism and ring attention for long T. (4) Assemble the 3D mesh with a worked 64-GPU layout (DP 4 × TP 8 × PP 2) and the rules of thumb. (5) Drive the mesh planner and watch TP spanning a node-boundary turn the plan red.</div>
+
+<h2>1 · Tensor parallelism — split the matmul itself</h2>
+
+<p>The unit of work inside a Transformer is a matmul: <span class="math">Y = X·A</span> with <span class="math">A</span> a weight matrix. Tensor parallelism (TP), introduced by Megatron-LM, splits <span class="math">A</span> across <span class="math">t</span> GPUs so each holds a slice, computes a partial result, and the partials are combined by a collective. The art is arranging the cuts so that two matmuls in a row — which every Transformer block has — cost <strong>exactly one</strong> communication instead of two.</p>
+
+<p><strong>Column-parallel then row-parallel.</strong> Take the MLP, two matmuls back to back: <span class="math">Z = GELU(X·A)·B</span>. Split the first matrix <span class="math">A</span> by its <em>columns</em> into <span class="math">[A₁ A₂ … A<sub>t</sub>]</span>; GPU <span class="math">i</span> computes <span class="math">GELU(X·A<sub>i</sub>)</span> — a full slice of the hidden activation, <em>no communication needed</em> because GELU is elementwise. Now split the second matrix <span class="math">B</span> by its <em>rows</em> into <span class="math">[B₁; B₂; …; B<sub>t</sub>]</span> so that GPU <span class="math">i</span> already holds the matching activation slice and computes the partial product <span class="math">GELU(X·A<sub>i</sub>)·B<sub>i</sub></span>. The full output is the <em>sum</em> of those partials — one <strong>all-reduce</strong> across the <span class="math">t</span> GPUs, and you're done. Two matmuls, one collective.</p>
+
+<div class="math block">Z &nbsp;=&nbsp; Σ<sub>i=1..t</sub> GELU(X·A<sub>i</sub>)·B<sub>i</sub> &nbsp;&nbsp; ← one all-reduce sums the partials</div>
+
+<p>Attention takes the identical pattern. The QKV projection is column-parallel: assign whole <strong>attention heads</strong> to GPUs, so GPU <span class="math">i</span> owns a subset of heads and computes their Q, K, V and the full per-head attention locally — heads are independent, so no cross-GPU comm inside the softmax. The output projection <span class="math">W<sub>o</sub></span> is then row-parallel, and a single all-reduce sums the per-head contributions back into the residual stream. So the canonical Megatron block costs <strong>two all-reduces in the forward</strong> (one for attention, one for the MLP) and, by symmetry, <strong>two in the backward</strong> — four collectives per layer, each over the <span class="math">t</span> TP ranks.</p>
+
+<pre class="ascii">  MLP block, t=2 tensor-parallel GPUs
+                 X  (replicated on both)
+        ┌──────────────┴──────────────┐
+   GPU0: X·A₁ (cols 0..h/2)       GPU1: X·A₂ (cols h/2..h)
+        GELU (elementwise, local)      GELU (local)
+   GPU0: (·)·B₁ (rows 0..h/2)     GPU1: (·)·B₂ (rows h/2..h)
+        └──────────────┬──────────────┘
+              ALL-REDUCE (sum partials)  ← the one collective
+                        Z  (replicated)</pre>
+
+<p><strong>Why TP must stay inside a node.</strong> That all-reduce is not cheap and it sits on the critical path — the matmul cannot finish until the bytes arrive. Each forward all-reduce of the residual stream moves on the order of <span class="math">B·T·d</span> elements; with four collectives per layer over dozens of layers, TP communicates an enormous amount per step, and it is <em>synchronous</em> (no useful overlap — the next op depends on the result). The only way this is affordable is on an intra-node fabric: <strong>NVLink/NVSwitch</strong> gives ~900 GB/s per GPU between the 8 GPUs in a node, versus ~25–50 GB/s per GPU over InfiniBand <em>between</em> nodes — roughly a 20–40× gap. Span TP across a node boundary and every block stalls on the slow link; MFU collapses. Hence the iron rule: <strong>TP degree ≤ GPUs per node</strong> (typically ≤ 8). TP is your "shrink one layer below one GPU" tool, and it is a within-node tool only.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">column-parallel</div><div class="v">split weight by output columns; each GPU makes a slice of the activation. No comm after (GELU/head-attn are local).</div></div>
+  <div class="topic-card"><div class="k">row-parallel</div><div class="v">split next weight by input rows to match the slice; output is the sum of partials → one all-reduce.</div></div>
+  <div class="topic-card"><div class="k">per-layer cost</div><div class="v">2 all-reduces forward + 2 backward, each ≈ B·T·d elements over t ranks — synchronous, on the critical path.</div></div>
+  <div class="topic-card"><div class="k">the rule</div><div class="v">keep TP ≤ GPUs/node so the collectives ride NVLink (~900 GB/s), not InfiniBand (~25–50 GB/s).</div></div>
+</div>
+
+<h2>2 · Pipeline parallelism — split the layer stack</h2>
+
+<p>TP shrinks a layer; it does nothing about a model with more layers than fit. Pipeline parallelism (PP) cuts the <span class="math">L</span>-layer stack into <span class="math">p</span> contiguous <strong>stages</strong>, one group of layers per device (or per node). A batch flows stage 0 → stage 1 → … → stage <span class="math">p−1</span> for the forward, then back through for the backward. The only communication is the <strong>activation tensor handed from one stage to the next</strong> — a single point-to-point send of shape <span class="math">(B, T, d)</span>, no collective. That makes PP comm tiny and, crucially, tolerant of slow links: it is the axis you run <em>across nodes</em>.</p>
+
+<p>The problem PP introduces is idleness. If you push one batch through naively, stage 1 sits idle until stage 0 finishes, stage 2 waits on stage 1, and so on — at any instant only one of <span class="math">p</span> stages is busy. The fix is to chop the batch into <span class="math">m</span> <strong>micro-batches</strong> and stream them, so stages fill up like an assembly line. But the line still has a startup and drain: the first micro-batch must traverse all <span class="math">p</span> stages before the pipeline is full, and the last must drain out. That dead time is the <strong>bubble</strong>:</p>
+
+<div class="math block">bubble fraction &nbsp;≈&nbsp; (p − 1) / (m + p − 1)</div>
+
+<p>The intuition: there are <span class="math">p−1</span> stage-times of fill and <span class="math">p−1</span> of drain spread over a schedule of <span class="math">m + p − 1</span> stage-times of length — so the wasted fraction shrinks as you raise <span class="math">m</span>. With <span class="math">p = 4</span> stages and <span class="math">m = 4</span> micro-batches the bubble is <span class="math">3/7 ≈ 43%</span> — brutal. Raise to <span class="math">m = 32</span> and it falls to <span class="math">3/35 ≈ 8.6%</span>; at <span class="math">m = 64</span>, <span class="math">3/67 ≈ 4.5%</span>. The rule of thumb is <span class="math">m ≳ 4p</span> to keep the bubble under ~15%. The cost of more micro-batches is more in-flight activations to store, so the bubble trades against activation memory — another instance of the course's spend-the-cheap-resource move.</p>
+
+<div class="lesson-flow">
+  <div><strong>naive 1-batch</strong><span>one stage busy at a time → (p−1)/p of the machine idle. For p=4 that's 75% waste.</span></div>
+  <div><strong>m micro-batches (GPipe)</strong><span>stream them so stages overlap; bubble drops to (p−1)/(m+p−1). All m forwards, then all m backwards.</span></div>
+  <div><strong>1F1B (PipeDream)</strong><span>interleave: once warmed up, each stage does one forward then one backward, freeing each micro-batch's activations as early as possible → far lower peak activation memory, same bubble.</span></div>
+</div>
+
+<p><strong>1F1B</strong> (one-forward-one-backward) is the schedule everyone ships. GPipe runs all <span class="math">m</span> forwards and only then all <span class="math">m</span> backwards, so every micro-batch's activations are alive at the peak — memory scales with <span class="math">m</span>. 1F1B instead, after a short warmup, alternates a forward and a backward on each stage, so a micro-batch's activations are released as soon as its backward runs. Same bubble fraction, dramatically lower peak activation memory — which is what lets you crank <span class="math">m</span> high enough to make the bubble negligible. Interleaved 1F1B goes further, giving each device several non-contiguous stage chunks to shave the bubble further at the cost of more point-to-point sends.</p>
+
+<h2>3 · Sequence and context parallelism — split along T</h2>
+
+<p>TP splits the hidden dimension <span class="math">d</span> and the heads; PP splits the layer index. Neither helps when the <em>sequence</em> <span class="math">T</span> is the thing that overflows — a 128k-token context produces activations ∝ <span class="math">B·T·d·L</span> and an attention term ∝ <span class="math">B·h·T²</span> that no amount of head-splitting or stage-splitting shrinks, because each token's activation still lives somewhere.</p>
+
+<p><strong>Sequence parallelism (SP)</strong> is a cheap companion to TP: the parts of a block that TP leaves replicated and elementwise — the LayerNorms, dropout, the residual adds — are split along <span class="math">T</span> across the same TP ranks, turning TP's all-reduces into all-gather + reduce-scatter pairs of the <em>same total volume</em> while cutting the activation memory of those regions by <span class="math">t</span>. It is nearly free and ships with Megatron TP by default.</p>
+
+<p><strong>Context parallelism with ring attention</strong> tackles the attention itself. Shard the sequence into <span class="math">c</span> chunks, one per GPU; each GPU holds its chunk's Q, K, V. To compute attention, the K,V chunks are passed around a <strong>ring</strong>: GPU <span class="math">i</span> attends its local Q to the K,V it currently holds, computes a partial using the same <strong>online-softmax running (max, sum) recurrence</strong> from FlashAttention (lesson 07), then forwards that K,V block to its neighbor and receives the next — after <span class="math">c</span> steps every Q has seen every K,V, and the <span class="math">T×T</span> score matrix was never materialized anywhere. Communication (one K,V block per step, point-to-point) overlaps with the local attention compute, so for long <span class="math">T</span> the ring is nearly free. This is how frontier models train at 128k–1M token contexts without any single device holding the whole sequence.</p>
+
+<h2>4 · The 3D mesh — composing DP × TP × PP</h2>
+
+<p>These axes are orthogonal, so you multiply them. Arrange all your GPUs into a logical <strong>3D mesh</strong>: every GPU has a coordinate <span class="math">(dp, tp, pp)</span>, and the total must factor exactly: <span class="math">G = DP · TP · PP</span>. Each axis uses the collective it can afford on the link it's placed on. The placement rules fall straight out of the comm costs derived above:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">TP — innermost</div><div class="v">heaviest, synchronous comm → place inside a node on NVLink. <strong>TP ≤ GPUs/node.</strong></div></div>
+  <div class="topic-card"><div class="k">PP — across nodes</div><div class="v">tiny point-to-point activation sends, latency-tolerant → put the slow inter-node hops here.</div></div>
+  <div class="topic-card"><div class="k">DP — outermost</div><div class="v">one all-reduce/reduce-scatter of gradients per step, fully overlappable with backward → the cheapest axis, spread it widest.</div></div>
+  <div class="topic-card"><div class="k">SP/EP — riders</div><div class="v">SP shares the TP group (split T on the same ranks); expert parallelism (lesson 10) adds an all-to-all axis for MoE.</div></div>
+</div>
+
+<p><strong>A worked 64-GPU layout.</strong> Take 8 nodes of 8 H100s each, 64 GPUs total, training a model too big for any one node. A standard factorization is <span class="math">DP 4 × TP 8 × PP 2 = 64</span>:</p>
+
+<table class="trade-table"><thead><tr><th>axis</th><th>degree</th><th>placement</th><th>collective / step</th><th>link it rides</th></tr></thead><tbody>
+  <tr><td>TP</td><td>8</td><td>the 8 GPUs <em>within</em> a node</td><td>2 all-reduce fwd + 2 bwd (≈B·T·d each)</td><td>NVLink ~900 GB/s</td></tr>
+  <tr><td>PP</td><td>2</td><td>2 nodes form one pipeline (stage 0 / stage 1)</td><td>point-to-point activation hand-off</td><td>InfiniBand ~25–50 GB/s</td></tr>
+  <tr><td>DP</td><td>4</td><td>4 such (TP×PP) groups, each a full model replica</td><td>1 grad all-reduce (overlapped)</td><td>InfiniBand, overlapped</td></tr>
+</tbody></table>
+
+<p>Read it as a hierarchy: the 8 GPUs in a node are one TP group (one layer's matmuls split 8 ways on NVLink); two nodes chain into a 2-stage pipeline (16 GPUs holding the full depth, activations handed over IB); and four of those 16-GPU model-groups form a 4-way data-parallel cluster, each chewing a quarter of the global batch and all-reducing gradients at the step boundary. Every GPU holds <span class="math">1/(TP·PP)</span> of the parameters and <span class="math">1/DP</span> of the batch. The rules of thumb: <strong>fill TP first up to GPUs/node, then PP across nodes to fit depth, then put all remaining GPUs into DP</strong> for throughput — and prefer more DP over more PP when the model already fits, because DP comm overlaps and PP adds a bubble.</p>
+
+<p><strong>Interaction with FSDP.</strong> The DP axis does not have to be plain replication — it is exactly where ZeRO/FSDP from lesson 08 plugs in. Run ZeRO-1/2/3 <em>along the DP dimension</em>: the optimizer state, gradients, and (for ZeRO-3) parameters are sharded across the DP ranks of the mesh, gathered just-in-time, while TP and PP split each replica's compute. This composition — FSDP as the outer dimension, TP×PP as the inner model split — is the standard frontier recipe: TP shrinks the layer below one GPU, PP fits the depth across nodes, and FSDP-DP both scales throughput and shards the leftover 16-bytes/param state across the widest, cheapest axis. (The same cluster topology shows up again in post-training; see <a href="../../reinforcement_learning/lessons/index.html">reinforcement_learning · the RL/post-training topology lessons</a> for how rollout, reward, and trainer workers are laid out across a similar mesh.) The fused-optimizer step that runs on each rank is detailed in <a href="../../gpu_kernels/30_fused_optimizers_training_step.html">gpu_kernels · 30 (fused optimizers & the training step)</a>.</p>
+
+<h2>5 · Drive the mesh planner</h2>
+
+<p>Set total GPUs, GPUs per node, model size <span class="math">N</span>, and layer count <span class="math">L</span>, then pick a DP × TP × PP factorization. The planner checks it multiplies to the total, computes the per-GPU memory (state sharded by TP·PP·DP under FSDP), the PP bubble at a sensible micro-batch count, and flags the comm-cost regime. The configuration that <em>breaks</em>: push TP past GPUs/node and the plan turns red — your tensor-parallel all-reduces would cross the node boundary onto InfiniBand and the run would crawl. Prove three things: (a) TP=16 with 8 GPUs/node is invalid; (b) at a fixed GPU count the 16N state is sharded across all three axes, so per-GPU memory depends only on the <em>product</em> DP·TP·PP — raising PP (and dropping DP to compensate) inflates the bubble while memory holds flat; (c) the corollary — shifting that split back from PP into DP lowers the bubble at no memory cost, which is why you prefer DP over PP once the model fits.</p>
+
+<div class="widget" id="mesh-widget">
+  <div class="title">3D-mesh planner — factor your cluster into DP × TP × PP</div>
+  <div class="hint">The product DP·TP·PP must equal total GPUs or the plan is invalid. TP must stay ≤ GPUs/node (NVLink) — exceed it and the tensor all-reduces spill onto the slow inter-node fabric and the plan goes red. Per-GPU memory is the 16-bytes/param state sharded across all three axes (FSDP on the DP axis); the bubble uses m = 4·PP micro-batches. Watch TP=GPUs/node·2 break it.</div>
+
+  <div class="controls factor-row">
+    <label>total GPUs
+      <select id="mesh-total">
+        <option value="8">8</option>
+        <option value="16">16</option>
+        <option value="32">32</option>
+        <option value="64" selected>64</option>
+        <option value="128">128</option>
+        <option value="256">256</option>
+      </select>
+    </label>
+    <label>GPUs / node
+      <select id="mesh-pernode">
+        <option value="4">4</option>
+        <option value="8" selected>8</option>
+      </select>
+    </label>
+    <label>model N
+      <select id="mesh-N">
+        <option value="7">7B</option>
+        <option value="13">13B</option>
+        <option value="70" selected>70B</option>
+        <option value="175">175B</option>
+      </select>
+    </label>
+    <label>layers L
+      <input type="range" id="mesh-L" min="24" max="128" step="4" value="80">
+      <span class="val" id="mesh-L-v">80</span>
+    </label>
+  </div>
+
+  <div class="controls factor-row" style="margin-top:10px;">
+    <label>DP <input type="number" id="mesh-dp" min="1" max="256" step="1" value="4" style="width:64px;"></label>
+    <label>TP <input type="number" id="mesh-tp" min="1" max="64"  step="1" value="8" style="width:64px;"></label>
+    <label>PP <input type="number" id="mesh-pp" min="1" max="64"  step="1" value="2" style="width:64px;"></label>
+    <span id="mesh-product" class="flag ok" style="align-self:flex-end;">DP·TP·PP = 64</span>
+  </div>
+
+  <div class="kpi-grid" style="margin-top:14px;">
+    <div class="kpi" id="mesh-k-valid-box"><div class="k">Plan valid?</div><div class="v" id="mesh-k-valid">—</div></div>
+    <div class="kpi"><div class="k">Per-GPU state (GB)</div><div class="v" id="mesh-k-mem">—</div></div>
+    <div class="kpi"><div class="k">PP bubble (m=4·PP)</div><div class="v" id="mesh-k-bubble">—</div></div>
+    <div class="kpi"><div class="k">Comm regime</div><div class="v" id="mesh-k-comm">—</div></div>
+  </div>
+  <div style="margin-top:10px;"><span id="mesh-note" class="flag ok">layout OK</span></div>
+</div>
+
+<p>The planner makes the whole hierarchy legible at a glance: the only configurations that stay green are the ones where TP fits inside a node, PP carries the cross-node depth, and DP soaks up the rest — exactly the placement the comm costs of §1–§4 forced.</p>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>TP spanning a node boundary.</strong> Setting TP=16 on 8-GPU nodes so the all-reduce crosses InfiniBand. <em>Signal:</em> MFU craters to single digits and per-step time is dominated by the attention/MLP collectives, not the matmuls.</li>
+    <li><strong>Too few micro-batches.</strong> Running PP with m≈p. <em>Signal:</em> ~40%+ of pipeline time is bubble; GPUs show long synchronized idle gaps at the start and end of each step.</li>
+    <li><strong>Over-using PP when DP would do.</strong> Adding pipeline stages on a model that already fits. <em>Signal:</em> a persistent bubble tax and rising activation memory, where plain (FSDP-)DP would have overlapped its comm and had no bubble.</li>
+    <li><strong>Forgetting the factorization must be exact.</strong> DP·TP·PP ≠ total GPUs. <em>Signal:</em> launch fails to assign ranks, or some GPUs sit unused / are over-subscribed.</li>
+    <li><strong>Long-context OOM with no context parallelism.</strong> Stretching T without SP/ring attention. <em>Signal:</em> the O(B·h·T²) attention activations overflow even though weights are well-sharded.</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><strong>Cap TP at GPUs/node</strong> (≤8) so every TP all-reduce rides NVLink, never the inter-node fabric.</li>
+    <li><strong>Run PP across nodes</strong> — its only comm is a point-to-point activation hand-off, which tolerates the slow link.</li>
+    <li><strong>Keep m ≳ 4·PP</strong> micro-batches and use 1F1B to push the bubble under ~15% without blowing up activation memory.</li>
+    <li><strong>Make DP the outermost, widest axis</strong> and fold FSDP/ZeRO into it to shard the 16-bytes/param state.</li>
+    <li><strong>Add SP for free with TP, and ring attention</strong> when T is what overflows, not d or L.</li>
+  </ul></div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the planner at 64 GPUs, 8/node, 70B, and the default DP 4 × TP 8 × PP 2 — confirm it's valid and green, and read the per-GPU state. Now (a) bump TP to 16 (leave DP·TP·PP product matching by dropping DP to 2): the product still equals 64, but the plan turns red — say in one sentence why TP=16 is illegal on 8-GPU nodes. (b) Reset, then shift the split from DP into PP (DP 1 × TP 8 × PP 8): per-GPU state stays flat (the 16N state is sharded across all three axes, so only the <em>product</em> 64 sets it) while the bubble KPI climbs from ~11% to ~18% — read both KPIs and explain why trading DP for PP buys you a bubble for no memory gain when the model already fits. (c) By hand: with p=8 stages, how many micro-batches m do you need to get the bubble under 10%? Finally: a 175B model on 128 GPUs (8/node) — give a valid DP × TP × PP that keeps TP intra-node and explain your PP choice.</div>
+
+<h2>Where this points next</h2>
+
+<p>You can now train a model of <em>any</em> size: TP shrinks a layer below one GPU, PP fits the depth across nodes, context parallelism handles arbitrary T, and FSDP-DP shards the leftover state across the widest axis. There is no longer a dense model too big to train. But notice what you are paying for that reach — the budget identity <span class="math">C ≈ 6ND</span> from lessons 00 and 05 says every token's forward and backward run through <em>every parameter</em>. Capability scales with total parameters; cost scales with the same total parameters, because each one costs FLOPs on every token. The two are welded together, and the budget caps both at once. The obvious question — the one that breaks this lesson's victory — is whether you can <em>decouple</em> them: grow the parameter count without growing the FLOPs each token pays. You can, by making each token use only a sparse <em>slice</em> of the parameters. That is <a href="10_moe.html"><strong>10 · Mixture of Experts — parameters without the FLOPs</strong></a>.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>Data parallelism (lesson 08) shards <em>storage</em> but every rank still executes the whole model; when a layer's compute or activations exceed one device, or the model exceeds any GPU, you must split the model itself. <strong>Tensor parallelism</strong> cuts each matmul across GPUs — column-parallel then row-parallel so a whole attention or MLP block costs exactly <em>one all-reduce</em> per forward and one per backward, with attention heads divided across ranks; that comm is synchronous and on the critical path, so TP must stay <em>inside a node</em> on NVLink (TP ≤ GPUs/node). <strong>Pipeline parallelism</strong> cuts the layer stack into <span class="math">p</span> stages across nodes, communicating only a point-to-point activation hand-off; its idle <strong>bubble ≈ (p−1)/(m+p−1)</strong> shrinks as you add micro-batches, and the <strong>1F1B</strong> schedule keeps peak activation memory low so you can. <strong>Sequence/context parallelism</strong> with <strong>ring attention</strong> splits along T for long contexts, reusing FlashAttention's online softmax so the T×T scores never materialize. Compose all three into a <strong>3D mesh</strong> DP × TP × PP that must factor the GPU count exactly — for 64 GPUs, DP 4 × TP 8 × PP 2 — placing the heaviest comm (TP) innermost on NVLink, the lightest (PP) across nodes, and DP outermost with FSDP folded in to shard the 16-bytes/param state. The reward: any dense size is now trainable. The catch that forces lesson 10: you still pay <span class="math">6ND</span> FLOPs through every parameter, so capability and cost rise together — unless you make each token touch only a sparse slice of the weights.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>Why does a column-parallel then row-parallel linear pair need only one all-reduce? <em>(§1 — column-split A gives each GPU a local activation slice; GELU/attention-per-head are elementwise/independent so no comm; row-split B makes the block output the sum of partials, summed by a single all-reduce. Two matmuls, one collective.)</em></li>
+  <li>Why must tensor parallelism stay within a node? <em>(§1 — it does ~4 synchronous all-reduces of ≈B·T·d per layer on the critical path; NVLink is ~900 GB/s vs IB ~25–50 GB/s, a 20–40× gap, so crossing the node boundary stalls every block and MFU collapses. Rule: TP ≤ GPUs/node.)</em></li>
+  <li>State the pipeline bubble fraction and how to shrink it. <em>(§2 — (p−1)/(m+p−1) with p stages, m micro-batches; raise m (rule of thumb m ≳ 4p): p=4,m=4 → 43%, m=32 → ~9%. 1F1B keeps the bubble the same but cuts peak activation memory so you can afford large m.)</em></li>
+  <li>How do tensor and pipeline parallelism differ in communication, and where do you place each? <em>(§1–4 — TP: heavy synchronous all-reduce, NVLink, intra-node; PP: tiny point-to-point activation hand-off, latency-tolerant, across nodes. DP/FSDP outermost as the cheap overlappable axis.)</em></li>
+  <li>What does ring attention buy you, and how does it relate to FlashAttention? <em>(§3 — context parallelism shards T across c GPUs and rotates K,V around a ring, using FlashAttention's online-softmax (max,sum) recurrence to accumulate partials so the T×T scores never materialize; comm overlaps compute → arbitrary-length contexts.)</em></li>
+  <li>Lay out 64 GPUs (8/node) for a model too big for one node. <em>(§4 — DP 4 × TP 8 × PP 2: TP 8 inside each node on NVLink, PP 2 chains two nodes into a pipeline over IB, 4 such model-groups form DP with FSDP sharding the state. TP first to GPUs/node, PP across nodes for depth, DP for the rest.)</em></li>
+  <li>How does FSDP fit into the 3D mesh? <em>(§4 — ZeRO/FSDP runs along the DP axis: optimizer state, grads, and (ZeRO-3) params are sharded across DP ranks and gathered just-in-time, while TP×PP split each replica's compute — FSDP outer, model-split inner.)</em></li>
+  <li>You can train any dense size now — so what still forces a change? <em>(Where this points next — capability ~ total params but cost ~ 6ND runs through every param, so the budget caps both together; decoupling them requires each token touch only a sparse slice of weights → MoE, lesson 10.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="08_data_parallel.html"><span class="dir">← Back</span><span class="ttl">08 · Data parallelism</span></a>
+  <a class="next" href="10_moe.html"><span class="dir">Next →</span><span class="ttl">10 · Mixture of Experts</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var elTotal   = document.getElementById('mesh-total');
+  var elPerNode = document.getElementById('mesh-pernode');
+  var elN       = document.getElementById('mesh-N');
+  var elL       = document.getElementById('mesh-L'),  elLv = document.getElementById('mesh-L-v');
+  var elDP      = document.getElementById('mesh-dp');
+  var elTP      = document.getElementById('mesh-tp');
+  var elPP      = document.getElementById('mesh-pp');
+  var prod      = document.getElementById('mesh-product');
+  var kValid    = document.getElementById('mesh-k-valid');
+  var kValidBox = document.getElementById('mesh-k-valid-box');
+  var kMem      = document.getElementById('mesh-k-mem');
+  var kBubble   = document.getElementById('mesh-k-bubble');
+  var kComm     = document.getElementById('mesh-k-comm');
+  var note      = document.getElementById('mesh-note');
+  if (!elTotal) return;
+
+  var BYTES_PER_PARAM = 16;   // mixed-precision AdamW training state (lesson 05)
+
+  function compute(){
+    var total = +elTotal.value;
+    var perNode = +elPerNode.value;
+    var N = parseFloat(elN.value) * 1e9;
+    var L = +elL.value;
+    var dp = Math.max(1, Math.round(+elDP.value || 1));
+    var tp = Math.max(1, Math.round(+elTP.value || 1));
+    var pp = Math.max(1, Math.round(+elPP.value || 1));
+
+    elLv.textContent = L;
+
+    var product = dp * tp * pp;
+    var productOK = (product === total);
+
+    // ---- factorization flag ----
+    prod.textContent = 'DP·TP·PP = ' + product;
+    prod.className = 'flag ' + (productOK ? 'ok' : 'bad');
+
+    // ---- validity checks ----
+    var reasons = [];
+    if (!productOK) reasons.push('DP·TP·PP (' + product + ') ≠ total GPUs (' + total + ')');
+    var tpSpansNode = (tp > perNode);
+    if (tpSpansNode) reasons.push('TP ' + tp + ' > GPUs/node ' + perNode + ' → all-reduce crosses InfiniBand');
+    if (pp > L) reasons.push('PP ' + pp + ' > layers ' + L);
+
+    var valid = (reasons.length === 0);
+
+    // ---- per-GPU state memory: 16 B/param sharded across all three axes ----
+    // params split by TP·PP; FSDP shards the 16B state across the DP axis too.
+    var perGpuBytes = (BYTES_PER_PARAM * N) / (tp * pp * dp);
+    var perGpuGB = perGpuBytes / 1e9;
+
+    // ---- pipeline bubble with m = 4*PP micro-batches ----
+    var m = 4 * pp;
+    var bubble = pp > 1 ? (pp - 1) / (m + pp - 1) : 0;
+
+    // ---- comm regime flag ----
+    var commClass, commText;
+    if (tpSpansNode){
+      commClass = 'bad';
+      commText = 'TP crosses node → bandwidth-bound, MFU collapses';
+    } else if (tp === perNode && pp > 1){
+      commClass = 'warn';
+      commText = 'TP saturates the node; PP adds a bubble — healthy but tuned';
+    } else if (bubble > 0.20){
+      commClass = 'warn';
+      commText = 'PP bubble high (' + (bubble*100).toFixed(0) + '%) — raise micro-batches or shift to DP';
+    } else {
+      commClass = 'ok';
+      commText = 'TP on NVLink, PP cross-node, DP cheap — well placed';
+    }
+
+    // ---- write KPIs ----
+    kValid.textContent = valid ? 'valid' : 'INVALID';
+    kValidBox.classList.toggle('bad', !valid);
+
+    kMem.textContent = perGpuGB.toFixed(1) + ' GB' + (perGpuGB > 80 ? ' (>80!)' : '');
+
+    kBubble.textContent = pp > 1 ? (bubble*100).toFixed(1) + '%  (m=' + m + ')' : '0% (no PP)';
+
+    kComm.textContent = tpSpansNode ? 'cross-node TP' : (tp === perNode ? 'TP fills node' : 'TP intra-node');
+
+    if (valid){
+      note.className = 'flag ' + commClass;
+      note.textContent = commText;
+    } else {
+      note.className = 'flag bad';
+      note.textContent = 'INVALID: ' + reasons.join('  ·  ');
+    }
+  }
+
+  [elTotal, elPerNode, elN, elL, elDP, elTP, elPP].forEach(function(e){
+    e.addEventListener('input', compute);
+    e.addEventListener('change', compute);
+  });
+  compute();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

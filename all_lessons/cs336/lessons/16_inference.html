@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>16 · Inference — serving the model you paid for</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; }
+  .meter-row { display: grid; grid-template-columns: 96px 1fr 96px; align-items: center; gap: 10px; margin: 6px 0; font-family: var(--mono); font-size: 12px; }
+  .meter-row .lab { color: var(--text-mute); text-transform: uppercase; letter-spacing: 0.05em; }
+  .meter-row .num { text-align: right; color: var(--text-dim); }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="index.html">cs336 / lessons</a><span class="crumb">/</span><span class="crumb">16 · inference</span><span class="step-pill">lesson 17 / 18</span></div></header>
+
+<main>
+
+<p class="kicker">Part V — Alignment &amp; inference</p>
+<h1>Inference — serving the model you paid for</h1>
+<p class="subtitle">Lesson 15 finished the model: a base net pretrained on a budget, SFT'd into an assistant, then nudged toward human preferences under a KL anchor. The weights are frozen and good. But a frontier model nobody can afford to <em>run</em> is a museum piece. The economics of <em>generating</em> a token are nothing like the economics of training one, and the chip you optimized for training (lesson 06) is now mostly idle — starved on memory bandwidth, not FLOPs. This lesson derives why, and the four levers that get your tokens-per-dollar back.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>Training spends <span class="math">6ND</span> FLOPs <em>once</em> and is over. Serving runs the forward pass billions of times, interactively, with a latency SLA. The catch: autoregressive generation produces tokens <em>one at a time</em> — token <span class="math">t+1</span> cannot start until token <span class="math">t</span> is sampled — and each step reloads the model's <em>entire</em> weight set from HBM to compute a single new column of activations. A 14 GB model on a 3.3 TB/s GPU can physically stream its weights only ~235 times per second. That ceiling, not arithmetic, is why generation feels slow and costs what it costs — and it forces an entirely separate engineering stack to claw back.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> a finished, aligned model is worthless unless each generated token is cheap in latency <em>and</em> dollars — and naive generation wastes the GPU it runs on.<br><strong>New idea:</strong> the <strong>prefill (compute-bound) vs decode (memory-bound)</strong> asymmetry; the <strong>KV cache</strong> as the central object and the real cap on batch/context (size <span class="math">= 2·L·n<sub>kv</sub>·d<sub>head</sub>·T·batch·bytes</span>, shrunk by GQA — payback of lesson 03); and the four levers — <strong>continuous batching</strong>, <strong>speculative decoding</strong>, <strong>weight/KV quantization</strong> — that trade off latency, throughput, and quality.<br><strong>Forces next:</strong> nothing new — this is the last build stage. Lesson 17 walks the whole budget end to end, every decision a forced consequence of the last.</div>
+
+<div class="callout"><div class="label">The plan</div>Five moves. (1) Split generation into prefill and decode, and show decode is memory-bound — callback to the roofline of lesson 06. (2) Derive the KV-cache size and prove it, not compute, caps batch and context; watch GQA divide it. (3) Batch for throughput: static vs continuous, and the latency it costs. (4) Speculative decoding: a small draft guesses, the big model checks k tokens in one pass. (5) Quantization: weight-only INT8/INT4 attacks the bandwidth wall directly, KV-quant attacks the cache. Then drive the decode-arithmetic widget: every knob is a real serving decision.</div>
+
+<h2>1 · Two phases: prefill is compute-bound, decode is memory-bound</h2>
+
+<p>A single request is two completely different workloads stitched together. Naming them is the whole lesson.</p>
+
+<p><strong>Prefill</strong> processes the entire prompt in one parallel forward pass. If the prompt is <span class="math">P</span> tokens, you push a <span class="math">(1, P, d)</span> tensor through the model once: every position is computed simultaneously, the matmuls are big and dense, and the GPU's tensor cores run near peak. Prefill's job is to compute the logits for the <em>last</em> prompt position (the first generated token) and — crucially — to populate the <strong>KV cache</strong>: the key and value vectors for all <span class="math">P</span> positions, at every layer, so future steps never recompute them. Prefill is <strong>compute-bound</strong>: it does <span class="math">≈ 2N·P</span> FLOPs against a one-time weight load, so its arithmetic intensity is high — it sits on the right side of the lesson-06 roofline.</p>
+
+<p><strong>Decode</strong> generates the rest, one token per step. At step <span class="math">t</span> you feed <em>a single token</em> — a <span class="math">(batch, 1, d)</span> tensor — through the model. To do that you must load every weight matrix from HBM once (a 14 GB model = 14 GB of traffic) and read the entire KV cache, but you do only <span class="math">≈ 2N</span> FLOPs <em>per sequence</em>. With batch size 1 the arithmetic intensity is roughly <span class="math">2N / (2N) = 1</span> FLOP per byte — catastrophically below the H100 ridge point of ~300 FLOP/byte (lesson 06). The tensor cores idle while the memory bus is pinned. <strong>Decode is memory-bound, and decode is where essentially all the wall-clock and the cost live</strong> — a 500-token answer is 1 prefill pass and 499 decode steps.</p>
+
+<table class="trade-table"><thead><tr><th></th><th>Prefill</th><th>Decode</th></tr></thead><tbody>
+  <tr><td>Input shape</td><td>(1, P, d) — whole prompt at once</td><td>(batch, 1, d) — one token / step</td></tr>
+  <tr><td>FLOPs</td><td>≈ 2N·P (large)</td><td>≈ 2N per sequence per step (tiny)</td></tr>
+  <tr><td>Bytes moved / step</td><td>weights once, amortized over P</td><td>all weights + KV cache, every step</td></tr>
+  <tr><td>Arithmetic intensity</td><td>high → compute-bound</td><td>≈ 1 (batch 1) → memory-bound</td></tr>
+  <tr><td>Bottleneck</td><td>tensor-core FLOP/s</td><td>HBM bandwidth (TB/s)</td></tr>
+  <tr><td>Runs</td><td>once per request</td><td>once per output token</td></tr>
+</tbody></table>
+
+<div class="callout"><div class="label">Callback — the roofline of lesson 06</div>Lesson 06 split every op into compute-bound (sits at the FLOP ceiling, the chip is happy) and memory-bound (sits at the bandwidth ceiling, the chip starves). Training is dominated by big GEMMs — compute-bound. Decode is the canonical memory-bound op: it loads ~<span class="math">2N</span> bytes to do ~<span class="math">2N</span> FLOPs. That is why the entire inference stack below is, at heart, a campaign to raise decode's arithmetic intensity — push it rightward across the roofline ridge.</div>
+
+<h2>2 · The KV cache: the object that actually caps you</h2>
+
+<p>Why cache K and V at all? Because attention at step <span class="math">t</span> needs the keys and values of <em>every</em> prior token. Recomputing them each step would make decode <span class="math">O(T²)</span> in compute. Instead you store them once and append one column per step. The cache is what makes decode <span class="math">O(T)</span> per step — but it is also the thing that fills up your GPU. Derive its size:</p>
+
+<div class="math block">KV bytes = 2 · L · n<sub>kv</sub> · d<sub>head</sub> · T · batch · bytes<sub>elt</sub></div>
+
+<p>The <span class="math">2</span> is one tensor for K, one for V; <span class="math">L</span> layers; <span class="math">n<sub>kv</sub></span> key/value heads (this is where GQA bites — see below); <span class="math">d<sub>head</sub></span> per-head width; <span class="math">T</span> cached positions; <span class="math">batch</span> concurrent sequences; <span class="math">bytes<sub>elt</sub></span> = 2 for bf16, 1 for INT8. Plug in a 7B-class model — the exact config from lesson 03: <span class="math">L = 32, d<sub>head</sub> = 128</span>, bf16. With full multi-head attention (<span class="math">n<sub>kv</sub> = h = 32</span>) one token costs <span class="math">2 · 32 · 32 · 128 · 2 = 524,288 bytes = 512 KB</span>. So:</p>
+
+<div class="lesson-flow">
+<div><strong>1 token, MHA</strong><span>= 512 KB</span></div>
+<div><strong>× 32,768 context</strong><span>≈ 17.2 GB for one sequence</span></div>
+<div><strong>weights themselves</strong><span>≈ 14 GB (bf16)</span></div>
+<div><strong>an 80 GB H100 holds</strong><span>~3–4 such long-context sequences, then it is full</span></div>
+</div>
+
+<p>Read that again: a single 32K-context request eats more memory than the model weights, and the KV cache — not the FLOPs, not the parameters — is what decides how many requests you can serve concurrently. Batch size is capped by <span class="math">(HBM − weights) / (KV per sequence)</span>. That is the bottleneck the entire serving stack is built around.</p>
+
+<h3>GQA pays back lesson 03</h3>
+
+<p>Lesson 03 introduced grouped-query attention as a swap with no training-time motivation — "its payoff lives in lesson 16." Here is the payoff. GQA shares each K/V head across a group of <span class="math">g</span> query heads, so <span class="math">n<sub>kv</sub> = h / g</span> instead of <span class="math">h</span>. The cache divides by exactly <span class="math">g</span>. For the same 7B-class model at <span class="math">g = 4</span> (<span class="math">n<sub>kv</sub> = 8</span>): <span class="math">2 · 32 · 8 · 128 · 2 = 131,072 bytes = 128 KB</span> per token, and the 32K sequence drops from ~17.2 GB to <strong>~4.3 GB</strong>. Same query heads, same quality to within a hair — 4× more concurrent users. <strong>GQA is a serving decision disguised as an architecture decision</strong>, and the multiply on your throughput is the group factor <span class="math">g</span>.</p>
+
+<p>The cache also grows one token per step per sequence, so storing it as one contiguous block per request wastes huge amounts to fragmentation. <strong>PagedAttention</strong> (vLLM) borrows the OS virtual-memory trick — chop the cache into fixed-size blocks behind a page table, so memory packs tightly and prompts can share prefix blocks — and radix-tree prefix sharing (SGLang) goes further; see <a href="../../gpu_kernels/14_layouts_paged_radix.html">gpu_kernels/14 · paged &amp; radix layouts</a> and <a href="../../vllm/lessons/index.html">the vLLM track</a>.</p>
+
+<h2>3 · Batching: static vs continuous, and the throughput/latency trade</h2>
+
+<p>Decode at batch 1 wastes the GPU: you load 14 GB of weights to update one sequence. Load them once and update <span class="math">B</span> sequences in the same pass and the weight traffic is <em>shared</em> — arithmetic intensity rises ~<span class="math">B</span>×, throughput (tokens/s across all users) rises with it, right up until you re-cross the ridge into compute-bound or run out of KV memory. Batching is the single biggest throughput lever in decode. But <em>how</em> you batch matters enormously.</p>
+
+<p><strong>Static batching</strong> groups <span class="math">B</span> requests, runs them lockstep, and the whole batch finishes when the <em>longest</em> sequence does. A request that wants 20 tokens sitting next to one that wants 2,000 wastes 1,980 steps of a GPU slot it cannot release, and new arrivals wait for the entire batch to drain. Utilization craters under realistic, variable-length traffic.</p>
+
+<p><strong>Continuous (in-flight) batching</strong> works at the granularity of a single decode step: the moment any sequence emits its end-of-sequence token, it leaves the batch and a queued request takes its slot <em>on the very next step</em>. The batch composition changes every iteration. This is the headline scheduler trick in vLLM and TGI, and it routinely doubles-to-triples throughput over static batching on real workloads with no quality change. It is also what makes prefill/decode scheduling interesting — a fresh request needs a (compute-bound) prefill spliced in among the (memory-bound) decodes, and the scheduler chooses chunk sizes to keep latency smooth.</p>
+
+<table class="trade-table"><thead><tr><th></th><th>Static batching</th><th>Continuous batching</th></tr></thead><tbody>
+  <tr><td>Batch changes</td><td>only between batches</td><td>every decode step</td></tr>
+  <tr><td>A finished sequence</td><td>holds its slot until the longest finishes</td><td>frees its slot immediately</td></tr>
+  <tr><td>GPU utilization (variable lengths)</td><td>low — padded to the max</td><td>high — slots refilled continuously</td></tr>
+  <tr><td>Throughput on real traffic</td><td>baseline</td><td>~2–3× baseline</td></tr>
+</tbody></table>
+
+<p>The catch is universal and worth stating as a law: <strong>throughput and latency trade against each other.</strong> Bigger batches amortize the weight load over more users, so tokens/s/GPU climbs — but any individual user's tokens/s can fall, because their sequence now shares bandwidth and may queue behind a prefill. Interactive chat optimizes for low per-user latency (small batches, fast first token); a batch summarization job optimizes for throughput (huge batches, who cares about latency). Same model, opposite serving config. There is no single "fast."</p>
+
+<h2>4 · Speculative decoding: guess cheap, verify in bulk</h2>
+
+<p>Decode is bandwidth-bound, which means the GPU has FLOPs to spare — verifying several tokens at once costs almost the same as verifying one (you still load the weights once). Speculative decoding exploits exactly that slack. A small, cheap <strong>draft model</strong> autoregressively proposes the next <span class="math">k</span> tokens (it is fast precisely because it is small). The big <strong>target model</strong> then runs <em>one</em> forward pass over all <span class="math">k</span> proposals in parallel — like a mini-prefill — and checks each against its own distribution.</p>
+
+<div class="lesson-flow">
+<div><strong>1 · draft</strong><span>small model proposes k tokens, k cheap steps</span></div>
+<div><strong>2 · verify</strong><span>target scores all k in ONE forward pass (weights loaded once)</span></div>
+<div><strong>3 · accept</strong><span>keep the longest prefix the target agrees with; resample the first reject</span></div>
+<div><strong>4 · repeat</strong><span>each target pass yields 1…k+1 tokens instead of exactly 1</span></div>
+</div>
+
+<p>A rejection-sampling acceptance rule guarantees the output distribution is <em>identical</em> to plain target sampling — speculative decoding changes speed, never quality. If the draft agrees a fraction <span class="math">α</span> of the time and proposes <span class="math">k</span>, you emit on the order of <span class="math">(1 − α<sup>k+1</sup>)/(1 − α)</span> tokens per target pass; at <span class="math">α ≈ 0.7, k = 4</span> that is ~2–3× fewer target passes, i.e. ~2–3× lower latency. The art is a draft that is fast yet agrees often — typically a distilled version of the target, which is exactly what the <a href="../../distillation/lessons/index.html">distillation track</a> produces (self-speculative variants like Medusa instead bolt extra heads onto the target). The speedup is biggest where decode hurts most — small batch — and shrinks once batching already saturates the GPU.</p>
+
+<h2>5 · Quantization: attack the bandwidth wall directly</h2>
+
+<p>Decode's cost is bytes-of-weights moved per token. So the most direct lever is obvious: <em>move fewer bytes</em>. <strong>Weight-only quantization</strong> stores the weights in INT8 or INT4 and dequantizes them in-kernel just before the matmul. Activations and the math can stay in bf16 — the point is purely to shrink the HBM→SM traffic, which is the binding constraint. INT8 halves the weight bytes (≈2× decode speedup, near-lossless); INT4 quarters them (≈4× in the bandwidth limit, with a small, recoverable quality cost using schemes like GPTQ/AWQ that protect salient weights). Because decode is bandwidth-bound, this is one of the rare wins that improves both memory footprint <em>and</em> speed at once.</p>
+
+<p>This is also where the <strong>params-vs-active-FLOPs</strong> motif from <a href="10_moe.html">lesson 10</a> returns, now on the serving side. Decode cost scales with the bytes of weights you must <em>load per token</em> — and a Mixture-of-Experts model loads only its <em>active</em> experts per token, not all of them. So the same trick that let MoE buy parameters without buying training FLOPs also lets it serve a far larger total parameter count at the bandwidth cost of a small dense model. Capability tracks total params; both training FLOPs and decode bandwidth track only the <em>active</em> ones.</p>
+
+<p>The second target is the cache. <strong>KV-cache quantization</strong> stores K and V in INT8 instead of bf16, halving the per-token cache bytes from §2 and composing with GQA — the <span class="math">÷g</span> and the <span class="math">÷2</span> multiply. Mind the floor: KV is sensitive, and 4-bit KV needs per-channel scaling to avoid attention degrading. Quantization is also the on-ramp to the <a href="../../distillation/lessons/index.html">distillation/compression track</a>, where quantization-aware training, distillation into a smaller dense model, and the speculative draft live in full.</p>
+
+<table class="trade-table"><thead><tr><th>Lever</th><th>What it attacks</th><th>Rough win</th><th>Cost / risk</th></tr></thead><tbody>
+  <tr><td>GQA (lesson 03)</td><td>KV bytes ÷ g</td><td>~4× more concurrency (g=4)</td><td>tiny quality drop, baked in at train time</td></tr>
+  <tr><td>Continuous batching</td><td>GPU idle time</td><td>~2–3× throughput</td><td>per-user latency variance</td></tr>
+  <tr><td>Speculative decoding</td><td>target passes / token</td><td>~2–3× latency (small batch)</td><td>needs a good draft; gains fade at high batch</td></tr>
+  <tr><td>Weight INT8 / INT4</td><td>weight HBM traffic</td><td>~2× / ~4× decode speed</td><td>INT4 needs GPTQ/AWQ; small quality cost</td></tr>
+  <tr><td>KV-cache INT8</td><td>cache bytes ÷ 2</td><td>~2× context / batch</td><td>KV is precision-sensitive at 4-bit</td></tr>
+</tbody></table>
+
+<h2>6 · Where the deep treatment lives</h2>
+
+<p>This lesson is the map; the territory is three tracks. The production serving engines — paged KV, continuous batching, prefix caching, the scheduler — are <a href="../../vllm/lessons/index.html">the vLLM track</a> and <a href="../../sglang/lessons/index.html">the SGLang track</a>. The kernels underneath — fused attention-decode, paged/radix layouts, INT4 dequant-fused GEMMs, CUDA-graph capture to kill launch overhead at batch 1 — are <a href="../../gpu_kernels/13_sglang_kernel_stack.html">gpu_kernels/13 (SGLang kernel stack)</a> and <a href="../../gpu_kernels/14_layouts_paged_radix.html">gpu_kernels/14 (paged &amp; radix layouts)</a>, with quantization kernels continuing into gpu_kernels/15. Compression — distillation, quantization-aware training, the speculative draft — is the <a href="../../distillation/lessons/index.html">distillation track</a>. Read this to know <em>which</em> lever and <em>why</em>; read those to implement it.</p>
+
+<h2>7 · Drive the decode arithmetic</h2>
+
+<p>Every knob below is a real serving decision. <strong>Model size</strong> and <strong>weight precision</strong> set the per-token weight traffic (the bandwidth wall). <strong>Context T</strong>, <strong>batch</strong>, and <strong>GQA groups</strong> set the KV cache. Watch three things. First, KV cache fills the 80 GB budget long before compute does — and GQA / KV-quant claw it back. Second, raising <strong>batch</strong> climbs aggregate throughput (tokens/s) while per-user tokens/s falls — the throughput/latency trade made concrete. Third, the FLOP/byte readout shows prefill sitting comfortably above the ridge (compute-bound) while decode sits far below it (memory-bound) — the asymmetry that defines the whole lesson. The configuration that "breaks": long context × large batch × MHA overflows HBM (the meter turns red); shrink it with GQA or KV-quant.</p>
+
+<div class="widget" id="dec-widget">
+  <div class="title">Decode arithmetic — the bandwidth wall and the KV cap</div>
+  <div class="hint">A single 80 GB H100 at ~3.3 TB/s, ~990 bf16 TFLOP/s. Decode tokens/s is a weight-bandwidth-bound estimate: bytes/step = (weights at the chosen precision + KV read) × batch; tokens/s ≈ bandwidth / bytes-per-step × batch. The KV meter is weights + cache vs 80 GB; it turns red on overflow. Push <strong>batch</strong> up to watch aggregate throughput rise while per-user tokens/s falls, then drop <strong>GQA groups g</strong> or precision to shrink the wall.</div>
+
+  <div class="controls">
+    <label class="inline">model params (B): <input type="range" id="d-N" min="1" max="70" step="1" value="7"> <span class="val" id="v-N">7</span></label>
+    <label class="inline">context T: <input type="range" id="d-T" min="512" max="32768" step="512" value="8192"> <span class="val" id="v-T">8192</span></label>
+    <label class="inline">batch: <input type="range" id="d-B" min="1" max="128" step="1" value="8"> <span class="val" id="v-B">8</span></label>
+    <label class="inline">GQA groups g: <input type="range" id="d-G" min="1" max="8" step="1" value="4"> <span class="val" id="v-G">4</span></label>
+    <label class="inline">weight precision:
+      <select id="d-P">
+        <option value="2">bf16 (2 B)</option>
+        <option value="1" selected>INT8 (1 B)</option>
+        <option value="0.5">INT4 (0.5 B)</option>
+      </select>
+    </label>
+    <label class="inline">KV precision:
+      <select id="d-K">
+        <option value="2" selected>bf16 (2 B)</option>
+        <option value="1">INT8 (1 B)</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">KV cache / token</div><div class="v" id="k-kvtok">—</div></div>
+    <div class="kpi"><div class="k">KV cache total</div><div class="v" id="k-kvtot">—</div></div>
+    <div class="kpi"><div class="k">Decode tokens/s (aggregate)</div><div class="v" id="k-tps">—</div></div>
+    <div class="kpi"><div class="k">Per-user tokens/s</div><div class="v" id="k-tpu">—</div></div>
+    <div class="kpi"><div class="k">Prefill FLOP/byte</div><div class="v" id="k-pf">—</div></div>
+    <div class="kpi"><div class="k">Decode FLOP/byte</div><div class="v" id="k-df">—</div></div>
+  </div>
+
+  <div style="margin-top:14px;">
+    <div class="meter-row"><span class="lab">HBM 80 GB</span><div class="budget-meter" id="d-meter"></div><span class="num" id="d-meternum">—</span></div>
+    <div id="d-verdict" style="font-family:var(--mono); font-size:12px; margin-top:6px; color:var(--text-mute);"></div>
+  </div>
+</div>
+
+<p>Notice the asymmetry the FLOP/byte KPIs expose: prefill processes the whole prompt so it does hundreds of FLOPs per weight byte and sits compute-bound; decode does ~<span class="math">2N</span> FLOPs against a full weight reload and sits at single digits — far under the ~300 ridge. Every lever in this lesson is an attempt to drag that decode number rightward: batching shares the byte load, quantization shrinks it, speculation does more useful work per load.</p>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+<li><strong>Optimizing decode FLOPs.</strong> Buying a faster-FLOP GPU to speed up generation. Decode is bandwidth-bound; you needed more TB/s or fewer bytes, not more TFLOP/s. <em>Signal:</em> a chip with 2× the FLOPs gives near-zero decode speedup.</li>
+<li><strong>Forgetting the KV cache in the memory budget.</strong> Sizing a deployment by weights alone, then OOM-ing under long-context concurrent traffic. <em>Signal:</em> fits at 2K context, crashes at 32K with the same batch.</li>
+<li><strong>Static batching in production.</strong> One 2,000-token request stalls a whole batch of short ones. <em>Signal:</em> p99 latency spikes and GPU utilization sits at 30% under bursty, variable-length load.</li>
+<li><strong>A draft model that's too big or too divergent.</strong> Speculative decoding where the draft is slow or rarely accepted — overhead with no payoff. <em>Signal:</em> acceptance rate &lt; 50% or end-to-end latency worse than plain decode.</li>
+<li><strong>Quantizing the KV cache too aggressively.</strong> 4-bit KV without per-channel scaling silently degrades long-context attention. <em>Signal:</em> quality fine on short prompts, falls apart deep into long contexts.</li>
+</ul>
+  </div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+<li><strong>Separate prefill and decode</strong> in your mental model and your scheduler; they are different workloads.</li>
+<li><strong>Budget HBM as weights + KV cache</strong>, and size KV at <span class="math">2·L·n<sub>kv</sub>·d<sub>head</sub>·T·batch·bytes</span> for your worst-case context.</li>
+<li><strong>Pick GQA group g from the serving budget</strong> (lesson 03) — it divides the cache directly.</li>
+<li><strong>Use continuous batching</strong> for any variable-length traffic; it is nearly free throughput.</li>
+<li><strong>Choose your point on the throughput/latency curve deliberately</strong> — chat ≠ batch jobs.</li>
+<li><strong>Reach for weight INT8/INT4 first</strong> on a bandwidth-bound decode; add speculative decoding for low-batch latency.</li>
+</ul>
+  </div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the widget with the default 7B-class config. (1) Set context to 32,768, batch to 8, GQA g to 1 (MHA), precision bf16 — watch the HBM meter overflow red. Now drag g to 4: the KV cache quarters and it fits. That is lesson 03's payback in one motion. (2) Reset, then sweep <strong>batch</strong> from 1 to 64 and read both tokens/s KPIs: aggregate climbs, per-user falls — the throughput/latency trade. (3) Switch weight precision bf16 → INT4 at batch 1 and watch decode tokens/s roughly quadruple while the FLOP/byte readout stays memory-bound. In one sentence each: why did INT4 help decode but barely help prefill, and which single knob would you turn first to serve 64 concurrent 32K-context users?</div>
+
+<h2>Where this points next</h2>
+
+<p>The model is built, aligned, and now servable — paged KV cache, GQA-shrunk and INT8-quantized, packed into continuous batches, latency cut with a distilled speculative draft. There is no new wall: this is the last engineering stage in the chain. What remains is to see that it <em>was</em> a chain — that the tokenizer choice (01), the architecture swaps (03), the FSDP/TP split (08–09), the scaling-law size (11), and the serving levers here are all the same decision asked at different points: <em>what is the most capable model this budget can buy, and serve?</em> Lesson 17, <a href="17_capstone.html">the capstone</a>, walks one concrete budget end to end and shows every earlier choice as a forced consequence of the last.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>Serving an autoregressive model is two workloads: <strong>prefill</strong> runs the whole prompt in one compute-bound pass and fills the <strong>KV cache</strong>; <strong>decode</strong> emits one token per step, reloading every weight and the whole cache from HBM for only ~<span class="math">2N</span> FLOPs — so decode is <em>memory-bound</em> (callback to lesson 06's roofline) and is where all the latency and cost live. The KV cache, <span class="math">2·L·n<sub>kv</sub>·d<sub>head</sub>·T·batch·bytes</span>, not compute, caps how many requests you can hold — a single 32K bf16-MHA sequence on a 7B model is ~17 GB, more than the weights — which is exactly why <strong>GQA</strong> (lesson 03, cache ÷ g) is a serving win and why vLLM pages it. Four levers raise decode's arithmetic intensity or shrink its bytes: <strong>continuous batching</strong> (~2–3× throughput, at the cost of per-user latency), <strong>speculative decoding</strong> (a distilled draft proposes k, the target verifies in one pass — same distribution, ~2–3× faster at low batch), and <strong>quantization</strong> (weight INT8/INT4 cuts the bandwidth wall ~2–4×; KV-INT8 doubles the context you can hold). Throughput and latency always trade; the deep implementation lives in vLLM, SGLang, and gpu_kernels/12–15. This closes the build — lesson 17 ties the whole budget together.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why is decode memory-bound while prefill is compute-bound? <em>(§1 — prefill does ≈2N·P FLOPs against one weight load over P parallel positions (high intensity); decode does ≈2N FLOPs per sequence but reloads all weights + KV each step, so intensity ≈ 1 FLOP/byte at batch 1, far below the ~300 ridge. All the cost is in the 499 decode steps, not the 1 prefill.)</em></li>
+  <li>Derive the KV-cache size and explain what it caps. <em>(§2 — 2·L·n_kv·d_head·T·batch·bytes; the 2 is K+V. For a 7B model (L=32, d_head=128, bf16, MHA) it's 512 KB/token, ~17 GB at 32K context — more than the weights. Concurrent batch is capped by (HBM − weights)/(KV per sequence); the cache, not FLOPs, is the limit.)</em></li>
+  <li>How does GQA help inference and by how much? <em>(§2 — it shares each K/V head across g query heads, so n_kv = h/g and the cache divides by exactly g; g=4 turns 512 KB/token into 128 KB, quadrupling concurrency, with query heads and quality essentially unchanged. It's a serving decision made at training time.)</em></li>
+  <li>Static vs continuous batching — what changes and why does it matter? <em>(§3 — static finishes when the longest sequence does and holds slots idle; continuous swaps a finished sequence out and a queued one in every decode step, refilling slots, giving ~2–3× throughput on variable-length traffic. It also requires splicing compute-bound prefills among memory-bound decodes.)</em></li>
+  <li>How does speculative decoding speed things up without changing the output? <em>(§4 — a small draft proposes k tokens; the target verifies all k in one parallel pass (cheap because decode had spare FLOPs); a rejection-sampling rule keeps the longest agreed prefix and guarantees the target's exact distribution. ~2–3× fewer target passes at α≈0.7, k=4; the draft is typically a distilled target.)</em></li>
+  <li>Why does weight-only quantization help decode specifically? <em>(§5 — decode is bound by weight bytes moved per token, so INT8/INT4 halving/quartering the weight traffic gives ~2×/~4× decode speedup; dequant happens in-kernel and math stays bf16. It barely helps compute-bound prefill, because prefill isn't bandwidth-limited.)</em></li>
+  <li>State the throughput/latency trade in one rule. <em>(§3 — bigger batches amortize the weight load over more users so aggregate tokens/s rises, but each user's tokens/s falls and may queue behind a prefill; chat optimizes per-user latency with small batches, batch jobs optimize aggregate throughput with large ones. There is no single "fast.")</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="15_preferences.html"><span class="dir">← Back</span><span class="ttl">15 · Preferences &amp; rewards</span></a>
+  <a class="next" href="17_capstone.html"><span class="dir">Next →</span><span class="ttl">17 · Capstone</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var elN = document.getElementById('d-N');
+  var elT = document.getElementById('d-T');
+  var elB = document.getElementById('d-B');
+  var elG = document.getElementById('d-G');
+  var elP = document.getElementById('d-P');
+  var elK = document.getElementById('d-K');
+  if (!elN) return;
+
+  var vN = document.getElementById('v-N');
+  var vT = document.getElementById('v-T');
+  var vB = document.getElementById('v-B');
+  var vG = document.getElementById('v-G');
+
+  var kKvtok = document.getElementById('k-kvtok');
+  var kKvtot = document.getElementById('k-kvtot');
+  var kTps   = document.getElementById('k-tps');
+  var kTpu   = document.getElementById('k-tpu');
+  var kPf    = document.getElementById('k-pf');
+  var kDf    = document.getElementById('k-df');
+  var meter  = document.getElementById('d-meter');
+  var meternum = document.getElementById('d-meternum');
+  var verdict  = document.getElementById('d-verdict');
+
+  // Hardware: one H100-class GPU.
+  var HBM_GB   = 80;
+  var BW_TBs   = 3.3;          // TB/s
+  var PEAK_TF  = 990;          // bf16 TFLOP/s
+  var RIDGE    = PEAK_TF * 1e12 / (BW_TBs * 1e12); // ~300 FLOP/byte
+  var d_head   = 128;
+  var PREFILL_P = 2048;        // illustrative prompt length for prefill intensity
+
+  // Map a parameter count (in billions) to a representative (L, h) 7B-style config.
+  // Keep it simple & monotone: layers and heads grow gently with N.
+  function configFor(Nb){
+    // anchor on 7B = L32,h32; scale layers ~ N^0.33-ish, heads to keep d_head=128.
+    var L = Math.max(12, Math.round(32 * Math.cbrt(Nb / 7)));
+    var h = Math.max(8,  Math.round(32 * Math.cbrt(Nb / 7)));
+    return { L: L, h: h };
+  }
+
+  function fmtGB(gb){ return gb >= 1 ? gb.toFixed(1) + ' GB' : (gb*1024).toFixed(0) + ' MB'; }
+  function fmtKB(bytes){
+    if (bytes >= 1024*1024) return (bytes/1024/1024).toFixed(2) + ' MB';
+    return (bytes/1024).toFixed(0) + ' KB';
+  }
+  function fmtTps(x){
+    if (x >= 1000) return (x/1000).toFixed(1) + 'k';
+    return Math.round(x).toString();
+  }
+
+  function recompute(){
+    var Nb = +elN.value;       // params in billions
+    var T  = +elT.value;       // context tokens
+    var B  = +elB.value;       // batch
+    var g  = +elG.value;       // GQA group factor
+    var pB = +elP.value;       // weight bytes/elt
+    var kB = +elK.value;       // KV bytes/elt
+
+    vN.textContent = Nb; vT.textContent = T.toLocaleString(); vB.textContent = B; vG.textContent = g;
+
+    var cfg = configFor(Nb);
+    var L = cfg.L, h = cfg.h;
+    var n_kv = Math.max(1, Math.round(h / g));
+
+    var N = Nb * 1e9;
+
+    // --- KV cache ---
+    var kvPerTok = 2 * L * n_kv * d_head * kB;          // bytes / token / sequence
+    var kvTotalGB = kvPerTok * T * B / 1e9;
+    var weightsGB = N * pB / 1e9;
+    var totalGB = weightsGB + kvTotalGB;
+
+    kKvtok.textContent = fmtKB(kvPerTok);
+    kKvtot.textContent = fmtGB(kvTotalGB);
+
+    // --- Decode throughput (weight-bandwidth-bound) ---
+    // bytes moved per decode step (whole batch): weights once + KV read for all B seqs at length ~T.
+    var kvReadBytes = kvPerTok * T * B;                 // approx: read full cache each step
+    var bytesPerStep = N * pB + kvReadBytes;            // weights shared across batch + per-seq KV
+    var bwBytes = BW_TBs * 1e12;                        // bytes/s
+    var stepsPerSec = bwBytes / bytesPerStep;           // batched decode steps per second
+    var aggTps = stepsPerSec * B;                       // tokens/s across all users
+    var perUserTps = stepsPerSec;                       // tokens/s for one user
+
+    kTps.textContent = fmtTps(aggTps) + ' tok/s';
+    kTpu.textContent = fmtTps(perUserTps) + ' tok/s';
+
+    // --- Arithmetic intensity (FLOP/byte) ---
+    // decode: ~2N FLOPs per sequence, weight bytes per sequence ~ (N*pB)/B shared.
+    var decodeFlops = 2 * N * B;
+    var decodeBytes = N * pB + kvReadBytes;
+    var decodeFB = decodeFlops / decodeBytes;
+    // prefill: ~2N*P FLOPs over one weight load.
+    var prefillFB = (2 * N * PREFILL_P) / (N * pB);
+    kPf.textContent = Math.round(prefillFB).toLocaleString() + ' (compute-bound)';
+    kDf.textContent = decodeFB.toFixed(1) + (decodeFB < RIDGE ? ' (memory-bound)' : ' (compute-bound)');
+
+    // --- HBM meter: weights + KV vs 80 GB ---
+    var wPct = Math.min(100, weightsGB / HBM_GB * 100);
+    var kvPct = Math.min(100 - wPct, kvTotalGB / HBM_GB * 100);
+    var overflow = totalGB > HBM_GB;
+    meter.innerHTML = '';
+    var sW = document.createElement('span'); sW.className = 'seg-a'; sW.style.width = wPct + '%'; meter.appendChild(sW);
+    var sK = document.createElement('span'); sK.className = overflow ? 'seg-e' : 'seg-c'; sK.style.width = kvPct + '%';
+    if (overflow) sK.style.background = 'var(--bad)';
+    meter.appendChild(sK);
+    meternum.textContent = fmtGB(totalGB) + ' / 80';
+    if (overflow){
+      verdict.style.color = 'var(--bad)';
+      verdict.textContent = 'OVERFLOW: weights ' + fmtGB(weightsGB) + ' + KV ' + fmtGB(kvTotalGB)
+        + ' > 80 GB. Shrink with GQA (raise g), KV-INT8, or smaller batch/context.';
+    } else {
+      verdict.style.color = 'var(--text-mute)';
+      verdict.textContent = 'fits: weights ' + fmtGB(weightsGB) + ' (seg A) + KV ' + fmtGB(kvTotalGB)
+        + ' (seg C). Ridge point ≈ ' + Math.round(RIDGE) + ' FLOP/byte.';
+    }
+  }
+
+  [elN, elT, elB, elG, elP, elK].forEach(function(e){
+    e.addEventListener('input', recompute);
+    e.addEventListener('change', recompute);
+  });
+  recompute();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

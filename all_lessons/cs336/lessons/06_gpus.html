@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>06 · GPUs — the hardware you're renting</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local layout only — failure/checklist columns + roofline canvas */
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; font-size: 15px; }
+  .lesson-card ul { margin: 0; padding-left: 18px; }
+  .lesson-card li { margin: 7px 0; font-size: 13.5px; line-height: 1.5; }
+  .dist-canvas { width: 100%; max-width: 640px; height: 300px; display: block; margin: 6px auto 2px;
+                 background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; }
+  .preset-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 10px; }
+  .preset-row button { font-family: var(--mono); font-size: 12px; }
+  .verdict { margin-top: 8px; font-family: var(--mono); font-size: 13px; padding: 8px 11px; border-radius: 6px; border: 1px solid var(--border); }
+  .verdict.mem { background: rgba(220,38,38,0.08); border-color: var(--bad); color: var(--bad); }
+  .verdict.comp { background: rgba(22,163,74,0.10); border-color: var(--ok); color: var(--ok); }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="index.html">cs336 / lessons</a><span class="crumb">/</span><span class="crumb">06 · gpus</span><span class="step-pill">lesson 7 / 18</span></div></header>
+
+<main>
+
+<p class="kicker">Part II — Systems</p>
+<h1>GPUs — the hardware you're renting</h1>
+<p class="subtitle">Lesson 05 quoted two numbers as if they were given to us: a "peak FLOP/s" the runtime estimate divided by, and an "MFU" of ~50% that quietly halved your calendar. Neither was explained — they were placeholders for the machine. The whole budget is denominated in GPU-hours, yet we have not once looked at what a GPU actually is: how it moves bytes, how it does math, and why those two rates are wildly out of balance. This lesson opens the box. The single concept inside — <strong>arithmetic intensity</strong>, plotted on the <strong>roofline</strong> — explains where the 50% comes from and which operations in your model are throwing tensor cores away.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>Lesson 05 turned a dollar budget into a model size with <span class="math">time ≈ 6ND / (GPUs · peak · MFU)</span>, then plugged in "peak ≈ 990 TFLOP/s" and "MFU ≈ 50%" with no justification. But MFU is not a constant of nature — it is the fraction of the chip's compute you manage to keep busy, and that fraction is decided by a tug-of-war between two hardware rates: how fast the GPU can multiply (TFLOP/s) and how fast it can feed itself data (TB/s). Until you know those two rates and how an operation's structure determines which one binds it, you cannot say why MFU is 50% rather than 90%, nor which kernels to fix. You are reasoning about utilization while blind to the machine.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> the budget is GPU-hours and lesson 05's runtime estimate hinges on "peak" and "MFU" — numbers you cannot defend without knowing how the chip moves data and does math.<br><strong>New idea:</strong> the GPU memory hierarchy (HBM ↔ SRAM ↔ registers) and tensor cores; the master concept <strong>arithmetic intensity = FLOPs ÷ bytes moved</strong>, plotted on the <strong>roofline</strong>, which classifies every op as <em>memory-bound</em> or <em>compute-bound</em> relative to a ridge point (≈300 FLOP/byte on an H100).<br><strong>Forces next:</strong> most LM ops — norms, softmax, every elementwise step, attention at decode — sit far below the ridge, so naive one-kernel-per-op execution leaves the tensor cores idle while the chip waits on HBM. The fix is to do more math per byte loaded: <strong>kernel fusion</strong> (lesson 07).</div>
+
+<div class="callout"><div class="label">The plan</div>Five moves. (1) Climb the memory hierarchy with H100 numbers — HBM, SRAM, registers — and see the bandwidth cliff. (2) Put compute next to it: ~1,000 TFLOP/s of tensor-core bf16, and stare at the gap between TFLOP/s and TB/s. (3) Define arithmetic intensity and derive the roofline and its ridge point. (4) Classify the LM op zoo — GEMM is compute-bound and good; norms, softmax, elementwise, attention-decode are memory-bound. (5) Sketch the execution model (grid/block/warp, occupancy), say where MFU&lt;100% comes from, and drag the roofline explorer until an op falls off the cliff.</div>
+
+<h2>1 · The memory hierarchy: a bandwidth cliff</h2>
+
+<p>A GPU is not one pool of memory; it is a steep pyramid, and the price of moving a byte changes by orders of magnitude as you climb it. Take an NVIDIA H100 (SXM) as the running example — the chip most frontier runs are actually rented on.</p>
+
+<table class="trade-table"><thead><tr><th>level</th><th>capacity</th><th>bandwidth</th><th>who sees it</th></tr></thead><tbody>
+  <tr><td><strong>HBM</strong> (global / "VRAM")</td><td>≈80 GB</td><td>≈3.3 TB/s</td><td>the whole GPU; off-chip, where your weights, activations, and KV cache live</td></tr>
+  <tr><td><strong>SRAM</strong> (L2 + per-SM shared/L1)</td><td>tens of MB total (~50 MB L2; ~228 KB shared per SM)</td><td>~20× HBM (tens of TB/s aggregate on-chip)</td><td>a single thread block (shared mem) or all SMs (L2); on-chip scratchpad</td></tr>
+  <tr><td><strong>registers</strong></td><td>tiny (256 KB/SM, a few KB per thread)</td><td>fastest — effectively free, read every cycle</td><td>one thread; the operands the ALUs actually consume</td></tr>
+</tbody></table>
+
+<p>Read the table as a cliff. The 80 GB of HBM is where everything you allocated in PyTorch actually sits, and it is the <em>slow</em> tier: 3.3 TB/s sounds enormous until you compare it to the compute rate in section 2. On-chip SRAM is roughly <strong>20× faster per byte</strong> but holds only tens of megabytes total — you cannot park a 7B model there, you can only stage a <em>tile</em> of it. Registers are faster still and essentially free, but a thread has only a handful of kilobytes. The entire performance game on a GPU is: <strong>get data into SRAM/registers once, do as much math on it as possible, and write back to HBM as little as you can.</strong> Every byte you re-read from HBM that you could have kept on-chip is bandwidth you set on fire.</p>
+
+<pre class="ascii">  registers   few KB/thread     fastest          <- ALUs eat from here
+      ^
+  SRAM        ~228 KB/SM        ~20x HBM BW       <- staging tile, shared within a block
+  (L1/shared) ~50 MB L2
+      ^
+  HBM         ~80 GB            ~3.3 TB/s         <- everything lives here; the slow tier
+      ^
+  host/PCIe   TB                ~tens of GB/s     <- off-GPU; avoid in the hot loop entirely</pre>
+
+<p>One concrete consequence to keep in your pocket: an operation that just reads a big tensor from HBM and writes it back — say, adding a bias — is paying full HBM latency for almost no math. Whether that op is fast has <em>nothing</em> to do with how many TFLOP/s the chip has. It is gated entirely by 3.3 TB/s. Hold that thought; it is the whole lesson.</p>
+
+<h2>2 · Compute: ~1,000 TFLOP/s, and the gap that is the whole story</h2>
+
+<p>Now the other rate. An H100's <strong>tensor cores</strong> — dedicated matrix-multiply-accumulate units, separate from the general CUDA cores — do roughly <strong>990 TFLOP/s of bf16</strong> (call it ~1 PFLOP/s; with FP8 and sparsity the marketing numbers roughly double). The CUDA cores that handle elementwise math (an add, a GELU, a comparison) are far slower — on the order of tens of TFLOP/s of fp32. So "the GPU's compute" is really "the tensor cores doing matmuls," and everything else is a sideshow that mostly exists to feed them.</p>
+
+<p>Put the two rates side by side and the central tension of GPU programming appears:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">compute</div><div class="v">≈990×10¹² bf16 FLOP/s (tensor cores)</div></div>
+  <div class="topic-card"><div class="k">bandwidth</div><div class="v">≈3.3×10¹² bytes/s (HBM)</div></div>
+  <div class="topic-card"><div class="k">ratio</div><div class="v">≈300 FLOP per byte — the chip can do ~300 math ops in the time it takes to fetch one byte from HBM</div></div>
+</div>
+
+<p>That ratio is the crux of Part II. The hardware can perform on the order of <strong>300 floating-point operations in the time it takes to read a single byte from HBM</strong>. So unless an operation does ≥300 FLOPs of useful work for every byte it pulls from HBM, the tensor cores spend most of their cycles <em>idle</em>, waiting on memory. The TFLOP/s number on the spec sheet — the one you bragged about in the runtime estimate — is reachable only by operations dense enough to clear that bar. Most operations in a language model are not. The gap between TFLOP/s and TB/s is not a footnote; it is the reason MFU is 50% and not 95%, and the reason every remaining lesson in Part II exists.</p>
+
+<h2>3 · Arithmetic intensity and the roofline</h2>
+
+<p>To make "does this op clear the bar" precise, define one number per operation. <strong>Arithmetic intensity</strong> (AI) is the ratio of useful work to data traffic:</p>
+
+<div class="math block">arithmetic intensity &nbsp;=&nbsp; (FLOPs performed) ÷ (bytes moved to/from HBM) &nbsp;&nbsp; [FLOP / byte]</div>
+
+<p>It is a property of the <em>algorithm and its data layout</em>, not of the chip. An op with low AI touches a lot of memory per unit of math (bandwidth-hungry); an op with high AI reuses each loaded byte for many operations (compute-hungry). Now overlay the two hardware rates. The time an op takes is bounded below by whichever ceiling is binding:</p>
+
+<div class="math block">time &nbsp;≥&nbsp; max( FLOPs ÷ peakCompute , &nbsp; bytes ÷ peakBandwidth )</div>
+
+<p>Turn that into achievable throughput as a function of AI and you get the <strong>roofline</strong>: a curve that rises linearly while bandwidth is the limit, then flattens once compute takes over.</p>
+
+<div class="math block">achievable FLOP/s &nbsp;=&nbsp; min( peakCompute , &nbsp; AI × peakBandwidth )</div>
+
+<p>The two regimes meet at the <strong>ridge point</strong> — the arithmetic intensity at which a perfectly bandwidth-bound op would exactly saturate compute:</p>
+
+<div class="math block">ridge &nbsp;=&nbsp; peakCompute ÷ peakBandwidth &nbsp;≈&nbsp; 990×10¹² ÷ 3.3×10¹² &nbsp;≈&nbsp; 300 FLOP / byte</div>
+
+<p>The verdict is binary and unforgiving. An op whose AI is <strong>below ≈300</strong> can never reach peak FLOP/s no matter how good your kernel is — it is <strong>memory-bound</strong>, capped at <span class="math">AI × 3.3 TB/s</span>, and the tensor cores idle. An op whose AI is <strong>above ≈300</strong> is <strong>compute-bound</strong> — it can in principle saturate the tensor cores, and is the only kind of op that earns the spec-sheet TFLOP/s. The roofline is the single picture that says, for any operation, the best speed it could possibly hit on this chip and which resource you would have to buy more of to go faster.</p>
+
+<div class="callout warn"><div class="label">The ridge moves with precision</div>The ridge is <span class="math">peakCompute ÷ peakBandwidth</span>, so changing either rate slides it. Switch to FP8 and peakCompute roughly doubles → the ridge climbs to ~600 FLOP/byte, making <em>more</em> ops memory-bound (harder to feed the faster cores). Quantizing weights to fewer bytes cuts the <em>bytes moved</em> for weight-bound ops, raising their AI. "Below the ridge" is always relative to a specific (compute, bandwidth, dtype) configuration — which is why decode-time INT4 (lesson 16) is a bandwidth play, not a compute one.</div>
+
+<h2>4 · Classifying the LM op zoo</h2>
+
+<p>Now walk the operations a Transformer actually runs and place each on the roofline. The pattern is stark: exactly one family is compute-bound, and it is the one you want to dominate the budget.</p>
+
+<table class="trade-table"><thead><tr><th>operation</th><th>arithmetic intensity</th><th>regime</th><th>why</th></tr></thead><tbody>
+  <tr><td><strong>matmul / GEMM</strong> (training, large M·N·K)</td><td>high — scales with the shared dimension, easily &gt;300</td><td><span style="color:var(--ok)">compute-bound ✓</span></td><td>each loaded tile of A and B is reused across many output elements; the math grows as <span class="math">M·N·K</span> while traffic grows as <span class="math">M·K + K·N</span></td></tr>
+  <tr><td><strong>LayerNorm / RMSNorm</strong></td><td>≈2–4 FLOP/byte</td><td><span style="color:var(--bad)">memory-bound</span></td><td>read the tensor, compute a mean/variance, write it back — a handful of FLOPs per element read</td></tr>
+  <tr><td><strong>softmax</strong></td><td>≈3–5 FLOP/byte</td><td><span style="color:var(--bad)">memory-bound</span></td><td>max, subtract, exp, sum, divide — still only a few FLOPs per element, dominated by the read/write</td></tr>
+  <tr><td><strong>elementwise</strong> (GELU, residual add, dropout, scale)</td><td>≈1–4 FLOP/byte</td><td><span style="color:var(--bad)">memory-bound</span></td><td>one or two FLOPs per element loaded; pure bandwidth</td></tr>
+  <tr><td><strong>attention at decode</strong> (one query token)</td><td>low — re-reads the whole KV cache per step for a single query</td><td><span style="color:var(--bad)">memory-bound</span></td><td>a matrix-times-vector: each cached K/V byte is used once, no reuse → bandwidth-bound (the heart of lesson 16)</td></tr>
+</tbody></table>
+
+<p>The lesson of the table: a big training GEMM has arithmetic intensity in the hundreds-to-thousands because a tile of the weight matrix, once in SRAM, is multiplied against many rows of activations — the loaded bytes are reused heavily, so the math piles up while the traffic does not. That is why matmuls are the only ops that hit the tensor-core ceiling, and why you want them to be the overwhelming majority of your FLOPs. Everything else — every norm, every activation, every softmax, and decode-time attention — does only a few FLOPs per byte and is pinned to the 3.3 TB/s wall, the tensor cores sitting idle the whole time.</p>
+
+<p>This is precisely why real training MFU lands at ~40–55% rather than near 100% (lesson 05): even though GEMMs dominate the FLOP <em>count</em>, the memory-bound ops between them consume wall-clock time during which the tensor cores do nothing. The chip is fast at the one thing and starved on everything else, and "everything else" still has to run.</p>
+
+<div class="callout"><div class="label">A back-of-envelope you can do in your head</div>RMSNorm on a bf16 tensor of <span class="math">B·T·d</span> elements reads ~2 bytes and does ~4 FLOPs per element → AI ≈ 2 FLOP/byte. Against the H100 roofline that op tops out at <span class="math">2 × 3.3 TB/s ≈ 6.6 TFLOP/s</span> — under <strong>1%</strong> of the 990 TFLOP/s peak. No kernel, no compiler, no amount of cleverness moves a single-pass RMSNorm above that line; only changing what gets moved (fusing it into a neighbor so the tensor never round-trips HBM) helps. Hold that 1% — it is the motivation for lesson 07.</div>
+
+<h2>5 · The execution model, briefly — and where MFU leaks</h2>
+
+<p>You do not need the full programming model to reason about the budget, but you need the vocabulary, because the leaks in MFU live here. A GPU runs a <strong>kernel</strong> (one function) as a <strong>grid</strong> of <strong>thread blocks</strong>; each block is scheduled onto one <strong>streaming multiprocessor</strong> (SM — an H100 has ~132) and runs as groups of 32 threads called <strong>warps</strong> that execute in lockstep. Threads in a block share that SM's fast SRAM and can cooperate; threads in different blocks cannot. <strong>Occupancy</strong> is how many warps an SM keeps resident at once — enough resident warps let the scheduler hide memory latency by switching to a ready warp while another waits on HBM. Low occupancy (too few warps, too many registers per thread) means the SM stalls with nothing to run during a memory wait.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">grid → block → warp</div><div class="v">a kernel launch is a grid of blocks; a block lands on one SM; a warp is 32 threads in lockstep. The unit of scheduling is the warp.</div></div>
+  <div class="topic-card"><div class="k">occupancy</div><div class="v">resident warps per SM. High occupancy hides HBM latency by overlapping waits with other warps' work; low occupancy stalls.</div></div>
+  <div class="topic-card"><div class="k">launch overhead</div><div class="v">each kernel has fixed launch cost. Many tiny ops (one per elementwise step) means launch + HBM round-trip dominates the actual math.</div></div>
+</div>
+
+<p>That gives the four reasons MFU comes in under 100%, all visible from this lesson:</p>
+
+<ul>
+  <li><strong>Memory-bound ops (§3–4):</strong> norms, softmax, elementwise, decode-attention can't saturate the tensor cores by construction — they're below the ridge, so the cores idle while HBM is read.</li>
+  <li><strong>Kernel-launch + HBM round-trips:</strong> running each op as its own kernel pays launch overhead and re-reads the tensor from HBM every time — the exact waste lesson 07's fusion removes.</li>
+  <li><strong>Low occupancy / small ops:</strong> tensors too small to fill the SMs, or too register-hungry, leave warps idle and latency un-hidden.</li>
+  <li><strong>Communication stalls:</strong> once work is split across GPUs (lessons 08–09), devices wait on each other's all-reduces — compute idles during comm that isn't overlapped.</li>
+</ul>
+
+<p>The depth here is its own track. For the line-level programming model — threads, warps, divergence, the launch — see <a href="../../gpu_kernels/01_gpu_execution_model.html">gpu_kernels · 01 (the execution model)</a>; for the memory hierarchy and coalesced access, <a href="../../gpu_kernels/02_memory_hierarchy.html">gpu_kernels · 02</a>; and for the kernel-engineering mindset that turns a roofline into a fast kernel, <a href="../../gpu_kernels/10_kernel_first_principles.html">gpu_kernels · 10 (kernels from first principles)</a>. This lesson only needs you to hold the roofline and know which side of the ridge your ops fall on.</p>
+
+<h2>6 · Drive the roofline</h2>
+
+<p>The plot below is the H100 roofline: the diagonal is the bandwidth ceiling (<span class="math">AI × 3.3 TB/s</span>), the flat top is the compute ceiling (990 TFLOP/s), and they meet at the ridge (~300 FLOP/byte). Pick a preset op or drag the slider to set an arithmetic intensity. The marker lands on the roofline at that AI, and the readout shows the best achievable throughput and what fraction of peak that is. Drag below the ridge and the verdict turns red: <em>memory-bound — you're wasting tensor cores.</em> Drag past it and the op finally reaches the flat ceiling where the spec-sheet TFLOP/s lives. Notice how far left every real LM op except big GEMM sits.</p>
+
+<div class="widget" id="roof-widget">
+  <div class="title">Roofline explorer — where does your op hit the ceiling?</div>
+  <div class="hint">The marker is your op's <em>best possible</em> throughput on an H100 at its arithmetic intensity — no kernel can beat the roofline. Below the ridge (~300 FLOP/byte) the op is capped by 3.3 TB/s of HBM and the tensor cores idle; above it the op is capped by 990 TFLOP/s of compute. The presets are real LM ops: notice all of them except the big GEMM live far down the bandwidth slope.</div>
+
+  <div class="preset-row">
+    <button type="button" data-ai="2">LayerNorm (AI≈2)</button>
+    <button type="button" data-ai="4">softmax (AI≈4)</button>
+    <button type="button" data-ai="1.5">attention-decode (AI≈1.5)</button>
+    <button type="button" data-ai="800">big GEMM (AI≈800)</button>
+  </div>
+
+  <div class="controls">
+    <label class="inline">arithmetic intensity (FLOP/byte): <input type="range" id="roof-ai" min="0" max="1000" step="1" value="4"> <span class="val" id="roof-ai-v">4</span></label>
+  </div>
+
+  <canvas class="dist-canvas" id="roof-canvas" width="640" height="300"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">Arithmetic intensity</div><div class="v" id="roof-k-ai">—</div></div>
+    <div class="kpi"><div class="k">Achievable throughput</div><div class="v" id="roof-k-tput">—</div></div>
+    <div class="kpi"><div class="k">% of 990 TFLOP/s peak</div><div class="v" id="roof-k-pct">—</div></div>
+    <div class="kpi"><div class="k">Ridge point</div><div class="v" id="roof-k-ridge">~300</div></div>
+  </div>
+
+  <div class="verdict" id="roof-verdict">—</div>
+</div>
+
+<p>The widget makes the spine of Part II visible: the great majority of an LM's distinct operations sit on the bandwidth slope at single-digit percentages of peak, and no kernel rewrite can lift a single-pass op off that line. The only way to recover the wasted tensor cores is to change <em>what gets moved</em> — to stop round-tripping each intermediate through HBM. That is fusion.</p>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Reading peak FLOP/s as a promise.</strong> Assuming a kernel runs near 990 TFLOP/s because the chip can. <em>Signal:</em> a profiler shows 2% of peak on a norm/softmax — it was always memory-bound, the peak was never reachable.</li>
+    <li><strong>Optimizing the wrong ceiling.</strong> Hand-tuning the math of a memory-bound op (fewer FLOPs in a softmax). <em>Signal:</em> no speedup — the op is gated by bytes, not FLOPs; you must cut HBM traffic, not arithmetic.</li>
+    <li><strong>Ignoring the gap between op count and time.</strong> Believing GEMMs dominate runtime because they dominate the FLOP count. <em>Signal:</em> the profile is full of tiny memory-bound kernels eating wall-clock between the GEMMs — the source of MFU&lt;100%.</li>
+    <li><strong>Forgetting the ridge moves with dtype.</strong> Switching to FP8 and expecting all ops to speed up. <em>Signal:</em> compute-bound GEMMs get faster but memory-bound ops don't — the ridge climbed and they're further below it.</li>
+    <li><strong>Treating decode like prefill.</strong> Assuming generation is compute-bound like training. <em>Signal:</em> tiny GPU utilization at decode despite a big model — it's a memory-bound matrix-vector against the KV cache (lesson 16).</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><strong>Compute AI first</strong> (FLOPs ÷ HBM bytes) and compare to the ~300 ridge before touching a kernel.</li>
+    <li><strong>Below the ridge → cut bytes, not FLOPs:</strong> fuse, keep data in SRAM, avoid round-tripping intermediates through HBM.</li>
+    <li><strong>Above the ridge → feed the cores:</strong> ensure tiles are big enough and occupancy high enough to actually hit peak.</li>
+    <li><strong>Want matmuls to dominate</strong> the budget; treat every memory-bound op between them as MFU you're leaking.</li>
+    <li><strong>Re-derive the ridge for your dtype</strong> (peakCompute ÷ peakBandwidth) — it is not a fixed 300.</li>
+  </ul></div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the roofline explorer. (1) Click "LayerNorm (AI≈2)" and read off the achievable throughput and % of peak — confirm it is well under 1% and explain in one sentence why no kernel can beat it. (2) Click "big GEMM (AI≈800)" and watch the marker jump to the flat compute ceiling: what fraction of peak now, and which resource binds it? (3) Drag the slider slowly up from 4 and find the AI where the verdict flips from memory-bound to compute-bound — that value is the ridge; confirm it matches <span class="math">990 ÷ 3.3</span>. (4) By hand: if you switched the chip to FP8 (peakCompute ≈ 1,980 TFLOP/s, same 3.3 TB/s), what is the new ridge, and does softmax become more or less starved? State why in one line.</div>
+
+<h2>Where this points next</h2>
+
+<p>The roofline just delivered an uncomfortable verdict: the overwhelming majority of an LM's distinct operations — every norm, every activation, every softmax, attention at decode — live far below the ridge and can reach only a few percent of the chip's compute, because they do only a handful of FLOPs per byte they pull from HBM. And the way frameworks run them makes it worse: naive PyTorch launches <em>each</em> op as its own kernel, so every intermediate tensor is written to HBM by one kernel and immediately read back by the next, paying full 3.3 TB/s round-trips for math that takes nanoseconds. The tensor cores starve between every step. The forced fix is to stop moving data we don't need to move — to load a tile once into SRAM and do a whole <em>chain</em> of operations on it before writing back, so many ops share one HBM round-trip. That is kernel fusion, and its headline case is FlashAttention. Next: <a href="07_kernels.html"><strong>07 · Kernels — fusion and FlashAttention</strong></a>.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>A GPU is a steep memory pyramid feeding a very fast matrix engine, and the two are badly mismatched. On an H100, HBM holds ≈80 GB at ≈3.3 TB/s; on-chip SRAM is tens of MB at ~20× that bandwidth; registers are tiny and free. The tensor cores do ≈990 TFLOP/s of bf16 — so the chip can do <strong>~300 FLOPs in the time it takes to read one byte from HBM</strong>. That ratio is the <strong>ridge point</strong> of the <strong>roofline</strong>: an op's <strong>arithmetic intensity</strong> (FLOPs ÷ bytes moved) decides whether it is <strong>memory-bound</strong> (AI below ~300, capped at <span class="math">AI × 3.3 TB/s</span>, tensor cores idle) or <strong>compute-bound</strong> (AI above ~300, able to hit peak). In a Transformer, only big GEMMs clear the ridge; norms, softmax, elementwise, and decode-attention all do a few FLOPs per byte and are pinned to the bandwidth wall — which is exactly why training MFU is ~40–55% and not ~100%, since the chip idles its cores during all the memory-bound work between the matmuls. You cannot lift a single-pass op off the bandwidth line by computing less; you can only move fewer bytes — fuse the ops so intermediates never round-trip HBM. That necessity forces lesson 07.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>Define arithmetic intensity and the roofline; what is the ridge point on an H100? <em>(§3 — AI = FLOPs ÷ bytes moved to/from HBM; achievable FLOP/s = min(peakCompute, AI×peakBW); the ridge = peakCompute ÷ peakBW ≈ 990 ÷ 3.3 ≈ 300 FLOP/byte, the AI above which an op can saturate compute.)</em></li>
+  <li>Why is a LayerNorm memory-bound and a large matmul compute-bound? <em>(§4 — a norm does ~2–4 FLOPs per element read (AI≈2), so it's capped at AI×3.3 TB/s ≈ &lt;1% of peak; a GEMM reuses each loaded tile across many outputs (math ∝ M·N·K, traffic ∝ M·K+K·N), giving AI in the hundreds, above the ridge.)</em></li>
+  <li>Walk the H100 memory hierarchy and the cost of moving a byte at each level. <em>(§1 — HBM ≈80 GB @ ≈3.3 TB/s (everything lives here, slow); SRAM tens of MB @ ~20× HBM (staging tile, on-chip); registers tiny/fastest. The game is load to SRAM once, compute a lot, write back rarely.)</em></li>
+  <li>Why is real training MFU ~50% and not ~100%? <em>(§4–5 — GEMMs dominate the FLOP count but the memory-bound ops between them (norms, softmax, elementwise) consume wall-clock with the tensor cores idle; add kernel-launch/HBM round-trips, low occupancy, and comm stalls.)</em></li>
+  <li>Estimate the best achievable throughput of an RMSNorm on an H100. <em>(§4 — AI ≈ 2 FLOP/byte → 2 × 3.3 TB/s ≈ 6.6 TFLOP/s, under 1% of 990 TFLOP/s peak; no kernel beats it, only fusing away the HBM round-trip helps.)</em></li>
+  <li>How does switching from bf16 to FP8 change the roofline? <em>(§3 caveat — peakCompute roughly doubles, so the ridge climbs from ~300 to ~600 FLOP/byte; compute-bound GEMMs speed up, but memory-bound ops fall <em>further</em> below the ridge — harder to feed the faster cores.)</em></li>
+  <li>Why is attention at decode memory-bound while training attention is not? <em>(§4, lesson 16 — decode processes one query token against the whole KV cache: a matrix-vector with no reuse, each cached byte read once → low AI; training attention is dense matmuls over the full sequence with reuse → higher AI.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="05_accounting.html"><span class="dir">← Back</span><span class="ttl">05 · Resource accounting</span></a>
+  <a class="next" href="07_kernels.html"><span class="dir">Next →</span><span class="ttl">07 · Kernels</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var ai    = document.getElementById('roof-ai');
+  var aiV   = document.getElementById('roof-ai-v');
+  var cv     = document.getElementById('roof-canvas');
+  var kAI    = document.getElementById('roof-k-ai');
+  var kTput  = document.getElementById('roof-k-tput');
+  var kPct   = document.getElementById('roof-k-pct');
+  var verdict = document.getElementById('roof-verdict');
+  if (!cv) return;
+  var ctx = cv.getContext('2d');
+
+  var PEAK = 990e12;     // bf16 FLOP/s
+  var BW   = 3.3e12;     // HBM bytes/s
+  var RIDGE = PEAK / BW; // ~300 FLOP/byte
+
+  var W = cv.width, H = cv.height;
+  var padL = 56, padR = 18, padT = 18, padB = 40;
+  var plotW = W - padL - padR, plotH = H - padT - padB;
+
+  // log-log axes: x = AI in [0.5, 2000] FLOP/byte, y = TFLOP/s in [1, 2000]
+  var X_MIN = 0.5, X_MAX = 2000, Y_MIN = 1, Y_MAX = 2000; // y in TFLOP/s
+  function lx(x){ return Math.log10(x); }
+  function px(x){ return padL + (lx(Math.max(x, X_MIN)) - lx(X_MIN)) / (lx(X_MAX) - lx(X_MIN)) * plotW; }
+  function py(yT){ return padT + plotH - (lx(Math.max(yT, Y_MIN)) - lx(Y_MIN)) / (lx(Y_MAX) - lx(Y_MIN)) * plotH; }
+
+  // colors pulled from the shared sheet
+  var cs = getComputedStyle(document.documentElement);
+  var COL = {
+    grid:  cs.getPropertyValue('--border').trim()    || '#d8dde6',
+    mute:  cs.getPropertyValue('--text-mute').trim()  || '#5b6573',
+    roof:  cs.getPropertyValue('--accent').trim()     || '#2563eb',
+    bad:   cs.getPropertyValue('--bad').trim()        || '#dc2626',
+    ok:    cs.getPropertyValue('--ok').trim()         || '#16a34a',
+    accent2: cs.getPropertyValue('--accent-2').trim() || '#d97706'
+  };
+
+  function achievableTflops(x){
+    return Math.min(PEAK, x * BW) / 1e12;   // TFLOP/s
+  }
+
+  function fmtT(tflops){
+    if (tflops >= 1000) return (tflops/1000).toFixed(2) + ' PFLOP/s';
+    if (tflops >= 1)    return tflops.toFixed(1) + ' TFLOP/s';
+    return (tflops*1000).toFixed(1) + ' GFLOP/s';
+  }
+
+  function draw(){
+    var x = Math.max(0.5, +ai.value);
+    ctx.clearRect(0, 0, W, H);
+
+    // ---- gridlines + axis ticks (log decades) ----
+    ctx.font = '10px ui-monospace, monospace';
+    ctx.fillStyle = COL.mute;
+    ctx.strokeStyle = COL.grid;
+    ctx.lineWidth = 1;
+    var xticks = [0.5, 1, 10, 100, 1000, 2000];
+    xticks.forEach(function(t){
+      var X = px(t);
+      ctx.globalAlpha = 0.5; ctx.beginPath(); ctx.moveTo(X, padT); ctx.lineTo(X, padT+plotH); ctx.stroke(); ctx.globalAlpha = 1;
+      ctx.textAlign = 'center';
+      ctx.fillText(t >= 1000 ? (t/1000)+'k' : ''+t, X, padT+plotH+14);
+    });
+    var yticks = [1, 10, 100, 1000];
+    yticks.forEach(function(t){
+      var Y = py(t);
+      ctx.globalAlpha = 0.5; ctx.beginPath(); ctx.moveTo(padL, Y); ctx.lineTo(padL+plotW, Y); ctx.stroke(); ctx.globalAlpha = 1;
+      ctx.textAlign = 'right';
+      ctx.fillText(t >= 1000 ? (t/1000)+'P' : t+'T', padL-6, Y+3);
+    });
+    ctx.textAlign = 'center';
+    ctx.fillText('arithmetic intensity  (FLOP / byte, log)', padL + plotW/2, H-4);
+    ctx.save();
+    ctx.translate(13, padT + plotH/2); ctx.rotate(-Math.PI/2);
+    ctx.fillText('achievable throughput (log)', 0, 0);
+    ctx.restore();
+
+    // ---- the roofline ----
+    ctx.strokeStyle = COL.roof;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    var first = true;
+    for (var lxv = lx(X_MIN); lxv <= lx(X_MAX) + 1e-6; lxv += 0.02){
+      var xx = Math.pow(10, lxv);
+      var yy = achievableTflops(xx);
+      var X = px(xx), Y = py(yy);
+      if (first){ ctx.moveTo(X, Y); first = false; } else ctx.lineTo(X, Y);
+    }
+    ctx.stroke();
+
+    // peak compute ceiling label
+    ctx.fillStyle = COL.roof;
+    ctx.textAlign = 'left';
+    ctx.fillText('compute ceiling 990 TFLOP/s', px(RIDGE)+6, py(PEAK/1e12)-6);
+
+    // ---- ridge marker (vertical dashed) ----
+    ctx.strokeStyle = COL.accent2;
+    ctx.setLineDash([4,4]);
+    ctx.beginPath(); ctx.moveTo(px(RIDGE), padT); ctx.lineTo(px(RIDGE), padT+plotH); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = COL.accent2;
+    ctx.textAlign = 'center';
+    ctx.fillText('ridge ~300', px(RIDGE), padT+11);
+
+    // ---- the op marker ----
+    var yT = achievableTflops(x);
+    var below = x < RIDGE;
+    var mc = below ? COL.bad : COL.ok;
+    // guide lines down to axes
+    ctx.strokeStyle = mc; ctx.globalAlpha = 0.35; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(px(x), py(yT)); ctx.lineTo(px(x), padT+plotH); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(px(x), py(yT)); ctx.lineTo(padL, py(yT)); ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = mc;
+    ctx.beginPath(); ctx.arc(px(x), py(yT), 6, 0, Math.PI*2); ctx.fill();
+
+    // ---- readouts ----
+    var pct = (yT*1e12) / PEAK * 100;
+    aiV.textContent = x >= 100 ? Math.round(x) : x.toFixed(1);
+    kAI.textContent = (x >= 100 ? Math.round(x) : x.toFixed(1)) + ' FLOP/byte';
+    kTput.textContent = fmtT(yT);
+    kPct.textContent = (pct < 1 ? pct.toFixed(2) : pct.toFixed(0)) + ' %';
+
+    if (below){
+      verdict.className = 'verdict mem';
+      verdict.textContent = 'MEMORY-BOUND — capped by 3.3 TB/s of HBM at ' + (pct<1?pct.toFixed(2):pct.toFixed(0)) + '% of peak. You are wasting the tensor cores; only moving fewer bytes (fusion) helps.';
+    } else {
+      verdict.className = 'verdict comp';
+      verdict.textContent = 'COMPUTE-BOUND — above the ridge, this op can saturate the 990 TFLOP/s tensor cores. This is where the spec-sheet peak lives.';
+    }
+  }
+
+  ai.addEventListener('input', draw);
+  Array.prototype.forEach.call(document.querySelectorAll('#roof-widget .preset-row button'), function(b){
+    b.addEventListener('click', function(){
+      ai.value = b.getAttribute('data-ai');
+      draw();
+    });
+  });
+  draw();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>
