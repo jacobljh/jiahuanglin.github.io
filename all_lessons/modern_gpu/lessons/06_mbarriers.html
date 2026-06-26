@@ -1,0 +1,597 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>06 · mbarriers and the phase model</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local: the three-handoff table + a small phase-bit chip */
+  .handoff-table td { vertical-align: top; }
+  .handoff-table code { font-size: 12px; }
+  .phasechip {
+    display:inline-block; font-family: var(--mono); font-size: 11px;
+    padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border);
+    color: var(--accent-2);
+  }
+  /* stage ring: physical stage = iter mod num_stages */
+  .stage-note { color: var(--text-mute); font-size: 13px; margin: 6px 0 0; }
+</style>
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">modern_gpu / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">06 · mbarriers</span>
+    <span class="step-pill">lesson 7 / 15</span>
+  </div>
+</header>
+
+<main>
+
+<p class="kicker">Part II · the five hardware primitives</p>
+<h1>mbarriers and the phase model</h1>
+<p class="subtitle">An asynchronous engine that returns immediately needs an asynchronous way to tell you it has finished. The classic block-wide <code>__syncthreads()</code> cannot do this job — it is thread-only, stateless, and can name only a single rendezvous point. The replacement is the <strong>mbarrier</strong>: a hardware sync object that counts arrivals, counts <em>bytes</em>, and carries a phase bit so it can be safely reused round after round. That phase bit is the single most important — and most error-prone — idea in the whole async paradigm. Get it wrong and the kernel computes silent garbage.</p>
+
+<div class="forced">
+  <div class="label">Forced move — the bottleneck from lessons 04–05</div>
+  Lessons 04 and 05 gave us two engines that <strong>return before they finish</strong>: a <a href="04_tma.html">TMA</a> copy issued by one thread that fills an SMEM tile on its own time, and a <a href="03_tensor_cores_generations.html"><code>tcgen05</code></a> MMA whose accumulator lands in <a href="05_tmem.html">TMEM</a> some cycles later. The math warps must <em>wait</em> for those — but for what, exactly? <code>__syncthreads()</code> waits for <em>threads to reach a line</em>. It cannot wait for "the copy engine has delivered 32 KB," it has no idea the TMA unit even exists, and it forgets everything the instant it returns. The forced move is a richer object that can: track a byte budget, accept an arrival from a non-thread agent, name several concurrent barriers, and — crucially — <em>persist across loop iterations</em>. That object is the mbarrier, and the mechanism that makes reuse safe is the <strong>phase</strong>.
+</div>
+
+<h2>Why <code>__syncthreads()</code> is the wrong tool</h2>
+
+<p>The barrier from the <a href="../../gpu_kernels/06_warps_divergence.html"><code>gpu_kernels</code></a> world is a synchronous, all-threads-in-the-block, single-point rendezvous. Line up every thread, release them together, done. For the async supply chain it fails on four counts at once:</p>
+
+<table>
+  <thead><tr><th>requirement of the async paradigm</th><th><code>__syncthreads()</code></th><th>mbarrier</th></tr></thead>
+  <tbody>
+    <tr><td>wait for a <em>partial</em> set of arrivals (not all threads)</td><td>no — all-or-nothing</td><td>yes — arrival counter</td></tr>
+    <tr><td>wait until a copy engine has delivered <em>N bytes</em></td><td>no — threads only</td><td>yes — transaction-byte count</td></tr>
+    <tr><td>accept an arrival from a non-thread agent (TMA unit, tensor core)</td><td>no</td><td>yes — engines signal it directly</td></tr>
+    <tr><td>name several barriers and wait on each independently</td><td>no — one implicit point</td><td>yes — each is a named SMEM object</td></tr>
+    <tr><td>persist across many loop iterations</td><td>stateless — re-arms by re-running</td><td>yes — via the phase bit</td></tr>
+  </tbody>
+</table>
+
+<p>An mbarrier ("memory barrier," sometimes "async barrier") is a <strong>64-bit object that lives in shared memory</strong>. The kernel allocates it, initializes it, and from then on producers <em>arrive</em> on it and consumers <em>wait</em> on it. Its entire state is two numbers packed into those 64 bits.</p>
+
+<h2>The two pieces of state</h2>
+
+<p>Everything about correctness flows from understanding exactly what an mbarrier holds:</p>
+
+<ul>
+  <li><strong>An arrival counter</strong> — how many arrivals are still <em>missing</em> this round. <code>init(count)</code> sets the expected arrival count; each <code>arrive</code> decrements it.</li>
+  <li><strong>A phase bit</strong> — which round the barrier is in: 0, then 1, then 0, … It starts at phase 0 after <code>init</code>.</li>
+</ul>
+
+<p>In the toolchain the object is set up with a single PTX instruction, and the count is the number of arrivals that constitute "done" for one round:</p>
+
+<pre><code>// allocate a 64-bit mbarrier in shared memory, expect `count` arrivals, start in phase 0
+mbarrier.init.shared.b64 [bar], count;</code></pre>
+
+<h3>The operations</h3>
+
+<p>Three operations act on the object. The second one does double duty and is the source of most confusion, so read it twice:</p>
+
+<ul>
+  <li><strong><code>arrive</code></strong> — a producer signals arrival, decrementing the arrival counter by one.</li>
+  <li><strong><code>arrive.expect_tx(bytes)</code></strong> — does <em>two</em> jobs in one instruction: it records the expected <strong>transaction byte count</strong> for this round <em>and</em> counts as the issuing thread's arrival. The round is complete only when <strong>both</strong> conditions hold: arrival count → 0 <em>and</em> pending byte count → 0. As the TMA engine streams the tile in, it issues <strong>complete-tx</strong> updates against the same barrier that decrement the pending byte count — so the engine, not a thread, drives the byte half to zero.</li>
+  <li><strong><code>wait</code></strong> — <code>try_wait(bar, phase)</code> blocks until the barrier's internal phase <em>differs</em> from the <code>phase</code> argument. Read that carefully: the argument names the phase you expect to <strong>leave behind</strong>, not the one you are reaching. You pass the phase you are <em>currently in</em>; the call returns once the round completes and the bit flips away from it.</li>
+</ul>
+
+<div class="callout">
+  <div class="label">The completion condition, precisely</div>
+  A round on an mbarrier completes — and the phase flips — exactly when <strong>arrival count = 0 AND pending byte count = 0</strong>. A pure-thread handoff uses plain <code>arrive</code> and never touches the byte count (it stays 0, so only arrivals matter). A TMA handoff uses <code>arrive.expect_tx(bytes)</code> so the byte budget gates completion as well; the load is "ready" only when the last byte has landed.
+</div>
+
+<h2>The phase flip rule</h2>
+
+<p>Here is the mechanism that makes a single barrier reusable forever. Each time a barrier completes all arrivals (and all bytes) for its round, it <strong>flips</strong>:</p>
+
+<p class="math block" style="text-align:center;">phase: 0 → 1 → 0 → 1 → …  (toggle on every completed round)</p>
+
+<p>The kernel does not read the bit back from the barrier. Instead it keeps the <em>expected</em> phase in a register and <strong>toggles that register</strong> after each successful wait. First use is phase 0, so:</p>
+
+<ul>
+  <li>iteration 0 waits for phase <strong>0</strong> (it expects to leave phase 0 behind),</li>
+  <li>iteration 1 waits for phase <strong>1</strong>,</li>
+  <li>iteration 2 waits for phase <strong>0</strong> again, and so on.</li>
+</ul>
+
+<p>In code this is one line — the line whose omission is the canonical bug of the entire paradigm:</p>
+
+<pre><code>int phase = 0;
+for (int it = 0; it &lt; num_iters; ++it) {
+    // ... producer arrives on `bar` for this round ...
+    mbarrier.try_wait.parity.shared.b64  done, [bar], phase;   // block until bit != phase
+    // ... consume the freshly-ready data ...
+    phase ^= 1;                                                // TOGGLE — distinguish next round
+}</code></pre>
+
+<p>The PTX spin is the non-blocking <code>mbarrier.try_wait.parity.shared.b64</code> in a loop — "parity" is NVIDIA's name for the phase bit. CUTLASS wraps this whole dance as <code>PipelineTmaAsync</code> so you rarely write the spin by hand, but the phase register is still yours to manage.</p>
+
+<h2>Interactive · the mbarrier state inspector and the phase-reuse bug</h2>
+
+<p>This is the centerpiece of the lesson. Drive an mbarrier by hand: <code>init</code> it, have a thread <code>arrive.expect_tx</code> to announce a byte budget, let the <strong>TMA engine</strong> deliver bytes in chunks, and <code>wait</code>. Watch the arrival counter and pending-byte count fall to zero, the phase bit flip, and the round complete. Then step through several pipeline iterations and watch the bit toggle 0 → 1 → 0 …</p>
+
+<p>Now flip the <strong>"forget phase ^= 1"</strong> toggle. The consumer stops toggling its expected phase, so on iteration 1 it waits for phase 0 — which the barrier <em>already left behind in iteration 0</em>. The wait returns <strong>immediately</strong> on last round's completion, before the new load has landed. The inspector flags the early return: the consumer reads a half-filled tile. That is silent corruption.</p>
+
+<div class="widget" id="mb-widget">
+  <div class="title">mbarrier · arrival counter + byte budget + phase bit, across pipeline iterations</div>
+  <div class="hint">A TMA→MMA handoff on one reused barrier. <code>init(1)</code> expects one arrival; <code>arrive.expect_tx</code> announces a 32 KB budget and counts as that arrival; the TMA engine delivers in 8 KB chunks (complete-tx); <code>wait</code> blocks until <em>both</em> reach zero, then the phase flips. The consumer toggles its expected phase per round — unless you tell it to forget.</div>
+
+  <div class="controls">
+    <button id="mb-init">init(1)</button>
+    <button id="mb-arrive">arrive.expect_tx(32KB)</button>
+    <button id="mb-tma">TMA delivers 8KB ▷</button>
+    <button id="mb-wait">consumer wait ▷</button>
+    <button id="mb-auto">▶ run 3 iterations</button>
+    <button id="mb-reset">⟲ reset</button>
+    <label class="inline"><input type="checkbox" id="mb-forget"> forget <code>phase ^= 1</code> (reuse bug)</label>
+  </div>
+
+  <canvas id="mb-canvas" width="760" height="430" style="width:100%; height:430px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">barrier phase bit</div><div class="v" id="mb-phase" style="font-size:20px;">—</div></div>
+    <div class="kpi"><div class="k">arrival count (missing)</div><div class="v" id="mb-arr">—</div></div>
+    <div class="kpi"><div class="k">pending bytes</div><div class="v" id="mb-bytes">—</div></div>
+    <div class="kpi"><div class="k">consumer expects phase</div><div class="v" id="mb-exp" style="font-size:20px;">—</div></div>
+  </div>
+</div>
+
+<p class="stage-note">Run it once cleanly, then again with the bug toggle on and watch iteration 1's <code>wait</code> return on the stale completion — the byte bar is still red (data not yet delivered) when the consumer is released.</p>
+
+<div class="callout bad">
+  <div class="label">The reuse bug — the heart of this lesson</div>
+  Suppose a barrier was used for one TMA load and already completed (phase flipped 0 → 1). The next loop iteration <strong>reuses the same barrier</strong>. If the consumer does <em>not</em> track phase and calls <code>try_wait(bar, 0)</code> again, the barrier is already in phase 1 — so <code>0 ≠ 1</code> is true <strong>immediately</strong>. The consumer observes <em>last round's</em> completion and assumes the <em>new</em> load is ready. It reads the SMEM tile before the TMA engine has refilled it → it consumes stale or half-written bytes → <strong>silent corruption</strong>. No crash, no error, just wrong numbers (often row-striped, because each warp races a different stage). The phase bit is exactly what distinguishes "this round's completion" from "last round's completion" on a reused barrier. The bug is always the same one line: <code>phase ^= 1</code> omitted. It recurs as a checkpoint in the GEMM lessons.
+</div>
+
+<h2><code>tcgen05</code> does not arrive on its own</h2>
+
+<p>The TMA engine politely issues complete-tx updates as it delivers bytes, so a load self-completes its barrier. The tensor core does <strong>not</strong>. A <code>tcgen05</code> MMA finishes asynchronously but advances <em>no</em> barrier unless you explicitly attach an arrival to its commit path:</p>
+
+<pre><code>// the MMA completes async — you must route its completion to a barrier:
+tcgen05.commit.mbarrier::arrive  [mma_done];   // the MMA path arrives here when math is done
+// the epilogue then waits on mma_done before reading TMEM
+// (tcgen05.cp — SMEM→TMEM scale-factor copies — attaches an arrival the same way)</code></pre>
+
+<p>So the rule splits by agent: TMA loads carry their own completion through <code>expect_tx</code> + complete-tx; MMA commits must be wired to a barrier by hand. Forgetting this wiring is its own deadlock — the epilogue waits on a barrier that no one will ever arrive on.</p>
+
+<h2>Multi-stage pipelines — one barrier per <em>stage</em>, not per iteration</h2>
+
+<p>A pipelined K-loop runs the same TMA → MMA handoff hundreds of times. The naive reading of "one barrier per handoff" would allocate hundreds of barriers — one per iteration. That is wrong, and it would exhaust SMEM. The phase bit exists precisely so you don't have to.</p>
+
+<p>Instead you allocate a small <strong>fixed</strong> number of SMEM buffers (the "stages" of a software pipeline), a matching <strong>fixed</strong> number of barriers, and a small set of phase registers. Each logical iteration maps to one physical stage:</p>
+
+<p class="math block" style="text-align:center;">stage = iteration mod num_stages</p>
+
+<p>The stage index selects which barrier and which buffer to use; the per-stage phase register (toggled each time that stage is reused) distinguishes the current use from the previous one. A <strong>two-stage</strong> pipeline is therefore exactly <strong>2 mbarriers + 2 phase registers</strong> — not two hundred. Stage 0 handles even iterations, stage 1 handles odd ones, and each stage's phase toggles every time the loop comes back around to it.</p>
+
+<p class="stage-note">This is the structure lesson 09 builds the <code>PIPE_DEPTH=2</code> double-buffer ring on, and the reason barriers also signal <strong>resource reuse</strong>: a stage's SMEM buffer cannot be overwritten by the next load until that stage's consumers are done with it — which the barrier's next round enforces.</p>
+
+<h2>The three canonical handoffs</h2>
+
+<p>Across every modern kernel, mbarriers coordinate exactly three kinds of producer→consumer handoff. Two of them are barrier waits; the first needs an extra ingredient.</p>
+
+<table class="handoff-table">
+  <thead><tr><th>handoff</th><th>producer signals</th><th>consumer waits</th><th>the subtlety</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>1. thread → async engine</strong></td>
+      <td>threads write SMEM, then a fence</td>
+      <td>the TMA store / MMA that reads that SMEM</td>
+      <td>thread writes must be made <em>visible</em> to the async proxy first — a barrier is not enough, you need <code>fence.proxy_async</code>.</td>
+    </tr>
+    <tr>
+      <td><strong>2. TMA → MMA</strong></td>
+      <td>TMA load completes via <code>expect_tx</code> + complete-tx</td>
+      <td>the MMA path <code>try_wait</code>s, then reads the SMEM tile</td>
+      <td>the load's byte budget gates the wait — the MMA reads only after the last byte lands.</td>
+    </tr>
+    <tr>
+      <td><strong>3. MMA → epilogue</strong></td>
+      <td>MMA commit arrives via <code>tcgen05.commit.mbarrier::arrive</code></td>
+      <td>the epilogue <code>try_wait</code>s, then reads TMEM</td>
+      <td>the MMA does not self-arrive — you must wire its commit to the completion barrier.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>Handoff 1 is the one beginners miss because it looks like a normal barrier problem but isn't. The TMA store and the tensor core operate in a different memory "proxy" than ordinary thread stores; an mbarrier orders <em>arrivals</em>, but it does not by itself flush a thread's SMEM writes into view of the async proxy. A <code>fence.proxy_async</code> is what publishes those writes before the engine reads them. Skip it and the engine reads pre-write bytes — another silent-corruption path, distinct from the phase bug.</p>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  <code>__syncthreads()</code> is a stateless, all-threads, single-point barrier; it cannot represent partial arrivals, a transaction-byte budget, arrivals from the TMA unit or the tensor core, or several named barriers at once. The <strong>mbarrier</strong> can — it is a 64-bit SMEM object holding an <strong>arrival counter</strong> and a <strong>phase bit</strong>, and a round completes (and the bit flips) only when <em>arrival count = 0 AND pending bytes = 0</em>. The phase bit is what lets one barrier be reused across hundreds of iterations: the kernel keeps an expected phase in a register, waits for the bit to <em>differ</em> from it, then toggles it with <code>phase ^= 1</code>. Omit that toggle and a consumer sees last round's completion and reads data that hasn't arrived — <strong>silent corruption</strong>. Allocate <em>one barrier per stage</em> (stage = iteration mod num_stages), wire <code>tcgen05</code> commits to a barrier by hand, and fence thread→engine writes with <code>fence.proxy_async</code>.
+</div>
+
+<div class="callout">
+  <div class="label">Where this connects</div>
+  This lesson <em>defines</em> the phase mechanics that the capstones depend on. In <a href="08_gemm_tiled.html">lesson 08 · GEMM I</a>, Step 2's K-loop accumulation introduces the <strong>phase-flip table</strong> as an explicit checkpoint — "forget <code>phase ^= 1</code> → wait returns early → silent corruption" is the bug it makes you trace by hand. In <a href="10_gemm_warp_specialized.html">lesson 10 · GEMM III</a>, warp specialization runs <strong>two producer–consumer rings on four named barriers</strong> with <em>opposite initial phases</em> (the producer passes immediately, the consumer blocks) — the same phase logic, doubled. And <a href="13_debugging_lowering.html">lesson 13 · debugging</a> catalogs phase desync as a top deadlock-and-corruption class, with the tell-tale row-stripe symptom you saw in the widget. The async paradigm puts the entire correctness burden here: <strong>no compiler pass verifies your phases or byte counts.</strong>
+  <br><br>
+  <strong>mbarriers coordinate engines within one CTA — but one CTA's SMEM can't stage a big-enough tile, and neighboring CTAs redundantly reload the same operands. How do CTAs cooperate across SMs?</strong> That is <a href="07_clusters_clc.html">lesson 07 · clusters, distributed shared memory & CLC</a>.
+</div>
+
+<footer class="lesson-nav">
+  <a href="05_tmem.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">05 · TMEM: the accumulator's new home</span>
+  </a>
+  <a class="next" href="07_clusters_clc.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">07 · Clusters, distributed shared memory &amp; CLC</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+/* ─── Widget: mbarrier state inspector + phase-reuse bug ───
+   Deterministic state machine. One reused barrier coordinates a TMA→MMA handoff
+   across pipeline iterations. State:
+     phase       : barrier's internal phase bit (0/1), flips on round completion
+     arrCount    : arrivals still MISSING this round (init -> count; arrive -> --)
+     pendBytes   : transaction bytes still owed this round
+     expPhase    : the phase the CONSUMER expects (its register); toggled per round
+                   UNLESS the "forget" toggle is set.
+   A round completes when arrCount===0 && pendBytes===0 -> phase ^= 1.
+   The consumer wait returns when (phase !== expPhase). With the bug, expPhase is
+   never toggled, so on iter>=1 the wait sees the stale (already-flipped) phase and
+   returns EARLY while pendBytes is still > 0. */
+(function(){
+  const C = document.getElementById('mb-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    init:$('mb-init'), arrive:$('mb-arrive'), tma:$('mb-tma'),
+    wait:$('mb-wait'), auto:$('mb-auto'), reset:$('mb-reset'), forget:$('mb-forget'),
+    phase:$('mb-phase'), arr:$('mb-arr'), bytes:$('mb-bytes'), exp:$('mb-exp'),
+  };
+
+  const COL = {
+    accent:'#2563eb', accent2:'#d97706', ok:'#16a34a', bad:'#dc2626',
+    purple:'#7c3aed', mute:'#5b6573', dim:'#94a3b8',
+    text:'#1f2430', border:'#dde2ea', panel:'#ffffff', grid:'#eef1f5'
+  };
+
+  const EXPECT = 32;     // KB announced by expect_tx
+  const CHUNK  = 8;      // KB per TMA delivery
+  const TARGET_ITERS = 3;
+
+  let S = {};
+  function reset(){
+    S = {
+      inited:false,
+      phase:0,          // barrier internal phase
+      arrCount:0,       // arrivals missing
+      pendBytes:0,      // bytes owed
+      expPhase:0,       // consumer's expected phase register
+      iter:0,           // which pipeline iteration we're on (0-based)
+      armed:false,      // has arrive.expect_tx happened this round
+      delivered:0,      // KB delivered this round (for the bar)
+      log:[],           // recent event lines
+      bug:false,        // did the last wait return early on a stale phase?
+      done:false,       // round just completed cleanly this step
+      consumed:false,   // has the current round's completion been consumed by a wait
+      flash:null,       // {kind, t} transient highlight
+    };
+    pushLog('reset · barrier uninitialized');
+    render();
+  }
+  function pushLog(s){ S.log.unshift(s); if (S.log.length>7) S.log.pop(); }
+
+  function doInit(){
+    S.inited = true;
+    S.phase = 0; S.arrCount = 0; S.pendBytes = 0;
+    S.expPhase = 0; S.iter = 0; S.armed = false; S.delivered = 0;
+    S.bug = false; S.done = false; S.consumed = false;
+    pushLog('mbarrier.init.shared.b64 [bar], 1   → phase 0, arrivals 1');
+    // init sets the EXPECTED arrival count for the first round to 1
+    S.arrCount = 1;
+    S.flash = {kind:'init', t:performance.now()};
+    render();
+  }
+
+  function doArrive(){
+    if (!S.inited){ pushLog('✗ arrive before init — ignored'); render(); return; }
+    if (S.armed){ pushLog('✗ already armed this round — ignored'); render(); return; }
+    // arrive.expect_tx: counts as THE arrival AND sets the byte budget
+    S.arrCount = Math.max(0, S.arrCount - 1);
+    S.pendBytes = EXPECT;
+    S.delivered = 0;
+    S.armed = true;
+    S.done = false;
+    S.consumed = false;   // a fresh round is open and not yet consumed
+    pushLog('mbarrier.arrive.expect_tx [bar], '+EXPECT+'KB  → arrival counted, '+EXPECT+'KB owed');
+    S.flash = {kind:'arrive', t:performance.now()};
+    render();
+  }
+
+  function deliver(){
+    if (!S.inited){ pushLog('✗ no barrier'); render(); return; }
+    if (!S.armed || S.pendBytes<=0){ pushLog('✗ nothing to deliver (no open byte budget)'); render(); return; }
+    const give = Math.min(CHUNK, S.pendBytes);
+    S.pendBytes -= give; S.delivered += give;
+    pushLog('TMA complete-tx '+give+'KB  → pending '+S.pendBytes+'KB');
+    S.flash = {kind:'tma', t:performance.now()};
+    maybeComplete();
+    render();
+  }
+
+  function maybeComplete(){
+    // a round completes when BOTH reach zero -> phase flips, barrier re-arms for next round
+    if (S.armed && S.arrCount===0 && S.pendBytes===0){
+      S.phase ^= 1;            // THE FLIP
+      S.armed = false;
+      S.done = true;
+      pushLog('● round complete (arrivals 0 AND bytes 0) → phase flips to '+S.phase);
+      // re-arm expected arrival count for the NEXT round's producer
+      S.arrCount = 1;
+    }
+  }
+
+  function doWait(){
+    if (!S.inited){ pushLog('✗ wait before init — ignored'); render(); return; }
+    if (S.consumed){
+      // the consumer already passed this round and is now working on the next iteration —
+      // a redundant wait before the next arrive is a no-op (real spin would just re-read)
+      pushLog('try_wait(bar, '+S.expPhase+') — round already consumed, idle');
+      render(); return;
+    }
+    // try_wait(bar, expPhase): returns when barrier.phase !== expPhase, else spins (blocks)
+    const released = (S.phase !== S.expPhase);
+    if (!released){
+      pushLog('try_wait(bar, '+S.expPhase+') BLOCKS · barrier still phase '+S.phase);
+      S.flash = {kind:'block', t:performance.now()};
+      render(); return;
+    }
+    // released. Was the data actually ready? (bytes all in AND a real completion happened)
+    const dataReady = (S.pendBytes===0 && S.done);
+    if (!dataReady){
+      // EARLY RETURN on a stale phase — the reuse bug
+      S.bug = true;
+      pushLog('⚠ try_wait(bar, '+S.expPhase+') RETURNED on phase '+S.phase+
+              ' — but '+S.pendBytes+'KB NOT delivered! reads stale tile');
+      S.flash = {kind:'bug', t:performance.now()};
+    } else {
+      S.bug = false;
+      pushLog('✓ try_wait(bar, '+S.expPhase+') released · phase '+S.phase+' · tile ready');
+      S.flash = {kind:'ok', t:performance.now()};
+    }
+    // consumer toggles its expected phase — UNLESS the bug toggle is on
+    if (!els.forget.checked){
+      S.expPhase ^= 1;
+    }
+    S.consumed = true;   // this round is consumed; next arrive opens a fresh one
+    S.iter += 1;
+    render();
+  }
+
+  // ---- auto: run TARGET_ITERS clean iterations as a scripted sequence ----
+  let timer = null;
+  function runAuto(){
+    if (timer){ clearInterval(timer); timer=null; els.auto.textContent='▶ run 3 iterations'; return; }
+    if (!S.inited) doInit();
+    // Build a deterministic action queue reflecting the REAL pipeline ordering:
+    // the producer opens a round (arrive), then the consumer checks readiness (wait),
+    // then the bytes land (deliver). With correct phase tracking the consumer's wait
+    // BLOCKS until delivery flips the bit. With the bug, expPhase is frozen, so on
+    // iteration >=1 that early wait sees LAST round's already-flipped phase and
+    // releases on the stale completion — before delivery — the reuse bug.
+    const queue = [];
+    const startIter = S.iter;
+    const deliveries = EXPECT/CHUNK;
+    for (let k=0; k<TARGET_ITERS; k++){
+      queue.push('arrive');
+      queue.push('wait');                               // consumer checks early (real ordering)
+      for (let c=0;c<deliveries;c++) queue.push('tma');
+      queue.push('wait');                               // and again once bytes have landed
+    }
+    let i = 0;
+    els.auto.textContent = '❚❚ stop';
+    timer = setInterval(()=>{
+      if (i>=queue.length || S.iter>=startIter+TARGET_ITERS){
+        clearInterval(timer); timer=null; els.auto.textContent='▶ run 3 iterations'; return;
+      }
+      const a = queue[i++];
+      if (a==='arrive') doArrive();
+      else if (a==='tma') deliver();
+      else if (a==='wait') doWait();
+    }, 420);
+  }
+
+  // ───────────────────── rendering ─────────────────────
+  function rr(x,y,w,h,r){
+    ctx.beginPath();
+    ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+    ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+  }
+
+  function render(){
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const flashOn = S.flash && (performance.now() - S.flash.t < 600);
+    const fk = flashOn ? S.flash.kind : null;
+
+    // ── header ──
+    ctx.fillStyle = COL.mute; ctx.font='11px monospace'; ctx.textAlign='left';
+    ctx.fillText('one reused mbarrier · TMA → MMA handoff · iteration '+S.iter+
+                 (els.forget.checked ? '   ·   BUG MODE: phase ^= 1 disabled' : ''), 16, 20);
+
+    // ── the barrier object panel (left) ──
+    const bx=16, by=40, bw=300, bh=210;
+    rr(bx,by,bw,bh,10);
+    ctx.fillStyle = COL.panel; ctx.fill();
+    ctx.strokeStyle = (fk==='init') ? COL.accent : COL.border;
+    ctx.lineWidth = (fk==='init') ? 2.5 : 1.25; ctx.stroke();
+
+    ctx.fillStyle = COL.text; ctx.font='12px monospace';
+    ctx.fillText('mbarrier  [bar]   (64-bit SMEM object)', bx+14, by+24);
+    ctx.fillStyle = COL.dim; ctx.font='10px monospace';
+    ctx.fillText(S.inited ? 'initialized' : 'uninitialized — call init(1)', bx+14, by+40);
+
+    // phase bit — big toggle
+    const pY = by+58;
+    ctx.fillStyle = COL.mute; ctx.font='11px monospace';
+    ctx.fillText('phase bit', bx+14, pY+14);
+    // draw the two cells 0 / 1
+    const cellW=42, cellH=34, pcx=bx+110;
+    [0,1].forEach(v=>{
+      const cxp = pcx + v*(cellW+8);
+      const active = S.inited && S.phase===v;
+      rr(cxp, pY, cellW, cellH, 7);
+      ctx.fillStyle = active ? COL.accent2 : COL.grid;
+      ctx.fill();
+      ctx.strokeStyle = (active && fk==='ok') ? COL.ok :
+                        (active && fk==='bug') ? COL.bad : COL.border;
+      ctx.lineWidth = active ? 2 : 1; ctx.stroke();
+      ctx.fillStyle = active ? '#fff' : COL.dim;
+      ctx.font='15px monospace'; ctx.textAlign='center';
+      ctx.fillText(v, cxp+cellW/2, pY+cellH/2+5); ctx.textAlign='left';
+    });
+    if (S.done){
+      ctx.fillStyle = COL.ok; ctx.font='10px monospace';
+      ctx.fillText('↻ just flipped', pcx + 2*(cellW+8) + 6, pY+cellH/2+4);
+    }
+
+    // arrival counter
+    const aY = pY+52;
+    ctx.fillStyle = COL.mute; ctx.font='11px monospace';
+    ctx.fillText('arrivals missing', bx+14, aY+13);
+    rr(pcx, aY-2, cellW, cellH, 7);
+    ctx.fillStyle = (S.inited && S.arrCount>0) ? '#fdecea' : COL.grid;
+    ctx.fill();
+    ctx.strokeStyle = (fk==='arrive') ? COL.accent : COL.border;
+    ctx.lineWidth = (fk==='arrive')?2:1; ctx.stroke();
+    ctx.fillStyle = (S.arrCount>0)? COL.bad : COL.ok;
+    ctx.font='15px monospace'; ctx.textAlign='center';
+    ctx.fillText(S.inited? S.arrCount : '–', pcx+cellW/2, aY+cellH/2+3); ctx.textAlign='left';
+
+    // pending bytes bar
+    const byY = aY+50;
+    ctx.fillStyle = COL.mute; ctx.font='11px monospace';
+    ctx.fillText('pending bytes', bx+14, byY+12);
+    const barX=bx+110, barW=bw-110-18, barH=20, barY2=byY;
+    rr(barX, barY2, barW, barH, 5);
+    ctx.fillStyle = COL.grid; ctx.fill();
+    ctx.strokeStyle = (fk==='tma') ? COL.accent2 : COL.border; ctx.lineWidth=(fk==='tma')?2:1; ctx.stroke();
+    if (S.inited && S.armed){
+      const fillFrac = S.delivered / EXPECT;
+      // delivered portion = green (landed); pending = red
+      ctx.save();
+      rr(barX, barY2, barW, barH, 5); ctx.clip();
+      ctx.fillStyle = '#d4f3df'; ctx.fillRect(barX, barY2, barW*fillFrac, barH);
+      ctx.fillStyle = '#fdecea'; ctx.fillRect(barX+barW*fillFrac, barY2, barW*(1-fillFrac), barH);
+      ctx.restore();
+      ctx.fillStyle = COL.text; ctx.font='10px monospace'; ctx.textAlign='center';
+      ctx.fillText(S.delivered+' / '+EXPECT+'KB landed', barX+barW/2, barY2+14); ctx.textAlign='left';
+    } else {
+      ctx.fillStyle = COL.dim; ctx.font='10px monospace'; ctx.textAlign='center';
+      ctx.fillText(S.inited?'0KB owed (round closed)':'—', barX+barW/2, barY2+14); ctx.textAlign='left';
+    }
+
+    // completion rule reminder
+    ctx.fillStyle = COL.dim; ctx.font='10px monospace';
+    ctx.fillText('completes when arrivals 0 AND bytes 0 → flip', bx+14, by+bh-10);
+
+    // ── consumer panel (right) ──
+    const cxp2=332, cyp=40, cwp=W-332-16, chp=210;
+    rr(cxp2,cyp,cwp,chp,10);
+    ctx.fillStyle = COL.panel; ctx.fill();
+    const consumerHot = (fk==='ok'||fk==='bug'||fk==='block');
+    ctx.strokeStyle = fk==='bug'?COL.bad : fk==='ok'?COL.ok : COL.border;
+    ctx.lineWidth = consumerHot?2.5:1.25; ctx.stroke();
+
+    ctx.fillStyle = COL.text; ctx.font='12px monospace';
+    ctx.fillText('consumer (the MMA / epilogue)', cxp2+14, cyp+24);
+
+    // expected phase register
+    ctx.fillStyle = COL.mute; ctx.font='11px monospace';
+    ctx.fillText('try_wait(bar, expPhase)', cxp2+14, cyp+46);
+    ctx.fillText('expPhase register', cxp2+14, cyp+72);
+    const ecW=42, ecH=34, ecx=cxp2+150, ecy=cyp+52;
+    [0,1].forEach(v=>{
+      const xx = ecx + v*(ecW+8);
+      const active = S.inited && S.expPhase===v;
+      rr(xx, ecy, ecW, ecH, 7);
+      ctx.fillStyle = active ? COL.accent : COL.grid; ctx.fill();
+      ctx.strokeStyle = COL.border; ctx.lineWidth = active?2:1; ctx.stroke();
+      ctx.fillStyle = active?'#fff':COL.dim; ctx.font='15px monospace'; ctx.textAlign='center';
+      ctx.fillText(v, xx+ecW/2, ecy+ecH/2+5); ctx.textAlign='left';
+    });
+
+    // the comparison verdict
+    const vy = cyp+108;
+    ctx.font='12px monospace';
+    if (S.inited){
+      const cmp = (S.phase!==S.expPhase);
+      ctx.fillStyle = COL.mute;
+      ctx.fillText('barrier.phase '+S.phase+'  '+(cmp?'≠':'=')+'  expPhase '+S.expPhase, cxp2+14, vy);
+      ctx.font='12px monospace';
+      if (!cmp){
+        ctx.fillStyle = COL.accent2;
+        ctx.fillText('→ BLOCKS (round not done)', cxp2+14, vy+20);
+      } else if (S.bug){
+        ctx.fillStyle = COL.bad;
+        ctx.fillText('→ RELEASES on STALE phase ⚠ reads unfilled tile', cxp2+14, vy+20);
+      } else {
+        ctx.fillStyle = COL.ok;
+        ctx.fillText('→ RELEASES · tile fully delivered ✓', cxp2+14, vy+20);
+      }
+    } else {
+      ctx.fillStyle = COL.dim; ctx.fillText('init the barrier to begin', cxp2+14, vy);
+    }
+
+    // toggle reminder
+    ctx.fillStyle = els.forget.checked ? COL.bad : COL.dim; ctx.font='10px monospace';
+    ctx.fillText(els.forget.checked
+      ? 'phase ^= 1 DISABLED → expPhase frozen at '+S.expPhase
+      : 'after each release: expPhase ^= 1', cxp2+14, cyp+chp-12);
+
+    // ── event log (bottom) ──
+    const ly=268;
+    ctx.strokeStyle = COL.border; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(16, ly); ctx.lineTo(W-16, ly); ctx.stroke();
+    ctx.fillStyle = COL.mute; ctx.font='10px monospace';
+    ctx.fillText('event log', 16, ly+16);
+    ctx.font='11px monospace';
+    S.log.forEach((line,i)=>{
+      const isWarn = line.indexOf('⚠')>=0 || line.indexOf('✗')>=0;
+      const isOk = line.indexOf('✓')>=0 || line.indexOf('●')>=0;
+      ctx.fillStyle = isWarn? COL.bad : isOk? COL.ok : COL.text;
+      ctx.fillText(line, 16, ly+34 + i*15);
+    });
+
+    // ── KPIs ──
+    els.phase.textContent = S.inited ? S.phase : '—';
+    els.arr.textContent   = S.inited ? S.arrCount : '—';
+    els.bytes.textContent = S.inited ? (S.armed? S.pendBytes+' KB' : '0 KB') : '—';
+    els.exp.textContent   = S.inited ? S.expPhase : '—';
+    els.phase.style.color = '#d97706';
+    els.exp.style.color   = els.forget.checked ? '#dc2626' : '#2563eb';
+
+    if (flashOn) requestAnimationFrame(render);
+  }
+
+  els.init.addEventListener('click', doInit);
+  els.arrive.addEventListener('click', doArrive);
+  els.tma.addEventListener('click', deliver);
+  els.wait.addEventListener('click', doWait);
+  els.auto.addEventListener('click', runAuto);
+  els.reset.addEventListener('click', ()=>{ if(timer){clearInterval(timer);timer=null;els.auto.textContent='▶ run 3 iterations';} reset(); });
+  els.forget.addEventListener('change', render);
+  window.addEventListener('resize', render);
+  reset();
+})();
+</script>
+
+</body>
+</html>

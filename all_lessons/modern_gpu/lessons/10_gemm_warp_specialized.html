@@ -1,0 +1,577 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>10 · GEMM III — warp specialization & clusters</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local: the performance ladder table emphasis + the two-ring barrier legend */
+  table.ladder td.ms { font-family: var(--mono); text-align: right; white-space: nowrap; }
+  table.ladder td.sp { font-family: var(--mono); text-align: right; color: var(--accent); white-space: nowrap; }
+  table.ladder tr.parity td { font-weight: 600; }
+  table.ladder tr.parity { background: rgba(22,163,74,0.06); }
+  table.ladder tr.inflect td.sp { color: var(--bad); font-weight: 600; }
+  /* role legend chips for the choreography widget */
+  .role-key { display: flex; flex-wrap: wrap; gap: 10px; margin: 10px 0 0; font-size: 12px; }
+  .role-key span { display: inline-flex; align-items: center; gap: 6px; color: var(--text-mute); font-family: var(--mono); }
+  .role-key i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  /* two-ring labels */
+  .ring-tab { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; margin: 16px 0; }
+  .ring-tab > div { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 12px 15px; }
+  .ring-tab .r-smem { border-left: 4px solid var(--accent); }
+  .ring-tab .r-tmem { border-left: 4px solid var(--accent-2); }
+  .ring-tab h4 { margin: 0 0 6px; font-family: var(--mono); font-size: 12.5px; }
+  .ring-tab .r-smem h4 { color: var(--accent); }
+  .ring-tab .r-tmem h4 { color: var(--accent-2); }
+  .ring-tab p { margin: 0; color: var(--text-mute); font-size: 13px; line-height: 1.5; }
+  .ring-tab code { font-size: 12px; }
+  @media (max-width: 820px){ .ring-tab { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">modern_gpu / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">10 · GEMM → SOTA</span>
+    <span class="step-pill">lesson 11 / 15</span>
+  </div>
+</header>
+
+<main>
+
+<p class="kicker">Part III · GEMM from tiled to SOTA</p>
+<h1>GEMM III — warp specialization &amp; clusters to SOTA</h1>
+<p class="subtitle">This is the climax of the GEMM ladder. We have a persistent kernel with a TMA-fed software pipeline — correct, prefetching, and still leaving the tensor core idle half the time. The reason is structural, not a tuning knob: one team of threads is being asked to load <em>and</em> compute <em>and</em> write, so it can only ever do one at a time. The forced move is to stop sharing the work and give each engine its own warps. Then we pool two SMs into a cluster, then stack a second math consumer on top — and the kernel lands at <strong>cuBLAS parity</strong>.</p>
+
+<div class="forced">
+  <div class="label">Forced move — the bottleneck from lesson 09</div>
+  <a href="09_gemm_pipelined.html">Lesson 09</a> got us a persistent kernel whose K-loop issues TMA loads ahead of the math via a <code>PIPE_DEPTH=2</code> ring. But look at <em>who</em> runs that loop: <strong>all the threads, in lockstep</strong>. Every thread walks the same path — load, then compute, then write — so while it is loading, the tensor cores have nothing to do, and while it is computing, the TMA engine has nothing to do. The software pipeline prefetches the <em>next</em> tile's bytes, but the single team of threads is still the one place where all three engines meet, and a team can only be in one place at a time. That is the "prefetch ≠ overlap" honesty note from lesson 09 coming due. The forced move: <strong>give the engines separate warps</strong> — a warp whose only job is to feed the TMA, a warp whose only job is to issue the MMA, and warps whose only job is to drain the result — so the memory engine and the math engine run <em>at the same time</em> on independent warps.
+</div>
+
+<h2>The whole ladder, in one table</h2>
+
+<p>Before the climax, here is the entire journey on one screen. Every row is a forced move that removed one more thing starving the tensor core. The target throughout: a B200 (148 SMs, 228 KB SMEM/SM), M = N = K = 4096, fp16 in, fp32 accumulate.</p>
+
+<table class="ladder">
+  <thead><tr><th>step</th><th>what changed</th><th class="ms">time</th><th class="sp">vs naive</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>naive — one thread per output element, all of it from GMEM</td><td class="ms">70 ms</td><td class="sp">1×</td></tr>
+    <tr><td>3</td><td>SMEM tiling — stage tiles on-chip, reuse across a block</td><td class="ms">53.6 ms</td><td class="sp">~1.3×</td></tr>
+    <tr class="inflect"><td>4</td><td><strong>TMA async</strong> — the copy engine replaces thread-copy (lesson 09)</td><td class="ms">0.49 ms</td><td class="sp">~142×</td></tr>
+    <tr><td>7</td><td><strong>warp specialization</strong> — producer / consumer / writeback warps</td><td class="ms">0.23 ms</td><td class="sp">~309×</td></tr>
+    <tr><td>8</td><td><strong>2-CTA cluster</strong> — one cooperative MMA over a 256×256 tile</td><td class="ms">0.104 ms</td><td class="sp">~676×</td></tr>
+    <tr class="parity"><td>9</td><td><strong>multi-consumer</strong> — two consumers share one staged B tile</td><td class="ms">0.094 ms</td><td class="sp">~744× · cuBLAS parity</td></tr>
+  </tbody>
+</table>
+
+<p>Read the <em>shape</em> of this table, not just the numbers. One step dominates everything: <strong>TMA async is ≈142×</strong> — the inflection where the kernel stopped paying the thread-copy tax (lesson 09). Everything in <em>this</em> lesson is the long tail that closes the last gap: the software-pipeline-plus-warp-specialization combination is worth roughly <strong>2.2×</strong>, clusters another roughly <strong>2.2×</strong>, and the final multi-consumer step about <strong>10%</strong>. By Step 8 the kernel is <strong>compute-bound</strong> — the clusters doubled arithmetic intensity and removed the last big memory stalls, so there is simply very little memory latency left to hide. The closing 10% being small is not a disappointment; it is exactly what "we hit the compute ceiling" looks like.</p>
+
+<h2>Step 7 — warp specialization: give each engine its own warps</h2>
+
+<p>The single-warpgroup kernel from lesson 09 multiplexes three jobs onto one team of 128 threads. Warp specialization assigns those jobs to <strong>distinct warps by role</strong>, so the memory engine and the tensor-core engine run concurrently on independent warps. We use two warpgroups, <code>WG_NUMBER = 2</code> (256 threads, 8 warps), and split the roles:</p>
+
+<table>
+  <thead><tr><th>role</th><th>which warp(s)</th><th>job</th></tr></thead>
+  <tbody>
+    <tr><td><strong>TMA producer</strong></td><td>warpgroup 1, warp 3</td><td>continuously issues TMA loads of A and B into the SMEM ring</td></tr>
+    <tr><td><strong>MMA consumer</strong></td><td>warpgroup 1, warp 0</td><td>runs the <code>tcgen05.mma</code> the instant a staged tile is ready</td></tr>
+    <tr><td><strong>writeback</strong></td><td>warpgroup 0, all 4 warps</td><td>reads the finished accumulator from TMEM and writes it to GMEM</td></tr>
+  </tbody>
+</table>
+
+<p>Now the producer warp can be filling stage <em>k+1</em> of the SMEM ring while the consumer warp is multiplying stage <em>k</em> — the TMA engine and the tensor core are both busy in the same wall-clock window. That is the overlap the software pipeline alone could not deliver, because previously the <em>same</em> threads had to finish loading before they could start computing.</p>
+
+<h3>Four barriers = two producer–consumer rings</h3>
+
+<p>Concurrency means the warps no longer march together, so we cannot coordinate them with a single block-wide rendezvous. Each handoff between two roles needs its own <a href="06_mbarriers.html">mbarrier</a>, and each handoff is bidirectional — the consumer must also tell the producer "I'm done with that buffer, you may refill it." So the kernel runs <strong>two producer–consumer rings, four named barriers total</strong>:</p>
+
+<div class="ring-tab">
+  <div class="r-smem">
+    <h4>Ring 1 — the SMEM buffer (TMA ⇄ MMA)</h4>
+    <p><code>tma2mma</code> (a <code>TMABar</code>, TMA→MMA): "SMEM data is ready, go compute." The TMA load self-completes it via <code>expect_tx</code> + complete-tx.<br><br>
+    <code>mma2tma</code> (a <code>TCGen05Bar</code>, MMA→TMA): "I've consumed that SMEM buffer, you may overwrite it." The MMA commit arrives on it.</p>
+  </div>
+  <div class="r-tmem">
+    <h4>Ring 2 — the TMEM accumulator (MMA ⇄ writeback)</h4>
+    <p><code>mma2ld</code> (a <code>TCGen05Bar</code>, MMA→writeback): "the TMEM results are ready, go drain them."<br><br>
+    <code>ld2mma</code> (an <code>MBarrier</code>, <code>init(128)</code>, writeback→MMA): "TMEM is free for the next tile's accumulation." Init count is 128 because all 128 threads of the writeback warpgroup must finish reading before the MMA may overwrite TMEM.</p>
+  </div>
+</div>
+
+<p>A small state object, <code>PipelineState(PIPE_DEPTH, phase)</code>, carries the per-ring bookkeeping: a <code>.stage</code> index (which physical buffer in the ring) and a <code>.phase</code> bit (lesson 06's parity), advanced together by <code>.advance()</code>. This is the same stage-and-phase machinery from lesson 06, now instantiated <em>twice</em> — once per ring.</p>
+
+<pre><code>// PSEUDOCODE (TIRx-style) — the warp-specialized mainloop skeleton.
+// Maps to CUTLASS warp-specialized GEMM: producer/consumer warps + PipelineTmaAsync.
+
+WG_NUMBER = 2                       // two warpgroups = 256 threads = 8 warps
+
+if   warpgroup == 1 and warp == 3:  // ── TMA PRODUCER ───────────────────────
+    state = PipelineState(PIPE_DEPTH, phase=1)        // NOTE: starts phase 1
+    for k in range(num_k_tiles):
+        wait(mma2tma, state.phase)                    // buffer free to refill?
+        tma_load(A[k], B[k]  ->  Asmem[state.stage], Bsmem[state.stage],
+                 arrive=tma2mma[state.stage])         // expect_tx self-completes it
+        state.advance()
+
+elif warpgroup == 1 and warp == 0:  // ── MMA CONSUMER ──────────────────────
+    state = PipelineState(PIPE_DEPTH, phase=0)        // NOTE: starts phase 0
+    for k in range(num_k_tiles):
+        wait(tma2mma, state.phase)                    // SMEM tile ready?
+        tcgen05.mma(Asmem[state.stage], Bsmem[state.stage], -> TMEM, accum=(k>0),
+                    arrive=mma2tma[state.stage])       // free the SMEM buffer
+        state.advance()
+    tcgen05.commit(arrive=mma2ld)                      // TMEM results ready
+
+elif warpgroup == 0:                // ── WRITEBACK (all 4 warps) ────────────
+    wait(mma2ld, phase=0)                              // TMEM ready?
+    regs = tcgen05.ld(TMEM)                            // 4-warp readback, lesson 05
+    tma_store(regs -> C_gmem)                          // commit_group / wait_group
+    arrive(ld2mma)                                     // TMEM free for next tile</code></pre>
+
+<p>The <code>tcgen05.mma</code> here is the Blackwell tensor-core instruction from <a href="03_tensor_cores_generations.html">lesson 03</a>, reading SMEM operands and accumulating into <a href="05_tmem.html">TMEM</a>; <code>tcgen05.ld</code> is the 4-warp TMEM→register readback from lesson 05. The barrier waits lower to <code>mbarrier.try_wait.parity</code> and the loads to <code>cp.async.bulk.tensor</code> — exactly the PTX from lessons 04 and 06.</p>
+
+<h3>The subtlest bug: opposite initial phases</h3>
+
+<p>Look again at the two <code>PipelineState</code> initializations above. The producer starts <code>phase=1</code>; the consumer starts <code>phase=0</code>. This is not a typo, and getting it wrong is the most insidious failure in the whole kernel. It follows directly from lesson 06's rule that <code>try_wait(bar, phase)</code> passes when the barrier's phase <strong>differs</strong> from the argument:</p>
+
+<ul>
+  <li>The barrier is freshly initialized at <strong>phase 0</strong>, and the SMEM buffers start <strong>empty</strong>.</li>
+  <li>The <strong>producer's</strong> first <code>wait(mma2tma, phase=1)</code> sees the barrier at phase 0 → <span class="math">0 ≠ 1</span> → it <strong>passes immediately</strong>. Correct: the buffers are empty, so the producer is free to start filling them right away.</li>
+  <li>The <strong>consumer's</strong> first <code>wait(tma2mma, phase=0)</code> sees phase 0 → <span class="math">0 = 0</span> → it <strong>blocks</strong>. Correct: no data has been produced yet, so the consumer must wait.</li>
+</ul>
+
+<p>So the two ends are deliberately one phase apart: one must run, one must wait, and the opposite initial phases encode exactly that asymmetry on the same fresh barrier.</p>
+
+<div class="callout warn">
+  <div class="label">Give both ends the same initial phase → deadlock, or worse</div>
+  If you initialize <em>both</em> the producer and the consumer at <code>phase=0</code>, then on the empty barrier both evaluate <span class="math">0 = 0</span> and <strong>both block</strong> — neither side ever starts, a clean deadlock. The more dangerous mirror: give both <code>phase=1</code> and both pass immediately on the empty barrier — the consumer reads a buffer the producer hasn't filled, the producer overwrites a buffer the consumer hasn't read, and you get <strong>silent corruption</strong> with no hang to tip you off. The two warps run different code, so this never shows up as a symmetric "everyone waits at one line" bug — it shows up as wrong numbers or a partial hang. The opposite-initial-phase setup is the only correct one.
+</div>
+
+<h3><code>warpgroup_sync(10)</code>, not <code>cta_sync()</code></h3>
+
+<p>Once the warpgroups run different code paths, the block-wide barrier becomes a trap. <code>cta_sync()</code> uses hardware barrier <strong>#0</strong> and insists that <em>every</em> thread in the CTA arrive at it. But inside a warpgroup branch — <code>if warpgroup == 1 and warp == 3</code> — only some of the CTA's threads are even executing that code. A <code>cta_sync()</code> placed there waits for threads that will never arrive, because they took a different branch entirely.</p>
+
+<div class="callout warn">
+  <div class="label">cta_sync() inside a warpgroup branch → deadlock</div>
+  In the lockstep kernels of lessons 08–09, <code>cta_sync()</code> was the right rendezvous because every thread ran the same code and reached the same line. The moment warps specialize into divergent roles, that assumption breaks: <code>cta_sync()</code> demands all-CTA arrival on barrier #0, but a per-role branch only has a subset of threads present, so the barrier never completes. The fix is a <strong>per-warpgroup named barrier</strong>: <code>warpgroup_sync(10)</code> uses a named barrier (id 10) scoped to just the 128 threads of one warpgroup, so it rendezvouses exactly the threads that are actually there. Use named warpgroup barriers for intra-role sync; use the four mbarriers for cross-role handoffs; never reach for <code>cta_sync()</code> in specialized code.
+</div>
+
+<h3>A real-toolchain technique the course kernel omits: <code>setmaxnreg</code></h3>
+
+<div class="callout source-note">
+  <div class="label">Honesty note — <code>setmaxnreg</code> is a production add-on, not in the source</div>
+  In real CUTLASS / PTX warp-specialized kernels, the producer and consumer warpgroups <strong>reallocate the register file between themselves</strong>. The producer warpgroup — which mostly issues TMA descriptors and needs few registers — runs <code>setmaxnreg.dec.sync.aligned.u32</code> to <em>release</em> registers, and the math-heavy consumer runs <code>setmaxnreg.inc</code> to <em>claim</em> them. This lets the consumer hold a fatter accumulator footprint without dropping occupancy. The MLC course kernel we are following does <strong>not</strong> implement <code>setmaxnreg</code> — so treat it as a real-toolchain optimization that production kernels layer on top of the warp-specialization structure shown here, <em>not</em> as something present in the course source. The mental model still holds: different roles want different register budgets, and the hardware lets you move them.
+</div>
+
+<h3>Why <code>PIPE_DEPTH=2</code></h3>
+
+<p>The pipeline depth is the number of SMEM buffers in Ring 1. <code>PIPE_DEPTH=2</code> is the <strong>smallest depth that lets load and compute overlap at all</strong>: with two buffers, the producer can fill buffer B while the consumer drains buffer A, then they swap. With a depth of one there is only a single buffer, so the producer and consumer would contend for it and serialize again — no overlap. Going deeper (3, 4, …) hides <em>more</em> memory latency, because the producer can run further ahead of the consumer, right up until the SMEM budget runs out (228 KB/SM caps how many tiles you can stage). At depth 2 with warp specialization, the kernel hits <strong>0.23 ms (~309×)</strong> — more than double the serial-pipeline Step 4, exactly because the two engines now run concurrently.</p>
+
+<h2>Interactive · warp-role choreography vs lockstep</h2>
+
+<p>This is the centerpiece. The left timeline is lesson 09's <strong>lockstep</strong> kernel: one team of threads does load → compute → write, so only one engine is ever lit. The right timeline is this lesson's <strong>warp-specialized</strong> kernel: the TMA producer (WG1.w3), the MMA consumer (WG1.w0), and the writeback warpgroup (WG0) run as independent lanes, and you can watch the producer fill stage <em>k+1</em> while the consumer multiplies stage <em>k</em>. The four barriers are drawn as the two rings; step through the startup to see the producer's <code>wait(phase=1)</code> pass immediately while the consumer's <code>wait(phase=0)</code> blocks. The KPIs track the tensor-core busy fraction: lockstep wastes two-thirds of the tensor core (~33%), while specialization keeps it fed back-to-back in steady state (~100%) — the only idle left is the one-tile fill and drain, which amortize away as the K-loop grows. Driving that fraction to 100% is the whole point of the track.</p>
+
+<div class="widget" id="ws-widget">
+  <div class="title">warp specialization · concurrent engines vs lockstep, with the two barrier rings</div>
+  <div class="hint">Left: lockstep (lesson 09) — one team, one engine lit at a time. Right: specialized — producer / consumer / writeback overlap. Step the startup to see the opposite-initial-phase handshake; play to watch the steady state. Tensor-core busy % is computed from the lit spans.</div>
+
+  <div class="controls">
+    <button id="ws-play">▶ play</button>
+    <button id="ws-step">step ▷</button>
+    <button id="ws-reset">⟲ reset</button>
+    <label class="inline">PIPE_DEPTH: <input type="range" id="ws-depth" min="1" max="4" step="1" value="2"> <span class="val" id="ws-depth-v">2</span></label>
+  </div>
+
+  <div class="role-key">
+    <span><i style="background:#d97706"></i>TMA producer · WG1.w3</span>
+    <span><i style="background:#2563eb"></i>MMA consumer · WG1.w0</span>
+    <span><i style="background:#16a34a"></i>writeback · WG0</span>
+    <span><i style="background:#94a3b8"></i>idle / blocked</span>
+  </div>
+
+  <canvas id="ws-canvas" width="760" height="440" style="width:100%; height:440px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">cycle (steady state)</div><div class="v" id="ws-cycle">—</div></div>
+    <div class="kpi"><div class="k">tensor-core busy · lockstep</div><div class="v" id="ws-bl">—</div></div>
+    <div class="kpi"><div class="k">tensor-core busy · specialized (steady)</div><div class="v" id="ws-bs">—</div></div>
+    <div class="kpi"><div class="k">startup handshake</div><div class="v" id="ws-hs" style="font-size:13px;">—</div></div>
+  </div>
+</div>
+
+<h2>Step 8 — the 2-CTA cluster: one cooperative MMA over a 256×256 tile</h2>
+
+<p>Warp specialization keeps a <em>single</em> SM's tensor core busy, but lesson 07 showed a bigger lever: pool two SMs. In Step 8 the two CTAs join a <a href="07_clusters_clc.html">thread-block cluster</a> and issue <strong>one cooperative <code>tcgen05.mma</code> with <code>cta_group=2</code></strong> that reads operands from <em>both</em> CTAs' SMEM and produces a single <strong>256×256</strong> output tile (versus 128×128 from one CTA).</p>
+
+<p>The split mirrors lesson 07's cooperation pattern, by rows:</p>
+<ul>
+  <li><strong>A is split by M rows:</strong> CTA-0 owns output rows 0–127, CTA-1 owns rows 128–255. Each CTA holds its own half of A.</li>
+  <li><strong>Each CTA loads a different 128-row B slice</strong>, and the cooperative MMA reads across the pair via distributed shared memory.</li>
+</ul>
+
+<pre><code>// PSEUDOCODE → CuTe/PTX mapping for the cluster step
+B_remote     = map_shared_rank(Bsmem, cta_id=1)   // peer's SMEM  ↔  mapa.shared::cluster
+tma2mma_cta0 = tma2mma.remote_view(0)             // raise CTA-0's barrier from CTA-1
+
+// TMA arrive byte count is multiplied by CTA_GROUP — each CTA loads its OWN bytes:
+arrive.expect_tx(bytes_per_tile * CTA_GROUP)
+
+// the SINGLE cooperative MMA is issued only by CTA-0 (cbx == 0) and wakes BOTH CTAs:
+if cbx == 0:
+    tcgen05.mma.cta_group::2(A_pair, B_pair -> TMEM_pair,
+                             cta_mask = 0b11)      // 3 = both CTAs' barriers fire
+
+ld2mma.init(128 * CTA_GROUP)                       // = 256: both warpgroups must drain
+cluster_sync()                                     // replaces cta_sync() before TMEM dealloc</code></pre>
+
+<p>Three details are worth pinning down, because they are the ones easy to get wrong (and they are this lesson's exercises):</p>
+
+<ul>
+  <li><strong>Why multiply the arrive byte count by <code>CTA_GROUP</code>?</strong> Because each CTA issues its <em>own</em> TMA and delivers its <em>own</em> bytes into its own SMEM. The completion barrier for the pair must therefore expect the bytes from both CTAs' loads, so the <code>expect_tx</code> budget scales by the number of CTAs in the group. (This is <strong>Exercise 2</strong>: the byte count is per-delivered-data, and each CTA delivers a share.)</li>
+  <li><strong>Why is the MMA issued only by CTA-0?</strong> A cooperative <code>cta_group::2</code> MMA is a <em>single</em> instruction spanning both SMs; if both CTAs issued it you would launch the math twice. So only CTA-0 (<code>cbx == 0</code>) elects to issue it, and it wakes <em>both</em> CTAs' completion barriers via <code>cta_mask = 3</code> (binary <code>11</code>) — one signal for the whole pair.</li>
+  <li><strong>Why <code>ld2mma.init(128 * CTA_GROUP) = 256</code> and <code>cluster_sync()</code>?</strong> The writeback now spans both CTAs' warpgroups, so 256 threads must finish reading TMEM before the next tile may overwrite it; and the TMEM deallocation fence is now cluster-wide, so <code>cluster_sync()</code> replaces <code>cta_sync()</code>.</li>
+</ul>
+
+<div class="callout source-note">
+  <div class="label">From the course (mapped to hardware)</div>
+  The toolchain wiring under these pseudocode names: cluster launch is <code>cudaLaunchKernelEx</code> with a cluster-dimension attribute (lesson 07); <code>map_shared_rank</code> is <code>mapa.shared::cluster</code>; <code>cluster_sync</code> lowers to <code>barrier.cluster.arrive</code> / <code>barrier.cluster.wait</code>; the multicast load is <code>cp.async.bulk.tensor … .multicast::cluster</code>; and the cooperative MMA is the Blackwell two-SM <code>tcgen05.mma.cta_group::2</code>. Treat the DSL spellings as concepts and the PTX as the contract.
+</div>
+
+<p><strong>The payoff:</strong> each CTA's B slice is now reused against the <em>other</em> CTA's A slice as well as its own, so the same loaded B bytes feed twice as much math — <strong>arithmetic intensity roughly doubles</strong>. That is the move lesson 07 promised, and it drops the kernel to <strong>0.104 ms (~676×)</strong>, already within ~10% of cuBLAS and close to the compute roof. On a B200 whose roofline ridge sits near 250 FLOP/byte (<a href="00_feeding_the_tensor_core.html">lesson 00</a>), pushing AI up is pushing straight toward the ceiling.</p>
+
+<h2>Step 9 — multi-consumer: two math warps share one B tile</h2>
+
+<p>Step 8 doubled B's reuse by sharing it across two CTAs. Step 9 squeezes B again, this time <em>within</em> the cluster, by adding a <strong>second MMA consumer</strong> so two consumers share the same staged B tile. We grow the warpgroup count to <code>WG_NUMBER=3</code> with <code>NUM_CONSUMER=2</code>, and the cluster output grows from 256×256 to <strong>512×256</strong> (split along M):</p>
+
+<table>
+  <thead><tr><th>role</th><th>warp</th><th>job</th></tr></thead>
+  <tbody>
+    <tr><td>consumer 0</td><td>WG2.w0</td><td><code>A[…,0] × B → TMEM cols [0:256]</code></td></tr>
+    <tr><td>consumer 1</td><td>WG2.w1</td><td><code>A[…,1] × B → TMEM cols [256:512]</code></td></tr>
+    <tr><td>TMA producer</td><td>WG2.w3</td><td>loads <strong>2 A blocks + 1 B</strong> per stage</td></tr>
+    <tr><td>writeback (consumer 0)</td><td>WG0</td><td>drains TMEM cols [0:256]</td></tr>
+    <tr><td>writeback (consumer 1)</td><td>WG1</td><td>drains TMEM cols [256:512]</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <div class="label">Why share B and not A? (Exercise 3)</div>
+  Each consumer handles a <em>different</em> set of M rows (a different A block) but multiplies against the <strong>same</strong> B tile. So a single B load now feeds <strong>2× the MMA work</strong>, and B's load cost <em>per useful FLOP is halved</em>. Sharing A instead would be pointless here: the two consumers already need different A blocks (different rows), so there is nothing to share on the A side. The operand worth sharing is always the one that multiple math units consume identically — that is B. (This rhymes with lesson 07's headline: the win is on the operand you were otherwise re-reading.)
+</div>
+
+<p>Two implementation facts come with the second consumer:</p>
+<ul>
+  <li><strong><code>PIPE_DEPTH=4</code>.</strong> With two consumers draining each staged tile and a producer loading two A blocks per stage, a deeper ring keeps the producer far enough ahead to feed both consumers without stalling.</li>
+  <li><strong><code>EPI_N=64</code> epilogue chunking.</strong> Each writeback thread would otherwise hold the full 256 fp32 accumulator values = <strong>1024 bytes per thread</strong>, which risks spilling to local memory (slow, off-chip). So the writeback is broken into <strong>64-column chunks</strong>, keeping only 64 fp32 live at a time, and the TMEM→register→GMEM drain runs once per chunk.</li>
+</ul>
+
+<p><strong>The result: 0.094 ms (~744×) — cuBLAS parity.</strong> The final gain is only ~10%, and that is precisely what to expect this close to the compute ceiling: by Step 8 the kernel was already compute-bound, so there is very little memory stall left to hide. Halving B's per-FLOP load shaves the last sliver of memory traffic, and the kernel sits on the roofline.</p>
+
+<h2>Where the roofline ended up</h2>
+
+<p>Trace the regime across the ladder: the kernel was <strong>memory-bound until roughly Step 7</strong> — the tensor core kept waiting on operands. The cluster steps (8 and 9) doubled arithmetic intensity twice over, removing the last big memory stalls, so by Step 8 the kernel is <strong>compute-bound</strong>: it is limited by how fast the tensor core can multiply, not by how fast HBM can deliver. That crossover is the whole point of the track's engine — <em>feeding</em> the tensor core was the entire kernel, and once it is fed, the math sets the wall-clock. cuBLAS lives at the same ceiling because it is solving the same feeding problem with the same hardware.</p>
+
+<h2>The bridge to Flash Attention 4</h2>
+
+<p>Everything assembled in this lesson — TMA loads into an SMEM ring, the <code>tcgen05</code> cooperative MMA, TMEM readback, and warp-specialized barriers with opposite initial phases — carries <em>straight</em> into the next capstone. Flash Attention 4 reuses all of it. What changes is the <em>schedule</em>: a GEMM is one MMA repeated down the K-loop, but attention wedges an online-softmax step <strong>between two MMA phases</strong> (score <span class="math">S = QKᵀ</span>, then value <span class="math">O += P·V</span>) instead of repeating a single one. The machinery is identical; the dependency graph is fundamentally harder.</p>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  A software pipeline still runs the whole K-loop with one team of threads in lockstep, so only one engine is ever lit. <strong>Warp specialization</strong> (Step 7) splits the SM into a TMA producer warp, an MMA consumer warp, and a writeback warpgroup, coordinated by <strong>four mbarriers = two producer–consumer rings</strong> (SMEM: <code>tma2mma</code>/<code>mma2tma</code>; TMEM: <code>mma2ld</code>/<code>ld2mma</code>). The producer and consumer take <strong>opposite initial phases</strong> so the producer passes its first wait and the consumer blocks — same phase deadlocks or silently corrupts. Use <code>warpgroup_sync(10)</code>, never <code>cta_sync()</code>, in specialized code, and know that production kernels add <code>setmaxnreg</code> register reallocation on top (the course omits it). The <strong>2-CTA cluster</strong> (Step 8) issues one <code>cta_group::2</code> MMA over a 256×256 tile with B shared via DSMEM — arithmetic intensity doubles, and the kernel becomes compute-bound. The <strong>multi-consumer</strong> step (Step 9) shares one B tile across two math warps for a 512×256 tile, halving B's per-FLOP load. The journey: <strong>70 ms → 0.094 ms, ~744×, cuBLAS parity</strong>.
+</div>
+
+<div class="callout">
+  <div class="label">Where this connects</div>
+  The four-barrier choreography is the <a href="06_mbarriers.html">lesson 06</a> phase model run twice — and the opposite-initial-phase setup is the doubled form of lesson 06's reuse bug, made structural. The 2-CTA cluster, DSMEM (<code>map_shared_rank</code>), multicast, and <code>cta_group::2</code> are the cooperation primitives from <a href="07_clusters_clc.html">lesson 07</a>, finally spent on the GEMM they were planted for. Forward, <a href="11_flash_attention_algorithm.html">lesson 11 · Flash Attention 4</a> reuses this exact machinery and adds an online-softmax step between two MMA phases. For the serving-stack context — where FlashAttention plugs into a real inference engine — see <a href="../../gpu_kernels/12_vllm_kernel_stack.html"><code>gpu_kernels · 12 · the vLLM kernel stack</code></a>.
+  <br><br>
+  <strong>We have driven one MMA, repeated, to the compute ceiling. Attention is two MMAs with softmax wedged between — the same machinery, but a fundamentally harder schedule.</strong> That is <a href="11_flash_attention_algorithm.html">lesson 11 · Flash Attention 4: the algorithm</a>.
+</div>
+
+<footer class="lesson-nav">
+  <a href="09_gemm_pipelined.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">09 · GEMM II: pipelining with TMA</span>
+  </a>
+  <a class="next" href="11_flash_attention_algorithm.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">11 · Flash Attention 4: the algorithm</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+/* ─── Widget: warp-role choreography vs lockstep ───
+   Two deterministic schedules of the same K-loop work, drawn as Gantt timelines.
+
+   LOCKSTEP (lesson 09): one lane. Each iteration = LOAD then COMPUTE then WRITE,
+   strictly serial, so the tensor core (COMPUTE) is lit only 1/3 of the time.
+
+   SPECIALIZED (this lesson): three lanes (producer / consumer / writeback) that
+   overlap. With PIPE_DEPTH buffers the producer runs ahead of the consumer; in
+   steady state the consumer's COMPUTE spans cover the whole cycle, so the tensor
+   core approaches 100% busy. We also render the four barriers as two rings and
+   animate the opposite-initial-phase startup handshake.
+
+   Units: each "op" is 1 time unit. LOAD=1, COMPUTE=1, WRITE=1 (writeback overlaps
+   the next tile's compute once the pipe is primed). Busy% is measured from the
+   COMPUTE spans over the drawn window. Fully self-contained + deterministic. */
+(function(){
+  const C = document.getElementById('ws-canvas');
+  if (!C) return;
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    play:$('ws-play'), step:$('ws-step'), reset:$('ws-reset'),
+    depth:$('ws-depth'), depthv:$('ws-depth-v'),
+    cycle:$('ws-cycle'), bl:$('ws-bl'), bs:$('ws-bs'), hs:$('ws-hs'),
+  };
+
+  const COL = {
+    tma:'#d97706', mma:'#2563eb', wb:'#16a34a', idle:'#cbd5e1',
+    mute:'#5b6573', dim:'#94a3b8', text:'#1f2430', border:'#dde2ea',
+    panel:'#ffffff', grid:'#eef1f5', bad:'#dc2626', ok:'#16a34a'
+  };
+
+  const NTILES = 6;            // K-tiles drawn
+  let cursor = 0;              // animation cursor in time-units (for the sweep)
+  let playing = false, rafId = null;
+
+  function rr(x,y,w,h,r){
+    r = Math.min(r, h/2, w/2);
+    ctx.beginPath();
+    ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+    ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+  }
+
+  // ── build the two schedules as arrays of {lane, kind, t0, t1, tile} ──
+  function buildLockstep(){
+    // one lane index 0; each tile: load[3t]→compute[1t]→write[1t]? Keep simple:
+    // LOAD(1) COMPUTE(1) WRITE(1) serially per tile.
+    const segs = [];
+    let t = 0;
+    for (let k=0;k<NTILES;k++){
+      segs.push({lane:0, kind:'tma', t0:t, t1:t+1, tile:k}); t+=1;
+      segs.push({lane:0, kind:'mma', t0:t, t1:t+1, tile:k}); t+=1;
+      segs.push({lane:0, kind:'wb',  t0:t, t1:t+1, tile:k}); t+=1;
+    }
+    return { segs, span:t, lanes:1 };
+  }
+
+  function buildSpecialized(depth){
+    // three lanes: 0=producer(tma), 1=consumer(mma), 2=writeback
+    // producer issues load for tile k at time k (one per unit, can run `depth` ahead).
+    // consumer computes tile k only after (a) its load done AND (b) it's within `depth`
+    //   of the producer. Steady state: consumer does 1 compute per unit.
+    // writeback drains tile k one unit after its compute, overlapping next compute.
+    const segs = [];
+    // producer: load k starts at max(k, consumerStart(k)-depth+...) — simplified:
+    //   producer can be at most `depth` tiles ahead of the consumer. Model it as:
+    //   load_start(k) = max(k - 0, 0) but gated so load_start(k) <= compute_start(k-depth?) ...
+    // Concrete deterministic model:
+    //   compute_start(k) = max(load_end(k), compute_end(k-1))
+    //   load_start(k)    = max(k>=depth ? compute_start(k-depth) : 0 , load_end(k-1))
+    const loadStart=[], loadEnd=[], compStart=[], compEnd=[], wbStart=[], wbEnd=[];
+    for (let k=0;k<NTILES;k++){
+      const ls = Math.max(
+        k>=depth ? (compStart[k-depth]!==undefined?compStart[k-depth]:0) : 0,
+        k>0 ? loadEnd[k-1] : 0
+      );
+      loadStart[k]=ls; loadEnd[k]=ls+1;
+      const cs = Math.max(loadEnd[k], k>0?compEnd[k-1]:0);
+      compStart[k]=cs; compEnd[k]=cs+1;
+      const ws = compEnd[k];                      // drain starts when compute done
+      wbStart[k]=ws; wbEnd[k]=ws+1;
+      segs.push({lane:0, kind:'tma', t0:loadStart[k], t1:loadEnd[k], tile:k});
+      segs.push({lane:1, kind:'mma', t0:compStart[k], t1:compEnd[k], tile:k});
+      segs.push({lane:2, kind:'wb',  t0:wbStart[k],   t1:wbEnd[k],   tile:k});
+    }
+    const span = Math.max(...wbEnd, ...compEnd, ...loadEnd);
+    return { segs, span, lanes:3, compStart, compEnd };
+  }
+
+  function busyFrac(schedule, window){
+    // fraction of [0,window) during which a 'mma' span is active (single tensor core)
+    let lit = 0;
+    for (const s of schedule.segs){
+      if (s.kind!=='mma') continue;
+      const a = Math.max(0, s.t0), b = Math.min(window, s.t1);
+      if (b>a) lit += (b-a);
+    }
+    return lit / window;
+  }
+
+  function render(){
+    const depth = +els.depth.value;
+    els.depthv.textContent = depth;
+
+    const lock = buildLockstep();
+    const spec = buildSpecialized(depth);
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    // common time scale: use the larger span so both panels share a unit width
+    const maxSpan = Math.max(lock.span, spec.span);
+    const padL = 92, padR = 18;
+    const colGap = 26;
+    const panelW = (W - padL - padR - colGap)/2;
+    const unit = panelW / maxSpan;
+
+    const sweep = playing ? Math.min(cursor, maxSpan) : maxSpan;
+
+    // ── panel headers ──
+    ctx.textAlign='left'; ctx.font='11px monospace';
+    ctx.fillStyle = COL.mute;
+    ctx.fillText('LOCKSTEP — one team (lesson 09)', padL, 18);
+    ctx.fillText('SPECIALIZED — producer ∥ consumer ∥ writeback', padL+panelW+colGap, 18);
+
+    const laneTop = 36, laneH = 26, laneGap = 14;
+
+    function drawPanel(x0, sched, lanesLabels){
+      // lanes background
+      for (let L=0; L<sched.lanes; L++){
+        const y = laneTop + L*(laneH+laneGap);
+        ctx.fillStyle = COL.grid;
+        ctx.fillRect(x0, y, panelW, laneH);
+        ctx.fillStyle = COL.text; ctx.font='10px monospace'; ctx.textAlign='right';
+        ctx.fillText(lanesLabels[L], x0-8, y+laneH/2+3);
+        ctx.textAlign='left';
+      }
+      // segments
+      for (const s of sched.segs){
+        const drawEnd = Math.min(s.t1, sweep);
+        if (drawEnd <= s.t0) continue;
+        const y = laneTop + s.lane*(laneH+laneGap);
+        const x = x0 + s.t0*unit;
+        const w = (drawEnd - s.t0)*unit;
+        const col = s.kind==='tma'?COL.tma : s.kind==='mma'?COL.mma : COL.wb;
+        ctx.fillStyle = col; ctx.globalAlpha = 0.92;
+        rr(x+0.5, y+2, Math.max(2,w-1), laneH-4, 4); ctx.fill();
+        ctx.globalAlpha = 1;
+        if (w > 16){
+          ctx.fillStyle = '#fff'; ctx.font='9px monospace';
+          ctx.fillText('k'+s.tile, x+4, y+laneH/2+3);
+        }
+      }
+      // time axis baseline
+      const axisY = laneTop + sched.lanes*(laneH+laneGap) + 2;
+      ctx.strokeStyle = COL.border; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(x0, axisY); ctx.lineTo(x0+panelW, axisY); ctx.stroke();
+      ctx.fillStyle = COL.dim; ctx.font='9px monospace';
+      for (let t=0;t<=maxSpan;t+=3){
+        const xx = x0 + t*unit;
+        ctx.beginPath(); ctx.moveTo(xx, axisY); ctx.lineTo(xx, axisY+4); ctx.stroke();
+        ctx.fillText(t, xx-3, axisY+15);
+      }
+      return axisY;
+    }
+
+    const axisY = drawPanel(padL, lock, ['team']);
+    drawPanel(padL+panelW+colGap, spec, ['WG1.w3','WG1.w0','WG0']);
+
+    // sweep line
+    if (playing){
+      [padL, padL+panelW+colGap].forEach(x0=>{
+        const sx = x0 + sweep*unit;
+        ctx.strokeStyle = 'rgba(37,99,235,0.5)'; ctx.lineWidth=1.5;
+        ctx.beginPath(); ctx.moveTo(sx, laneTop-4); ctx.lineTo(sx, axisY); ctx.stroke();
+      });
+    }
+
+    // ── the two barrier rings (bottom of specialized side) ──
+    const ringY = axisY + 38;
+    ctx.fillStyle = COL.mute; ctx.font='11px monospace'; ctx.textAlign='left';
+    ctx.fillText('four mbarriers = two producer–consumer rings', padL, ringY-12);
+
+    // Ring 1: SMEM (TMA <-> MMA), Ring 2: TMEM (MMA <-> writeback)
+    function drawRing(cx, cy, label, top, topCol, bot, botCol, ringCol){
+      const rW=150, rH=58;
+      rr(cx, cy, rW, rH, 10);
+      ctx.fillStyle = COL.panel; ctx.fill();
+      ctx.strokeStyle = ringCol; ctx.lineWidth=1.5; ctx.stroke();
+      ctx.fillStyle = ringCol; ctx.font='10px monospace';
+      ctx.fillText(label, cx+10, cy+15);
+      // forward barrier (top), with arrow →
+      ctx.fillStyle = topCol; ctx.font='11px monospace';
+      ctx.fillText('→ '+top, cx+10, cy+33);
+      // backward barrier (bottom), with arrow ←
+      ctx.fillStyle = botCol;
+      ctx.fillText('← '+bot, cx+10, cy+50);
+    }
+    drawRing(padL, ringY, 'Ring 1 · SMEM buffer',
+             'tma2mma (data ready)', COL.tma, 'mma2tma (buf free)', COL.mma, COL.tma);
+    drawRing(padL+170, ringY, 'Ring 2 · TMEM accum',
+             'mma2ld (results ready)', COL.mma, 'ld2mma (TMEM free)', COL.wb, COL.wb);
+
+    // ── startup handshake panel (right of rings) ──
+    const hx = padL+360, hw = W - padR - hx;
+    rr(hx, ringY, hw, 58, 10);
+    ctx.fillStyle = COL.panel; ctx.fill();
+    ctx.strokeStyle = COL.border; ctx.lineWidth=1.25; ctx.stroke();
+    ctx.fillStyle = COL.mute; ctx.font='10px monospace';
+    ctx.fillText('startup · opposite initial phases (fresh barrier @ phase 0)', hx+10, ringY+15);
+    ctx.font='11px monospace';
+    ctx.fillStyle = COL.tma;
+    ctx.fillText('producer wait(phase=1): 0≠1 → PASS (fill empty buf)', hx+10, ringY+33);
+    ctx.fillStyle = COL.mma;
+    ctx.fillText('consumer wait(phase=0): 0=0 → BLOCK (no data yet)', hx+10, ringY+50);
+
+    // ── KPIs ──
+    // steady-state cycle length of the specialized pipe = 1 unit (one compute/unit
+    // once primed); report producer-ahead distance = depth.
+    const blFrac = busyFrac(lock, lock.span);               // periodic: full-span rate IS the steady-state rate
+    // specialized has a one-tile fill + one-tile drain that amortize away as K grows, so
+    // report the STEADY-STATE busy fraction: the window from first compute to last compute.
+    const ssLen = spec.compEnd[spec.compEnd.length-1] - spec.compStart[0];
+    const bsFrac = ssLen > 0 ? NTILES / ssLen : 0;          // NTILES unit-length compute spans
+    els.cycle.textContent = '1 compute / unit (primed)';
+    els.bl.textContent = (blFrac*100).toFixed(0) + ' %';
+    els.bs.textContent = (bsFrac*100).toFixed(0) + ' %';
+    els.hs.textContent = 'producer PASS · consumer BLOCK';
+    // color the busy KPIs
+    $('ws-bl').style.color = COL.bad;
+    $('ws-bs').style.color = bsFrac > 0.85 ? COL.ok : COL.tma;
+  }
+
+  function tick(){
+    if (!playing) return;
+    cursor += 0.12;
+    const lock = buildLockstep(), spec = buildSpecialized(+els.depth.value);
+    const maxSpan = Math.max(lock.span, spec.span);
+    if (cursor >= maxSpan){ cursor = maxSpan; playing = false; els.play.textContent='▶ play'; render(); return; }
+    render();
+    rafId = requestAnimationFrame(tick);
+  }
+
+  els.play.addEventListener('click', ()=>{
+    if (playing){ playing=false; els.play.textContent='▶ play'; if(rafId) cancelAnimationFrame(rafId); return; }
+    cursor = 0; playing = true; els.play.textContent='❚❚ pause';
+    rafId = requestAnimationFrame(tick);
+  });
+  els.step.addEventListener('click', ()=>{
+    playing = false; els.play.textContent='▶ play';
+    cursor = Math.min(cursor + 1, 30);
+    // when stepping, draw with a finite sweep
+    const saved = playing; playing = true; render(); playing = saved;
+  });
+  els.reset.addEventListener('click', ()=>{
+    playing=false; els.play.textContent='▶ play'; if(rafId) cancelAnimationFrame(rafId);
+    cursor = 0; render();
+  });
+  els.depth.addEventListener('input', ()=>{ render(); });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

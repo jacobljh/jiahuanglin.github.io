@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>04 · TMA</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local: the load-vs-store completion contrast + descriptor field list */
+  .tma-note { color: var(--text-mute); font-size: 13px; margin: 6px 0 0; }
+  .desc-fields { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; margin: 14px 0; }
+  .desc-fields div {
+    border: 1px solid var(--border); border-left: 3px solid var(--accent-2);
+    border-radius: 4px 8px 8px 4px; background: var(--bg-elev);
+    padding: 8px 12px; font-size: 13px;
+  }
+  .desc-fields strong { font-family: var(--mono); font-size: 12px; color: var(--accent-2); }
+  /* the two-path completion table — loads vs stores */
+  .completion-table td { vertical-align: top; }
+  .completion-table code { font-size: 12px; }
+  .sig {
+    display:inline-block; font-family: var(--mono); font-size: 11px;
+    padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border);
+  }
+  .sig-bar  { color: var(--accent);   }
+  .sig-grp  { color: var(--ok);       }
+  @media (max-width: 820px) { .desc-fields { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">modern_gpu / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">04 · TMA</span>
+    <span class="step-pill">lesson 5 / 15</span>
+  </div>
+</header>
+
+<main>
+
+<p class="kicker">Part II · the five hardware primitives</p>
+<h1>TMA — the async bulk copy engine</h1>
+<p class="subtitle">The tensor core reads its operands from shared memory through a descriptor. But <em>getting</em> the tile into shared memory the old way means the math threads do the copy themselves — computing addresses, issuing loads, bookkeeping the swizzle — burning the exact instruction slots the tensor core needs. The forced move is to take the copy off the threads entirely and hand it to a dedicated hardware unit. That unit is the <strong>Tensor Memory Accelerator</strong>.</p>
+
+<div class="forced">
+  <div class="label">Forced move — the bottleneck from lesson 03</div>
+  Lesson 03 ended on Blackwell's <code>tcgen05.mma</code> reading <strong>A</strong> and <strong>B</strong> from SMEM through descriptors. That settles where the operands are <em>read from</em>. It says nothing about how they got <em>into</em> SMEM — and the classic answer is the problem: the math warps copy the tiles in themselves. Each thread computes a global address, issues a load, tracks the swizzle, and counts off elements, with the entire copy path threaded through the instruction stream of the warps that are supposed to be feeding the tensor core. Every cycle a lane spends on address arithmetic is a cycle the tensor core is starved. The only way out is to stop making the threads copy. Issue <em>one</em> instruction that describes the whole tile and let a separate engine move the bytes while the warps do math.
+</div>
+
+<h2>What the issuing thread actually does</h2>
+
+<p>A TMA copy is issued by a <strong>single thread</strong>. That thread does <em>not</em> loop over elements and it does <em>not</em> compute per-element addresses. It provides exactly two things:</p>
+
+<ol>
+  <li>a <strong>tensor-map descriptor</strong> — a small object that records the tensor's shape, its strides, the element size, the <em>tile</em> shape to copy, and the swizzle mode; and</li>
+  <li>the <strong>SMEM destination address</strong> — where the tile should land.</li>
+</ol>
+
+<p>Then it issues the copy and keeps going. The rest of the CTA is free to compute on a tile that already arrived. The engine walks the rectangular region described by the descriptor, reads it from global memory, and writes it into shared memory — asynchronously, off to the side of the warps.</p>
+
+<p>Contrast this with the Ampere world. Ampere's <code>cp.async</code> (the <code>LDGSTS</code> "load-global-store-shared" instruction) is still <strong>thread-issued</strong>: every lane issues its own async copy of its own slice, so the warp still spends instructions generating 32 addresses even though the store-to-SMEM now bypasses the register file. TMA collapses all of that into one issue from one thread describing the whole tile. That is the difference between "async per element, still on the threads" and "one engine, off the threads."</p>
+
+<h3>The descriptor records the layout, including the swizzle</h3>
+
+<div class="desc-fields">
+  <div><strong>tensor shape</strong> the full GMEM tensor's extents (e.g. M × K)</div>
+  <div><strong>strides</strong> byte strides per dimension (row-major, col-major, padded…)</div>
+  <div><strong>element size</strong> bytes per element (fp16 = 2, fp8 = 1, …)</div>
+  <div><strong>tile / box shape</strong> the rectangular sub-region this op copies</div>
+  <div><strong>swizzle mode</strong> <code>SWIZZLE_NONE / 32B / 64B / 128B</code></div>
+  <div><strong>fill / OOB mode</strong> what to do at tensor edges (zero-fill, etc.)</div>
+</div>
+
+<p>The swizzle field is the load-bearing one. <strong>Swizzle is applied automatically as the bytes land in SMEM</strong> — there is no separate "swizzle pass" the kernel runs afterward. The TMA engine permutes bytes on the write so the tile arrives already in the layout the tensor core expects to read. This is the other half of lesson 03's iron rule made concrete: the swizzle mode in the TMA descriptor must <strong>match</strong> the swizzle mode named in the MMA descriptor (per lessons 02–03), or the tensor core reads scrambled bytes — a finite-garbage bug, not a crash.</p>
+
+<div class="callout source-note">
+  <div class="label">3D TMA — one op tiles <em>and</em> swizzles</div>
+  The SMEM destination is commonly described as a 3-D box: <span class="math">(group, row, col)</span>. The inner two coordinates <span class="math">(row, col)</span> address <em>within</em> one swizzle atom (e.g. an 8×128-byte block); the outer <span class="math">group</span> dimension <strong>walks across atoms</strong>. So a single TMA operation does two jobs at once: it <em>tiles</em> the data into swizzle atoms and it <em>swizzles each atom</em> on the way in. The kernel never writes a manual atom-by-atom swizzle loop — the descriptor's geometry expresses it.
+</div>
+
+<h2>Completion is where loads and stores split apart</h2>
+
+<p>Issuing the copy is the easy half. The hard half — and the central teaching point of this lesson — is knowing <em>when it finished</em>, because the consumer cannot touch the tile just because the instruction was issued. The data is in flight. And here loads and stores complete through <strong>two different mechanisms</strong>, for a simple reason: a load has an in-kernel consumer that must wait; a store usually does not.</p>
+
+<table class="completion-table">
+  <thead><tr><th></th><th>TMA load (GMEM → SMEM)</th><th>TMA store (SMEM → GMEM)</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><strong>who waits, and why</strong></td>
+      <td>the <em>consumer</em> (the MMA) must wait until the tile is fully present before reading it</td>
+      <td>usually <em>no</em> in-kernel consumer (it's the final output); the kernel only needs to know when the SMEM <em>source</em> is reusable</td>
+    </tr>
+    <tr>
+      <td><strong>completion signal</strong></td>
+      <td><span class="sig sig-bar">mbarrier + byte count</span></td>
+      <td><span class="sig sig-grp">commit group + wait group</span></td>
+    </tr>
+    <tr>
+      <td><strong>how</strong></td>
+      <td>the engine does <code>complete-tx</code> updates as bytes land; the barrier flips only when the byte count hits zero</td>
+      <td><code>cp.async.bulk.commit_group</code> bundles outstanding stores; <code>cp.async.bulk.wait_group N</code> blocks until ≤ N groups remain</td>
+    </tr>
+  </tbody>
+</table>
+
+<p class="tma-note"><strong>The rule, in one line:</strong> loads wait via an <em>mbarrier and a byte count</em>; stores wait via a <em>commit/wait group</em>. Keep these straight — using the wrong one is a classic source of silent corruption (lesson 13 catalogs it).</p>
+
+<h3>Load completion — the mbarrier and the byte budget</h3>
+
+<p>The asymmetry is worth slowing down on, because it is <em>not</em> "wait until the instruction retires." A TMA load completes through an <strong>mbarrier</strong> (a shared-memory async barrier; lesson 06 covers it in full — this is a preview) in a precise sequence:</p>
+
+<ol>
+  <li><strong>init / reuse</strong> an mbarrier object for this pipeline stage.</li>
+  <li><code>mbarrier.arrive.expect_tx(<em>bytes</em>)</code> — this does <em>two</em> things at once: it records how many bytes the barrier should expect (the tile's byte count), and it counts as the issuing thread's own <em>arrival</em>.</li>
+  <li>issue the TMA load, pointed at that same mbarrier.</li>
+  <li>the engine performs <strong>complete-tx</strong> updates as bytes arrive, decrementing the pending-byte counter.</li>
+  <li>the barrier's <strong>phase flips only when both conditions hold</strong>: the arrival count is satisfied <em>and</em> the pending byte count has reached zero.</li>
+  <li>the consumer <strong>waits on that phase</strong>; when it flips, the tile is guaranteed fully present and safe to read.</li>
+</ol>
+
+<p>So the completion condition is a conjunction — <em>arrivals done</em> <strong>AND</strong> <em>bytes == 0</em>. The byte budget is why a plain thread-only barrier cannot do this job: <code>__syncthreads()</code> can wait for threads, but it has no notion of "200 KB are still in flight from a copy engine." The <code>expect_tx</code> count is the hook that lets a barrier wait on a <em>data-movement</em> event rather than a thread-arrival event. (This is exactly why TMA forces lesson 06 into existence.)</p>
+
+<h3>Store completion — commit group and wait group</h3>
+
+<p>A TMA store typically writes the kernel's final output back to GMEM, where nothing inside the kernel reads it again. There is no consumer to release — so an mbarrier would be ceremony with no reader. What the kernel <em>does</em> need to know is when the SMEM region it stored <em>from</em> is free to be overwritten by the next tile. That is a producer-side question, answered by a lighter mechanism:</p>
+
+<pre><code>// issue one or more bulk-tensor stores SMEM → GMEM …
+cp.async.bulk.tensor.2d.global.shared::cta  [tmap, {x,y}], [smem_src];
+// … then bundle everything issued so far into a group:
+cp.async.bulk.commit_group;
+// … later, block until at most N groups are still outstanding:
+cp.async.bulk.wait_group 0;          // 0 ⇒ all prior stores have drained
+// after the wait, the SMEM source region is safe to reuse.</code></pre>
+
+<p>No byte count, no mbarrier, no phase. You commit a batch and later wait for the batch to drain. That is the whole store protocol.</p>
+
+<h2>Interactive · how a TMA load actually completes</h2>
+
+<p>The model below runs the load-completion sequence step by step. In <strong>TMA mode</strong>, one elected thread announces <code>expect_tx(bytes)</code> and issues the copy, then is free; the engine fills the byte budget on its own lane; the mbarrier phase bit flips <em>only</em> when bytes reach 0 <strong>and</strong> the arrival is in; then the MMA consumer is released to read. Flip to <strong>thread-copy mode</strong> to watch the alternative: the math warp itself drives the copy, lane by lane, with the tensor core idle the entire time. Step through, or hit play.</p>
+
+<div class="widget" id="tma-widget">
+  <div class="title">TMA load synchronization flow · engine-driven vs thread-driven</div>
+  <div class="hint">TMA mode: issue → <code>expect_tx</code> → bytes land on the engine's lane → phase flips at (bytes==0 ∧ arrived) → consumer reads. Thread-copy mode: the math warp does the copy itself; the tensor core stays idle. Watch which lane is busy.</div>
+
+  <div class="controls">
+    <label class="inline">mode:
+      <select id="tma-mode">
+        <option value="tma" selected>TMA — engine copies, threads free</option>
+        <option value="thread">thread-copy — math warp copies</option>
+      </select>
+    </label>
+    <button id="tma-play">▶ play</button>
+    <button id="tma-step">step ▷</button>
+    <button id="tma-reset">⟲ reset</button>
+    <label class="inline">tile bytes: <input type="range" id="tma-bytes" min="64" max="256" step="64" value="192"> <span class="val" id="tma-bytes-v">192</span> KB</label>
+  </div>
+
+  <canvas id="tma-canvas" width="760" height="400" style="width:100%; height:400px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">phase / step</div><div class="v" id="tma-phase" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">bytes pending</div><div class="v" id="tma-pending">—</div></div>
+    <div class="kpi"><div class="k">mbarrier phase bit</div><div class="v" id="tma-bit">0</div></div>
+    <div class="kpi"><div class="k">tensor core</div><div class="v" id="tma-tc" style="font-size:14px;">—</div></div>
+  </div>
+</div>
+
+<p>Two things the animation is built to make obvious. First, in TMA mode the <strong>issuing thread's lane goes idle the instant it issues</strong> — the work moves to the engine lane — whereas in thread-copy mode the math lane stays pinned to the copy. Second, the <strong>phase bit does not flip early</strong>: it waits for the byte counter to hit exactly zero. If you (wrongly) released the consumer on "instruction issued," it would read a half-arrived tile. That single guarantee — flip only at <span class="math">bytes == 0 ∧ arrived</span> — is the entire reason a byte-counting barrier exists.</p>
+
+<h2>Why this only pays off inside a pipeline</h2>
+
+<p>Issuing one async copy and then immediately waiting for it buys nothing — you've just renamed a synchronous load. TMA earns its keep when the copy for a <strong>future</strong> tile is in flight <em>while the tensor core computes the current one</em>. That is a pipeline, and it needs at least two SMEM buffers ("stages"):</p>
+
+<ul>
+  <li>one SMEM stage holds the tile currently being <strong>consumed</strong> by the MMA;</li>
+  <li>another stage is being <strong>filled</strong> by a TMA load for an upcoming iteration;</li>
+  <li>as the loop advances, the roles <strong>rotate</strong> (stage <span class="math">k mod num_stages</span>);</li>
+  <li>before the MMA reads a stage, it <strong>waits on that stage's load barrier</strong> (the mbarrier from above);</li>
+  <li>before a TMA load overwrites a stage, the kernel <strong>ensures the previous consumer is done</strong> with it.</li>
+</ul>
+
+<p>That choreography is precisely why <strong>TMA and mbarriers always appear together</strong> in Hopper and Blackwell kernels: TMA moves the bytes off the threads, and the mbarrier is the only thing that can tell the consumer "your stage is ready" and the producer "your stage is free." Neither is useful without the other. We build this double-buffered mainloop explicitly in the GEMM ladder; here, just hold the shape of it.</p>
+
+<h2>The real toolchain — PTX and the descriptor object</h2>
+
+<p>None of this is a course abstraction; it is the actual CUDA/PTX surface. The device-side instruction family is:</p>
+
+<pre><code>// TMA load: GMEM → SMEM, multidim, descriptor-driven, swizzled,
+// completion tracked by an mbarrier via complete-tx byte updates.
+cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes
+    [smem_dst], [tensor_map, {coord_x, coord_y}], [mbar];
+
+// the matching arrival that announces the byte budget (see lesson 06):
+mbarrier.arrive.expect_tx.shared::cta.b64  _, [mbar], <bytes>;
+
+// TMA store: SMEM → GMEM, drained via commit/wait group:
+cp.async.bulk.tensor.2d.global.shared::cta  [tensor_map, {x,y}], [smem_src];
+cp.async.bulk.commit_group;
+cp.async.bulk.wait_group  0;</code></pre>
+
+<p>A few real distinctions worth nailing down:</p>
+
+<ul>
+  <li><strong><code>cp.async.bulk</code></strong> (raw, 1-D) vs <strong><code>cp.async.bulk.tensor</code></strong> (multi-dimensional, descriptor-driven, swizzle-aware). The plain <code>cp.async.bulk</code> moves a contiguous byte range; the <code>.tensor</code> form is the one that reads a rectangular tile through a tensor map and applies the swizzle. Dimensionality runs <code>.1d</code> … <code>.5d</code>.</li>
+  <li>The descriptor is a <strong><code>CUtensorMap</code></strong> object. It is typically built <strong>on the host</strong> with <code>cuTensorMapEncodeTiled(...)</code> and passed to the kernel as a <code>const __grid_constant__ CUtensorMap</code> parameter — encoding the shape/strides/tile/swizzle once, on the CPU, rather than recomputing addresses per thread on the GPU.</li>
+  <li>The multicast variant <strong><code>.multicast::cluster</code></strong> lets one load feed several CTAs at once — a preview of lesson 07's clusters and distributed shared memory.</li>
+  <li>Contrast the whole thing with Ampere's <strong><code>cp.async</code></strong> (<code>LDGSTS</code>), which is thread-issued and per-slice. TMA is the generational step from "async copy, still on the threads" to "a copy engine, off the threads."</li>
+</ul>
+
+<pre><code>// host side: encode the tensor map once, pass it as a grid-constant kernel arg
+CUtensorMap tmap;
+cuTensorMapEncodeTiled(&amp;tmap, CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+    /*rank=*/2, gmem_ptr, gmem_extents, gmem_strides,
+    tile_extents, /*elem_strides=*/{1,1},
+    CU_TENSOR_MAP_INTERLEAVE_NONE,
+    CU_TENSOR_MAP_SWIZZLE_128B,            // MUST match the MMA descriptor
+    CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+    CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+// kernel signature:
+__global__ void gemm(const __grid_constant__ CUtensorMap tmapA, ...);</code></pre>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  TMA takes the copy off the math threads. One thread hands the engine a <strong>tensor-map descriptor</strong> (shape · strides · element size · tile shape · <strong>swizzle</strong>) plus an SMEM destination; the engine moves the rectangular tile asynchronously and <strong>swizzles each atom as it lands</strong>, so the tile arrives in the layout the tensor core reads. Completion is asymmetric and you must respect it: <strong>loads complete through an mbarrier + an <code>expect_tx</code> byte count</strong> — the phase flips only when arrivals are in <em>and</em> pending bytes hit zero — while <strong>stores complete through <code>commit_group</code> / <code>wait_group</code></strong>, signalling only that the SMEM source is reusable. TMA pays off only in a pipeline, where it fills a future stage while the tensor core consumes the current one — which is why it never travels without an mbarrier.
+</div>
+
+<div class="callout">
+  <div class="label">Where this connects</div>
+  The async-copy story starts in the prequel <a href="../../gpu_kernels/09_tensor_cores.html"><code>gpu_kernels/09 · tensor cores</code></a> (its "async copies — the Hopper trick" section sketches <code>cp.async</code> and names TMA); this lesson is the full hardware mechanism behind that sketch. TMA tiles plug straight into the operand descriptors from <a href="03_tensor_cores_generations.html">lesson 03</a>, and they feed the kernels that train the models in <a href="../../cs336/lessons/index.html"><code>cs336 · Language Modeling from Scratch</code></a>. But the completion machinery has a gap we only previewed: <em>what exactly is an mbarrier, how does the phase bit work across many loop iterations, and what breaks when you reuse one wrong?</em> That is <a href="06_mbarriers.html">lesson 06 · mbarriers and the phase model</a>.
+  <br><br>
+  <strong>TMA keeps the operands flowing into SMEM — but the <em>accumulator</em> the tensor core writes has outgrown the register file. Where does it live now?</strong> That is <a href="05_tmem.html">lesson 05 · TMEM</a>.
+</div>
+
+<footer class="lesson-nav">
+  <a href="03_tensor_cores_generations.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">03 · Tensor cores across generations</span>
+  </a>
+  <a class="next" href="05_tmem.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">05 · TMEM: the accumulator's new home</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+/* ─── Widget: TMA load synchronization flow (engine-driven vs thread-driven) ─── */
+(function(){
+  const C = document.getElementById('tma-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    mode:$('tma-mode'), play:$('tma-play'), step:$('tma-step'), reset:$('tma-reset'),
+    bytes:$('tma-bytes'), bytesv:$('tma-bytes-v'),
+    phase:$('tma-phase'), pending:$('tma-pending'), bit:$('tma-bit'), tc:$('tma-tc'),
+  };
+
+  const COL = {
+    accent:'#2563eb', ok:'#16a34a', bad:'#dc2626', amber:'#d97706', purple:'#7c3aed',
+    mute:'#5b6573', dim:'#94a3b8', text:'#1f2430', border:'#dde2ea', panel:'#ffffff',
+    track:'#eef1f5'
+  };
+
+  // ── TMA-mode steps: an explicit state machine the user steps through ──
+  // Each step names the phase + sets how much of the byte budget has landed,
+  // whether the issuing thread is busy, whether the engine is moving, the bit, TC state.
+  const TMA_STEPS = [
+    { ph:'init mbarrier (count=1, phase=0)',  frac:0, thread:'arming', engine:false, bit:0, tc:'idle',   note:'barrier object set up for this stage' },
+    { ph:'arrive.expect_tx(bytes)',           frac:0, thread:'arrived',engine:false, bit:0, tc:'idle',   note:'announces byte budget + counts as arrival' },
+    { ph:'issue cp.async.bulk.tensor',        frac:0, thread:'FREE',   engine:true,  bit:0, tc:'idle',   note:'one thread issues; then it is free' },
+    { ph:'engine: complete-tx …',             frac:0.4,thread:'FREE',  engine:true,  bit:0, tc:'idle',   note:'bytes land on the engine lane' },
+    { ph:'engine: complete-tx …',             frac:0.8,thread:'FREE',  engine:true,  bit:0, tc:'idle',   note:'pending byte count still > 0 → no flip' },
+    { ph:'bytes==0 ∧ arrived → PHASE FLIP',   frac:1, thread:'FREE',   engine:false, bit:1, tc:'idle',   note:'both conditions met: barrier flips' },
+    { ph:'consumer wait returns → MMA reads', frac:1, thread:'FREE',   engine:false, bit:1, tc:'BUSY',   note:'tile guaranteed present; tensor core fed' },
+  ];
+
+  // ── thread-copy mode: the math warp does the copy itself; TC idle throughout ──
+  const THR_STEPS = [
+    { ph:'warp computes 32 addresses',        frac:0,   busy:true,  bit:'—', tc:'idle', note:'address arithmetic on the math lanes' },
+    { ph:'lanes issue loads (slice 1/4)',     frac:0.25,busy:true,  bit:'—', tc:'idle', note:'each lane copies its own slice' },
+    { ph:'lanes issue loads (slice 2/4)',     frac:0.5, busy:true,  bit:'—', tc:'idle', note:'still on the warp' },
+    { ph:'lanes issue loads (slice 3/4)',     frac:0.75,busy:true,  bit:'—', tc:'idle', note:'still on the warp' },
+    { ph:'lanes issue loads (slice 4/4)',     frac:1,   busy:true,  bit:'—', tc:'idle', note:'copy done — warp was pinned the whole time' },
+    { ph:'__syncthreads()',                   frac:1,   busy:true,  bit:'—', tc:'idle', note:'thread-only barrier; cannot track bytes' },
+    { ph:'now (finally) MMA can read',         frac:1,   busy:false, bit:'—', tc:'BUSY', note:'tensor core idled through the entire copy' },
+  ];
+
+  let step = 0;
+  let playing = false;
+  let lastTs = 0;
+
+  function steps(){ return els.mode.value === 'tma' ? TMA_STEPS : THR_STEPS; }
+  function totalKB(){ return parseInt(els.bytes.value); }
+
+  function rr(x,y,w,h,r){
+    ctx.beginPath();
+    ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+    ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+  }
+  function arrow(x1,y1,x2,y2,col,dash){
+    ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 2;
+    ctx.setLineDash(dash || []);
+    ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+    ctx.setLineDash([]);
+    const a = Math.atan2(y2-y1, x2-x1);
+    ctx.beginPath(); ctx.moveTo(x2,y2);
+    ctx.lineTo(x2 - 9*Math.cos(a-0.4), y2 - 9*Math.sin(a-0.4));
+    ctx.lineTo(x2 - 9*Math.cos(a+0.4), y2 - 9*Math.sin(a+0.4));
+    ctx.closePath(); ctx.fill();
+  }
+  function box(x,y,w,h,fill,stroke,lw){
+    rr(x,y,w,h,9); ctx.fillStyle=fill; ctx.fill();
+    ctx.strokeStyle=stroke; ctx.lineWidth=lw||1.5; ctx.stroke();
+  }
+  function label(text,x,y,col,font,align){
+    ctx.fillStyle=col; ctx.font=font||'12px monospace'; ctx.textAlign=align||'left';
+    ctx.fillText(text,x,y); ctx.textAlign='left';
+  }
+
+  function render(){
+    els.bytesv.textContent = totalKB();
+    const S = steps();
+    if (step >= S.length) step = S.length - 1;
+    const s = S[step];
+    const isTMA = els.mode.value === 'tma';
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    // ── header ──
+    label(isTMA ? 'TMA mode · engine copies, threads free'
+                : 'thread-copy mode · the math warp does the copy itself',
+          16, 22, COL.mute, '11px monospace');
+    label('step ' + (step+1) + ' / ' + S.length + '  ·  ' + s.ph, 16, 40, COL.text, '12px monospace');
+
+    // ── three lanes: issuing thread/warp · copy path · SMEM/consumer ──
+    const laneX = 24, laneW = W - 48;
+    const tCY = 78;     // top: the threads
+    const eCY = 178;    // middle: the copy mover (engine OR warp)
+    const sCY = 286;    // bottom: SMEM stage + consumer
+
+    // ---- 1. the issuing agent (thread for TMA, warp for thread-copy) ----
+    const threadBusy = isTMA ? (s.thread !== 'FREE') : s.busy;
+    const thFill = threadBusy ? 'rgba(220,38,38,0.10)' : 'rgba(22,163,74,0.10)';
+    const thStroke = threadBusy ? COL.bad : COL.ok;
+    box(laneX, tCY-26, 250, 52, thFill, thStroke, 2);
+    label(isTMA ? 'issuing thread (1 lane)' : 'math warp (32 lanes)', laneX+14, tCY-6, COL.text, '12px monospace');
+    label(isTMA ? ('state: ' + s.thread) : (s.busy ? 'state: COPYING' : 'state: free'),
+          laneX+14, tCY+13, threadBusy ? COL.bad : COL.ok, '11px monospace');
+
+    // little lane-occupancy strip on the right of the thread box
+    const stripX = laneX+250+18, stripW = 120;
+    label(isTMA ? 'math lanes' : 'these ARE the math lanes', stripX, tCY-14, COL.dim, '10px monospace');
+    for (let i=0;i<8;i++){
+      const bx = stripX + i*(14);
+      const pinned = threadBusy;
+      ctx.fillStyle = pinned ? COL.bad : COL.track;
+      rr(bx, tCY-4, 11, 18, 2); ctx.fill();
+      ctx.strokeStyle = COL.border; ctx.lineWidth=1; ctx.stroke();
+    }
+    label(threadBusy ? 'busy on copy' : 'free for math', stripX, tCY+30, threadBusy?COL.bad:COL.ok, '10px monospace');
+
+    // ---- 2. the copy mover ----
+    const engineActive = isTMA ? s.engine : s.busy;
+    const moverLabel = isTMA ? 'TMA ENGINE (off the threads)' : 'copy runs ON the warp (in its instruction stream)';
+    const moverStroke = isTMA ? COL.accent : COL.bad;
+    box(laneX, eCY-26, laneW, 52, isTMA ? 'rgba(37,99,235,0.06)' : 'rgba(220,38,38,0.06)', moverStroke, 1.75);
+    label(moverLabel, laneX+14, eCY-7, COL.text, '12px monospace');
+
+    // byte-budget progress bar
+    const barX = laneX+14, barY = eCY+4, barW = laneW-28-150, barH = 14;
+    ctx.fillStyle = COL.track; rr(barX, barY, barW, barH, 4); ctx.fill();
+    const frac = Math.max(0, Math.min(1, s.frac));
+    ctx.fillStyle = isTMA ? COL.accent : COL.bad;
+    rr(barX, barY, Math.max(2, barW*frac), barH, 4); ctx.fill();
+    ctx.strokeStyle = COL.border; ctx.lineWidth=1; rr(barX, barY, barW, barH, 4); ctx.stroke();
+    const landedKB = Math.round(totalKB()*frac);
+    label(landedKB + ' / ' + totalKB() + ' KB landed', barX+barW+10, barY+11, COL.mute, '11px monospace');
+    // animated mover dot on the engine lane when active
+    if (engineActive && frac>0 && frac<1){
+      const dotX = barX + barW*frac;
+      ctx.fillStyle = isTMA ? COL.accent : COL.bad;
+      ctx.beginPath(); ctx.arc(dotX, barY+barH/2, 5, 0, Math.PI*2); ctx.fill();
+    }
+
+    // ---- 3. SMEM stage + consumer (tensor core) ----
+    // SMEM fill mirrors the byte fraction
+    box(laneX, sCY-26, 250, 56, COL.panel, COL.amber, 1.5);
+    label('SMEM stage', laneX+14, sCY-7, COL.text, '12px monospace');
+    const cellN = 12, cellW = 16, cellGap = 3;
+    const filled = Math.round(cellN*frac);
+    for (let i=0;i<cellN;i++){
+      const cx = laneX+14 + i*(cellW+cellGap);
+      ctx.fillStyle = i<filled ? COL.amber : COL.track;
+      rr(cx, sCY+6, cellW, 16, 2); ctx.fill();
+      ctx.strokeStyle = COL.border; ctx.lineWidth=1; ctx.stroke();
+    }
+
+    // mbarrier (TMA only) between SMEM and consumer
+    const mbX = laneX+250+24;
+    if (isTMA){
+      const flipped = s.bit === 1;
+      box(mbX, sCY-26, 150, 56, flipped ? 'rgba(22,163,74,0.12)' : 'rgba(37,99,235,0.06)',
+          flipped ? COL.ok : COL.accent, 2);
+      label('mbarrier', mbX+12, sCY-7, COL.text, '11px monospace');
+      label('phase bit: ' + s.bit, mbX+12, sCY+12, flipped?COL.ok:COL.accent, '12px monospace');
+      label(flipped ? 'FLIPPED ✓' : 'waiting…', mbX+12, sCY+27, flipped?COL.ok:COL.mute, '10px monospace');
+    } else {
+      box(mbX, sCY-26, 150, 56, COL.panel, COL.dim, 1.25);
+      label('__syncthreads()', mbX+10, sCY-7, COL.text, '11px monospace');
+      label('thread-only', mbX+10, sCY+12, COL.mute, '10px monospace');
+      label('no byte count', mbX+10, sCY+27, COL.dim, '10px monospace');
+    }
+
+    // consumer / tensor core
+    const tcX = mbX+150+24, tcW = W-24-tcX;
+    const tcBusy = s.tc === 'BUSY';
+    box(tcX, sCY-26, Math.max(120,tcW), 56, tcBusy ? 'rgba(22,163,74,0.14)' : COL.track,
+        tcBusy ? COL.ok : COL.dim, tcBusy ? 2.5 : 1.25);
+    label('TENSOR CORE', tcX+12, sCY-7, COL.text, '12px monospace');
+    label(tcBusy ? 'BUSY (reading tile)' : 'IDLE (starved)',
+          tcX+12, sCY+14, tcBusy?COL.ok:COL.bad, '11px monospace');
+
+    // ---- arrows between the three lanes ----
+    // thread → mover (issue)
+    arrow(laneX+125, tCY+26, laneX+laneW/2, eCY-26, isTMA?COL.accent:COL.bad, isTMA?[5,4]:[]);
+    label(isTMA?'issue (async)':'drives copy', laneX+laneW/2-30, (tCY+eCY)/2, isTMA?COL.accent:COL.bad, '10px monospace');
+    // mover → SMEM (bytes land)
+    arrow(laneX+laneW/2, eCY+26, laneX+125, sCY-26, COL.amber, [5,4]);
+    // SMEM → consumer (only meaningful once ready)
+    const ready = tcBusy;
+    arrow(laneX+250+ (isTMA?150+24:150+24) , sCY+2, tcX, sCY+2, ready?COL.ok:COL.dim, ready?[]:[3,3]);
+
+    // ---- caption note ----
+    label('▸ ' + s.note, 16, H-14, COL.mute, '11px monospace');
+
+    // ── KPIs ──
+    els.phase.textContent = s.ph;
+    const pending = isTMA ? (totalKB() - landedKB) : '—';
+    els.pending.textContent = isTMA ? (pending + ' KB') : 'n/a (thread copy)';
+    els.bit.textContent = isTMA ? s.bit : '—';
+    els.tc.textContent = tcBusy ? 'BUSY' : 'IDLE';
+    els.tc.style.color = tcBusy ? COL.ok : COL.bad;
+  }
+
+  function advance(){
+    const S = steps();
+    if (step < S.length - 1){ step++; render(); return true; }
+    return false;
+  }
+  function tick(ts){
+    if (!playing) return;
+    if (!lastTs) lastTs = ts;
+    if (ts - lastTs > 750){
+      const more = advance();
+      lastTs = ts;
+      if (!more){ playing = false; els.play.textContent='▶ play'; return; }
+    }
+    requestAnimationFrame(tick);
+  }
+
+  els.play.addEventListener('click', ()=>{
+    const S = steps();
+    if (step >= S.length-1) step = 0;
+    playing = !playing;
+    els.play.textContent = playing ? '❚❚ pause' : '▶ play';
+    if (playing){ lastTs=0; requestAnimationFrame(tick); }
+  });
+  els.step.addEventListener('click', ()=>{ playing=false; els.play.textContent='▶ play'; advance(); });
+  els.reset.addEventListener('click', ()=>{ step=0; playing=false; els.play.textContent='▶ play'; render(); });
+  els.mode.addEventListener('change', ()=>{ step=0; playing=false; els.play.textContent='▶ play'; render(); });
+  els.bytes.addEventListener('input', render);
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

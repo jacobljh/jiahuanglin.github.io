@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>01 · What makes a kernel fast now</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">modern_gpu / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">01 · fast now</span>
+    <span class="step-pill">lesson 2 / 15</span>
+  </div>
+</header>
+
+<main>
+
+<p class="kicker">Part I · Why the classic model breaks</p>
+<h1>What makes a kernel fast <em>now</em></h1>
+<p class="subtitle">Lesson 00 said the tensor core is starving. This lesson makes "fed vs starved" a number you can compute, and replaces the old lever — "add more warps to hide latency" — with the two that actually feed a Blackwell tensor core: the roofline and explicit async overlap.</p>
+
+<div class="forced">
+  <div class="label">The bottleneck we inherited</div>
+  Lesson 00 left us with a tensor core that idles inside a textbook synchronous tiled GEMM — the math finishes, then everyone waits at <code>__syncthreads()</code> for the next tile to arrive. The obvious fix from the <a href="../../gpu_kernels/index.html"><code>gpu_kernels</code></a> era was <strong>occupancy</strong>: launch more warps so that while one warp stalls on memory, another has work ready. On a B200 that lever is broken — and we need to know <em>why</em> before we can pick a real one.
+</div>
+
+<h2>First: turn "fed vs starved" into a number</h2>
+
+<p>You can't optimize what you can't measure. The roofline model is the measurement. It answers one question for a given kernel: <strong>what is the highest FLOP/s this kernel could possibly attain on this GPU</strong>, given how much data it has to move? The bound is a single inequality:</p>
+
+<p class="math block">attainable FLOP/s &le; min( peak FLOP/s, &nbsp; bandwidth × arithmetic intensity )</p>
+
+<p>Two terms compete inside the <code>min</code>, and each is a "roof" you cannot punch through:</p>
+
+<ul>
+  <li><strong>The compute roof</strong> — a flat ceiling at the hardware's <em>peak FLOP/s</em>. No kernel goes faster than the silicon can multiply-add.</li>
+  <li><strong>The memory roof</strong> — a sloped ceiling, <span class="math">bandwidth × AI</span>. If you only move bytes at <span class="math">BW</span> and each byte buys you <span class="math">AI</span> FLOPs, that product caps your FLOP/s. Double the bytes per useful FLOP and this roof drops by half.</li>
+</ul>
+
+<p>The lever is <strong>arithmetic intensity</strong> (AI): useful FLOPs done per byte moved.</p>
+
+<p class="math block">AI = useful FLOPs / bytes moved &nbsp; [FLOP/byte]</p>
+
+<p>Plot attainable FLOP/s (y) against AI (x) on log–log axes and you get the classic shape: the sloped memory roof rises with AI until it hits the flat compute roof. They cross at the <strong>ridge point</strong>:</p>
+
+<p class="math block">AI<sub>ridge</sub> = peak FLOP/s / bandwidth</p>
+
+<p>Left of the ridge, the memory roof is lower — you are <strong>memory-bound</strong> (starved): bytes arrive too slowly to keep the math busy. Right of the ridge, the compute roof is lower — you are <strong>compute-bound</strong> (fed): the math is the bottleneck, which is exactly where a tensor-core kernel wants to live.</p>
+
+<div class="callout source-note">
+  <div class="label">One subtlety — name the memory level</div>
+  A roofline is meaningless until you say <em>which</em> memory the bandwidth refers to. The same kernel has an HBM roofline, an L2 roofline, and an SMEM roofline, each with a different <span class="math">BW</span> and therefore a different ridge. Bytes counted are bytes crossing <em>that</em> boundary. Unless stated otherwise, "the roofline" means the <strong>HBM</strong> one — that is the boundary fusion and blocking fight to avoid crossing.
+</div>
+
+<h2>The B200 ridge: ≈250 FLOP/byte</h2>
+
+<p>Put the numbers in. A B200 sustains roughly <strong>2 PFLOP/s</strong> of fp16 tensor-core throughput, fed by roughly <strong>8 TB/s</strong> of HBM3e. The HBM ridge is their ratio:</p>
+
+<p class="math block">AI<sub>ridge</sub> = 2×10¹⁵ FLOP/s ÷ 8×10¹² B/s &approx; <strong>250 FLOP/byte</strong></p>
+
+<p>So the bar is brutally high. To be compute-bound on a B200, a kernel must do <strong>~250 useful FLOPs for every byte it reads from HBM</strong>. Anything less and the sloped roof — not the tensor core — sets the speed. (All three numbers are vendor-class approximations; the exact peak depends on clocks, the exact ridge on your HBM SKU. The point is the order of magnitude: hundreds of FLOPs per byte, not tens.)</p>
+
+<h2>Arithmetic intensity by workload — who is starved?</h2>
+
+<p>Now classify the operations in a transformer block by where they fall relative to that ridge.</p>
+
+<h3>Elementwise and reductions: memory-bound by nature</h3>
+
+<p>A <strong>GELU</strong> reads a big activation tensor, does a handful of FLOPs per element, and writes it back. Read one element, write one element, do a few FLOPs on it — an arithmetic intensity of order one FLOP per byte. <strong>RMSNorm</strong> is a reduction: read the row, sum of squares, scale, write — again a few FLOPs per element over two tensor traversals. Both sit at AI of order <em>one</em>, hundreds of times below the ridge. They are pinned to the far left of the roofline; the tensor core is irrelevant to them. <strong>These ops are memory-bound no matter how you write them</strong> — their job is just to move bytes, so the only win is to move fewer of them.</p>
+
+<h3>GEMM: compute-bound at the sizes that matter</h3>
+
+<p>A square fp16 matmul with <span class="math">M = N = K = N</span> does <span class="math">N³</span> multiply-adds = <span class="math">2N³</span> FLOPs, and (in the naive accounting) touches three <span class="math">N × N</span> matrices at 2 bytes each. So:</p>
+
+<p class="math block">AI = 2N³ / (3 · N² · 2) = <strong>N / 3</strong> &nbsp; FLOP/byte</p>
+
+<p>The numerator <span class="math">2N³</span> is <span class="math">N³</span> multiply-adds × 2 FLOPs each; the denominator is 3 matrices × <span class="math">N²</span> elements × 2 bytes. AI grows <em>linearly</em> with N. At <span class="math">N = 4096</span>:</p>
+
+<p class="math block">AI &approx; 4096 / 3 &approx; <strong>1365 FLOP/byte</strong> &nbsp;≫&nbsp; 250</p>
+
+<p>That is more than 5× past the ridge — GEMM at this size is deeply compute-bound. The algorithm <em>permits</em> living against the compute roof. Which sets up the single most important sentence in this lesson:</p>
+
+<div class="callout warn">
+  <div class="label">The trap</div>
+  <strong>A naive GEMM can still be slow even though GEMM has high arithmetic intensity.</strong> The roofline is an upper bound on what the <em>algorithm</em> allows — it says the tensor cores <em>could</em> run flat-out. It says nothing about whether your <em>implementation</em> actually keeps them busy. A synchronous kernel that stalls the math waiting for each tile leaves the tensor cores idle and lands far below the roof it was entitled to. High AI is permission, not a guarantee.
+</div>
+
+<h3>Attention: the score-matrix trap</h3>
+
+<p>Attention is the cautionary middle case. The matmuls inside it (<span class="math">QKᵀ</span> and <span class="math">P·V</span>) are high-AI like any GEMM. The problem is the <strong>score matrix</strong> in between: a naive implementation writes the full <span class="math">N × N</span> scores out to HBM, reads them back to softmax, writes again, reads again for the value matmul. That round-trip moves an enormous intermediate across the HBM boundary for almost no extra FLOPs — it drags attention's <em>effective</em> AI down to memory-bound territory even though its matmuls are not. (FlashAttention's whole reason to exist is to keep that score matrix on-chip and never round-trip it — a later lesson.)</p>
+
+<h2>Two responses, depending on which roof you hit</h2>
+
+<p>The roofline doesn't just diagnose; it tells you which knob to turn. There are exactly two situations, and they call for opposite work.</p>
+
+<h3>If you're memory-bound (left of ridge): two ways out</h3>
+
+<p><strong>(A) Raise AI</strong> — slide right, toward the compute roof. More FLOPs per byte:</p>
+<ul>
+  <li><strong>Fusion</strong> — the highest-leverage move. If an intermediate (the GELU output, the attention scores) is produced and immediately consumed, don't round-trip it through HBM — keep it in registers / SMEM / TMEM and fuse the producer and consumer into one kernel. You kill the bytes entirely, so AI can jump by an order of magnitude. This is why <code>matmul + bias + GELU</code> fused beats three separate kernels.</li>
+  <li><strong>Blocking for reuse</strong> — load a tile of an operand into SMEM <em>once</em> and use it for many output elements. Each byte read from HBM now serves many FLOPs instead of one, so AI rises. This is the entire point of tiled GEMM.</li>
+  <li><strong>Smaller dtype</strong> — fp32 → fp16 → fp8 → fp4 halves the bytes per element (and doubles the tensor-core FLOP rate) at each step, lifting both AI and the compute roof. <em>Honest caveat:</em> the real speedup is always less than the raw 2×, because low precision drags along scale factors, block metadata, and conversion work that the clean ratio ignores.</li>
+</ul>
+
+<p><strong>(B) Saturate the memory roof</strong> — if AI genuinely can't rise (a pure copy, a normalization), then accept memory-bound and get as close to the sloped roof as possible. Move each byte exactly once; eliminate redundant reads; coalesce and vectorize so every transaction is full-width; use a hardware copy engine (TMA) for regular bulk tiles; and keep enough requests in flight that the HBM channels never sit idle.</p>
+
+<h3>If you're compute-bound (right of ridge): keep the math units busy</h3>
+
+<p>Bytes are no longer the constraint — issue is. The job becomes scheduling: make sure a tensor-core instruction is always ready to fire, with its operands already on-chip, so the math pipe never bubbles. That is the rest of this track. And it starts with a scheduling idea that the occupancy mindset gets backwards.</p>
+
+<h2>Latency hiding: overlap, not occupancy</h2>
+
+<p>Every kernel that streams tiles has the same dependency chain per step: <em>load</em> a tile from HBM, <em>compute</em> on it, <em>store</em> the result. Written the obvious way, those happen in series:</p>
+
+<pre><code>// naive synchronous schedule — one engine works at a time
+for k in 0..K:
+    load(k)        // HBM busy, tensor core IDLE
+    compute(k)     // tensor core busy, copy engine IDLE
+    store(k)       // store path busy, the rest IDLE</code></pre>
+
+<p>At every moment exactly one hardware path is doing useful work and the others stall. The tensor core spends most of the loop waiting for <code>load(k)</code>. That is the idle we measured on the roofline.</p>
+
+<p>The fix is to <strong>software-pipeline</strong>: while the tensor core chews on tile <code>k</code>, the copy engine is already fetching tile <code>k+1</code>, and the store path is draining tile <code>k−1</code>. Same dependencies — you still can't compute a tile before it lands — but they're scheduled so different tiles occupy different engines at the same instant:</p>
+
+<pre><code>// pipelined schedule — engines run concurrently on different tiles
+load(0)                         // prologue: prime the pipe
+for k in 0..K:
+    load(k+1)     // copy engine fetches NEXT tile ...
+    compute(k)    // ... while tensor core computes THIS tile
+    store(k-1)    // ... while the store path drains the LAST tile</code></pre>
+
+<div class="callout">
+  <div class="label">The principle</div>
+  <strong>The point is not to remove dependencies — it's to schedule around them.</strong> The load for tile <code>k+1</code> runs <em>while the MMA for tile <code>k</code> is in flight</em>. The dependency (compute needs its tile loaded first) is untouched; what changed is that the long-latency load is overlapped with independent compute instead of blocking it.
+</div>
+
+<h2>Why occupancy stopped being the answer</h2>
+
+<p>Here is the crux of the lesson. The classic way to hide that load latency was <strong>occupancy</strong> — pack many warps onto each SM so the warp scheduler always has <em>some</em> warp whose operands are ready while others stall. That worked when a "compute step" was a few CUDA-core FMAs and you needed dozens of warps in flight to paper over memory latency.</p>
+
+<p>But occupancy is capped by physical resources — registers, SMEM, warp slots, and CTA slots per SM — and a modern tensor-core kernel <em>deliberately spends all of them</em> on a small number of CTAs:</p>
+
+<ul>
+  <li><strong>Multi-stage SMEM pipelines</strong> eat SMEM — you stage several tiles ahead, so each CTA's SMEM footprint balloons and fewer CTAs fit.</li>
+  <li><strong>Big register fragments</strong> (and large accumulators) eat registers — fewer warps fit per SM.</li>
+  <li><strong>TMEM</strong> (Blackwell's dedicated accumulator memory) eats tensor-memory, another scarce per-SM resource.</li>
+  <li><strong>Warp specialization</strong> reserves whole warps for a single role (a producer warp that only issues copies, a consumer warp that only issues MMAs) — capacity spent on coordination, not on more parallel copies of the same work.</li>
+</ul>
+
+<p>So these kernels run at <em>low</em> occupancy on purpose. They don't hide latency by having a spare warp ready — they hide it by <strong>explicit overlap</strong> inside a few resident CTAs: a copy engine, the tensor core, and the store path all working at once on different tiles. The hardware paths stay busy not because there are many warps, but because the one resident CTA keeps every engine fed.</p>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  <strong>The right question is not whether occupancy is high — it's whether the active hardware units are kept busy.</strong> Estimate a kernel's arithmetic intensity, locate it against the HBM ridge (≈250 FLOP/byte on a B200), and decide: memory-bound (raise AI via fusion/blocking/smaller dtype, or saturate the bandwidth roof) or compute-bound (schedule so the tensor core never bubbles). Then optimize the resource that actually sets the ceiling — not the one a decade-old rule of thumb tells you to.
+</div>
+
+<h2>Interactive · the B200 roofline calculator</h2>
+
+<p>Pick a square matmul size <span class="math">N</span> and a dtype. The widget computes the time to do <span class="math">2N³</span> FLOPs at that dtype's tensor-core peak (<code>t_compute</code>) versus the time to move the three <span class="math">N × N</span> matrices across HBM at 8 TB/s (<code>t_HBM</code>), reports the arithmetic intensity against the ≈250 FLOP/byte ridge, and draws both as bars — the kernel's wall-clock is whichever bar is <em>longer</em>. Slide N down to watch a compute-bound GEMM tip over into memory-bound; switch fp16 → fp8 to watch the compute roof drop and the crossover move.</p>
+
+<div class="widget" id="rl-widget">
+  <div class="title">B200 roofline · compute-bound vs memory-bound for a square matmul</div>
+  <div class="hint">Tensor-core peak (t_compute) is the FLOP-bound time; HBM at ≈8 TB/s (t_HBM) is the byte-bound time. The kernel takes the larger. Ridge ≈ peak ÷ BW; a workload is compute-bound when its AI sits to the right of the ridge.</div>
+
+  <div class="controls">
+    <label class="inline">N (square matmul): <input type="range" id="rl-n" min="128" max="16384" step="128" value="4096"> <span class="val" id="rl-n-v">4096</span></label>
+    <label class="inline">dtype:
+      <select id="rl-dt">
+        <option value="fp32">fp32 — CUDA cores only (~67 TF)</option>
+        <option value="fp16" selected>fp16 — B200 tensor core (~2000 TF)</option>
+        <option value="fp8">fp8 — B200 tensor core (~4000 TF)</option>
+      </select>
+    </label>
+  </div>
+
+  <canvas id="rl-canvas" width="760" height="250" style="width:100%; height:250px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">compute time</div><div class="v" id="rl-ct">—</div></div>
+    <div class="kpi"><div class="k">HBM time</div><div class="v" id="rl-mt">—</div></div>
+    <div class="kpi"><div class="k">bottleneck</div><div class="v" id="rl-bn" style="font-size:14px;">—</div></div>
+    <div class="kpi"><div class="k">arithmetic intensity</div><div class="v" id="rl-ai">—</div></div>
+    <div class="kpi"><div class="k">ridge (peak ÷ BW)</div><div class="v" id="rl-rg">—</div></div>
+    <div class="kpi"><div class="k">attained / peak</div><div class="v" id="rl-ut">—</div></div>
+  </div>
+</div>
+
+<p>Notice what the calculator makes concrete. At fp16, the crossover N (where the bars are equal) is small — only a couple hundred — so any real matmul is compute-bound, and the only way to go faster is to keep the tensor core busy. Drop to fp8 and the compute roof doubles: the same N is now <em>more</em> compute-bound, the crossover pushes higher, and the AI-vs-ridge gap widens because the ridge itself moved (peak doubled, bandwidth didn't). And at fp32 — CUDA cores only, no tensor core — the "peak" is ~30× lower, so even huge matmuls struggle to be impressively fast: that is the throughput the whole async paradigm exists to leave behind.</p>
+
+<h2>The six async mechanisms this track will build</h2>
+
+<p>Explicit overlap needs hardware that can run independent work on independent paths and coordinate them without thread-level barriers. The Hopper/Blackwell stack provides exactly six pieces, and the rest of Part II derives each one as a forced move. A preview, so you can see where we're going:</p>
+
+<table>
+  <thead><tr><th>Mechanism</th><th>What it does</th><th>Path it keeps busy</th></tr></thead>
+  <tbody>
+    <tr><td><strong>TMA</strong></td><td>hardware copy engine: GMEM → SMEM bulk tiles, no math threads involved</td><td>the copy path</td></tr>
+    <tr><td><strong>mbarriers</strong></td><td>async barriers that signal completion and hand work between roles</td><td>coordination</td></tr>
+    <tr><td><strong>tcgen05</strong></td><td>async tensor-core MMA issued by one elected thread</td><td>the math path</td></tr>
+    <tr><td><strong>TMEM</strong></td><td>dedicated memory for long-lived accumulators (off the register file)</td><td>accumulator storage</td></tr>
+    <tr><td><strong>warp specialization</strong></td><td>split the SM into producer (memory) and consumer (math) warps</td><td>both paths, concurrently</td></tr>
+    <tr><td><strong>clusters</strong></td><td>pool several SMs into bigger cooperative tiles + operand multicast</td><td>cross-SM reuse</td></tr>
+  </tbody>
+</table>
+
+<p>Six different mechanisms, one scheduling goal: <strong>keep useful work running on more than one hardware path at once.</strong> Every one of them is a way to make the pipelined schedule above real instead of aspirational — and every one of them costs occupancy, which is exactly why we had to retire occupancy as the thing we maximize.</p>
+
+<div class="callout">
+  <div class="label">Where this connects</div>
+  The classic single-level roofline — and the SIMT cost model it lives in — is laid out in <a href="../../gpu_kernels/10_kernel_first_principles.html"><code>gpu_kernels/10 · GPU as a bandwidth machine</code></a>; this lesson is that model upgraded for a tensor core fast enough that occupancy no longer feeds it. The roofline reasoning here is the same lens used to budget an entire training run end-to-end in <a href="../../cs336/lessons/index.html"><code>cs336 · Language Modeling from Scratch</code></a>, where "is this op memory- or compute-bound?" decides what to fuse, what to shard, and what precision to train in.
+</div>
+
+<p>So the workflow is fixed: <strong>estimate AI → locate the roof → decide memory- vs compute-bound → optimize the resource that actually sets the ceiling.</strong> But notice what both responses quietly assumed. Fusion keeps an intermediate "in registers / SMEM / TMEM"; overlap fires an MMA "with its operands already on-chip." Both depend on getting the <em>right bytes into the right place in a tensor-core-readable form</em> — and a tensor core does not accept bytes in any old arrangement. Before we can fuse or overlap anything, we need the rules for <em>where</em> bytes live and <em>how</em> they're shaped: a layout algebra.</p>
+
+<footer class="lesson-nav">
+  <a href="00_feeding_the_tensor_core.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">00 · Feeding the tensor core</span>
+  </a>
+  <a class="next" href="02_data_layout.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">02 · Data layout and its algebra</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+/* ─── Widget: B200 roofline calculator ─── */
+(function(){
+  const get = id => document.getElementById(id);
+  const els = {
+    n: get('rl-n'), nv: get('rl-n-v'),
+    dt: get('rl-dt'),
+    canvas: get('rl-canvas'),
+    ct: get('rl-ct'), mt: get('rl-mt'),
+    bn: get('rl-bn'), ai: get('rl-ai'),
+    rg: get('rl-rg'), ut: get('rl-ut'),
+  };
+  const ctx = els.canvas.getContext('2d');
+
+  // B200-class numbers. fp32 = CUDA-core path (no tensor core); fp16/fp8 = tensor core.
+  const DT = {
+    fp32: { bytes: 4,   peak: 67e12   },  // ~67 TFLOP/s CUDA cores
+    fp16: { bytes: 2,   peak: 2.0e15  },  // ~2 PFLOP/s tensor core
+    fp8:  { bytes: 1,   peak: 4.0e15  },  // ~4 PFLOP/s tensor core
+  };
+  const HBM = 8.0e12; // ~8 TB/s HBM3e
+
+  function compute(){
+    const N = parseInt(els.n.value);
+    const dt = els.dt.value;
+    const info = DT[dt];
+    els.nv.textContent = N;
+
+    const flops = 2 * N * N * N;                 // 2N^3 FLOPs
+    const bytes = 3 * N * N * info.bytes;         // 3 matrices (A, B, output)
+    const t_compute = flops / info.peak;
+    const t_mem = bytes / HBM;
+    const ai = flops / bytes;                     // = N / (3 * bytesPerElem/2) ... reduces to N/3 only at fp16
+    const ridge = info.peak / HBM;                // FLOP/byte
+    const wall = Math.max(t_compute, t_mem);
+    const computeBound = t_compute >= t_mem;
+    // attained / peak: if memory-bound, the math pipe only reaches t_compute/t_mem of peak.
+    const attainedFrac = computeBound ? 1 : (t_compute / t_mem);
+
+    els.ct.textContent = (t_compute * 1e3).toFixed(3) + ' ms';
+    els.mt.textContent = (t_mem * 1e3).toFixed(3) + ' ms';
+    els.bn.textContent = computeBound ? 'compute-bound' : 'memory-bound';
+    els.bn.style.color = computeBound ? 'var(--ok)' : 'var(--bad)';
+    els.ai.textContent = ai.toFixed(1) + ' F/B';
+    els.rg.textContent = ridge.toFixed(0) + ' F/B';
+    els.ut.textContent = (attainedFrac * 100).toFixed(0) + ' %';
+    return { t_compute, t_mem, wall, computeBound };
+  }
+
+  function render(){
+    const r = compute();
+    const dpr = window.devicePixelRatio || 1;
+    const W = els.canvas.clientWidth, H = els.canvas.clientHeight;
+    if (els.canvas.width !== Math.round(W*dpr)){
+      els.canvas.width = Math.round(W*dpr); els.canvas.height = Math.round(H*dpr);
+    }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 150, padR = 90, padT = 34, padB = 22;
+    const innerW = W - padL - padR;
+    const max = Math.max(r.t_compute, r.t_mem) * 1.12 || 1;
+
+    const rows = [
+      { name:'tensor core (t_compute)', v: r.t_compute, bound: r.computeBound,  c: '#16a34a' },
+      { name:'HBM @ 8 TB/s (t_HBM)',    v: r.t_mem,     bound: !r.computeBound, c: '#dc2626' },
+    ];
+    const rowH = 46;
+    const gap = 26;
+
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    ctx.fillText('the longer bar is the kernel’s wall-clock — that path is the bottleneck', padL, padT - 12);
+
+    rows.forEach((row, i) => {
+      const y = padT + i*(rowH + gap);
+      // label
+      ctx.fillStyle = '#1f2430'; ctx.font = '12px monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText(row.name, 6, y + rowH/2 + 4);
+      // track
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(padL, y, innerW, rowH);
+      ctx.strokeStyle = '#dde2ea'; ctx.lineWidth = 1;
+      ctx.strokeRect(padL+0.5, y+0.5, innerW, rowH);
+      // bar
+      const w = Math.max(2, (row.v / max) * innerW);
+      ctx.globalAlpha = row.bound ? 1 : 0.42;
+      ctx.fillStyle = row.c;
+      ctx.fillRect(padL, y, w, rowH);
+      ctx.globalAlpha = 1;
+      // value + winner tag
+      ctx.fillStyle = '#1f2430'; ctx.font = '12px monospace';
+      const ms = (row.v * 1e3).toFixed(3) + ' ms';
+      ctx.fillText(ms, padL + w + 8, y + rowH/2 + 4);
+      if (row.bound){
+        ctx.fillStyle = row.c; ctx.font = 'bold 11px monospace';
+        ctx.fillText('◄ bottleneck', padL + 8, y + rowH/2 + 4);
+      }
+    });
+
+    // footer summary line
+    const fy = padT + 2*(rowH + gap) + 2;
+    ctx.fillStyle = r.computeBound ? '#16a34a' : '#dc2626';
+    ctx.font = 'bold 12px monospace';
+    ctx.fillText(
+      r.computeBound ? 'compute-bound — feed the tensor core (overlap, do not bubble the math)'
+                     : 'memory-bound — raise AI (fuse / block / smaller dtype) or saturate HBM',
+      padL, fy + 10);
+    ctx.textAlign = 'left';
+  }
+
+  ['input','change'].forEach(ev=>{
+    [els.n, els.dt].forEach(el=>el.addEventListener(ev, render));
+  });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>

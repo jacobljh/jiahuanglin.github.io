@@ -1,0 +1,705 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>07 · clusters & CLC</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local: the two-topic split (cooperation vs distribution) and the steal-loop list */
+  .topic-split {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0,1fr));
+    gap: 12px;
+    margin: 18px 0;
+  }
+  .topic-split > div {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-elev);
+    padding: 12px 15px;
+  }
+  .topic-split .t-coop { border-left: 4px solid var(--accent-2); }
+  .topic-split .t-clc  { border-left: 4px solid #7c3aed; }
+  .topic-split h4 { margin: 0 0 6px; font-family: var(--mono); font-size: 12.5px; }
+  .topic-split .t-coop h4 { color: var(--accent-2); }
+  .topic-split .t-clc  h4 { color: #7c3aed; }
+  .topic-split p { margin: 0; color: var(--text-mute); font-size: 13.5px; line-height: 1.5; }
+  /* numbered steal-loop: each step a small ordinal pill */
+  .steal-loop { counter-reset: sl; list-style: none; padding: 0; margin: 16px 0; display: grid; gap: 8px; }
+  .steal-loop li {
+    counter-increment: sl;
+    position: relative;
+    padding: 10px 14px 10px 46px;
+    border: 1px solid var(--border);
+    border-left: 3px solid #7c3aed;
+    border-radius: 4px 8px 8px 4px;
+    background: var(--bg-elev);
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  .steal-loop li::before {
+    content: counter(sl);
+    position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
+    width: 22px; height: 22px; line-height: 22px; text-align: center;
+    font-family: var(--mono); font-size: 12px; font-weight: 600;
+    color: #fff; background: #7c3aed; border-radius: 50%;
+  }
+  .steal-loop li.exit { border-left-color: var(--bad); }
+  .steal-loop li.exit::before { background: var(--bad); }
+  @media (max-width: 820px){ .topic-split { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">modern_gpu / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">07 · clusters &amp; CLC</span>
+    <span class="step-pill">lesson 8 / 15</span>
+  </div>
+</header>
+
+<main>
+
+<p class="kicker">Part II · the five hardware primitives</p>
+<h1>Clusters, distributed shared memory &amp; cluster launch control</h1>
+<p class="subtitle">mbarriers let the engines inside <em>one</em> CTA coordinate. But one SM is too small to be the whole story: its shared memory can't stage a big-enough tile, neighboring CTAs reload the same operands, and a fixed schedule leaves SMs idle at the end. The fix is to make CTAs <strong>cooperate across SMs</strong> and to hand out work <strong>dynamically</strong>. This is the last primitive before we build a real GEMM.</p>
+
+<div class="forced">
+  <div class="label">Forced move — two bottlenecks from lesson 06</div>
+  Lesson 06's mbarriers solved coordination <em>within</em> a single CTA: TMA → MMA → epilogue, all on one SM, all phase-tracked. Two walls remain, and they are about <em>scale</em>, not timing.
+  <strong>(1) One CTA's SMEM is too small.</strong> A bigger output tile needs bigger A/B staging buffers than one SM's shared memory holds — and worse, every CTA computing an output tile in the same row reloads the <em>same</em> A operand from HBM, and every CTA in the same column reloads the same B. That redundant traffic is wasted bandwidth on a machine where bandwidth is the whole problem.
+  <strong>(2) A static schedule has a tail.</strong> A persistent kernel pins one CTA per SM and walks a precomputed list of tiles. When tiles cost unequal amounts of work — or simply don't divide evenly across the SM count — some SMs run out of tiles and sit idle while the slowest ones finish. That idle stretch is the <em>tail</em>.
+  The forced move is two mechanisms: <strong>clusters + distributed shared memory + multicast</strong> to make several SMs share one operand load, and <strong>cluster launch control</strong> to redistribute work at runtime so nobody idles.
+</div>
+
+<p>These two are genuinely separate ideas that happen to ride on the same hardware unit (the cluster). Keep them apart as you read:</p>
+
+<div class="topic-split">
+  <div class="t-coop">
+    <h4>① Cluster cooperation — spatial</h4>
+    <p>Several CTAs are co-scheduled close together and can read each other's shared memory. One operand load now feeds <em>more</em> math. This raises arithmetic intensity. It is about <strong>where data lives</strong>.</p>
+  </div>
+  <div class="t-clc">
+    <h4>② Cluster launch control — temporal</h4>
+    <p>A cluster that finishes its tile asks the hardware for another pending tile instead of idling. This kills the tail. It is about <strong>when work is handed out</strong> — and it reuses lesson 06's barrier-and-phase model verbatim.</p>
+  </div>
+</div>
+
+<h2>Thread-block clusters — the new scheduling unit</h2>
+
+<p>Through the whole track so far, the CTA (thread block) was the largest thing the hardware co-schedules: its threads share one SM and one shared-memory allocation, and that is the boundary. A <strong>thread-block cluster</strong> (introduced on Hopper, <code>sm_90</code>; extended on Blackwell) widens that boundary. A cluster is a small group of CTAs that the hardware guarantees are <strong>co-resident</strong> — launched together, possibly on <em>different</em> SMs within the same GPC, and able to <strong>synchronize</strong> and <strong>read/write each other's shared memory</strong>.</p>
+
+<p>The cluster becomes the unit of launch. You declare its dimensions at launch time:</p>
+
+<pre><code>// host: cluster dims travel as a launch attribute, not a kernel arg
+cudaLaunchConfig_t cfg = {};
+cfg.gridDim  = grid;            // grid is now measured in CLUSTERS
+cfg.blockDim = block;
+cudaLaunchAttribute attr[1];
+attr[0].id = cudaLaunchAttributeClusterDimension;
+attr[0].val.clusterDim = { /*x*/ 2, /*y*/ 1, /*z*/ 1 };   // a 2-CTA cluster
+cfg.attrs = attr; cfg.numAttrs = 1;
+cudaLaunchKernelEx(&amp;cfg, kernel, /*args…*/);</code></pre>
+
+<p>Inside the kernel, the cluster gets its own barrier — the analogue of <code>__syncthreads()</code> but across all CTAs in the cluster:</p>
+
+<pre><code>// CUTLASS / CuTe surface
+cluster.sync();                 // wait for every CTA in the cluster
+
+// lowers to a split arrive/wait, like an mbarrier:
+barrier.cluster.arrive;         // this CTA has reached the cluster barrier
+barrier.cluster.wait;           // block until all CTAs in the cluster have arrived</code></pre>
+
+<p>The split <code>arrive</code>/<code>wait</code> shape is deliberate: it is the same producer/consumer rhythm as an mbarrier, lifted from "threads in a CTA" to "CTAs in a cluster." Everything else in this lesson builds on that one capability — <em>CTAs in a cluster can see each other</em>.</p>
+
+<h2>Distributed shared memory — naming a neighbor's SMEM</h2>
+
+<p>Co-residence alone is not useful unless a CTA can actually <em>address</em> a peer's shared memory. That is <strong>distributed shared memory (DSMEM)</strong>: within a cluster, a thread can name a location in another CTA's SMEM and move bytes into it directly — no detour through global memory.</p>
+
+<p>The mapping is one instruction. Given a local SMEM address and the rank (id) of a peer CTA in the cluster, it returns the address of that <em>same</em> SMEM slot as seen in the peer:</p>
+
+<pre><code>// PTX: map a shared-memory address into a peer CTA's window
+mapa.shared::cluster.u32   %peer_addr, %local_addr, %peer_cta_rank;
+
+// the course's DSL spells the same thing:
+//     map_shared_rank(buffer, cta_id)  →  the address of `buffer` inside CTA `cta_id`</code></pre>
+
+<p>Combine that remote address with the TMA bulk-copy engine from lesson 04 and you can stage a tile from HBM straight into a <em>peer's</em> SMEM, raising a completion barrier <em>in that peer</em> when the bytes land. The payoff is the headline of bottleneck (1): a tile staged once can be made visible to several CTAs without a global round trip. SMEM stops being a per-SM island and becomes a small shared pool across the cluster — which is exactly what we need to build an output tile larger than one SM could hold.</p>
+
+<div class="callout source-note">
+  <div class="label">From the course (mapped to hardware)</div>
+  The MLC course's DSL exposes DSMEM as <code>map_shared_rank(buffer, cta_id)</code>; on real hardware that is <code>mapa.shared::cluster</code>, and the bulk copy into a peer is the same <code>cp.async.bulk.tensor</code> TMA path from lesson 04 with the destination address living in another CTA. Treat the DSL name as the concept and the PTX as the contract.
+</div>
+
+<h2>Two CTAs, one MMA — <code>cta_group::2</code></h2>
+
+<p>Lesson 03 showed that <code>tcgen05.mma</code> takes a <code>cta_group::1</code> / <code>cta_group::2</code> modifier and left the second case as a promissory note. Here it pays off. In a 2-CTA cooperative MMA, two CTAs in a cluster each contribute their SMEM operands to a <em>single, larger</em> tensor-core tile:</p>
+
+<ul>
+  <li><strong>A is split by M rows.</strong> CTA-0 holds rows 0–127, CTA-1 holds rows 128–255 — logically the stacked operand <span class="math">[A0 ; A1]</span>. Neither CTA holds the whole A.</li>
+  <li><strong>B is shared across the pair via DSMEM.</strong> One copy of the B slice is staged and made visible to both CTAs through the peer-SMEM mapping.</li>
+  <li><strong>The pair produces one 256×256 output tile</strong>, with each CTA owning <em>its half</em> of the accumulator in its own TMEM.</li>
+  <li><strong>Only CTA-0's elected lane issues the MMA.</strong> The hardware then drives the math across <em>both</em> SMs. The even CTA (CTA-0) commits the pair's completion barrier — one signal for the whole cooperative op.</li>
+</ul>
+
+<p>Why this is the move that matters: each CTA's B slice is now multiplied against the <em>other</em> CTA's A slice as well as its own. The same loaded B bytes feed twice as much math — <strong>B's per-FLOP load halves, so its arithmetic intensity roughly doubles</strong>. (A is split across the pair either way, so the <em>total</em> tile AI rises by a smaller factor; the win is on the operand we were forced to keep re-reading.) On a machine whose roofline ridge sits near 250 FLOP/byte (lesson 00), pushing AI up is pushing the kernel toward the compute roof — and lesson 10 stacks a second consumer on top to halve B's load again.</p>
+
+<div class="math block" style="text-align:center;">
+2 CTAs × (one B slice reused against both A halves) → 256×256 tile per load of B → B-operand AI ≈ 2×
+</div>
+
+<h2>TMA multicast — one load, many CTAs</h2>
+
+<p>Cooperation handles a <em>pair</em> sharing B. Bottleneck (1) had a wider form: in a tiled GEMM, <em>every</em> CTA computing a tile in the same grid row needs the same A operand, and every CTA in a column needs the same B. Issuing one TMA load per CTA reloads identical bytes from HBM many times over.</p>
+
+<p><strong>TMA multicast</strong> collapses that. A single load issued by the TMA engine delivers the same GMEM tile to <em>several</em> CTAs at once, selected by a bitmask of cluster ranks:</p>
+
+<pre><code>// one bulk-tensor load, broadcast to the CTAs named in the mask
+cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes \
+        .multicast::cluster                          \
+        [dst_smem], [tensor_map, {x, y}], [mbar], ctaMask;
+//                                                  ^^^^^^^  e.g. 0b11 = CTAs 0 and 1
+// CUTLASS names this copy atom: SM90_TMA_LOAD_MULTICAST</code></pre>
+
+<p>The redundant global traffic — N copies of the same row operand — becomes one. Completion is still signalled the lesson-06 way: an mbarrier with an <code>expect_tx</code> byte budget in each receiving CTA. Multicast doesn't change <em>how</em> a load completes; it changes <em>how many times the bytes cross the HBM bus</em>. That is the second bandwidth win, and it is why the GEMM tile scheduler (lesson 09) deliberately groups tiles that share operands.</p>
+
+<div class="widget" id="coop-widget">
+  <div class="title">2-CTA cooperation · B reused once vs reloaded twice</div>
+  <div class="hint">Toggle between two isolated 128×128 CTAs (each reloads its own copy of B) and one cooperative 2-CTA pair (B staged once via DSMEM, reused against both A halves → one 256×256 tile). The bars track HBM bytes moved and arithmetic intensity.</div>
+
+  <div class="controls">
+    <label class="inline">mode:
+      <select id="coop-mode">
+        <option value="iso">isolated · two 128×128 CTAs</option>
+        <option value="coop" selected>cooperative · one 256×256 pair (cta_group::2)</option>
+      </select>
+    </label>
+    <label class="inline">K (contraction depth): <input type="range" id="coop-k" min="64" max="4096" step="64" value="2048"> <span class="val" id="coop-k-v">2048</span></label>
+  </div>
+
+  <canvas id="coop-canvas" width="760" height="320" style="width:100%; height:320px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">B loads from HBM</div><div class="v" id="coop-bl">—</div></div>
+    <div class="kpi"><div class="k">bytes moved (A+B)</div><div class="v" id="coop-bytes">—</div></div>
+    <div class="kpi"><div class="k">FLOPs (same work)</div><div class="v" id="coop-flops">—</div></div>
+    <div class="kpi"><div class="k">arithmetic intensity</div><div class="v" id="coop-ai">—</div></div>
+  </div>
+</div>
+
+<h2>The second wall: the static schedule's tail</h2>
+
+<p>Now the temporal problem. The whole GEMM ladder (lessons 08–10) rides on the <strong>persistent-kernel</strong> pattern: instead of launching one CTA per output tile, you launch a fixed pool of CTAs sized to the machine — roughly the SM count — and each one loops over many tiles, keeping operands hot in L2 and amortizing launch cost over the whole problem. The classic version computes "my next tile" from a formula:</p>
+
+<pre><code>// static persistent schedule (the thing CLC replaces)
+for (int tile = blockIdx_in_pool; tile &lt; num_tiles; tile += pool_size) {
+    compute_tile(tile);            // next tile = a fixed stride. decided BEFORE any work runs.
+}</code></pre>
+
+<p>This is correct and it is fast — until the tiles cost different amounts. In a causal-attention problem, or any GEMM where <code>num_tiles</code> isn't a clean multiple of the pool size, the per-SM tile counts come out uneven. The SMs that drew cheap or few tiles finish early and idle; wall-clock is set by the unluckiest SM. That idle stretch at the end is the <strong>tail</strong>, and a static schedule cannot fix it, because the assignment was frozen before the kernel knew how long anything would take.</p>
+
+<h2>Cluster launch control — hardware work-stealing</h2>
+
+<p><strong>Cluster launch control (CLC)</strong> is the Blackwell mechanism that lets a <em>resident</em> cluster ask the hardware for another tile <em>at runtime</em>. Instead of computing "my next tile = formula," a cluster that is about to run dry issues a request to claim a not-yet-launched cluster's work. If the grid still has pending clusters, the request succeeds and hands back a coordinate; the early-finishing cluster picks up that work instead of idling. It is work-stealing, arbitrated in hardware.</p>
+
+<p>Crucially, CLC speaks the <em>exact same async protocol</em> as TMA from lesson 06 — an async request whose completion is reported through an mbarrier, with a phase bit you track. Three instructions do the work:</p>
+
+<pre><code>// 1) fire an ASYNC request to cancel-and-claim a pending cluster's launch.
+//    the 16-byte response lands in SMEM; completion is signalled on an mbarrier
+//    (the SAME barrier-and-phase model as a TMA load — see lesson 06).
+clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes \
+        [response_smem], [mbar];
+
+// 2) did the steal succeed? returns a predicate.
+clusterlaunchcontrol.query_cancel.is_canceled.pred.b128   %got, response;
+
+// 3) if it did, decode the stolen cluster's CTA id → a coordinate (x,y,z).
+//    VALID ONLY when is_canceled is true.
+clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128  {%x,%y,%z,%w}, response;</code></pre>
+
+<p>Note what the response is: a 16-byte record written to shared memory, and an mbarrier arrival that flips a phase exactly like a completed TMA load. You already know how to wait on this — it is lesson 06's machinery, reused. CLC didn't invent a new synchronization model; it plugged work-distribution into the one we already have.</p>
+
+<h3>The work-stealing loop — "ask first, then compute"</h3>
+
+<p>The loop has a specific shape, and the ordering is the whole point. You issue the request for the <em>next</em> tile <strong>before</strong> you compute the <em>current</em> one, so the scheduler's round-trip overlaps with useful math instead of stalling at the end:</p>
+
+<ol class="steal-loop">
+  <li><strong>Issue <code>try_cancel</code> for a possible next tile</strong> — fired off <em>before</em> the current tile's math begins, so the request is in flight while the tensor core works.</li>
+  <li><strong>Compute the current tile</strong> while the request travels to the scheduler and back.</li>
+  <li><strong>Wait on the response mbarrier</strong> — same <code>try_wait</code> + phase toggle as a TMA completion (lesson 06).</li>
+  <li><strong>Query <code>is_canceled</code></strong> — did we successfully steal a pending cluster's work?</li>
+  <li class="exit"><strong>Branch on the predicate.</strong> If <em>true</em>: decode <code>get_first_ctaid</code> → (x, y, z) → that becomes the next output tile; loop back to step 1. If <em>false</em>: there is no more work — <strong>exit</strong>.</li>
+</ol>
+
+<p>Two things to nail down, because both are easy to get wrong:</p>
+<ul>
+  <li><strong>There is no sentinel tile id.</strong> The loop does not look for a magic "−1" or "out of range" coordinate. It ends purely on the <code>is_canceled</code> predicate coming back <em>false</em>. The coordinate from <code>get_first_ctaid</code> is meaningful <em>only</em> when the predicate was true — reading it otherwise is garbage.</li>
+  <li><strong>Ask-then-compute is the overlap.</strong> If you computed first and asked afterward, the scheduler latency would land in series and reopen a (smaller) tail. Issuing the request first hides that latency behind the current tile's math — the same "issue the async op, then do work, then wait" pattern TMA taught us.</li>
+</ul>
+
+<p>The result: a cluster that finishes early doesn't wait for a static stride to grant it more work — it pulls the next pending cluster coordinate the instant it's free. The tail collapses toward the cost of a single tile, and all SMs finish close together.</p>
+
+<div class="widget" id="clc-widget">
+  <div class="title">CLC work-stealing vs the static tail</div>
+  <div class="hint">A grid of unevenly-costed tiles handed to a few SMs. <em>Static</em>: each SM is pre-assigned a fixed stride of tiles — late-finishing SMs leave others idle (the tail). <em>CLC</em>: an SM that runs dry steals the next pending tile, so all SMs finish together. The canvas computes the idle time and the tail.</div>
+
+  <div class="controls">
+    <label class="inline">mode:
+      <select id="clc-mode">
+        <option value="static">static schedule (fixed stride)</option>
+        <option value="clc" selected>CLC (hardware work-stealing)</option>
+      </select>
+    </label>
+    <label class="inline">SMs: <input type="range" id="clc-sm" min="2" max="6" step="1" value="4"> <span class="val" id="clc-sm-v">4</span></label>
+    <label class="inline">tiles: <input type="range" id="clc-t" min="7" max="40" step="1" value="19"> <span class="val" id="clc-t-v">19</span></label>
+    <label class="inline">cost spread: <input type="range" id="clc-var" min="0" max="100" step="5" value="70"> <span class="val" id="clc-var-v">70%</span></label>
+    <button id="clc-play">▶ run</button>
+  </div>
+
+  <canvas id="clc-canvas" width="760" height="340" style="width:100%; height:340px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">makespan (wall-clock)</div><div class="v" id="clc-make">—</div></div>
+    <div class="kpi"><div class="k">total idle (SM·time)</div><div class="v" id="clc-idle">—</div></div>
+    <div class="kpi"><div class="k">tail (last finisher − first)</div><div class="v" id="clc-tail">—</div></div>
+    <div class="kpi"><div class="k">SM utilization</div><div class="v" id="clc-util">—</div></div>
+  </div>
+</div>
+
+<h2>Where these plug into the GEMM</h2>
+
+<p>Both halves of this lesson are bottlenecks we deliberately <em>planted</em> for the ladder ahead, and both get spent there:</p>
+
+<ul>
+  <li><strong>CLC rides the persistent kernel.</strong> Lesson 09 builds the persistent kernel and its tile scheduler with the static "next tile = formula" step; CLC is the drop-in upgrade that replaces that formula with "ask the hardware," killing the tail.</li>
+  <li><strong>The 2-CTA cluster is a GEMM step of its own.</strong> Lesson 10 turns the single-CTA warp-specialized kernel into a <code>cta_group::2</code> pair with DSMEM + multicast — the 256×256-tile, AI-doubling step that pushes the kernel to the compute roof.</li>
+</ul>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  A single SM is too small twice over, and the cluster fixes both. <strong>Spatially</strong>, co-scheduled CTAs share shared memory through <strong>DSMEM</strong> (<code>mapa.shared::cluster</code>), so a <code>cta_group::2</code> pair builds one 256×256 tile from a B operand staged once — and <strong>TMA multicast</strong> broadcasts a shared row/column operand to many CTAs in a single load. Both moves <em>reuse loaded bytes</em>, so arithmetic intensity rises toward the roofline ridge. <strong>Temporally</strong>, <strong>cluster launch control</strong> lets an early-finishing cluster steal the next pending tile via an async <code>try_cancel</code> request whose completion is reported on an mbarrier — the lesson-06 protocol again — running an "ask first, then compute" loop that ends on a <em>false predicate</em>, not a sentinel. Clusters pool the hardware; CLC keeps it all busy to the last cycle.
+</div>
+
+<div class="callout">
+  <div class="label">Where this connects</div>
+  CLC is built on the same <strong>barrier-and-phase model</strong> as <a href="06_mbarriers.html">lesson 06 · mbarriers</a> — the <code>try_cancel</code> response is just another mbarrier completion with a phase to track. The persistent kernel and its tile scheduler that CLC upgrades are built in <a href="09_gemm_pipelined.html">lesson 09 · GEMM II (pipelining &amp; the persistent kernel)</a>, and the <code>cta_group::2</code> cooperative step with DSMEM + multicast is the cluster step of <a href="10_gemm_warp_specialized.html">lesson 10 · GEMM III (warp specialization &amp; clusters)</a>.
+  <br><br>
+  <strong>We now have all five primitives — the tensor-core generations, TMA, TMEM, mbarriers, and clusters (each expressed in the layout algebra of lesson 02). Time to stop describing parts and assemble them into a real kernel, starting from the smallest correct GEMM and growing it one forced step at a time.</strong> That is <a href="08_gemm_tiled.html">lesson 08 · GEMM I: the tiled baseline</a>.
+</div>
+
+<footer class="lesson-nav">
+  <a href="06_mbarriers.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">06 · mbarriers and the phase model</span>
+  </a>
+  <a class="next" href="08_gemm_tiled.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">08 · GEMM I: the tiled baseline</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+/* ─── Widget 1: 2-CTA cooperation · B reuse vs reload ─── */
+(function(){
+  const C = document.getElementById('coop-canvas');
+  if (!C) return;
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    mode:$('coop-mode'), k:$('coop-k'), kv:$('coop-k-v'),
+    bl:$('coop-bl'), bytes:$('coop-bytes'), flops:$('coop-flops'), ai:$('coop-ai'),
+  };
+
+  const COL = {
+    a:'#2563eb', b:'#d97706', c:'#16a34a', mute:'#5b6573', dim:'#94a3b8',
+    text:'#1f2430', border:'#dde2ea', panel:'#ffffff', accent2:'#d97706'
+  };
+
+  // Geometry of the worked tile. fp16 operands = 2 bytes.
+  // Each CTA owns 128 rows of A and produces a 128-col band of C.
+  // The cooperative pair makes a 256x256 tile; B (256 cols x K) is shared.
+  const BPE = 2;   // bytes/element (fp16)
+
+  function rr(x,y,w,h,r){
+    ctx.beginPath();
+    ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+    ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+  }
+  function fmtB(n){
+    if (n >= 1e9) return (n/1e9).toFixed(2)+' GB';
+    if (n >= 1e6) return (n/1e6).toFixed(1)+' MB';
+    if (n >= 1e3) return (n/1e3).toFixed(1)+' KB';
+    return n.toFixed(0)+' B';
+  }
+  function fmtF(n){
+    if (n >= 1e12) return (n/1e12).toFixed(2)+' TFLOP';
+    if (n >= 1e9)  return (n/1e9).toFixed(1)+' GFLOP';
+    if (n >= 1e6)  return (n/1e6).toFixed(1)+' MFLOP';
+    return n.toFixed(0);
+  }
+
+  function compute(){
+    const K = +els.k.value;
+    const coop = els.mode.value === 'coop';
+    // The SAME output work in both modes: a 256x256 output region.
+    const M = 256, N = 256;
+    const flops = 2 * M * N * K;
+    // A: always loaded once per row-band it's used in (256 rows total either way).
+    const aBytes = M * K * BPE;
+    // B: 256 cols x K. Cooperative loads it ONCE; isolated reloads it once PER CTA (twice).
+    const bLoads = coop ? 1 : 2;
+    const bBytes = bLoads * (N * K * BPE);
+    const bytes = aBytes + bBytes;
+    const ai = flops / bytes;
+    return { K, coop, M, N, flops, aBytes, bBytes, bLoads, bytes, ai };
+  }
+
+  function render(){
+    const r = compute();
+    els.kv.textContent = r.K;
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    // ── left: schematic of the two CTAs, A halves, shared/duplicated B, output tile ──
+    const ox = 24, oy = 56;
+    ctx.fillStyle = COL.mute; ctx.font = '11px monospace'; ctx.textAlign='left';
+    ctx.fillText(r.coop ? 'cta_group::2 — one 256×256 tile, B shared via DSMEM'
+                        : 'isolated — two 128×128 CTAs, B loaded by each',
+                 ox, 28);
+
+    const cell = 26;
+    // A0 / A1 column (M split by rows)
+    const aX = ox, aY = oy;
+    ctx.fillStyle = COL.text; ctx.font='10px monospace';
+    ctx.fillText('A (M rows)', aX, aY-8);
+    // A0
+    ctx.fillStyle = COL.a; ctx.globalAlpha=0.9;
+    rr(aX, aY, cell, cell, 4); ctx.fill();
+    ctx.globalAlpha=0.55;
+    rr(aX, aY+cell+6, cell, cell, 4); ctx.fill();   // A1
+    ctx.globalAlpha=1;
+    ctx.fillStyle='#fff'; ctx.font='10px monospace'; ctx.textAlign='center';
+    ctx.fillText('A0', aX+cell/2, aY+cell/2+3);
+    ctx.fillText('A1', aX+cell/2, aY+cell+6+cell/2+3);
+    ctx.textAlign='left';
+    ctx.fillStyle=COL.dim; ctx.font='9px monospace';
+    ctx.fillText('rows 0–127', aX+cell+6, aY+cell/2+3);
+    ctx.fillText('rows 128–255', aX+cell+6, aY+cell+6+cell/2+3);
+
+    // B box(es)
+    const bX = ox, bY = aY + 2*cell + 30;
+    ctx.fillStyle = COL.text; ctx.font='10px monospace';
+    ctx.fillText('B (N cols × K)', bX, bY-8);
+    if (r.coop){
+      ctx.fillStyle = COL.b; ctx.globalAlpha=0.9;
+      rr(bX, bY, cell*2+6, cell, 4); ctx.fill(); ctx.globalAlpha=1;
+      ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.font='10px monospace';
+      ctx.fillText('B ×1', bX+(cell*2+6)/2, bY+cell/2+3);
+      ctx.textAlign='left';
+      ctx.fillStyle=COL.c; ctx.font='9px monospace';
+      ctx.fillText('staged once → both CTAs (DSMEM)', bX+cell*2+14, bY+cell/2+3);
+    } else {
+      ctx.fillStyle = COL.b; ctx.globalAlpha=0.9;
+      rr(bX, bY, cell, cell, 4); ctx.fill();
+      rr(bX+cell+6, bY, cell, cell, 4); ctx.fill(); ctx.globalAlpha=1;
+      ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.font='10px monospace';
+      ctx.fillText('B', bX+cell/2, bY+cell/2+3);
+      ctx.fillText('B', bX+cell+6+cell/2, bY+cell/2+3);
+      ctx.textAlign='left';
+      ctx.fillStyle=COL.bad||'#dc2626'; ctx.fillStyle='#dc2626'; ctx.font='9px monospace';
+      ctx.fillText('loaded twice (redundant HBM)', bX+cell*2+14, bY+cell/2+3);
+    }
+
+    // output tile (C)
+    const cX = ox + 2*cell + 220, cYc = oy + 6;
+    const csz = r.coop ? cell*3 : cell*1.5;
+    ctx.fillStyle = COL.text; ctx.font='10px monospace';
+    ctx.fillText('C output', cX, cYc-8);
+    if (r.coop){
+      ctx.fillStyle = COL.c; ctx.globalAlpha=0.85;
+      rr(cX, cYc, csz, csz, 6); ctx.fill(); ctx.globalAlpha=1;
+      // split line: each CTA owns its TMEM half
+      ctx.strokeStyle='#fff'; ctx.lineWidth=1.5;
+      ctx.beginPath(); ctx.moveTo(cX, cYc+csz/2); ctx.lineTo(cX+csz, cYc+csz/2); ctx.stroke();
+      ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.font='10px monospace';
+      ctx.fillText('256×256', cX+csz/2, cYc+csz/2-6);
+      ctx.fillStyle='rgba(255,255,255,0.85)'; ctx.font='9px monospace';
+      ctx.fillText('CTA0 TMEM', cX+csz/2, cYc+csz/4+3);
+      ctx.fillText('CTA1 TMEM', cX+csz/2, cYc+3*csz/4+3);
+      ctx.textAlign='left';
+    } else {
+      ctx.fillStyle = COL.c; ctx.globalAlpha=0.85;
+      rr(cX, cYc, csz, csz, 6); ctx.fill();
+      rr(cX, cYc+csz+10, csz, csz, 6); ctx.fill(); ctx.globalAlpha=1;
+      ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.font='9px monospace';
+      ctx.fillText('128×128', cX+csz/2, cYc+csz/2+3);
+      ctx.fillText('128×128', cX+csz/2, cYc+csz+10+csz/2+3);
+      ctx.textAlign='left';
+    }
+
+    // ── right: two comparison bars (bytes & AI) ──
+    const barX = W*0.62, barTop = 60, barW = W - barX - 30, rowH = 30, gap = 64;
+    ctx.fillStyle = COL.mute; ctx.font='11px monospace'; ctx.textAlign='left';
+
+    // reference maxima (isolated mode = worst case) so the bar shrinks when cooperative
+    const refBytes = (256*r.K*BPE) + 2*(256*r.K*BPE);   // isolated A+B
+    const refAI    = (2*256*256*r.K) / refBytes;
+    const coopAI   = (2*256*256*r.K) / ((256*r.K*BPE) + (256*r.K*BPE));
+
+    // bytes bar (lower is better)
+    ctx.fillStyle = COL.text; ctx.font='11px monospace';
+    ctx.fillText('HBM bytes moved', barX, barTop-6);
+    const bw = (r.bytes / refBytes) * barW;
+    ctx.fillStyle = '#eef1f5'; rr(barX, barTop, barW, rowH, 5); ctx.fill();
+    ctx.fillStyle = r.coop ? COL.c : '#dc2626';
+    rr(barX, barTop, Math.max(4, bw), rowH, 5); ctx.fill();
+    ctx.fillStyle = COL.text; ctx.font='11px monospace';
+    ctx.fillText(fmtB(r.bytes), barX+8, barTop+rowH/2+4);
+
+    // AI bar (higher is better) — scale so cooperative fills ~full width
+    ctx.fillStyle = COL.text;
+    ctx.fillText('arithmetic intensity (FLOP/byte)', barX, barTop+gap-6);
+    const aw = (r.ai / coopAI) * barW;
+    ctx.fillStyle = '#eef1f5'; rr(barX, barTop+gap, barW, rowH, 5); ctx.fill();
+    ctx.fillStyle = r.coop ? COL.c : COL.accent2;
+    rr(barX, barTop+gap, Math.max(4, aw), rowH, 5); ctx.fill();
+    ctx.fillStyle = COL.text; ctx.font='11px monospace';
+    ctx.fillText(r.ai.toFixed(0)+' F/B', barX+8, barTop+gap+rowH/2+4);
+
+    // delta annotation
+    ctx.fillStyle = COL.mute; ctx.font='10.5px monospace';
+    const aiGain = (coopAI/refAI);
+    ctx.fillText(r.coop ? ('↑ B loaded 1× not 2× → B per-FLOP load halves; total AI ×'+aiGain.toFixed(2))
+                        : ('B reloaded by each CTA → AI capped at '+refAI.toFixed(0)+' F/B'),
+                 barX, barTop+gap+rowH+22);
+    ctx.fillText('the B operand alone reuses ×2; A is shared either way', barX, barTop+gap+rowH+38);
+    ctx.fillText('ridge ≈ 250 F/B (B200 roofline, lesson 00)', barX, barTop+gap+rowH+54);
+
+    // KPIs
+    els.bl.textContent    = r.bLoads + (r.bLoads===1 ? ' (shared)' : ' (redundant)');
+    els.bytes.textContent = fmtB(r.bytes);
+    els.flops.textContent = fmtF(r.flops);
+    els.ai.textContent    = r.ai.toFixed(0) + ' F/B';
+  }
+
+  ['change','input'].forEach(ev=>{
+    els.mode.addEventListener(ev, render);
+    els.k.addEventListener(ev, render);
+  });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+<script>
+/* ─── Widget 2: CLC work-stealing vs static tail ─── */
+(function(){
+  const C = document.getElementById('clc-canvas');
+  if (!C) return;
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    mode:$('clc-mode'), sm:$('clc-sm'), smv:$('clc-sm-v'),
+    t:$('clc-t'), tv:$('clc-t-v'), vr:$('clc-var'), vrv:$('clc-var-v'),
+    play:$('clc-play'),
+    make:$('clc-make'), idle:$('clc-idle'), tail:$('clc-tail'), util:$('clc-util'),
+  };
+
+  const COL = {
+    sm:['#2563eb','#d97706','#16a34a','#7c3aed','#dc2626','#0891b2'],
+    mute:'#5b6573', dim:'#94a3b8', text:'#1f2430', border:'#dde2ea',
+    idle:'#e2e8f0', panel:'#ffffff'
+  };
+
+  let anim = 0, playing = false, rafId = null;
+
+  // Deterministic per-tile cost from a seeded LCG so the picture is stable.
+  function tileCosts(n, spread){
+    const out = [];
+    let s = 0x9e3779b9 >>> 0;
+    for (let i=0;i<n;i++){
+      s = (s * 1664525 + 1013904223) >>> 0;
+      const u = (s >>> 8) / (1<<24);         // 0..1
+      // base 1.0, modulated by spread; spread 0 → all equal, 1 → 0.25..1.75
+      const cost = 1 + (u - 0.5) * 2 * spread * 0.75;
+      out.push(Math.max(0.25, cost));
+    }
+    return out;
+  }
+
+  // Assign tiles to SMs and produce per-SM ordered (tileIdx, start, end) segments.
+  function schedule(){
+    const nSM = +els.sm.value;
+    const nT  = +els.t.value;
+    const spread = (+els.vr.value)/100;
+    const mode = els.mode.value;
+    const costs = tileCosts(nT, spread);
+
+    const sms = Array.from({length:nSM}, ()=>({ t:0, segs:[] }));
+
+    if (mode === 'static'){
+      // fixed stride: SM j gets tiles j, j+nSM, j+2nSM, …  (decided up front)
+      for (let i=0;i<nT;i++){
+        const j = i % nSM;
+        const start = sms[j].t, dur = costs[i], end = start + dur;
+        sms[j].segs.push({ tile:i, start, end, dur });
+        sms[j].t = end;
+      }
+    } else {
+      // CLC work-stealing: greedily hand the next pending tile to whichever SM is free first.
+      // (models "ask first": an SM that finishes pulls the next coordinate immediately.)
+      let next = 0;
+      // prime: every SM grabs one
+      for (let j=0;j<nSM && next<nT;j++){
+        const dur = costs[next], end = sms[j].t + dur;
+        sms[j].segs.push({ tile:next, start:sms[j].t, end, dur }); sms[j].t = end; next++;
+      }
+      while (next < nT){
+        // earliest-free SM steals the next tile
+        let j = 0; for (let k=1;k<nSM;k++) if (sms[k].t < sms[j].t) j = k;
+        const dur = costs[next], end = sms[j].t + dur;
+        sms[j].segs.push({ tile:next, start:sms[j].t, end, dur }); sms[j].t = end; next++;
+      }
+    }
+
+    const finishes = sms.map(s=>s.t);
+    const makespan = Math.max(...finishes, 0.0001);
+    const firstDone = Math.min(...finishes);
+    const tail = makespan - firstDone;
+    const busy = sms.reduce((a,s)=>a + s.segs.reduce((b,g)=>b+g.dur,0), 0);
+    const idle = nSM*makespan - busy;
+    const util = busy / (nSM*makespan);
+    return { nSM, nT, mode, sms, makespan, tail, idle, util, finishes };
+  }
+
+  function render(){
+    els.smv.textContent = els.sm.value;
+    els.tv.textContent  = els.t.value;
+    els.vrv.textContent = els.vr.value + '%';
+    const S = schedule();
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 56, padR = 24, padT = 30, padB = 54;
+    const plotW = W - padL - padR;
+    const laneH = Math.min(40, (H - padT - padB) / S.nSM - 8);
+    const laneGap = 10;
+    const tScale = plotW / S.makespan;
+    const tCut = playing ? anim * S.makespan : S.makespan;   // animated sweep
+
+    ctx.fillStyle = COL.mute; ctx.font='11px monospace'; ctx.textAlign='left';
+    ctx.fillText((S.mode==='static'?'static schedule — fixed stride':'CLC — earliest-free SM steals next tile')
+                 + '   ·   '+S.nT+' tiles → '+S.nSM+' SMs', padL, 18);
+
+    // draw each SM lane
+    for (let j=0;j<S.nSM;j++){
+      const y = padT + j*(laneH+laneGap);
+      // lane background (full makespan) = potential idle
+      ctx.fillStyle = COL.idle;
+      ctx.fillRect(padL, y, plotW, laneH);
+      // lane label
+      ctx.fillStyle = COL.text; ctx.font='11px monospace'; ctx.textAlign='right';
+      ctx.fillText('SM'+j, padL-8, y+laneH/2+4);
+      ctx.textAlign='left';
+      // tiles
+      for (const g of S.sms[j].segs){
+        const x0 = padL + g.start*tScale;
+        const drawEnd = Math.min(g.end, tCut);
+        if (drawEnd <= g.start) continue;
+        const w = (drawEnd - g.start)*tScale;
+        ctx.fillStyle = COL.sm[j % COL.sm.length];
+        ctx.globalAlpha = 0.9;
+        ctx.fillRect(x0+0.5, y+0.5, Math.max(1,w-1), laneH-1);
+        ctx.globalAlpha = 1;
+        if (w > 18){
+          ctx.fillStyle = '#fff'; ctx.font='10px monospace';
+          ctx.fillText('t'+g.tile, x0+4, y+laneH/2+3);
+        }
+      }
+      // finish marker + idle hatch from finish → makespan
+      const fx = padL + S.finishes[j]*tScale;
+      if (S.finishes[j] < S.makespan - 1e-6 && tCut >= S.finishes[j]){
+        // idle region
+        ctx.fillStyle = 'rgba(220,38,38,0.10)';
+        ctx.fillRect(fx, y, (Math.min(tCut,S.makespan)-S.finishes[j])*tScale, laneH);
+        ctx.strokeStyle = 'rgba(220,38,38,0.45)'; ctx.lineWidth=1;
+        ctx.setLineDash([3,3]);
+        ctx.beginPath(); ctx.moveTo(fx, y); ctx.lineTo(fx, y+laneH); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+
+    // makespan line
+    const mx = padL + S.makespan*tScale;
+    ctx.strokeStyle = COL.text; ctx.lineWidth=1.25;
+    ctx.beginPath(); ctx.moveTo(mx, padT-4); ctx.lineTo(mx, padT + S.nSM*(laneH+laneGap) - laneGap + 4); ctx.stroke();
+    ctx.fillStyle = COL.text; ctx.font='10px monospace';
+    ctx.fillText('makespan', mx-58, padT-8);
+
+    // first-finish line (defines the tail)
+    const firstDone = Math.min(...S.finishes);
+    if (S.tail > 1e-6){
+      const fdx = padL + firstDone*tScale;
+      ctx.strokeStyle = '#16a34a'; ctx.lineWidth=1; ctx.setLineDash([4,3]);
+      ctx.beginPath(); ctx.moveTo(fdx, padT-4); ctx.lineTo(fdx, padT + S.nSM*(laneH+laneGap) - laneGap + 4); ctx.stroke();
+      ctx.setLineDash([]);
+      // tail bracket at the bottom
+      const by = padT + S.nSM*(laneH+laneGap) - laneGap + 18;
+      ctx.strokeStyle = '#dc2626'; ctx.lineWidth=1.5;
+      ctx.beginPath(); ctx.moveTo(fdx, by); ctx.lineTo(mx, by); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(fdx, by-4); ctx.lineTo(fdx, by+4); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(mx, by-4); ctx.lineTo(mx, by+4); ctx.stroke();
+      ctx.fillStyle = '#dc2626'; ctx.font='10px monospace'; ctx.textAlign='center';
+      ctx.fillText('TAIL = '+S.tail.toFixed(2), (fdx+mx)/2, by-6);
+      ctx.textAlign='left';
+    } else {
+      const by = padT + S.nSM*(laneH+laneGap) - laneGap + 18;
+      ctx.fillStyle = '#16a34a'; ctx.font='10px monospace';
+      ctx.fillText('✓ all SMs finish together — no tail', padL, by);
+    }
+
+    // KPIs
+    els.make.textContent = S.makespan.toFixed(2) + ' u';
+    els.idle.textContent = S.idle.toFixed(2) + ' u';
+    els.tail.textContent = S.tail.toFixed(2) + ' u';
+    els.util.textContent = (S.util*100).toFixed(0) + ' %';
+  }
+
+  function tick(){
+    if (!playing) return;
+    anim += 0.02;
+    if (anim >= 1){ anim = 1; playing = false; els.play.textContent='▶ run'; render(); return; }
+    render();
+    rafId = requestAnimationFrame(tick);
+  }
+
+  els.play.addEventListener('click', ()=>{
+    if (playing){ playing=false; els.play.textContent='▶ run'; if (rafId) cancelAnimationFrame(rafId); return; }
+    anim = 0; playing = true; els.play.textContent='❚❚ pause';
+    rafId = requestAnimationFrame(tick);
+  });
+  ['change','input'].forEach(ev=>{
+    [els.mode, els.sm, els.t, els.vr].forEach(el=>el.addEventListener(ev, ()=>{ playing=false; els.play.textContent='▶ run'; anim=1; render(); }));
+  });
+  window.addEventListener('resize', render);
+  anim = 1; render();
+})();
+</script>
+
+</body>
+</html>

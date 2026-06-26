@@ -1,0 +1,541 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>09 · GEMM pipelined</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local: the three-step ladder banner, the ring-buffer chips, and a
+     small "asymmetry" two-column split. Shared classes are NOT redefined. */
+  .steps3 { counter-reset: st; list-style: none; padding: 0; margin: 16px 0; display: grid; gap: 8px; }
+  .steps3 li {
+    counter-increment: st;
+    position: relative;
+    padding: 11px 14px 11px 48px;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 4px 8px 8px 4px;
+    background: var(--bg-elev);
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  .steps3 li::before {
+    content: "Step " counter(st, decimal);
+    position: absolute; left: -2px; top: -1px;
+    /* fall back to a simple ordinal pill */
+  }
+  /* simpler: number the steps 4/5/6 explicitly in markup; use a plain ordinal pill */
+  .steps3 li { padding-left: 14px; }
+  .steps3 li::before { content: none; }
+  .steps3 li .sn {
+    display: inline-block; min-width: 64px;
+    font-family: var(--mono); font-size: 11px; font-weight: 600;
+    color: #fff; background: var(--accent); border-radius: 999px;
+    text-align: center; padding: 2px 8px; margin-right: 8px;
+  }
+  .steps3 li:nth-child(2) .sn { background: var(--accent-2); }
+  .steps3 li:nth-child(3) .sn { background: var(--ok); }
+
+  /* load-vs-store asymmetry split */
+  .asym { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; margin: 18px 0; }
+  .asym > div { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 12px 15px; }
+  .asym .a-load  { border-left: 4px solid var(--accent); }
+  .asym .a-store { border-left: 4px solid var(--accent-2); }
+  .asym h4 { margin: 0 0 6px; font-family: var(--mono); font-size: 12.5px; }
+  .asym .a-load h4  { color: var(--accent); }
+  .asym .a-store h4 { color: var(--accent-2); }
+  .asym p { margin: 0; color: var(--text-mute); font-size: 13.5px; line-height: 1.5; }
+
+  /* a tiny phase-flip rule grid (2 rows) */
+  .flip-rule { display: grid; gap: 8px; margin: 16px 0; }
+  .flip-rule .row {
+    display: grid; grid-template-columns: 170px minmax(0,1fr); gap: 12px; align-items: center;
+    border: 1px solid var(--border); border-left: 4px solid var(--border);
+    border-radius: 8px; background: var(--bg-elev); padding: 10px 14px;
+  }
+  .flip-rule .row.mma { border-left-color: var(--ok); }
+  .flip-rule .row.tma { border-left-color: var(--accent); }
+  .flip-rule .row .which { font-family: var(--mono); font-size: 12px; font-weight: 600; }
+  .flip-rule .row.mma .which { color: var(--ok); }
+  .flip-rule .row.tma .which { color: var(--accent); }
+  .flip-rule .row .rule { color: var(--text-mute); font-size: 13.5px; line-height: 1.45; }
+
+  @media (max-width: 820px){
+    .asym { grid-template-columns: 1fr; }
+    .flip-rule .row { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">modern_gpu / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">09 · GEMM pipelined</span>
+    <span class="step-pill">lesson 10 / 15</span>
+  </div>
+</header>
+
+<main>
+
+<p class="kicker">Part III · GEMM from tiled to SOTA</p>
+<h1>GEMM II — pipelining with TMA</h1>
+<p class="subtitle">Lesson 08's tiled GEMM is <em>correct</em>: right tiles, right layouts, right math, fp32 accumulate. It is also slow — and slow in a way that has nothing to do with the math. The whole kernel takes turns. Threads copy a tile, the tensor core chews it, threads copy the next, the tensor core waits. Two engines that could run side by side instead stand in a line, each stalling on the one before it. This lesson closes that gap without touching the data path: same tiles, same layouts, same instructions. What changes is <strong>when</strong> the work happens and <strong>by whom</strong>.</p>
+
+<div class="forced">
+  <div class="label">Forced move — the tiled baseline leaves the tensor core idle</div>
+  Lesson 08 built the smallest correct GEMM and proved the thesis <em>"every step changes how a hop happens, never the hops"</em> — the path is always <span class="math">GMEM → SMEM → TMEM → reg → GMEM</span>. But Step 3 left the tensor core idle for most of the clock. The synchronous loop is a relay: <strong>load a tile</strong> (all threads copy GMEM→SMEM, then <code>cta_sync</code>), <strong>compute</strong> (the elected thread issues the MMA), <strong>wait</strong>, <strong>load the next</strong>, <strong>wait</strong>. Each stage stalls on the one before it. Yet loading the next tile and computing the current one touch <em>entirely separate hardware</em> — the copy path and the tensor core never contend. The relay is pure self-imposed serialization.
+  <br><br>
+  Closing the gap needs <strong>no new data path</strong>. The forced move is three steps that change scheduling only: <strong>Step 4</strong> hands the bulk GMEM↔SMEM transfers to <a href="04_tma.html">TMA</a> so the math threads never touch the load; <strong>Step 5</strong> adds a software pipeline so the <em>next</em> tile has somewhere to land while the current one computes; <strong>Step 6</strong> reshapes the launch into a persistent kernel so a fixed pool of CTAs amortizes setup and keeps operands hot in L2.
+</div>
+
+<ol class="steps3">
+  <li><span class="sn">Step 4</span> <strong>TMA async load.</strong> Replace the all-threads copy with one engine-driven bulk transfer; track its completion with an mbarrier and a byte count instead of <code>cta_sync</code>.</li>
+  <li><span class="sn">Step 5</span> <strong>Software pipeline.</strong> Double-buffer SMEM (<code>PIPE_DEPTH=2</code>) so the load for tile <em>k+depth</em> can be in flight while the MMA for tile <em>k</em> runs. One barrier per stage; phase flips follow slot count.</li>
+  <li><span class="sn">Step 6</span> <strong>Persistent kernel.</strong> Launch one CTA per SM and loop over many tiles, with a tile scheduler that groups operand-sharing tiles to keep them hot in L2 — paying off lesson 08's reuse debt.</li>
+</ol>
+
+<p class="callout source-note" style="display:block;">
+  <span class="label" style="display:block;font-size:11px;font-family:var(--mono);text-transform:uppercase;letter-spacing:.08em;color:var(--accent-2);margin-bottom:4px;">From the course (mapped to the real toolchain)</span>
+  The step kernels below are written as <strong>pseudocode</strong> in the MLC course's tile DSL and mapped to the production stack as we go. Step 4 swaps Ampere <code>cp.async</code> / <code>LDGSTS</code> for <code>cp.async.bulk.tensor</code> (TMA). Step 5 is the CUTLASS multi-stage pipeline <code>PipelineTmaAsync</code> with <code>Stages = 2</code> (production uses 3–8 to hide more latency). Step 6 is the CUTLASS persistent kernel with <code>PersistentTileSchedulerSm90</code> / <code>Sm100</code> and a raster/threadblock swizzle for L2 locality. Read the DSL as the concept and the named CUTLASS/PTX as the contract.
+</p>
+
+<h2>Step 4 — hand the load to TMA</h2>
+
+<p>The tiled baseline loads a tile with every thread copying its share of GMEM into SMEM, then a <code>cta_sync()</code> so the whole CTA agrees the tile is in place before the MMA reads it. Those copy instructions are issue slots stolen from the math, and the addresses they compute are registers stolen from the accumulator. Lesson 04 gave us the way out: the <strong>TMA engine</strong> moves a whole rectangular tile on its own, off the issue path. The math threads just say "go" and walk away.</p>
+
+<p>So the load shrinks to a single thread firing two bulk-tensor copies and announcing how many bytes are coming:</p>
+
+<pre><code>// PSEUDOCODE (tile DSL) — Step 4 load, mapped to PTX in the comments
+if (tid == 0) {                                  // ONE thread issues the whole tile
+    copy_async(Asmem, A, dispatch="tma");        // → cp.async.bulk.tensor … [Asmem], [A_map, {m,k}], [tma_bar]
+    copy_async(Bsmem, B, dispatch="tma");        // → cp.async.bulk.tensor … [Bsmem], [B_map, {n,k}], [tma_bar]
+    mbarrier.arrive.expect_tx(tma_bar, byte_count);  // announce the byte budget for this round
+}
+mbarrier.try_wait(tma_bar, phase);               // block until BOTH arrival + bytes hit zero (lesson 06)
+//                  ^ → mbarrier.try_wait.parity.shared.b64
+
+byte_count = (BLK_M*BLK_K + BLK_N*BLK_K) * F16_SIZE;   // A tile + B tile, fp16 = 2 B</code></pre>
+
+<p>This is lesson 06's machinery applied to a GEMM tile: <code>arrive.expect_tx</code> records the transaction byte budget <em>and</em> counts as the issuing thread's arrival; as the TMA engine streams the tile in, complete-tx updates drive the byte count to zero; the round completes — and the phase flips — only when arrival count <em>and</em> pending bytes both reach zero. The math path waits on that one barrier, then reads SMEM.</p>
+
+<div class="callout warn">
+  <div class="label">Exam-worthy: <code>tid == 0</code>, never <code>elect_sync()</code></div>
+  The byte budget must be announced to the mbarrier <strong>exactly once</strong>. It is tempting to reach for <code>elect_sync()</code> — it picks "one thread" and reads as the idiomatic way to do single-thread work. But <code>elect_sync()</code> elects one lane <em>per warp</em>. A Hopper/Blackwell warpgroup is <strong>128 threads = 4 warps</strong>, so <code>elect_sync()</code> would elect <strong>four</strong> threads, and <code>arrive.expect_tx</code> would announce the byte count <strong>4×</strong>. The barrier would then expect four times the bytes that the TMA engine will ever deliver — the pending-byte count never reaches zero and the <code>try_wait</code> <strong>deadlocks</strong>. Using <code>tid == 0</code> picks exactly one thread across the whole warpgroup. (<code>elect_sync()</code> is the right tool when you want one issuer <em>per warp</em> — it is the wrong tool for a once-per-CTA announcement.)
+</div>
+
+<div class="callout warn">
+  <div class="label">Why <code>cta_sync()</code> no longer suffices — and the byte-count trap</div>
+  <code>cta_sync()</code> (i.e. <code>__syncthreads()</code>) waits only for the CTA's own threads to reach the line, and it orders only <em>their</em> SMEM writes. It knows <strong>nothing</strong> about an in-flight TMA transfer — the copy is happening on an engine, not on a thread, so a thread barrier cannot tell whether the bytes have landed. Completion <em>must</em> be tracked by the mbarrier plus the byte count. And that byte count has to be exact: if <code>expect_tx</code> is set <strong>too small</strong>, the byte half hits zero before the last bytes arrive, the barrier releases early, and the MMA reads an <strong>incomplete tile</strong> (silent garbage). If it is set <strong>too large</strong>, the byte half never reaches zero and the wait <strong>never releases</strong> (deadlock). The byte count is part of the contract, not a hint.
+</div>
+
+<p>What Step 4 buys, and what it does <em>not</em>: the load is now off the issue path, but the loop is still strictly serial — <strong>load → wait → MMA → wait → load …</strong>. We replaced who does the copy, not when it happens relative to the math. The tensor core still sits idle through every load. That is the wall Step 5 removes.</p>
+
+<h2>Step 5 — a software pipeline so the next tile has somewhere to land</h2>
+
+<p>To overlap a load with a compute, the next tile needs a buffer that is <em>not</em> the one the MMA is currently reading. So we <strong>double-buffer</strong> SMEM: give each operand a small ring of <code>PIPE_DEPTH</code> stages, indexed by a dimension-0 axis that is the pipeline stage.</p>
+
+<pre><code>// PSEUDOCODE — Step 5 allocation. PIPE_DEPTH = 2 (a double buffer).
+constexpr int PIPE_DEPTH = 2;
+Asmem(PIPE_DEPTH, BLK_M, BLK_K);          // dim-0 index = pipeline stage (the ring slot)
+Bsmem(PIPE_DEPTH, BLK_N, BLK_K);
+
+mbarrier  tma_bar[PIPE_DEPTH];            // ONE TMA barrier PER STAGE
+mbarrier  mma_bar;                        // ONE MMA-completion barrier (1 slot, revisited every iter)</code></pre>
+
+<p>The barrier counts are the subtle part, and they fall straight out of lesson 06's "one barrier per <em>stage</em>, not per iteration." Each ring slot gets its own TMA barrier — <code>PIPE_DEPTH</code> of them. The MMA has a single barrier because there is only ever one MMA in flight. The K-loop runs in three phases:</p>
+
+<pre><code>// PSEUDOCODE — Step 5 mainloop. phase_tma, phase_mma start at 0.
+
+// ── PROLOGUE: prime the pipe — prefetch the first PIPE_DEPTH stages ──
+for (int s = 0; s < PIPE_DEPTH; ++s)
+    if (tid == 0) tma_load(stage = s, k_tile = s);     // fire the first `depth` loads, no waiting
+
+// ── STEADY STATE ──
+for (int k = 0; k < K_TILES; ++k) {
+    int stage = k % PIPE_DEPTH;                         // which ring slot holds tile k
+
+    try_wait(tma_bar[stage], phase_tma);                // wait for THIS stage's load to land
+    mma(stage, accum = (k != 0));                       // first MMA initializes the accumulator
+    try_wait(mma_bar, phase_mma);  phase_mma ^= 1;      // 1 slot, revisited every iter → flip EVERY iter
+
+    int next_k = k + PIPE_DEPTH;                        // the tile this slot will hold next
+    if (next_k < K_TILES && tid == 0)
+        tma_load(stage, next_k);                        // refill THIS slot for its next trip
+    if (stage == PIPE_DEPTH - 1) phase_tma ^= 1;        // ring wrapped → flip the TMA phase ONCE per trip
+}
+// ── EPILOGUE: TMEM → registers → GMEM (the TMA-store path below) ──</code></pre>
+
+<p>Map to the toolchain: this is exactly CUTLASS's <code>PipelineTmaAsync</code> with <code>Stages = 2</code>. The library hides the spin loop and the phase bookkeeping behind a <code>PipelineState</code>; production code sets <code>Stages</code> to 3–8 to keep more loads in flight and hide more HBM latency. The structure — prologue prefetch, steady-state wait/compute/refill, per-stage barriers — is identical.</p>
+
+<h3>The phase-flip rule follows slot count</h3>
+
+<p>This is the one place Step 5 is easy to get wrong, and the rule is mechanical once you see it: <strong>flip a barrier's phase exactly when you come back around to a slot you have used before.</strong></p>
+
+<div class="flip-rule">
+  <div class="row mma">
+    <div class="which">mma_bar — 1 slot</div>
+    <div class="rule">There is a single MMA barrier, revisited on <em>every</em> iteration. Every iteration is a fresh round on that one slot → <strong>flip <code>phase_mma</code> every iteration</strong>.</div>
+  </div>
+  <div class="row tma">
+    <div class="which">tma_bar[ ] — PIPE_DEPTH slots</div>
+    <div class="rule">The TMA barriers form a <code>PIPE_DEPTH</code>-element array. Each stage is revisited once per trip around the ring → <strong>flip <code>phase_tma</code> only when <code>stage == PIPE_DEPTH − 1</code></strong> (the ring has wrapped and the next iteration reuses stage 0 with a new load).</div>
+  </div>
+</div>
+
+<p>And the reason each stage needs its <em>own</em> barrier, not one shared barrier: a single shared TMA barrier could not distinguish <em>"tile 0's first load completed"</em> from <em>"tile 0's second load completed"</em> — both arrive on the same object. The consumer would wait on a stale completion (exactly the phase-reuse bug from lesson 06) and read a half-refilled slot → race or deadlock. One barrier per stage, with its own phase register, is what keeps the rounds distinct.</p>
+
+<div class="callout">
+  <div class="label">Honest caveat — this is prefetch, not yet true concurrency</div>
+  Be precise about what Step 5 achieves. The TMA load for tile <em>k+PIPE_DEPTH</em> is <em>queued</em> in the same iteration as the MMA for tile <em>k</em>, so the copy engine is kept busy ahead of the math. But the loop still <strong>waits for the current MMA to finish before the next iteration proceeds</strong> (<code>try_wait(mma_bar, …)</code> is on the critical path). The load and the compute overlap only to the extent that the next load was already in flight — the math thread is not free to <em>issue</em> the next MMA while the current one runs, because the same threads do both. This is <strong>prefetch</strong>: the load latency is hidden behind compute, which is most of the win. It is <strong>not</strong> full load/compute overlap. Getting the two engines to run genuinely at once requires splitting the threads into producer and consumer roles — <strong>warp specialization</strong>, which is Step 7 in <a href="10_gemm_warp_specialized.html">lesson 10</a>.
+</div>
+
+<h2>Interactive · the pipeline Gantt — serial vs prefetch</h2>
+
+<p>Two lanes, one per engine: <span style="color:#2563eb;font-weight:600;">TMA</span> (the copy engine) and <span style="color:#16a34a;font-weight:600;">MMA</span> (the tensor core). <strong>Step 4 (serial)</strong> takes turns — load, wait, compute, wait — and the gaps are the tensor core sitting idle. <strong>Step 5 (prefetch)</strong> lets TMA run ahead so the MMA lane is fed nearly back-to-back, and the idle % drops sharply. The <code>PIPE_DEPTH</code> slider sets the <em>ring size</em> — how many loads can be in flight at once; here a load fits behind a single compute, so <code>PIPE_DEPTH=2</code> already hides the latency and deeper rings mainly buy headroom for longer or burstier loads. (Either way this is prefetch: the MMA still gates each iteration — full overlap is lesson 10.)</p>
+
+<div class="widget" id="pipe-widget">
+  <div class="title">Pipeline Gantt · TMA + MMA lanes · serial vs software-pipelined prefetch</div>
+  <div class="hint">A K-loop of tiles fed through a ring buffer. <em>Serial</em> = Step 4 (each MMA waits for its own load). <em>Prefetch</em> = Step 5 (loads run ahead by PIPE_DEPTH). The model uses a fixed load time and MMA time per tile; the engine-idle KPI is the fraction of the makespan the tensor core is not computing.</div>
+
+  <div class="controls">
+    <label class="inline">mode:
+      <select id="pipe-mode">
+        <option value="serial">Step 4 · serial (load → wait → MMA → wait)</option>
+        <option value="prefetch" selected>Step 5 · software pipeline (prefetch)</option>
+      </select>
+    </label>
+    <label class="inline">PIPE_DEPTH: <input type="range" id="pipe-d" min="2" max="4" step="1" value="2"> <span class="val" id="pipe-d-v">2</span></label>
+    <label class="inline">K tiles: <input type="range" id="pipe-k" min="4" max="12" step="1" value="8"> <span class="val" id="pipe-k-v">8</span></label>
+    <label class="inline">load : MMA cost: <input type="range" id="pipe-r" min="50" max="180" step="10" value="120"> <span class="val" id="pipe-r-v">1.2×</span></label>
+    <button id="pipe-play">▶ animate</button>
+  </div>
+
+  <canvas id="pipe-canvas" width="760" height="340" style="width:100%; height:340px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">makespan</div><div class="v" id="pipe-make">—</div></div>
+    <div class="kpi"><div class="k">tensor-core idle</div><div class="v" id="pipe-idle">—</div></div>
+    <div class="kpi"><div class="k">MMA back-to-back?</div><div class="v" id="pipe-b2b" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">loads in flight (max)</div><div class="v" id="pipe-inflight">—</div></div>
+  </div>
+</div>
+
+<h2>Step 6 — a persistent kernel that keeps operands hot</h2>
+
+<p>Steps 4–5 fixed <em>one tile's</em> schedule. Step 6 fixes how tiles are handed out across the whole problem. The tiled baseline used a 2D launch: one CTA per output tile. For a 4096² GEMM with 128×128 tiles that is 32×32 = <strong>1024 ephemeral CTAs</strong>, each paying kernel setup (allocate SMEM, allocate TMEM, prime barriers) once and then vanishing after a single tile. The setup cost is paid 1024 times, and nothing the first CTA loaded survives for the next — every CTA re-reads its operands cold from HBM.</p>
+
+<p>The <strong>persistent kernel</strong> inverts that: launch a <em>fixed pool</em> of CTAs sized to the machine — <strong>one per SM</strong> — and have each one loop over many output tiles. Setup is paid once per SM, not once per tile, and operands a CTA already touched can stay resident in L2 for the next tile it draws.</p>
+
+<pre><code>// PSEUDOCODE — Step 6 persistent kernel. SM_COUNT = 148 on B200.
+constexpr int SM_COUNT = 148;                  // launch ONE CTA per SM (the whole pool)
+
+tile_scheduler = ClusterPersistentScheduler2D(
+        num_m_tiles, num_n_tiles,
+        l2_group_size = 8,                     // group nearby tiles so they share operands in L2
+        num_clusters  = SM_COUNT);
+
+allocate_tmem(accum);                          // allocated ONCE — persists across every tile
+
+while (tile_scheduler.valid()) {
+    (m_st, n_st) = tile_scheduler.current();   // this CTA's current output tile
+    phase_tma = 0;  phase_mma = 0;             // RESET phases — each tile is a fresh K-loop
+
+    prologue_prefetch();                       // prime the pipe (Step 5)
+    steady_state_K_loop();                     // the Step-5 pipelined mainloop
+    epilogue_tma_store(m_st, n_st);            // TMA-store the result tile (below)
+
+    tile_scheduler.next();                     // advance to the next tile in this CTA's list
+}</code></pre>
+
+<p>Two sizing facts and two state-reset rules carry the whole step:</p>
+
+<ul>
+  <li><strong>CTA count = SM count.</strong> Over-launch (more CTAs than SMs) and the extra CTAs queue behind resident ones, idling until a slot frees — the launch overhead you were trying to amortize comes back. Under-launch and some SMs never get a CTA — wasted hardware. One CTA per SM is the sweet spot; <code>SM_COUNT = 148</code> on a B200 (a device-queried number — read it, don't hardcode it in production).</li>
+  <li><strong>Phases reset to 0 at the start of every tile.</strong> Each output tile runs its own fresh K-loop, so <code>phase_tma</code> and <code>phase_mma</code> start over from 0. Forgetting this reset would carry a stale phase into the new tile's first <code>try_wait</code> → the lesson-06 reuse bug, one tile later.</li>
+  <li><strong>TMEM allocation is NOT reset.</strong> The accumulator's TMEM is allocated once and <em>persists</em> across every tile the CTA processes. Re-allocating per tile would pay <code>tcgen05.alloc</code> repeatedly for no reason; the persistent kernel reuses the same TMEM region, zeroing it via the <code>accum=false</code> flag on each tile's first MMA instead.</li>
+  <li><strong><code>l2_group_size = 8</code> pays off lesson 08's reuse debt.</strong> Step 3 of the tiled baseline <em>planted</em> a debt: neighbors recompute over the same A (row-band) and same B (column-band) operands. Grouping nearby tiles so a CTA runs them back-to-back keeps those shared operands hot in L2 — the second tile in a row-band finds its A already cached. This is the same operand-reuse idea TMA multicast attacks spatially (lesson 07); the scheduler attacks it temporally.</li>
+</ul>
+
+<p>The arithmetic: 4096² → 1024 output tiles spread over 148 SMs ≈ <strong>7 tiles per CTA</strong>. Map to the toolchain: this is the CUTLASS persistent kernel with <code>PersistentTileSchedulerSm90</code> / <code>Sm100</code> and a raster (threadblock-swizzle) ordering that is exactly the L2-locality grouping. And the static "next tile = the scheduler's formula" here is precisely what <a href="07_clusters_clc.html">lesson 07's Cluster Launch Control</a> upgrades: CLC replaces the precomputed assignment with hardware work-stealing, killing the tail when tile costs are uneven.</p>
+
+<h2>The TMA-store epilogue (used in Steps 4–6)</h2>
+
+<p>Once the K-loop finishes, the accumulator sits in TMEM and has to reach GMEM. The path is the reverse of the load, and it ends with TMA again — but the completion signal is <em>different</em>, and that difference is worth pinning down.</p>
+
+<pre><code>// PSEUDOCODE — TMA-store epilogue, mapped to PTX
+copy_async(regs, accum, dispatch="tmem");        // TMEM → registers  (→ tcgen05.ld)
+tcgen05.wait.ld;                                 // wait for the TMEM read to complete
+regs_fp16 = cast_fp32_to_fp16(regs);             // narrow for the output dtype
+write(Dsmem, regs_fp16);                         // registers → SMEM (staging buffer)
+
+fence.proxy_async("shared::cta");                // make thread SMEM writes visible to the TMA proxy
+
+if (tid == 0) {
+    copy_async(D, Dsmem, dispatch="tma");         // SMEM → GMEM  (→ cp.async.bulk.tensor store)
+    cp.async.bulk.commit_group();                 // close the group of outstanding bulk stores
+    cp.async.bulk.wait_group(0);                  // wait until 0 groups remain → Dsmem reusable
+}</code></pre>
+
+<p>Two things are load-bearing here. The <code>fence.proxy_async("shared::cta")</code> exists because the thread writes to <code>Dsmem</code> and the TMA <em>store</em> reads it through a different memory proxy; without the fence, the TMA proxy may not see the thread's writes yet and would copy stale bytes. (This is the "thread → engine handoff needs a fence" rule from lesson 06, on the store side.) And then the completion mechanism flips:</p>
+
+<div class="asym">
+  <div class="a-load">
+    <h4>Load completion — mbarrier + byte count</h4>
+    <p>On a <em>load</em> you know exactly how many bytes are coming <strong>in</strong>, so you announce that budget with <code>arrive.expect_tx(bytes)</code> and the barrier completes when the byte count hits zero. The consumer waits on a phase.</p>
+  </div>
+  <div class="a-store">
+    <h4>Store completion — commit_group + wait_group</h4>
+    <p>On a <em>store</em> there is no expected byte count that makes sense — the bytes are going <strong>out</strong>, and the kernel doesn't need to know when they <em>arrive</em>, only when its stores are <strong>done so it can reuse <code>Dsmem</code></strong>. So stores are tracked with <code>commit_group</code> (close a batch) + <code>wait_group(0)</code> (block until no batches remain).</p>
+  </div>
+</div>
+
+<p>This load/store asymmetry first appeared in lesson 04; here it is the concrete reason the epilogue looks nothing like the mainloop's wait. Loads track <em>"how many bytes have landed"</em>; stores track <em>"are my outgoing transfers retired."</em></p>
+
+<h2>Where Step 6 leaves us — and the bottleneck for lesson 10</h2>
+
+<p>After three scheduling changes and zero data-path changes, the kernel is dramatically faster: the tensor core is fed off an engine, its loads are prefetched a ring ahead, and the launch is amortized over a persistent pool with operands kept hot in L2. But there is a ceiling baked into the structure. <strong>Step 6 still runs the whole pipeline with all threads marching in lockstep.</strong> One team of threads issues the TMA, waits, issues the MMA, waits, runs the epilogue — it is still the case that one set of threads is where all three engines meet, and the <code>try_wait(mma_bar, …)</code> on the critical path is the proof: the loop cannot issue the next MMA while the current one runs, because the same threads must do both.</p>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  Lesson 08's tiled GEMM was correct but took turns — the tensor core idled through every load. Three scheduling-only steps close the gap with no new data path. <strong>Step 4</strong> hands the bulk copies to <strong>TMA</strong>, tracked by an mbarrier + an exact <code>expect_tx</code> byte count (issued by <code>tid == 0</code>, never <code>elect_sync()</code>, so the budget is announced once not four times; <code>cta_sync()</code> can't see an in-flight engine transfer). <strong>Step 5</strong> double-buffers SMEM into a <code>PIPE_DEPTH</code>-stage ring with <strong>one barrier per stage</strong>; the phase-flip rule follows slot count — <code>phase_mma</code> flips every iteration (1 slot), <code>phase_tma</code> flips once per ring trip. This is <strong>prefetch, not full overlap</strong>. <strong>Step 6</strong> launches <strong>one CTA per SM</strong> looping over many tiles, resetting phases per tile but persisting the TMEM accumulator, with <code>l2_group_size</code> grouping operand-sharing tiles to pay off lesson 08's reuse debt. The store epilogue uses <code>commit_group</code>/<code>wait_group</code>, not a byte count — the load/store asymmetry. The wall that remains: all threads still march in lockstep, so the two engines can't truly run at once.
+</div>
+
+<div class="callout">
+  <div class="label">Where this connects</div>
+  The load engine and its <code>expect_tx</code> byte budget are <a href="04_tma.html">lesson 04 · TMA</a>; the phase bit, the <code>try_wait</code> semantics, "one barrier per stage," and the reuse bug are all <a href="06_mbarriers.html">lesson 06 · mbarriers</a> — Step 5's ring is the <code>PIPE_DEPTH=2</code> pipeline that lesson promised. The persistent kernel's static tile scheduler is the thing <a href="07_clusters_clc.html">lesson 07 · clusters &amp; CLC</a> upgrades to hardware work-stealing, and <code>l2_group_size</code> is the temporal cousin of that lesson's TMA multicast.
+  <br><br>
+  <strong>Step 6 still runs the whole pipeline with all threads marching in lockstep — one team of threads is still where all three engines meet. Split them into producer and consumer roles so the copy engine and the tensor core finally run at the same time.</strong> That is <a href="10_gemm_warp_specialized.html">lesson 10 · GEMM III: warp specialization &amp; clusters</a> — the climax of the ladder.
+</div>
+
+<footer class="lesson-nav">
+  <a href="08_gemm_tiled.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">08 · GEMM I: the tiled baseline</span>
+  </a>
+  <a class="next" href="10_gemm_warp_specialized.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">10 · GEMM III: warp specialization &amp; clusters</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+/* ─── Widget: pipeline Gantt — serial (Step 4) vs prefetch (Step 5) ───
+   Builds an explicit per-tile schedule for both engines and measures the
+   tensor-core idle fraction directly from the timeline. Deterministic. */
+(function(){
+  const C = document.getElementById('pipe-canvas');
+  if (!C) return;
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    mode:$('pipe-mode'), d:$('pipe-d'), dv:$('pipe-d-v'),
+    k:$('pipe-k'), kv:$('pipe-k-v'), r:$('pipe-r'), rv:$('pipe-r-v'),
+    play:$('pipe-play'),
+    make:$('pipe-make'), idle:$('pipe-idle'), b2b:$('pipe-b2b'), inflight:$('pipe-inflight'),
+  };
+
+  const COL = {
+    tma:'#2563eb', mma:'#16a34a', mute:'#5b6573', dim:'#94a3b8',
+    text:'#1f2430', border:'#dde2ea', idle:'#fde2e2', idleLine:'#dc2626'
+  };
+
+  const MMA = 1.0;                 // MMA time per tile (the unit)
+  let anim = 0, playing = false, rafId = null;
+
+  /* Build the schedule.
+     Returns: { tma:[{tile,s,e}], mma:[{tile,s,e}], makespan, idle, b2b, inflight } */
+  function build(){
+    const mode = els.mode.value;
+    const depth = +els.d.value;
+    const K = +els.k.value;
+    const LOAD = (+els.r.value)/100;        // load time relative to MMA
+
+    const tma = [], mma = [];
+
+    if (mode === 'serial'){
+      // load(k) then mma(k), strictly in series. One slot reused.
+      let t = 0;
+      for (let k=0;k<K;k++){
+        const ls = t, le = ls + LOAD; t = le;     // load tile k
+        tma.push({tile:k, s:ls, e:le});
+        const ms = t, me = ms + MMA; t = me;       // then compute tile k
+        mma.push({tile:k, s:ms, e:me});
+      }
+    } else {
+      // prefetch: TMA engine is a single resource that processes loads in issue order,
+      // started `depth` ahead. MMA(k) starts when BOTH mma(k-1) done AND load(k) done.
+      // TMA timeline: loads are serialized on the one copy engine but begin during the prologue.
+      let tmaFree = 0;
+      const loadEnd = new Array(K);
+      // prologue: issue the first `depth` loads back-to-back on the TMA engine
+      // steady state: load(k+depth) is issued conceptually during iter k, but the TMA
+      // engine simply processes loads 0,1,2,… in order as fast as it can.
+      for (let k=0;k<K;k++){
+        const s = tmaFree, e = s + LOAD; tmaFree = e;
+        tma.push({tile:k, s, e}); loadEnd[k] = e;
+      }
+      // MMA(k) gated by previous MMA and by its load landing
+      let mmaPrevEnd = 0;
+      for (let k=0;k<K;k++){
+        const ms = Math.max(mmaPrevEnd, loadEnd[k]);
+        const me = ms + MMA; mmaPrevEnd = me;
+        mma.push({tile:k, s:ms, e:me});
+      }
+    }
+
+    const makespan = Math.max(
+      tma.length ? tma[tma.length-1].e : 0,
+      mma.length ? mma[mma.length-1].e : 0
+    );
+    // tensor-core idle = makespan − total MMA busy, as a fraction
+    const mmaBusy = mma.reduce((a,g)=>a+(g.e-g.s),0);
+    const idle = makespan > 0 ? (makespan - mmaBusy) / makespan : 0;
+    // back-to-back? are MMAs contiguous (no gap between consecutive)?
+    let b2b = true;
+    for (let k=1;k<mma.length;k++) if (mma[k].s - mma[k-1].e > 1e-9){ b2b = false; break; }
+    // max loads in flight = how far TMA reaches ahead of the MMA cursor (depth in prefetch, 1 in serial)
+    let inflight = 1;
+    if (mode === 'prefetch'){
+      // count, at MMA(0).start, how many loads have completed or are running ahead
+      inflight = Math.min(depth, K);
+    }
+    return { tma, mma, makespan, idle, b2b, inflight, mode, depth, LOAD };
+  }
+
+  function render(){
+    els.dv.textContent = els.d.value;
+    els.kv.textContent = els.k.value;
+    els.rv.textContent = ((+els.r.value)/100).toFixed(1) + '×';
+    // depth slider only meaningful in prefetch mode — disable in serial
+    els.d.disabled = (els.mode.value === 'serial');
+
+    const S = build();
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const padL = 56, padR = 24, padT = 38, padB = 70;
+    const plotW = W - padL - padR;
+    const laneH = 46, laneGap = 22;
+    const tScale = plotW / Math.max(S.makespan, 1e-6);
+    const tCut = playing ? anim * S.makespan : S.makespan;
+
+    // header
+    ctx.fillStyle = COL.mute; ctx.font='11px monospace'; ctx.textAlign='left';
+    ctx.fillText(
+      (S.mode==='serial'
+        ? 'Step 4 · serial — load, wait, compute, wait (tensor core idles every load)'
+        : 'Step 5 · prefetch — TMA reaches ahead by PIPE_DEPTH='+S.depth+' (MMA runs near back-to-back)'),
+      padL, 18);
+
+    const lanes = [
+      { key:'tma', name:'TMA',  y: padT,                 color: COL.tma, segs: S.tma },
+      { key:'mma', name:'MMA',  y: padT + laneH+laneGap, color: COL.mma, segs: S.mma },
+    ];
+
+    // MMA idle shading first (so bars draw on top): shade gaps in the MMA lane
+    const mmaLaneY = lanes[1].y;
+    // full lane faint background
+    lanes.forEach(L=>{
+      ctx.fillStyle = '#f1f4f8';
+      ctx.fillRect(padL, L.y, plotW, laneH);
+    });
+    // idle stripes on MMA lane = makespan regions where no MMA is running
+    {
+      let cursor = 0;
+      const sorted = S.mma.slice().sort((a,b)=>a.s-b.s);
+      const drawIdle = (from,to)=>{
+        const f = Math.max(0, Math.min(from, tCut)), t = Math.max(0, Math.min(to, tCut));
+        if (t - f <= 1e-9) return;
+        ctx.fillStyle = COL.idle;
+        ctx.fillRect(padL + f*tScale, mmaLaneY, (t-f)*tScale, laneH);
+      };
+      for (const g of sorted){ drawIdle(cursor, g.s); cursor = Math.max(cursor, g.e); }
+      drawIdle(cursor, S.makespan);
+    }
+
+    // draw lane bars
+    lanes.forEach(L=>{
+      // lane label
+      ctx.fillStyle = COL.text; ctx.font='12px monospace'; ctx.textAlign='right';
+      ctx.fillText(L.name, padL-8, L.y+laneH/2+4);
+      ctx.textAlign='left';
+      for (const g of L.segs){
+        const drawEnd = Math.min(g.e, tCut);
+        if (drawEnd <= g.s) continue;
+        const x0 = padL + g.s*tScale, w = (drawEnd - g.s)*tScale;
+        ctx.fillStyle = L.color; ctx.globalAlpha = 0.92;
+        ctx.fillRect(x0+0.5, L.y+4, Math.max(1,w-1), laneH-8);
+        ctx.globalAlpha = 1;
+        if (w > 20){
+          ctx.fillStyle = '#fff'; ctx.font='10px monospace';
+          ctx.fillText((L.key==='tma'?'ld ':'mma ')+g.tile, x0+5, L.y+laneH/2+3);
+        }
+      }
+      // lane border
+      ctx.strokeStyle = COL.border; ctx.lineWidth=1;
+      ctx.strokeRect(padL+0.5, L.y+0.5, plotW-1, laneH-1);
+    });
+
+    // makespan line
+    const mx = padL + S.makespan*tScale;
+    ctx.strokeStyle = COL.text; ctx.lineWidth=1.25;
+    ctx.beginPath(); ctx.moveTo(mx, padT-6); ctx.lineTo(mx, padT + 2*laneH+laneGap + 6); ctx.stroke();
+    ctx.fillStyle = COL.text; ctx.font='10px monospace';
+    ctx.fillText('makespan', Math.min(mx+4, W-66), padT-8);
+
+    // legend / idle note
+    const ly = padT + 2*laneH + laneGap + 30;
+    ctx.fillStyle = COL.idleLine; ctx.font='10.5px monospace';
+    ctx.fillRect(padL, ly-9, 11, 11);
+    ctx.fillStyle = COL.text;
+    ctx.fillText('= tensor-core idle (the gap we are closing)', padL+16, ly);
+    ctx.fillStyle = COL.mute; ctx.font='10px monospace';
+    ctx.fillText(
+      (S.mode==='prefetch'
+        ? 'prefetch ≠ overlap: each MMA still gates the next iteration — full overlap is lesson 10 (warp specialization)'
+        : 'serial: every MMA waits on its own load — the tensor core works only half the time'),
+      padL, ly+18);
+
+    // KPIs
+    els.make.textContent = S.makespan.toFixed(2) + ' u';
+    els.idle.textContent = (S.idle*100).toFixed(0) + ' %';
+    els.b2b.textContent  = S.b2b ? 'yes — no gaps' : 'no — gaps remain';
+    els.inflight.textContent = S.inflight + (S.inflight>1 ? ' (ring ahead)' : ' (serial)');
+  }
+
+  function tick(){
+    if (!playing) return;
+    anim += 0.015;
+    if (anim >= 1){ anim = 1; playing = false; els.play.textContent='▶ animate'; render(); return; }
+    render();
+    rafId = requestAnimationFrame(tick);
+  }
+
+  els.play.addEventListener('click', ()=>{
+    if (playing){ playing=false; els.play.textContent='▶ animate'; if (rafId) cancelAnimationFrame(rafId); return; }
+    anim = 0; playing = true; els.play.textContent='❚❚ pause';
+    rafId = requestAnimationFrame(tick);
+  });
+  ['change','input'].forEach(ev=>{
+    [els.mode, els.d, els.k, els.r].forEach(el=>el.addEventListener(ev, ()=>{
+      playing=false; els.play.textContent='▶ animate'; anim=1; render();
+    }));
+  });
+  window.addEventListener('resize', render);
+  anim = 1; render();
+})();
+</script>
+
+</body>
+</html>

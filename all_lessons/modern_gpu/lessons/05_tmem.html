@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>05 · TMEM</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local: the three-instruction access table + the data-path strip */
+  .tmem-ops td { vertical-align: top; }
+  .tmem-ops code { font-size: 12px; }
+  .addr-pill {
+    display: inline-block; font-family: var(--mono); font-size: 11px;
+    padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border);
+    color: #7c3aed;
+  }
+  /* the full GMEM→SMEM→TMEM→reg data path as a horizontal strip of stages */
+  .datapath {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 6px;
+    margin: 18px 0;
+  }
+  .datapath .stage {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-elev);
+    padding: 10px 10px 12px;
+  }
+  .datapath .stage .loc {
+    font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--accent);
+    display: block; margin-bottom: 4px;
+  }
+  .datapath .stage .via {
+    display: block; font-family: var(--mono); font-size: 10.5px;
+    color: var(--text-dim); margin-bottom: 6px;
+  }
+  .datapath .stage .what { color: var(--text-mute); font-size: 12.5px; line-height: 1.4; }
+  .datapath .stage.tmem { border-left: 3px solid #7c3aed; }
+  @media (max-width: 820px) { .datapath { grid-template-columns: 1fr 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../../index.html">all_lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">modern_gpu / lessons</a>
+    <span class="crumb">/</span>
+    <span class="crumb">05 · TMEM</span>
+    <span class="step-pill">lesson 6 / 15</span>
+  </div>
+</header>
+
+<main>
+
+<p class="kicker">Part II · the five hardware primitives</p>
+<h1>TMEM — the accumulator's new home</h1>
+<p class="subtitle">Lesson 04 fixed the operand-supply problem: <a href="04_tma.html">TMA</a> streams A and B into shared memory so the math warps never touch the load. But there is a <em>second</em> starvation pressure, and it sits on the output side of the tensor core. On Blackwell, the cure is a third kind of on-chip memory that exists for one job: holding the accumulator. This lesson is about <strong>TMEM</strong> — what it is, why the kernel must name it explicitly, and the three instructions that move data in and out of it.</p>
+
+<div class="forced">
+  <div class="label">Forced move — the bottleneck from lesson 04</div>
+  TMA keeps operands flowing into SMEM, so the consumer warps stop wasting issue slots on the copy. But on Ampere and Hopper the MMA <strong>accumulator lives in registers</strong>. To get more throughput you grow the MMA tile — and the per-thread accumulator fragment grows right along with it. A 64×256 <code>wgmma</code> accumulator is already 128 fp32 registers <em>per warp lane</em> dedicated to nothing but the running sum. That register pressure crowds out everything else (operand fragments, address math, loop state) and collapses occupancy, so the bigger tile you wanted becomes infeasible. The accumulator and the register budget are chained together, and the chain is the wall. <strong>Blackwell breaks the link by giving the accumulator its own memory: TMEM.</strong>
+</div>
+
+<h2>What TMEM is</h2>
+
+<p><strong>TMEM (Tensor Memory)</strong> is a Blackwell-only, 2D scratchpad that sits on each SM and is scoped <strong>per-CTA</strong>. It is the dedicated home for the <code>tcgen05.mma</code> accumulator (and, for block-scaled MMA, the scale factors). It is not the register file, not shared memory, and not L2 — it is a fourth address space that exists specifically to decouple the accumulator's size from each thread's register budget.</p>
+
+<p>Its physical shape is rigid and worth memorizing, because every layout you write against it is phrased in these two axes:</p>
+
+<ul>
+  <li><strong>128 hardware <em>Lane</em> rows</strong> (indexed 0–127), and</li>
+  <li><strong>up to 512 <em>Col</em> columns</strong> (indexed 0–511), each Col <strong>32 bits</strong> wide.</li>
+</ul>
+
+<div class="callout">
+  <div class="label">A computed number, not a datasheet quote</div>
+  Multiply the shape out: 128 rows × 512 cols × 4 bytes = <strong>256 KB per SM</strong>. That figure is <em>derived</em> from the published 128×512×32-bit geometry — treat it as the implied capacity, not a number NVIDIA prints on a spec sheet. The shape is what matters for writing kernels; the byte total is just its product.
+</div>
+
+<p>The 128×512 shape is not arbitrary: it <strong>mirrors how <code>tcgen05.mma</code> writes its accumulator</strong>. The 128 Lane rows line up with the M dimension of the output tile, and the Col columns hold the N dimension, 32 bits per fp32 element. So an accumulator of width <span class="math">N</span> occupies a <strong>128 × N</strong> block of the grid.</p>
+
+<h2>TMEM is part of the layout interface, not a hidden cache</h2>
+
+<p>This is the conceptual hinge. Unlike a CPU cache — which the program never names — TMEM lives <em>inside</em> the tile-layout semantics. The CuTe-style layout notation from <a href="02_data_layout.html">lesson 02</a> grew two new named axes for it: <code>TLane</code> and <code>TCol</code>. An accumulator that is 128 rows tall and <span class="math">N</span> columns wide is written</p>
+
+<p class="math block" style="text-align:center;">S[(128, N) : (1@TLane, 1@TCol)]</p>
+
+<p>Read that the same way as any other layout: the shape is <span class="math">(128, N)</span>, and the strides say "step one position along the <code>TLane</code> axis to move down a row, step one position along the <code>TCol</code> axis to move right a column." Because TMEM coordinates appear directly in the layout algebra, the kernel must <strong>name it, allocate it, and layout-match it</strong> exactly like it does for SMEM. There is no silent backing store doing the right thing on your behalf. If the layout you declare against TMEM disagrees with what the MMA wrote there, you read scrambled accumulator values — the same "layout is part of the instruction interface" rule from lessons 02 and 03, now applied to the output side.</p>
+
+<h2>Allocation — a budgeted CTA resource</h2>
+
+<p>Registers are assigned by the compiler; TMEM is not. The kernel <strong>explicitly allocates and frees</strong> it, and the mental model is "a budgeted CTA resource, much like shared memory." The protocol:</p>
+
+<ol>
+  <li><strong>One warp</strong> in the CTA requests a range of TMEM columns. The request is in <strong>units of 32 columns</strong> — you ask for a multiple of 32, and the hardware rounds your request up to the next multiple per its allocation rules.</li>
+  <li>The CTA receives a <strong>base TMEM address</strong>, which every subsequent <code>tcgen05</code> instruction uses to locate its rows and columns.</li>
+  <li>When the work is done, the kernel <strong>frees</strong> the range explicitly.</li>
+</ol>
+
+<p>The toolchain instructions are vendor-real PTX:</p>
+
+<pre><code>// one warp in the CTA does the allocation; ncols rounded up to a multiple of 32.
+// the base TMEM address is written back to an SMEM slot the CTA can read.
+tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32   [tmem_base_ptr], ncols;
+
+// ... run the K-loop: tcgen05.mma accumulates into [tmem_base + col offsets] ...
+
+// give back the allocation permit, then free the columns.
+tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;
+tcgen05.dealloc.cta_group::1.sync.aligned.b32             tmem_base, ncols;</code></pre>
+
+<p>That <code>relinquish_alloc_permit</code> step is a real correctness gotcha you will meet again in the debugging lesson: allocation is gated by a permit, and a CTA must surrender the permit before it (or a successor) can cleanly tear down. For now the takeaway is simply that <strong>TMEM is requested and released like a heap allocation</strong>, in 32-column granules, by exactly one warp on behalf of the whole CTA.</p>
+
+<h2>Access — three dedicated instructions</h2>
+
+<p>Here is the rule that surprises people: <strong>ordinary <code>ld.shared</code> / <code>st.shared</code> cannot touch TMEM.</strong> It is a separate address space, so the shared-memory load/store instructions simply do not address it. Blackwell adds three dedicated instructions, one per direction of movement:</p>
+
+<table class="tmem-ops">
+  <thead><tr><th>instruction</th><th>direction</th><th>role in the kernel</th><th>completion</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>tcgen05.ld</code></td>
+      <td>TMEM → registers</td>
+      <td>the <strong>epilogue read-back</strong>: pull the finished accumulator into registers to cast / add bias / store.</td>
+      <td><code>tcgen05.wait::ld</code></td>
+    </tr>
+    <tr>
+      <td><code>tcgen05.st</code></td>
+      <td>registers → TMEM</td>
+      <td>the reverse: write register values back into TMEM (e.g. a correction pass rewriting the accumulator).</td>
+      <td><code>tcgen05.wait::st</code></td>
+    </tr>
+    <tr>
+      <td><code>tcgen05.cp</code></td>
+      <td>SMEM → TMEM</td>
+      <td>bulk copy, used mainly to stage <strong>block-scaled MMA scale factors</strong> into the TMEM layout the tensor core expects.</td>
+      <td>commit group + mbarrier (like <code>tcgen05.mma</code>)</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3><code>tcgen05.ld</code> — and why the epilogue code is reusable</h3>
+
+<p>The read-back is the one to understand in detail, because it is what lets Blackwell reuse the epilogue code written for Ampere and Hopper. A single <code>tcgen05.ld</code> lowers to <strong>four warp-level operations — one per warp</strong>, and each warp handles <strong>32 of the 128 Lane rows</strong>. (Four warps × 32 rows = the 128 Lane rows; this is the same four-way split a warpgroup uses.) The instruction has a load-shape family and a repeat factor:</p>
+
+<pre><code>// load-shape family:   .16x64b  .16x128b  .16x256b  .32x32b  .16x32bx2
+// repeat factor:       .x1 .x2 .x4 ... .x128   (how many shapes per issue)
+tcgen05.ld.sync.aligned.16x256b.x4.b32   {d0, d1, ... },  [tmem_addr];
+tcgen05.wait::ld.sync.aligned;            // accumulator now in registers</code></pre>
+
+<p>The payoff is the lane mapping. For the common epilogue, <strong>lane <span class="math">l</span> receives values from TMEM row <span class="math">l/4</span></strong> and two columns — which reproduces exactly the <strong>m8n8 fragment</strong> that lesson 03 traced through every generation. Because the accumulator arrives back in registers in that same shape, the Blackwell epilogue can reuse the <em>identical</em> register-level cast-and-store code as an Ampere <code>mma.sync</code> or a Hopper <code>wgmma</code> — even though the accumulator spent the entire K-loop living in TMEM instead of registers. The home changed; the fragment shape the epilogue sees did not.</p>
+
+<h2>Interactive · the TMEM map and the <code>tcgen05.ld</code> read-back</h2>
+
+<p>The grid below is one SM's TMEM: <strong>128 Lane rows × 512 Col columns</strong>. Pick an accumulator width <span class="math">N</span> and watch it occupy a 128×<span class="math">N</span> block, allocated in units of 32 columns (the hardware rounds your request up). Toggle a second MMA with <span class="math">M = 64</span> to see a <em>strided</em> Lane allocation that leaves gaps. Then press <strong>animate <code>tcgen05.ld</code></strong> to watch the four-warp read-back sweep the rows, each warp owning 32 lanes, with lane <span class="math">l</span> mapping to row <span class="math">l/4</span>.</p>
+
+<div class="widget" id="tmem-widget">
+  <div class="title">TMEM map · 128 Lane × 512 Col · accumulator placement &amp; the l/4 read-back</div>
+  <div class="hint">The accumulator of width N occupies a 128×N block. Allocation is rounded up to a multiple of 32 columns. The read-back splits into 4 warp ops (32 lanes each); lane l ← row l/4.</div>
+
+  <div class="controls">
+    <label class="inline">accumulator width N:
+      <input type="range" id="tm-n" min="32" max="256" step="16" value="128">
+      <span class="val" id="tm-n-v">128</span>
+    </label>
+    <label class="inline"><input type="checkbox" id="tm-second"> add 2nd MMA (M=64, strided)</label>
+    <button id="tm-ld">▶ animate tcgen05.ld</button>
+    <button id="tm-reset">⟲ reset</button>
+  </div>
+
+  <canvas id="tm-canvas" width="760" height="380" style="width:100%; height:380px; display:block; background:var(--code-bg); border:1px solid var(--border); border-radius:8px;"></canvas>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">requested cols</div><div class="v" id="tm-req">—</div></div>
+    <div class="kpi"><div class="k">allocated (×32)</div><div class="v" id="tm-alloc">—</div></div>
+    <div class="kpi"><div class="k">TMEM used</div><div class="v" id="tm-use">—</div></div>
+    <div class="kpi"><div class="k">ld warp / lane→row</div><div class="v" id="tm-map" style="font-size:13px;">—</div></div>
+  </div>
+</div>
+
+<h2>Async completion — you cannot read TMEM early</h2>
+
+<p>All three instructions are <strong>asynchronous</strong>. They return immediately and signal completion separately:</p>
+
+<ul>
+  <li><code>tcgen05.ld</code> → wait with <code>tcgen05.wait::ld</code>.</li>
+  <li><code>tcgen05.st</code> → wait with <code>tcgen05.wait::st</code>.</li>
+  <li><code>tcgen05.cp</code> → completes via a <strong>commit group + mbarrier</strong>, exactly like <code>tcgen05.mma</code>.</li>
+</ul>
+
+<div class="callout warn">
+  <div class="label">The early-read trap (preview of lesson 06)</div>
+  The MMA accumulates into TMEM <em>asynchronously</em>. If the epilogue fires <code>tcgen05.ld</code> before the MMA's completion barrier has signaled, it reads the accumulator <strong>too early</strong> — a partial sum, or last iteration's values — and the result is silently wrong, not a crash. Nothing in <code>ld.shared</code>-style thinking protects you here, because <code>__syncthreads()</code> cannot wait on a hardware MMA engine. The barrier that <em>does</em> gate this hand-off is the entire subject of the next lesson.
+</div>
+
+<h2>Block-scaled MMA — why scale factors take an extra hop</h2>
+
+<p>Lesson 03 introduced Blackwell's block-scaled formats (MXFP8, NVFP4), where a block of elements shares one scale factor. Those scale operands have a specific home: <strong>they are read from TMEM</strong>, while the data operands A and B stay in SMEM. That asymmetry forces an extra step, because TMA only lands data in SMEM:</p>
+
+<div class="math block" style="text-align:center;">scales: GMEM &nbsp;<span style="color:var(--accent-2)">— TMA →</span>&nbsp; SMEM &nbsp;<span style="color:#7c3aed">— tcgen05.cp →</span>&nbsp; TMEM</div>
+
+<p>So <code>tcgen05.cp</code> exists largely to perform that SMEM→TMEM hop for the scales, repacking them into the layout the tensor core reads. The packing is compact and a little clever. A 128-row scale vector folds into just <strong>32 Lane rows</strong> — lane <span class="math">= r mod 32</span>, column <span class="math">= r/32</span> — and is then broadcast <strong>×4</strong> so all four warps of the reading warpgroup can find a copy:</p>
+
+<p class="math block" style="text-align:center;">S[(32, sf) : (1@TLane, 1@TCol)] &nbsp;+&nbsp; R[4 : 32@TLane]</p>
+
+<p>The <code>R[4 : 32@TLane]</code> part places four replicas at Lane offsets <strong>0, 32, 64, 96</strong>. Each of the four warps reads from its own 32-lane window, and each window finds a full copy of the scales — no warp has to reach across the warpgroup for them. It is the same "lay it out so the consumer finds it locally" discipline the whole track keeps returning to, applied to scale factors.</p>
+
+<h2>The full data path</h2>
+
+<p>Now assemble every hop a block-scaled <code>tcgen05</code> GEMM tile makes. This is the capstone picture for the lesson, and it is the skeleton of the GEMM mainloop you will build in Part III:</p>
+
+<div class="datapath">
+  <div class="stage">
+    <span class="loc">GMEM</span>
+    <span class="via">— TMA →</span>
+    <span class="what">A, B tiles (and, for block-scaled, the scale vectors) bulk-copied into SMEM.</span>
+  </div>
+  <div class="stage tmem">
+    <span class="loc">SMEM → TMEM</span>
+    <span class="via">tcgen05.cp</span>
+    <span class="what">scale factors repacked into the TMEM layout the tensor core expects.</span>
+  </div>
+  <div class="stage">
+    <span class="loc">tensor core</span>
+    <span class="via">tcgen05.mma</span>
+    <span class="what">reads A, B from SMEM (+ scales from TMEM), runs async, accumulates into TMEM.</span>
+  </div>
+  <div class="stage tmem">
+    <span class="loc">completion</span>
+    <span class="via">barrier</span>
+    <span class="what">the MMA's completion barrier fires — only now is the accumulator safe to read.</span>
+  </div>
+  <div class="stage">
+    <span class="loc">TMEM → reg</span>
+    <span class="via">tcgen05.ld</span>
+    <span class="what">accumulator pulled into the m8n8 fragment; epilogue casts &amp; stores.</span>
+  </div>
+</div>
+
+<p>Three layout contracts have to stay matched all the way down this path, and a mismatch in any one reads scrambled bytes rather than crashing:</p>
+
+<div class="triad">
+  <div>
+    <strong>SMEM operand layout</strong>
+    <span>how A, B (and staged scales) are swizzled in shared memory — set by the TMA descriptor.</span>
+  </div>
+  <div>
+    <strong>TMEM accumulator / scale layout</strong>
+    <span>the <code>(128, N) : (1@TLane, 1@TCol)</code> accumulator block and the ×4 scale packing.</span>
+  </div>
+  <div>
+    <strong>async completion signal</strong>
+    <span>the barrier that says the MMA actually finished writing TMEM before the read.</span>
+  </div>
+</div>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  On Ampere and Hopper the accumulator lived in registers, and growing the MMA tile grew the per-thread fragment until register pressure throttled occupancy. Blackwell severs that link with <strong>TMEM</strong> — a per-CTA 2D scratchpad, <strong>128 Lane rows × ≤512 Col (32-bit) columns</strong> (so a 128×<span class="math">N</span> block per accumulator; ~256&nbsp;KB/SM is the <em>computed</em> product, not a quoted figure). It is not reachable by <code>ld/st.shared</code> and is integral to the layout algebra: you <strong>name, allocate (in 32-col units), and layout-match</strong> it. Three dedicated async instructions move data — <code>tcgen05.ld</code> (TMEM→reg, four warp ops, lane <span class="math">l</span> ← row <span class="math">l/4</span>, reproducing the m8n8 fragment so the old epilogue code still works), <code>tcgen05.st</code> (reg→TMEM), and <code>tcgen05.cp</code> (SMEM→TMEM, to stage block-scale factors). The accumulator's <em>size</em> is now free of the register budget — and the tensor core can finally grow its tile.
+</div>
+
+<div class="callout">
+  <div class="label">Where this connects</div>
+  TMEM is the <em>home</em> the accumulator marched toward in <a href="03_tensor_cores_generations.html">lesson 03</a> (registers → registers → TMEM). Its async instructions are what the phase model of <a href="06_mbarriers.html">lesson 06</a> learns to synchronize. The full path above becomes the GEMM mainloop in <a href="10_gemm_warp_specialized.html">lesson 10 (warp-specialized GEMM)</a>, where producer and consumer warps pipeline the SMEM↔TMEM↔reg hops; and the fp32/fp16 aliasing of one TMEM allocation is what lets the score, probability, and output matrices share storage in <a href="11_flash_attention_algorithm.html">lesson 11 (Flash Attention 4)</a>.
+  <br><br>
+  <strong>But notice what just piled up: TMA loads, <code>tcgen05</code> MMAs, and TMEM reads all complete <em>asynchronously</em> — <code>__syncthreads()</code> can't wait on a hardware engine. How does the kernel know when each async step is actually done?</strong> That is <a href="06_mbarriers.html">lesson 06 · mbarriers and the phase model</a>.
+</div>
+
+<footer class="lesson-nav">
+  <a href="04_tma.html">
+    <span class="dir">← Previous</span>
+    <span class="ttl">04 · TMA: the async bulk copy engine</span>
+  </a>
+  <a class="next" href="06_mbarriers.html">
+    <span class="dir">Next →</span>
+    <span class="ttl">06 · mbarriers and the phase model</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+/* ─── Widget: TMEM map · accumulator placement + tcgen05.ld read-back ─── */
+(function(){
+  const C = document.getElementById('tm-canvas');
+  const ctx = C.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const els = {
+    n:$('tm-n'), nv:$('tm-n-v'),
+    second:$('tm-second'),
+    ld:$('tm-ld'), reset:$('tm-reset'),
+    req:$('tm-req'), alloc:$('tm-alloc'), use:$('tm-use'), map:$('tm-map'),
+  };
+
+  // colors from the shared sheet / local palette
+  const COL = {
+    tmem:'#7c3aed', tmem2:'#a855f7', second:'#d97706',
+    ok:'#16a34a', bad:'#dc2626', mute:'#5b6573', dim:'#94a3b8',
+    text:'#1f2430', border:'#dde2ea', empty:'#eef1f5', warpline:'#fbbf24'
+  };
+
+  const LANES = 128;     // Lane rows
+  const COLS = 512;      // Col columns
+  const WARPS = 4;       // tcgen05.ld lowers to 4 warp ops
+  const LANES_PER_WARP = LANES / WARPS; // 32
+
+  // animation state: which warp (0..3) is currently sweeping, and a fractional
+  // progress 0..1 across its 32 lanes. -1 = idle.
+  let anim = { active:false, warp:0, prog:0, last:0 };
+
+  function ceil32(x){ return Math.ceil(x / 32) * 32; }
+
+  // ---- geometry helpers (shared by render + describe) ----
+  function geom(W, H){
+    const padL = 52, padR = 18, padT = 46, padB = 44;
+    const gw = W - padL - padR;
+    const gh = H - padT - padB;
+    return { padL, padT, gw, gh, cw: gw / COLS, ch: gh / LANES };
+  }
+
+  function render(){
+    const N = +els.n.value;
+    els.nv.textContent = N;
+    const second = els.second.checked;
+
+    // allocation: primary block of N cols, rounded up to a multiple of 32.
+    const reqCols = N + (second ? 32 : 0); // a 2nd MMA needs more columns
+    const allocCols = ceil32(reqCols);
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = C.clientWidth, H = C.clientHeight;
+    if (C.width !== Math.round(W*dpr)){ C.width=Math.round(W*dpr); C.height=Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    const g = geom(W, H);
+
+    // ---- header ----
+    ctx.fillStyle = COL.mute; ctx.font='11px monospace'; ctx.textAlign='left';
+    ctx.fillText('TMEM · one SM · 128 Lane rows × 512 Col columns (32-bit each)', g.padL, 22);
+    ctx.fillStyle = COL.dim; ctx.font='10px monospace';
+    ctx.fillText('accumulator = 128 × N block · allocation rounded up to ×32 cols', g.padL, 37);
+
+    // ---- empty grid backdrop (drawn as one rect; gridlines every 32 cols) ----
+    ctx.fillStyle = COL.empty;
+    ctx.fillRect(g.padL, g.padT, g.gw, g.gh);
+
+    // 32-col allocation granule gridlines
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1;
+    for (let c=0; c<=COLS; c+=32){
+      const x = g.padL + c*g.cw;
+      ctx.beginPath(); ctx.moveTo(x, g.padT); ctx.lineTo(x, g.padT+g.gh); ctx.stroke();
+    }
+
+    // ---- the primary accumulator block: 128 × N ----
+    // If a 2nd MMA is on, the primary occupies cols [0, N) and is full-height.
+    ctx.fillStyle = COL.tmem;
+    ctx.globalAlpha = 0.82;
+    ctx.fillRect(g.padL, g.padT, N*g.cw, g.gh);
+    ctx.globalAlpha = 1;
+
+    // ---- optional 2nd MMA: M=64 → strided lane allocation leaving gaps ----
+    // It shares the same 32 columns just past the primary, but only occupies
+    // 64 of the 128 lanes, laid out strided (every other lane), so gaps show.
+    if (second){
+      const baseCol = N;            // sits right after the primary block
+      const w2 = 32;                // one 32-col granule
+      ctx.fillStyle = COL.second;
+      for (let lane=0; lane<LANES; lane++){
+        // strided: occupy lanes where (lane % 2 == 0) → 64 lanes, gaps between
+        if (lane % 2 !== 0) continue;
+        const y = g.padT + lane*g.ch;
+        ctx.globalAlpha = 0.85;
+        ctx.fillRect(g.padL + baseCol*g.cw, y, w2*g.cw, g.ch);
+      }
+      ctx.globalAlpha = 1;
+      // label
+      ctx.fillStyle = COL.second; ctx.font='10px monospace'; ctx.textAlign='left';
+      ctx.fillText('M=64 strided', g.padL + baseCol*g.cw + 2, g.padT - 4);
+    }
+
+    // ---- the tcgen05.ld read-back overlay: 4 warp bands, sweeping ----
+    // Each warp owns 32 contiguous lanes (warp w → lanes [32w, 32w+32)).
+    // While animating, highlight the active warp's swept lanes + the lane→row
+    // mapping (lane l reads TMEM row l/4).
+    if (anim.active){
+      const w = anim.warp;
+      const loLane = w*LANES_PER_WARP;
+      // draw faint bands for already-completed warps
+      for (let pw=0; pw<w; pw++){
+        const y = g.padT + pw*LANES_PER_WARP*g.ch;
+        ctx.fillStyle = COL.ok; ctx.globalAlpha = 0.16;
+        ctx.fillRect(g.padL, y, N*g.cw, LANES_PER_WARP*g.ch);
+        ctx.globalAlpha = 1;
+      }
+      // active warp: sweep proportion of its 32 lanes
+      const sweptLanes = Math.floor(anim.prog * LANES_PER_WARP);
+      const yTop = g.padT + loLane*g.ch;
+      ctx.fillStyle = COL.warpline; ctx.globalAlpha = 0.30;
+      ctx.fillRect(g.padL, yTop, N*g.cw, sweptLanes*g.ch);
+      ctx.globalAlpha = 1;
+      // moving scan line at the current lane
+      const curLane = loLane + sweptLanes;
+      const yScan = g.padT + curLane*g.ch;
+      ctx.strokeStyle = COL.warpline; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(g.padL, yScan); ctx.lineTo(g.padL + N*g.cw, yScan); ctx.stroke();
+
+      // annotate the lane→row mapping for the current lane
+      const row = Math.floor(curLane / 4);
+      ctx.fillStyle = COL.text; ctx.font='11px monospace'; ctx.textAlign='left';
+      const tx = g.padL + N*g.cw + 8;
+      if (tx < W - 8){
+        ctx.fillText('warp '+w, tx, yScan - 6);
+        ctx.fillStyle = COL.mute;
+        ctx.fillText('lane '+curLane+' ← row '+row, tx, yScan + 8);
+      }
+    }
+
+    // ---- warp boundary lines (the 4-way 32-lane split) always shown faintly ----
+    ctx.strokeStyle = COL.dim; ctx.setLineDash([4,3]); ctx.lineWidth=1;
+    for (let wb=1; wb<WARPS; wb++){
+      const y = g.padT + wb*LANES_PER_WARP*g.ch;
+      ctx.beginPath(); ctx.moveTo(g.padL, y); ctx.lineTo(g.padL+g.gw, y); ctx.stroke();
+    }
+    ctx.setLineDash([]);
+
+    // ---- grid outline ----
+    ctx.strokeStyle = COL.border; ctx.lineWidth=1;
+    ctx.strokeRect(g.padL-0.5, g.padT-0.5, g.gw+1, g.gh+1);
+
+    // ---- axis labels ----
+    ctx.fillStyle = COL.dim; ctx.font='9.5px monospace'; ctx.textAlign='right';
+    for (let lane=0; lane<=LANES; lane+=32){
+      const y = g.padT + lane*g.ch;
+      ctx.fillText(lane, g.padL - 6, y + 3);
+    }
+    ctx.textAlign='center';
+    for (let c=0; c<=COLS; c+=128){
+      const x = g.padL + c*g.cw;
+      ctx.fillText(c, x, g.padT + g.gh + 14);
+    }
+    ctx.fillStyle = COL.mute; ctx.font='10px monospace'; ctx.textAlign='left';
+    ctx.fillText('Col →', g.padL, g.padT + g.gh + 30);
+    ctx.save();
+    ctx.translate(14, g.padT + g.gh/2); ctx.rotate(-Math.PI/2);
+    ctx.textAlign='center'; ctx.fillText('Lane', 0, 0);
+    ctx.restore();
+
+    // ---- 4-warp split caption inside the primary block ----
+    ctx.fillStyle = '#ffffff'; ctx.font='10px monospace'; ctx.textAlign='left';
+    for (let w=0; w<WARPS; w++){
+      const y = g.padT + (w*LANES_PER_WARP + 14)*g.ch;
+      if (N*g.cw > 70) ctx.fillText('warp '+w+' · 32 lanes', g.padL + 4, y);
+    }
+
+    // ---- KPIs ----
+    els.req.textContent = reqCols + ' cols';
+    els.alloc.textContent = allocCols + ' cols';
+    const kb = (LANES * allocCols * 4 / 1024);
+    els.use.textContent = kb.toFixed(0) + ' KB / 256 KB';
+    if (anim.active){
+      const loLane = anim.warp*LANES_PER_WARP;
+      const cur = loLane + Math.floor(anim.prog*LANES_PER_WARP);
+      els.map.textContent = 'warp '+anim.warp+' · lane '+cur+' ← row '+Math.floor(cur/4);
+    } else {
+      els.map.textContent = 'lane l ← row l/4';
+    }
+  }
+
+  // ---- animation loop: sweep warp 0..3, 32 lanes each ----
+  function tick(ts){
+    if (!anim.active) return;
+    if (!anim.last) anim.last = ts;
+    const dt = ts - anim.last; anim.last = ts;
+    anim.prog += dt / 520;                 // ~0.5s per warp
+    if (anim.prog >= 1){
+      anim.prog = 0;
+      anim.warp += 1;
+      if (anim.warp >= WARPS){             // all 4 warps done
+        anim.active = false;
+        els.ld.textContent = '▶ animate tcgen05.ld';
+        render();
+        return;
+      }
+    }
+    render();
+    requestAnimationFrame(tick);
+  }
+
+  els.ld.addEventListener('click', ()=>{
+    if (anim.active){
+      anim.active = false; els.ld.textContent = '▶ animate tcgen05.ld'; render(); return;
+    }
+    anim = { active:true, warp:0, prog:0, last:0 };
+    els.ld.textContent = '❚❚ stop';
+    requestAnimationFrame(tick);
+  });
+  els.reset.addEventListener('click', ()=>{
+    anim = { active:false, warp:0, prog:0, last:0 };
+    els.ld.textContent = '▶ animate tcgen05.ld';
+    els.n.value = 128; els.second.checked = false;
+    render();
+  });
+  ['input','change'].forEach(ev=>{
+    els.n.addEventListener(ev, ()=>{ if(!anim.active) render(); else render(); });
+    els.second.addEventListener(ev, render);
+  });
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>
