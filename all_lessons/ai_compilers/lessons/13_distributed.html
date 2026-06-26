@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>13 · Distributed compilation</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local layout only — failure/checklist columns + the sharding-propagator widget */
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; font-size: 15px; }
+  .lesson-card ul { margin: 0; padding-left: 18px; }
+  .lesson-card li { margin: 7px 0; font-size: 13.5px; line-height: 1.5; }
+  .kpi.over .v { color: var(--bad); }
+  .kpi.good .v { color: var(--ok); }
+  .flag { font-family: var(--mono); font-size: 12px; padding: 3px 8px; border-radius: 5px; display: inline-block; }
+  .flag.ok   { background: rgba(22,163,74,0.16); color: var(--ok); border: 1px solid #2f7d4f; }
+  .flag.warn { background: rgba(234,179,8,0.16); color: #b08900; border: 1px solid #8a6d00; }
+  .flag.bad  { background: rgba(220,38,38,0.16); color: var(--bad); border: 1px solid #7a2230; }
+  /* the little graph diagram inside the widget */
+  .shard-graph { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 14px 0 4px; font-family: var(--mono); font-size: 12px; }
+  .shard-graph .nodebox { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 8px 10px; min-width: 92px; text-align: center; }
+  .shard-graph .nodebox .nm { color: var(--accent); font-weight: 600; }
+  .shard-graph .nodebox .sh { color: var(--text-mute); font-size: 11px; margin-top: 3px; }
+  .shard-graph .coll { border-radius: 8px; padding: 8px 10px; text-align: center; min-width: 92px; font-size: 11px; }
+  .shard-graph .coll.none { border: 1px dashed var(--border); color: var(--text-dim); }
+  .shard-graph .coll.ar   { border: 1px solid #2f7d4f; background: rgba(22,163,74,0.14); color: var(--ok); }
+  .shard-graph .coll.aa   { border: 1px solid #7a2230; background: rgba(220,38,38,0.16); color: var(--bad); }
+  .shard-graph .arrow { color: var(--text-dim); }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">ai_compilers / lessons</a><span class="crumb">/</span><span class="crumb">13 · distributed</span><span class="step-pill">lesson 14 / 16</span></div></header>
+
+<main>
+
+<p class="kicker">Part V — The hard parts</p>
+<h1>Distributed compilation</h1>
+<p class="subtitle">Lesson 12 handed you the joint forward+backward graph and ran the whole middle end over it — fused, planned, laid out, scheduled. Every one of those passes optimized for <em>one device</em>. But the models that need this machinery are exactly the ones that don't fit on one device: a 70B's training state is ~1.1 TB, a single MLP block's transient footprint can overflow 80 GB, and even when it fits, one GPU finishes a step too slowly to ever train. The classic answer is to shard by hand — split this matmul across eight GPUs, chain those layers into a pipeline, all-reduce the gradients — and the result is some of the most error-prone code in the field. This lesson makes partitioning the compiler's job: you annotate a handful of tensors, and the compiler propagates the sharding through the graph, inserts the collectives, and overlaps them with compute.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>The joint graph from lesson 12 is a single-device program: it assumes every tensor lives in one HBM and every op reads its inputs locally. For a frontier model that assumption is simply false — the parameters, the optimizer state, and the activations each exceed one GPU. The hand-written fix (cross-link <a href="../../cs336/lessons/08_data_parallel.html">cs336 · 08 data parallelism</a> and <a href="../../cs336/lessons/09_model_parallel.html">cs336 · 09 model parallelism</a>) demands that a human reason globally about where every tensor is split, insert the right collective at every layout mismatch, get the backward's collectives right by symmetry, and place each axis on the link it can afford — across hundreds of devices, by hand, with a single wrong all-reduce silently corrupting the gradient. It does not compose with the compiler: the moment you fuse or repartition a layer, the hand-placed collectives are wrong. Partitioning by hand is intractable at scale and fights every pass you just built.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> the joint graph (lesson 12) exceeds one device, and placing tensors and inserting collectives across hundreds of GPUs by hand is intractable and doesn't compose with the rest of the compiler.<br><strong>New idea:</strong> make <strong>partitioning a compiler pass</strong> — annotate a few tensors with <strong>sharding specs</strong> over a device <strong>mesh</strong>, then the compiler <strong>propagates</strong> shardings through the graph (GSPMD / Shardy / <code>jax.shard_map</code> / DTensor), <strong>inserts the collectives</strong> (all-reduce, all-gather, reduce-scatter, all-to-all) wherever the producer's and consumer's layouts disagree, and <strong>schedules comm/compute overlap</strong> as just another scheduling pass (call back lesson 08). Single-device semantics + sharding hints → an <strong>SPMD</strong> program for N devices.<br><strong>Forces next:</strong> you've now seen every pass in isolation — capture, IR, rewrite, fuse, plan, layout, schedule, codegen, autotune, dynamic shapes, autodiff, and now distribution. Time to see how the real stacks assemble them, and that they're the same chain under different names (lesson 14).</div>
+
+<div class="callout"><div class="label">The plan</div>Five moves. (1) Why data/tensor/pipeline parallelism by hand is brittle — and the alternative: <em>declare</em> the sharding and let the compiler do the rest. (2) The vocabulary — device mesh, sharding spec (replicate / shard along an axis), and SPMD. (3) Sharding propagation: given a few annotations, infer the rest by minimizing communication, and insert a collective at every mismatch — with worked comm-byte numbers for a sharded matmul. (4) Collective scheduling: overlap comm with compute (it's a scheduling pass) and fuse collectives. (5) The stacks — XLA GSPMD/Shardy, PyTorch DTensor + <code>torch.compile</code>, Megatron as the hand-written contrast. Then drive the propagator until a bad annotation needs an all-to-all everywhere.</div>
+
+<h2>1 · The problem: hand-sharding is brittle and doesn't compose</h2>
+
+<p>The three parallelism axes from cs336 are real and necessary. <strong>Data parallelism</strong> replicates the model and splits the batch; <strong>tensor parallelism</strong> splits each matmul (column-parallel then row-parallel, one all-reduce per block); <strong>pipeline parallelism</strong> splits the layer stack into stages. Written by hand — the Megatron way — each is a separate, intricate rewrite of the model code: you replace <code>nn.Linear</code> with <code>ColumnParallelLinear</code>, you hand-place <code>all_reduce</code> calls, you write the backward's collectives to mirror the forward, and you wire the micro-batch pipeline schedule. It works, and for the configurations Megatron ships it is close to optimal. But it is rigid: change the mesh shape, fuse two layers, add an expert, and the hand-placed collectives are now in the wrong places.</p>
+
+<p>The compiler's bet is different. You wrote a <em>single-device</em> program — one tensor, one matmul, one HBM — and that program already states the math exactly. The only new information distribution needs is <em>where each tensor is split</em>. So: keep the single-device program, attach a sharding annotation to a handful of tensors (the inputs, the parameters), and let the compiler derive everything else. Partitioning becomes a pass in the same pipeline as fusion and memory planning, subject to the same invariant — <strong>it must preserve the math exactly</strong> (the motif from lessons 03–04) — which is precisely why inserting a collective is legal: an all-reduce that sums partial products computes the same value the single-device matmul would.</p>
+
+<h2>2 · The vocabulary: device mesh, sharding spec, SPMD</h2>
+
+<p>A <strong>device mesh</strong> is your N devices arranged as a named, multi-dimensional grid. Sixteen GPUs might be a 1-D mesh <span class="math">(16,)</span>, or a 2-D mesh <span class="math">(4, 4)</span> with axes named <code>data</code> and <code>model</code>. The axis names are the handle you shard against — "split this tensor's rows across the <code>model</code> axis" — and they let one annotation scale to any device count.</p>
+
+<p>A <strong>sharding spec</strong> says, for each dimension of a tensor, whether it is <strong>replicated</strong> (every device holds the full copy) or <strong>sharded</strong> along a mesh axis (each device holds a contiguous slice). Write a matrix's sharding as a tuple over its dims: <code>(model, replicate)</code> means dim 0 is split across the <code>model</code> axis and dim 1 is whole on every device. A <span class="math">8,192 × 8,192</span> bf16 weight (128 MB) sharded <code>(model, replicate)</code> over a <code>model</code> axis of 8 lives as eight <span class="math">1,024 × 8,192</span> slices of 16 MB each — that is how the parameters fit.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">device mesh</div><div class="v">N devices as a named grid, e.g. <span class="math">(data=4, model=4)</span>. Axis names are what you shard against, so one spec scales to any size.</div></div>
+  <div class="topic-card"><div class="k">sharding spec</div><div class="v">per-tensor-dim: <em>replicate</em> (full copy everywhere) or <em>shard</em> along a mesh axis (a slice per device). The compiler's currency.</div></div>
+  <div class="topic-card"><div class="k">SPMD</div><div class="v">single-program-multiple-data: one program text runs on every device, each on its own shard. The compiler emits it from single-device code.</div></div>
+  <div class="topic-card"><div class="k">collective</div><div class="v">a comm op every device runs together: all-reduce, all-gather, reduce-scatter, all-to-all. Inserted wherever two layouts disagree.</div></div>
+</div>
+
+<p><strong>SPMD</strong> — single-program-multiple-data — is the execution model that makes this affordable. Rather than emit a different program per device, the compiler emits <em>one</em> program that every device runs, each on its own shard, with collectives at the synchronization points. The host launches the same compiled artifact N times; the only difference between devices is which slice of data they hold. This is what lets a 1,000-line model compile once and run on 8 or 8,000 GPUs.</p>
+
+<h2>3 · Sharding propagation: infer the rest, insert collectives at mismatches</h2>
+
+<p>You annotate a few tensors; the compiler must decide the sharding of every <em>other</em> tensor in the graph. This is <strong>sharding propagation</strong> (GSPMD's core algorithm): treat shardings as a dataflow property and push them forward and backward through the ops until every value has a spec, choosing, at each op, the layout that <em>minimizes communication</em>. It is the same shape-inference idea as the type system in lesson 03, but the property being inferred is "where is this split," and the cost being minimized is bytes-on-the-wire.</p>
+
+<p>The crux is a matmul whose operands disagree. Consider <span class="math">Y = X · A</span> with the contraction dimension <span class="math">K</span>. If <span class="math">X</span> is sharded along <span class="math">K</span> and <span class="math">A</span> is sharded along the same <span class="math">K</span>, then each device computes a <em>partial</em> product over its slice of <span class="math">K</span>, and the true result is the <strong>sum</strong> of those partials → the compiler inserts <strong>one all-reduce</strong>. This is exactly Megatron's row-parallel pattern, derived automatically. But annotate badly — say <span class="math">X</span> sharded on <span class="math">K</span> while <span class="math">A</span> is sharded on its output dim <span class="math">N</span> — and the layouts don't line up for a local matmul at all; the compiler must first <strong>reshard</strong> one operand with an <strong>all-to-all</strong> (every device sends a piece to every other), which moves far more bytes, before any math runs. The annotation <em>is</em> the communication bill.</p>
+
+<p><strong>Worked comm bytes.</strong> Take <span class="math">X: 8,192 × 8,192</span>, <span class="math">A: 8,192 × 8,192</span>, bf16, on a <code>model</code> axis of 8 devices. The output <span class="math">Y</span> is <span class="math">8,192 × 8,192 × 2 ≈ 134 MB</span>.</p>
+
+<table class="trade-table">
+  <thead><tr><th>annotation</th><th>what the compiler must insert</th><th>comm bytes moved</th></tr></thead>
+  <tbody>
+    <tr><td>good: both operands sharded on contraction <span class="math">K</span></td><td>one <strong>all-reduce</strong> of the <span class="math">134 MB</span> partial result</td><td>≈ <span class="math">2 · 134 MB ≈ 268 MB</span> (ring all-reduce moves ≈2× the tensor)</td></tr>
+    <tr><td>good: weights sharded on output <span class="math">N</span>, X replicated</td><td>nothing for the matmul; an <strong>all-gather</strong> only if a later op wants <span class="math">Y</span> whole</td><td>0–134 MB, deferred</td></tr>
+    <tr><td>bad: operands misaligned (X on <span class="math">K</span>, A on <span class="math">N</span>)</td><td><strong>all-to-all</strong> to reshard, <em>then</em> the matmul, <em>then</em> maybe another collective</td><td>≈ <span class="math">134 MB</span> reshuffled + the matmul's own collective — multiplied at <em>every</em> layer</td></tr>
+  </tbody>
+</table>
+
+<p>The lesson of the table: a sharded matmul's <em>cost</em> is set by the annotation, not by the FLOPs. A good sharding closes a two-matmul block (attention or MLP) with a single all-reduce — the Megatron cost — and the propagator finds it for you. A bad one pays an all-to-all reshard at every layer, and across 80 layers that is the difference between a step that overlaps its comm and one that is entirely bandwidth-bound. The collectives, named once:</p>
+
+<div class="lesson-flow">
+  <div><strong>all-reduce</strong><span>sum (or max/min) partials across devices, every device gets the full result. The row-parallel matmul's closer; ≈2× tensor bytes on a ring.</span></div>
+  <div><strong>all-gather</strong><span>concatenate every device's shard so all end up with the whole tensor. Used to un-shard a value a later op needs replicated.</span></div>
+  <div><strong>reduce-scatter</strong><span>sum partials <em>and</em> leave each device only its slice — half of an all-reduce; the workhorse of FSDP/ZeRO gradient sharding.</span></div>
+  <div><strong>all-to-all</strong><span>every device sends a distinct piece to every other — a full transpose of the sharding. The expensive reshard; also MoE expert routing.</span></div>
+</div>
+
+<h2>4 · Collective scheduling — overlap comm with compute</h2>
+
+<p>Inserting the right collectives makes the program <em>correct</em>; it does not make it <em>fast</em>. A naively placed all-reduce blocks the next op on the critical path, and the device idles while bytes cross the wire. The fix is the same one lesson 08 used for loop nests: <strong>treat collective placement as a scheduling problem</strong>. <strong>Overlap</strong> means running a collective concurrently with independent compute on a separate stream, so the comm latency is hidden under math the device was going to do anyway. The data-parallel gradient all-reduce is the textbook case — it overlaps almost perfectly with the backward pass, because gradients for early layers are ready while later layers are still computing, so the all-reduce of layer L's grads runs while layer L−1's grads are still being produced.</p>
+
+<p>Two scheduling moves the compiler makes here. First, <strong>reorder for overlap</strong>: hoist a collective earlier so more independent compute sits between its launch and its first use, maximizing the hidden window. Second, <strong>collective fusion</strong>: merge many small collectives into one large one — a hundred tiny per-tensor gradient all-reduces become a few bucketed all-reduces, because a collective's cost is latency + bytes/bandwidth, and batching amortizes the fixed latency. (This is the comm analogue of operator fusion from lesson 05: fewer, larger operations beat many small ones for the same total bytes.) When the compiler owns partitioning, it owns this schedule too — which is exactly why hand-sharding leaves performance on the table: a human places the collective correctly but rarely overlaps it as aggressively as a pass that can see the whole dependency graph.</p>
+
+<h2>5 · The stacks: GSPMD, DTensor, and Megatron as the contrast</h2>
+
+<p>Three points on the spectrum from "compiler does everything" to "human does everything":</p>
+
+<table class="trade-table">
+  <thead><tr><th>system</th><th>how you express sharding</th><th>who inserts collectives</th><th>niche</th></tr></thead>
+  <tbody>
+    <tr><td><strong>XLA GSPMD / Shardy</strong></td><td>annotate a few tensors with sharding specs over a mesh (<code>jax.sharding</code>, <code>jax.shard_map</code>); the compiler does the rest</td><td>the compiler — full propagation + collective insertion + overlap</td><td>JAX / TF on TPU & GPU; the most automatic. Shardy is the next-gen MLIR-based propagation system replacing GSPMD.</td></tr>
+    <tr><td><strong>PyTorch DTensor + torch.compile</strong></td><td>wrap tensors as <code>DTensor</code> with a placement (<code>Shard(dim)</code> / <code>Replicate()</code>) on a <code>DeviceMesh</code>; eager redistributes, <code>torch.compile</code> fuses/overlaps</td><td>DTensor inserts collectives at redistribution; Inductor schedules overlap</td><td>PyTorch-native; composes with FSDP2 and the rest of the eager ecosystem</td></tr>
+    <tr><td><strong>Megatron-LM</strong></td><td>you rewrite the model with <code>ColumnParallelLinear</code> / <code>RowParallelLinear</code> and hand-placed collectives</td><td>the human — collectives are written into the model code</td><td>peak performance for its fixed recipes; the hand-written baseline the compilers aim to match</td></tr>
+  </tbody>
+</table>
+
+<p>The verdict the field has reached: the compiler approach (GSPMD/Shardy, DTensor) wins on <em>flexibility and composition</em> — you change one annotation to repartition, and the sharding pass re-runs against fused, autodiffed, dynamically-shaped graphs without you rewriting collectives. Megatron still wins on <em>peak</em> for the exact configurations it was tuned for, because a human hand-picked every collective and overlap. The trajectory is toward the compiler: as propagation and scheduling get better, the hand-written gap shrinks, and the flexibility of "annotate, don't rewrite" matters more as meshes and models change every few months.</p>
+
+<h2>Drive it: the sharding propagator</h2>
+
+<p>The widget is a two-matmul graph — <span class="math">H = X · A</span> then <span class="math">Y = H · B</span>, the shape of an MLP block — on a device mesh you size to 2, 4, or 8. You pick how the <em>input</em> <span class="math">X</span> is sharded; the propagator infers the rest, inserts the collectives at the mismatches, and reports the bill. Set a <em>good</em> annotation (operands aligned on the contraction dim) and the block closes with one all-reduce, comm bytes stay flat as the mesh grows, and per-device memory drops by the mesh size. Set a <em>bad</em> one (misaligned) and watch all-to-all reshards appear between every op, comm bytes explode, and the overlap fraction collapse. The knob that breaks it: flip "shard X on the wrong axis" and the green all-reduce turns into red all-to-alls everywhere.</p>
+
+<div class="widget" id="shard-widget">
+  <div class="title">Sharding propagator — annotate one tensor, pay the comm bill</div>
+  <div class="hint">A two-matmul block <span class="math">X·A·B</span> on an N-device mesh. Pick the input sharding; the compiler propagates it, inserts collectives at every layout mismatch, and prices them. A <em>good</em> annotation closes the block with one all-reduce (flat comm, memory ÷ N). A <em>bad</em> one forces an all-to-all reshard at every op — comm explodes and overlap dies. Flip the annotation and watch the graph go red.</div>
+
+  <div class="controls" style="margin-top:4px;">
+    <label class="inline">mesh size N:
+      <select id="sh-mesh">
+        <option value="2">2 devices</option>
+        <option value="4" selected>4 devices</option>
+        <option value="8">8 devices</option>
+      </select>
+    </label>
+    <label class="inline">input X sharding:
+      <select id="sh-ann">
+        <option value="good" selected>shard X on contraction K (good)</option>
+        <option value="weights">replicate X, shard weights on output (good)</option>
+        <option value="bad">shard X on the wrong axis (bad)</option>
+      </select>
+    </label>
+    <label class="inline">tensor dim d:
+      <input type="range" id="sh-d" min="2048" max="16384" step="1024" value="8192">
+      <span class="val" id="sh-dv">8,192</span>
+    </label>
+  </div>
+
+  <div class="shard-graph" id="sh-graph"></div>
+
+  <div class="kpi-grid" style="margin-top:12px;">
+    <div class="kpi" id="sh-k-coll"><div class="k">collectives inserted</div><div class="v" id="sh-coll">—</div></div>
+    <div class="kpi" id="sh-k-bytes"><div class="k">comm bytes / step</div><div class="v" id="sh-bytes">—</div></div>
+    <div class="kpi"><div class="k">per-device memory</div><div class="v" id="sh-mem">—</div></div>
+    <div class="kpi" id="sh-k-ovl"><div class="k">compute / comm overlap</div><div class="v" id="sh-ovl">—</div></div>
+  </div>
+  <div style="margin-top:10px;"><span id="sh-note" class="flag ok">layout OK</span></div>
+</div>
+
+<p>The shape of the readouts is the whole point: the same math, the same FLOPs, the same mesh — and the only thing you changed was a single sharding annotation, yet the comm bill moved by an order of magnitude. That is why partitioning belongs in the compiler: the propagator searches for the layout that minimizes communication so you don't have to hand-place a single collective.</p>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Annotations that fight the math.</strong> Sharding operands on mismatched axes so the propagator must reshard with all-to-all at every op. <em>Signal:</em> the trace is dominated by all-to-all collectives, not matmuls; step time barely improves as you add devices.</li>
+    <li><strong>Trusting propagation blindly on a huge graph.</strong> Under-annotating so the compiler picks a globally poor layout it can't escape. <em>Signal:</em> unexpected all-gathers of large activations; comm bytes far above the Megatron one-all-reduce-per-block baseline.</li>
+    <li><strong>No overlap.</strong> Collectives placed correctly but on the critical path, so the device idles on the wire. <em>Signal:</em> a gap in the timeline exactly the length of each all-reduce; MFU well below what FLOPs predict.</li>
+    <li><strong>Tensor-parallel collectives crossing a node boundary.</strong> Mapping the heavy all-reduce axis onto the slow inter-node link. <em>Signal:</em> per-step time scales with inter-node bandwidth, not NVLink (cross-link cs336/09 — TP ≤ GPUs/node).</li>
+    <li><strong>Mismatched forward/backward shardings.</strong> Letting autodiff (lesson 12) produce a backward whose layouts disagree with the forward, forcing extra reshards. <em>Signal:</em> the backward has more collectives than the forward for a symmetric block.</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><strong>Annotate the few load-bearing tensors</strong> (inputs, parameters) and let propagation infer the rest — don't hand-spec every value.</li>
+    <li><strong>Align operands on the contraction dim</strong> so a two-matmul block closes with one all-reduce, the Megatron-optimal cost.</li>
+    <li><strong>Place the heavy axis on the fast link</strong> — tensor-parallel collectives on NVLink intra-node, data-parallel reduce-scatter on the wide cheap axis.</li>
+    <li><strong>Confirm overlap</strong> in the profile: every collective should hide under independent compute; bucket small collectives via fusion.</li>
+    <li><strong>Check the comm bill against the baseline</strong> — one all-reduce per attention/MLP block forward and backward; more means the propagation chose a poor layout.</li>
+  </ul></div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the widget at mesh size 4, input sharding "good", <span class="math">d = 8,192</span>. Read the three KPIs: one all-reduce, comm bytes around a few hundred MB, per-device memory cut to a quarter, overlap high. Now switch input sharding to "bad" and watch all-to-all collectives appear between every op and comm bytes jump roughly an order of magnitude while overlap collapses. Reset to "good" and slide the mesh from 2 → 8: per-device memory keeps dropping (the parameters shard further) while comm bytes stay roughly flat — that's the win. By hand, for the good case: a <span class="math">8,192 × 8,192</span> bf16 result is ≈134 MB, and a ring all-reduce moves ≈2× the tensor, so predict the comm bytes and check the KPI. Finally explain in one sentence why the bad annotation's cost is multiplied by the layer count while the good one is not.</div>
+
+<h2>Where this points next</h2>
+
+<p>You can now take a single-device graph and, from a handful of sharding hints, get a correct, overlapped SPMD program for hundreds of devices — partitioning is a pass like any other, and it composes with fusion, autodiff, and dynamic shapes because they all share the preserve-the-math invariant. That completes the catalog: you have seen every pass a modern ML compiler runs, each one forced by the wall the previous one hit. What you have <em>not</em> seen is how the field actually packages them. The same chain — capture, represent, optimize, lower, codegen, plus autodiff and distribution — ships under a dozen product names with different IRs and different bets, and it is easy to lose the through-line. The next lesson lines them up side by side and shows they are the same pipeline. That is <a href="14_stacks.html"><strong>14 · The real stacks</strong></a>.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+Lesson 12's joint graph is optimized for one device, but frontier models exceed any single GPU and hand-sharding them — splitting matmuls, hand-placing collectives, mirroring the backward, across hundreds of devices — is intractable and doesn't compose with the rest of the compiler. The fix is to make <strong>partitioning a compiler pass</strong>: annotate a few tensors with <strong>sharding specs</strong> (replicate or shard along a named axis) over a device <strong>mesh</strong>, and the compiler <strong>propagates</strong> shardings through the graph (GSPMD / Shardy / DTensor), <strong>inserts a collective</strong> — all-reduce, all-gather, reduce-scatter, all-to-all — at every layout mismatch, and turns single-device semantics into an <strong>SPMD</strong> program every device runs on its own shard. The annotation <em>is</em> the comm bill: operands aligned on the contraction dim close a two-matmul block with <em>one all-reduce</em> of ≈2× the result tensor (Megatron's cost, derived automatically), while a misaligned annotation forces an <strong>all-to-all</strong> reshard at every layer. Then <strong>collective scheduling</strong> — the same scheduling idea as lesson 08 — <strong>overlaps</strong> comm with independent compute and <strong>fuses</strong> small collectives into bucketed ones, hiding the wire under math. XLA GSPMD/Shardy and PyTorch DTensor automate it; Megatron is the hand-written contrast that still wins on peak for fixed recipes. The compiler turns "single-device program + sharding hints" into N-device SPMD — and with that, you have seen every pass; lesson 14 shows how the real stacks assemble them.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>What is a sharding spec and a device mesh, and why annotate only a few tensors? <em>(§2–3 — a mesh is N devices as a named grid; a spec says, per tensor dim, replicate or shard along a mesh axis. You annotate a few load-bearing tensors and the propagator infers the rest by minimizing communication, so one spec scales to any device count.)</em></li>
+  <li>How does sharding propagation decide where to put a collective? <em>(§3 — it pushes shardings through the graph as a dataflow property; at each op it picks the layout minimizing comm, and inserts a collective wherever producer and consumer layouts disagree — e.g. operands sharded on the contraction dim need one all-reduce to sum partials.)</em></li>
+  <li>Why does a good vs bad annotation change the comm bill by an order of magnitude? <em>(§3 — aligned operands close a block with one all-reduce (≈2× the result tensor); misaligned operands force an all-to-all reshard before the matmul, moving far more bytes, and that cost repeats at every layer.)</em></li>
+  <li>Distinguish all-reduce, all-gather, reduce-scatter, all-to-all and where each appears. <em>(§3 — all-reduce sums partials so all get the full result (row-parallel matmul); all-gather concatenates shards to replicate; reduce-scatter sums and keeps a slice each (FSDP grads); all-to-all is a full sharding transpose (resharding, MoE routing).)</em></li>
+  <li>Why is collective scheduling the same problem as loop scheduling? <em>(§4 — placement decides performance: a collective on the critical path idles the device, so you reorder to overlap it with independent compute on a separate stream and fuse small collectives into bucketed ones — exactly the scheduling/fusion moves from lessons 08 and 05, applied to comm.)</em></li>
+  <li>Compare GSPMD/Shardy, DTensor, and Megatron. <em>(§5 — GSPMD/Shardy: annotate, compiler propagates + inserts + overlaps, most automatic; DTensor: placements on a mesh, collectives at redistribution, torch.compile overlaps; Megatron: human rewrites the model with parallel layers and hand-placed collectives — peak for fixed recipes, the baseline compilers chase.)</em></li>
+  <li>Why does compiler-based partitioning compose with the rest of the compiler when hand-sharding doesn't? <em>(§1 — inserting a collective preserves the math, so it's just another semantics-preserving pass; it re-runs against fused, autodiffed, dynamically-shaped graphs, whereas hand-placed collectives break the moment you repartition or fuse a layer.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="12_autodiff.html"><span class="dir">← Back</span><span class="ttl">12 · Autodiff as a pass</span></a>
+  <a class="next" href="14_stacks.html"><span class="dir">Next →</span><span class="ttl">14 · The real stacks</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var elMesh = document.getElementById('sh-mesh');
+  var elAnn  = document.getElementById('sh-ann');
+  var elD    = document.getElementById('sh-d'), elDv = document.getElementById('sh-dv');
+  var graph  = document.getElementById('sh-graph');
+  var kColl  = document.getElementById('sh-coll'),  boxColl = document.getElementById('sh-k-coll');
+  var kBytes = document.getElementById('sh-bytes'), boxBytes = document.getElementById('sh-k-bytes');
+  var kMem   = document.getElementById('sh-mem');
+  var kOvl   = document.getElementById('sh-ovl'),  boxOvl = document.getElementById('sh-k-ovl');
+  var note   = document.getElementById('sh-note');
+  if (!elMesh) return;
+
+  var BYTES = 2;  // bf16
+
+  function comma(n){ return Math.round(n).toLocaleString('en-US'); }
+  function fmtBytes(b){
+    if (b >= 1e9) return (b/1e9).toFixed(2) + ' GB';
+    if (b >= 1e6) return (b/1e6).toFixed(0) + ' MB';
+    if (b >= 1e3) return (b/1e3).toFixed(0) + ' KB';
+    return Math.round(b) + ' B';
+  }
+
+  function compute(){
+    var N = +elMesh.value;
+    var ann = elAnn.value;
+    var d = +elD.value;
+    elDv.textContent = comma(d);
+
+    // one matmul result tensor d x d, bf16
+    var resultBytes = d * d * BYTES;
+    // full unsharded params for the block: two d x d weights
+    var fullParamBytes = 2 * d * d * BYTES;
+
+    var collsPerBlock, commBytes, overlap, perDevMem, note1, noteClass, collKind, collLabel;
+
+    if (ann === 'good'){
+      // operands aligned on contraction K -> one all-reduce per matmul, 2 matmuls = 2 all-reduces
+      collsPerBlock = 2;
+      // ring all-reduce moves ~2x the tensor; two of them
+      commBytes = 2 * (2 * resultBytes);
+      overlap = 0.85;
+      perDevMem = fullParamBytes / N;          // params shard by N
+      collKind = 'ar'; collLabel = 'all-reduce';
+      noteClass = 'ok';
+      note1 = 'aligned on contraction K — block closes with one all-reduce per matmul; comm flat as N grows';
+    } else if (ann === 'weights'){
+      // weights sharded on output N, X replicated -> matmul local, defer an all-gather
+      collsPerBlock = 1;
+      commBytes = 1 * (resultBytes);           // one deferred all-gather of the result
+      overlap = 0.9;
+      perDevMem = fullParamBytes / N;
+      collKind = 'ag'; collLabel = 'all-gather';
+      noteClass = 'ok';
+      note1 = 'weights sharded on output dim, X replicated — matmuls run local, only a deferred all-gather';
+    } else {
+      // misaligned -> all-to-all reshard before EACH matmul, then the matmul's own collective
+      collsPerBlock = 4;                        // 2 reshards + 2 result collectives
+      // all-to-all reshuffles the operand (~d*d) plus the result collective, twice, and it
+      // does NOT amortize across the mesh the way the aligned case does
+      commBytes = 2 * (resultBytes + 2 * resultBytes) * Math.min(N, 4) / 2;
+      overlap = 0.15;
+      perDevMem = fullParamBytes / N;          // still sharded, but you pay to reshuffle every step
+      collKind = 'aa'; collLabel = 'all-to-all';
+      noteClass = 'bad';
+      note1 = 'operands misaligned — all-to-all reshard before every matmul; comm explodes, overlap dies';
+    }
+
+    // ---- KPIs ----
+    kColl.textContent = collsPerBlock + (collKind === 'aa' ? ' (incl. all-to-all)' : ' ' + collLabel);
+    kBytes.textContent = fmtBytes(commBytes);
+    kMem.textContent = fmtBytes(perDevMem) + ' / device';
+    kOvl.textContent = Math.round(overlap * 100) + '%';
+
+    boxColl.classList.toggle('over', collKind === 'aa');
+    boxBytes.classList.toggle('over', collKind === 'aa');
+    boxOvl.classList.toggle('over', overlap < 0.4);
+    boxOvl.classList.toggle('good', overlap >= 0.8);
+
+    note.className = 'flag ' + noteClass;
+    note.textContent = note1;
+
+    drawGraph(collKind);
+  }
+
+  function drawGraph(kind){
+    function nb(name, sh){ return '<div class="nodebox"><div class="nm">'+name+'</div><div class="sh">'+sh+'</div></div>'; }
+    function arrow(){ return '<span class="arrow">&rarr;</span>'; }
+    function coll(cls, label){ return '<div class="coll '+cls+'">'+label.replace(/\n/g,'<br>')+'</div>'; }
+
+    var html = '';
+    if (kind === 'ar'){
+      // aligned on contraction K: local matmul, one all-reduce closes each
+      html += nb('X', 'sharded K') + arrow();
+      html += nb('matmul A', 'H = X&middot;A') + arrow();
+      html += coll('ar', 'all-reduce') + arrow();
+      html += nb('matmul B', 'Y = H&middot;B') + arrow();
+      html += coll('ar', 'all-reduce') + arrow();
+      html += nb('Y', 'result');
+    } else if (kind === 'ag'){
+      // weights sharded on output dim, X replicated: matmuls run local, one deferred all-gather at the end
+      html += nb('X', 'replicated') + arrow();
+      html += nb('matmul A', 'H = X&middot;A') + arrow();
+      html += coll('none', 'no comm') + arrow();
+      html += nb('matmul B', 'Y = H&middot;B') + arrow();
+      html += coll('ar', 'all-gather') + arrow();
+      html += nb('Y', 'result');
+    } else {
+      // misaligned: all-to-all reshard before each matmul, plus the result collective
+      html += nb('X', 'mis-sharded') + arrow();
+      html += coll('aa', 'all-to-all\nreshard') + arrow();
+      html += nb('matmul A', 'H = X&middot;A') + arrow();
+      html += coll('aa', 'all-to-all\nreshard') + arrow();
+      html += nb('matmul B', 'Y = H&middot;B') + arrow();
+      html += coll('aa', 'all-to-all') + arrow();
+      html += nb('Y', 'result');
+    }
+    graph.innerHTML = html;
+  }
+
+  [elMesh, elAnn, elD].forEach(function(e){
+    e.addEventListener('input', compute);
+    e.addEventListener('change', compute);
+  });
+  compute();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

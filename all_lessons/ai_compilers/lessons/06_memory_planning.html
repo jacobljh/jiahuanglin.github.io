@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>06 · Memory planning</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local layout only — failure/checklist columns + the planner timeline */
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; font-size: 15px; }
+  .lesson-card ul { margin: 0; padding-left: 18px; }
+  .lesson-card li { margin: 7px 0; font-size: 13.5px; line-height: 1.5; }
+  .kpi.over .v { color: var(--bad); }
+  .kpi.good .v { color: var(--ok); }
+  .mp-canvas-wrap { margin: 14px 0 6px; }
+  .mp-legend { display: flex; flex-wrap: wrap; gap: 16px; margin: 8px 0 2px; font-family: var(--mono); font-size: 11px; color: var(--text-mute); }
+  .mp-legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .mp-legend i { width: 14px; height: 10px; border-radius: 2px; display: inline-block; }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">ai_compilers / lessons</a><span class="crumb">/</span><span class="crumb">06 · memory planning</span><span class="step-pill">lesson 7 / 16</span></div></header>
+
+<main>
+
+<p class="kicker">Part III — Middle end</p>
+<h1>Memory planning</h1>
+<p class="subtitle">Lesson 05 fused chains of ops to cut HBM traffic — but fusion, and the graph itself, leave behind a litter of intermediate buffers: every value flowing along an edge needs storage somewhere. Hand each one its own allocation, free it when the op finishes, and you do the obvious thing — which is also the wrong thing. The naive plan makes peak memory the <em>sum</em> of every buffer that ever existed and drowns the runtime in per-op allocator calls. This lesson treats deciding where each buffer lives as a compile-time problem: figure out exactly when each value is alive, then let buffers that are never alive at the same time share the same bytes.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>Fusion (lesson 05) is a transform on the graph; it decided which ops become one kernel, but it said nothing about the bytes those kernels read and write. The optimized graph is still a dataflow DAG, and every edge carries a tensor that must occupy physical memory at the moment it is produced. Run the naive policy — allocate a fresh buffer for each value, free it after its last consumer — and two costs explode. First, <strong>peak memory</strong>: a careless allocator can hold dozens of intermediates live at once and your peak is the sum of all of them, even though most never overlap in time. Second, <strong>allocator traffic</strong>: thousands of <code>cudaMalloc</code>/<code>cudaFree</code> calls per step, each a synchronizing, fragmenting, microsecond-scale tax. The model fits the chip in <em>FLOPs</em> and runs fast in <em>kernels</em>, and still OOMs or stalls because nobody decided where the bytes go.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> a graph of intermediate buffers, allocated naively, makes peak memory the sum of all buffers and floods the runtime with allocator calls.<br><strong>New idea:</strong> <strong>memory planning</strong> as a compile-time pass — run <strong>liveness analysis</strong> to learn each buffer's lifetime (first def to last use), build the <strong>interference graph</strong> of buffers that are live at the same time, then assign storage so non-overlapping buffers share a slot (register-coloring style), do ops <strong>in place</strong> when safe, <strong>donate</strong> an input's storage to an output, and serve everything from one preallocated <strong>arena</strong>. Goal: collapse peak from sum-of-buffers toward max-concurrent, and cut allocator calls to ≈1.<br><strong>Forces next:</strong> the plan decides <em>where</em> and <em>when</em> a buffer lives, but not its physical <em>shape</em> in memory — and the wrong byte layout makes every downstream kernel slow. That is layout (lesson 07).</div>
+
+<div class="callout"><div class="label">The plan</div>Five moves. (1) Price the naive policy: per-tensor malloc/free, fragmentation, and why peak = sum, not max. (2) Define <strong>liveness</strong> — first-def to last-use — and read it off a worked graph with byte counts. (3) Reuse by graph coloring; the interference graph; in-place ops. (4) Buffer <strong>donation/aliasing</strong> (XLA input-output aliasing, JAX donated args) and the correctness guard that makes it legal. (5) Arena/static allocation, and how training (recompute, checkpointing) reshapes the plan — the activation-memory wall. Then drive the planner widget until peak collapses from sum toward max-concurrent.</div>
+
+<h2>1 · The naive policy and why peak = sum</h2>
+
+<p>The simplest allocator is "allocate on produce, free on last consume." It is correct and it is what eager mode does. It has two failure modes that a compiler, seeing the whole graph at once, can fix.</p>
+
+<p><strong>Allocator traffic.</strong> Every intermediate is a real <code>cudaMalloc</code> and a real <code>cudaFree</code>. A device malloc is not free: it can synchronize the stream, it fragments the heap, and it costs on the order of a few microseconds. A transformer layer fused down to, say, 20 kernels can still produce 30–50 live intermediates; across 80 layers that is thousands of allocator calls per forward step. Even at ≈2 µs each, a few thousand calls is several milliseconds of pure bookkeeping per step — wasted next to the kernels you worked so hard to fuse.</p>
+
+<p><strong>Peak memory.</strong> This is the expensive one. Define <strong>peak memory</strong> as the maximum, over the whole execution, of the total bytes live at any one instant. The naive policy does not control it; it merely <em>reacts</em> to it. Worse, a naive allocator that does not reuse freed blocks well makes your high-water mark drift toward the <em>sum</em> of every buffer that was ever allocated, because freed-but-not-recycled slabs sit in the heap fragmenting it. The whole point of planning is to recognize that two buffers whose lifetimes never overlap can occupy the <em>same</em> bytes — so the real lower bound on peak is the <strong>maximum concurrent</strong> live bytes, not the sum. The gap between those two numbers is what this pass recovers.</p>
+
+<div class="math block">peak<sub>naive</sub> ≈ Σ<sub>all buffers</sub> size(b) &nbsp;&nbsp;⟶&nbsp;&nbsp; peak<sub>planned</sub> = max<sub>t</sub> Σ<sub>b live at t</sub> size(b)</div>
+
+<h2>2 · Liveness: when is each buffer alive?</h2>
+
+<p><strong>Liveness analysis</strong> is the classic compiler dataflow question, lifted to tensors: a buffer is <em>live</em> from the instant it is defined (the op that produces it) to the instant of its last use (the last op that reads it). Before its def and after its last use, its bytes are free for anyone. In SSA / value-semantics IR (lesson 03), this is trivial to read off — each value is defined exactly once, and you walk the DAG in execution order to find the last consumer of each edge.</p>
+
+<p>Work a concrete chain. Take the fused residual block from lesson 05, executed as a linear schedule of six ops, each producing one buffer on a tensor of 64 MB (call that one unit, <span class="math">U = 64 MB</span>):</p>
+
+<pre class="ascii">step   op                produces   reads          buffer lifetime  (• live)
+  0    x   = input        x  (64MB)  —              x : 0 ──────────► 3
+  1    a   = matmul(x,W)   a  (64MB)  x             a : 1 ──► 2
+  2    b   = bias(a)       b  (64MB)  a             b : 2 ──► 3
+  3    c   = gelu(b)+x     c  (64MB)  b, x          c : 3 ──────────► 5
+  4    d   = norm(c)       d  (64MB)  c             d : 4 ──► 5
+  5    y   = matmul(d,W2)  y  (64MB)  d             y : 5 ─►
+</pre>
+
+<p>Naive accounting: six buffers ever produced, so a sloppy allocator drifts toward <span class="math">6 × 64 = 384 MB</span>. Now read the <em>concurrent</em> live set step by step. At step 3 the live buffers are <span class="math">{x, b, c}</span> — <span class="math">x</span> is still needed for the residual add, <span class="math">b</span> is being consumed, <span class="math">c</span> is being produced — that is <span class="math">3 × 64 = 192 MB</span>, the busiest instant. Everywhere else only two are live. So the true <strong>peak is 192 MB</strong>, not 384 MB: planning can halve it just by recognizing that <span class="math">a</span> dies before <span class="math">d</span> is born, so they can share bytes. The naive number counts buffers that were never alive together.</p>
+
+<h2>3 · Reuse by coloring, and in-place ops</h2>
+
+<p>Once you have lifetimes, assigning storage is exactly <strong>graph coloring</strong> — the same algorithm a CPU compiler uses for register allocation, scaled up from registers to tensor-sized slots. Build the <strong>interference graph</strong>: one node per buffer, an edge between two buffers whose lifetimes <em>overlap</em>. Two buffers that interfere must get different storage; two that do not (their lifetimes are disjoint) may share. A valid storage assignment is a coloring where no edge connects two same-colored nodes, and the number of colors you need — weighted by size — sets your peak.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">interference</div><div class="v">Two buffers <strong>interfere</strong> if their lifetimes overlap at any instant. Interfering buffers cannot share storage; non-interfering ones can. Same relation a register allocator colors.</div></div>
+  <div class="topic-card"><div class="k">reuse / coloring</div><div class="v">Assign each buffer to a slot so no two interfering buffers share a slot. Greedy best-fit over a lifetime sweep is the practical heuristic; optimal slot-packing is NP-hard, so compilers approximate.</div></div>
+  <div class="topic-card"><div class="k">in-place</div><div class="v">If an op's only remaining consumer of its input is the op itself, the output can overwrite the input's buffer — zero extra bytes. A degenerate, free case of reuse.</div></div>
+</div>
+
+<p>In the worked chain above, <span class="math">a</span> (lives 1→2) and <span class="math">d</span> (lives 4→5) do <em>not</em> interfere — <span class="math">a</span> is dead by the time <span class="math">d</span> is born — so they get the same slot. Likewise <span class="math">b</span> and <span class="math">y</span>. After coloring you need only three physical slots of 64 MB, which is 192 MB — exactly the max-concurrent bound. The allocator went from six allocations to three slots carved once.</p>
+
+<p><strong>In-place</strong> is the cheapest reuse of all. An elementwise op like <code>relu</code> or <code>add_</code> can write its result over its input buffer if that input has no other live consumer — the bytes are recycled with zero new storage. Fusion (lesson 05) creates lots of these opportunities, because a fused epilogue's intermediate scalars never need their own HBM buffer at all. The catch is the <em>only remaining consumer</em> test: overwrite a buffer that something later still reads and you have silently corrupted the math. That guard is the recurring <strong>preserve-semantics</strong> motif — every reuse decision is legal only if you can prove no live value is clobbered.</p>
+
+<h2>4 · Donation and aliasing: reuse an input's storage</h2>
+
+<p>The graph's <em>inputs</em> are buffers too, and often the caller does not need them after the call. <strong>Buffer donation</strong> (a.k.a. input-output aliasing) lets the output of the program reuse the storage of an input that is dead afterward — the single biggest win for the parameter-update step, where a new weight tensor can be written straight over the old one instead of doubling parameter memory.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">XLA input-output aliasing</div><div class="v">XLA lets you mark that output <span class="math">i</span> may alias input <span class="math">j</span>; the compiled executable writes the result in place over the donated input's buffer. Standard for the optimizer's <code>params ← params − lr·grad</code> update.</div></div>
+  <div class="topic-card"><div class="k">JAX donated args</div><div class="v"><code>jax.jit(f, donate_argnums=(0,))</code> promises the caller will not use argument 0 again, so XLA may reuse its buffer for an output. Donating the params + optimizer state can roughly halve update-step memory.</div></div>
+  <div class="topic-card"><div class="k">the correctness guard</div><div class="v">Donation is legal only if the donated buffer has <strong>no later use</strong> anywhere — the host must not read it after the call. Violate it and you read overwritten garbage; frameworks therefore make donation an explicit, opt-in promise.</div></div>
+</div>
+
+<p>The mechanism and the guard are the same as in-place, one level up: aliasing input <span class="math">j</span> to output <span class="math">i</span> is sound exactly when <span class="math">j</span> is provably dead after the call. Because the compiler cannot always see the host's later use, donation is an explicit contract: in JAX you pass <code>donate_argnums</code>, in XLA you set the aliasing config, and you accept that touching the donated value afterward is undefined. Done right on a 7B model's update step, donating params and the two Adam moments can save tens of gigabytes — the difference between fitting and not.</p>
+
+<h2>5 · Arena allocation, and the training wall</h2>
+
+<p>The final move turns the plan into one allocation. Once coloring has assigned every buffer to a slot and sized the slots, the compiler computes the offset of each slot inside a single contiguous slab — the <strong>arena</strong> — preallocates it once at the start, and serves every "allocation" as a pointer into the arena at a known offset. No per-op malloc, no fragmentation, no synchronization: allocator traffic drops from thousands of calls to <strong>one</strong>. This is what XLA, TensorRT, and TVM's graph executor all do — the buffer assignment is baked into the compiled artifact.</p>
+
+<div class="lesson-flow">
+  <div><strong>1. liveness</strong><span>Walk the schedule; record each buffer's [def, last-use] interval.</span></div>
+  <div><strong>2. interference</strong><span>Edge between buffers whose intervals overlap; in-place / donation are special dead-input cases.</span></div>
+  <div><strong>3. color + size slots</strong><span>Greedy best-fit assigns non-interfering buffers to shared slots; slot size = max buffer assigned to it.</span></div>
+  <div><strong>4. arena</strong><span>Lay slots out at fixed offsets in one slab; preallocate once; every buffer is now a known offset.</span></div>
+</div>
+
+<p>Training breaks the tidy picture and is where planning earns its keep. The backward pass needs the forward <strong>activations</strong>, so every activation produced in the forward is <em>live until its gradient is computed</em> — lifetimes stretch across the whole forward and backward, and the concurrent live set balloons. This is the <strong>activation-memory wall</strong>: for a deep model, saved activations, not parameters, dominate peak memory (see <a href="../../cs336/lessons/05_accounting.html">cs336 · 05 the memory ledger</a> for the per-parameter accounting). The compiler's lever here is <strong>rematerialization</strong> — drop some activations and recompute them in the backward, trading FLOPs for bytes. That makes save-vs-recompute a memory-planning decision the partitioner makes (a min-cut on the lifetime graph), which lesson 12 develops fully when autodiff builds the joint forward+backward graph. For now the point stands: liveness + coloring + arena collapse peak from sum toward max-concurrent, and recompute pushes max-concurrent itself down.</p>
+
+<h2>6 · Drive it: collapse peak from sum to max-concurrent</h2>
+
+<p>The widget lays out a fixed schedule of buffers as horizontal bars on a timeline — each bar spans a buffer's lifetime from def to last use. The vertical axis is storage slots. Turn on <strong>reuse (color)</strong> and watch non-overlapping bars drop into a <em>shared</em> slot while overlapping bars are forced apart; turn on <strong>in-place</strong> and watch elementwise outputs fold onto their inputs for free. The KPIs track the only numbers that matter: peak bytes, number of allocations, and bytes saved versus naive.</p>
+
+<div class="widget" id="mp">
+  <div class="title">Memory planner: liveness, reuse, in-place</div>
+  <div class="hint">Each bar is a buffer's lifetime. <strong>Naive</strong> gives every buffer its own slot — peak = sum. Turn on <strong>reuse</strong> and buffers whose lifetimes don't overlap share a slot (peak → max-concurrent); turn on <strong>in-place</strong> to fold elementwise outputs onto their inputs. The knob that proves it: with everything off, peak is the tall sum; flip both on and peak collapses to the single busiest instant.</div>
+
+  <div class="controls" style="margin-top: 4px;">
+    <label class="inline"><input type="checkbox" id="mp-reuse"> reuse (color non-overlapping)</label>
+    <label class="inline"><input type="checkbox" id="mp-inplace"> in-place elementwise</label>
+    <label class="inline">buffer size: <input type="range" id="mp-sz" min="16" max="128" step="16" value="64"> <span class="val" id="mp-szv">64</span> MB</label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi" id="mp-k-peak"><div class="k">Peak live bytes</div><div class="v" id="mp-peak">—</div></div>
+    <div class="kpi"><div class="k">Slots allocated</div><div class="v" id="mp-slots">—</div></div>
+    <div class="kpi good"><div class="k">Bytes saved vs naive</div><div class="v" id="mp-saved">—</div></div>
+    <div class="kpi"><div class="k">Max-concurrent bound</div><div class="v" id="mp-bound">—</div></div>
+  </div>
+
+  <div class="mp-canvas-wrap">
+    <canvas id="mp-canvas" width="860" height="320" style="width:100%; height:320px; background: var(--code-bg); border:1px solid var(--border); border-radius:8px; display:block;"></canvas>
+  </div>
+  <div class="mp-legend">
+    <span><i style="background:var(--accent)"></i> buffer lifetime bar</span>
+    <span><i style="background:var(--ok)"></i> in-place (folded onto input)</span>
+    <span><i style="background:var(--text-mute); height:2px;"></i> slot boundary</span>
+    <span id="mp-mode">mode: naive</span>
+  </div>
+</div>
+
+<p>The lesson is the gap between the two horizontal bands. With reuse off, each buffer claims its own slot and the stack is as tall as the buffer count. With reuse on, the bars compact into the smallest number of slots that respects interference — and that number is fixed by the single busiest column of the timeline, the max-concurrent live set. No transform changed the math; the planner only noticed which buffers were never alive together.</p>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>In-place over a still-live input.</strong> Overwriting a buffer that a later op (or a residual branch) still reads. <em>Signal:</em> numerically wrong outputs that change when you toggle the in-place pass — the math depends on a clobbered value.</li>
+    <li><strong>Donating an input the host reuses.</strong> Marking an argument donated, then reading it after the call. <em>Signal:</em> garbage in the supposedly-untouched input; nondeterministic results across runs.</li>
+    <li><strong>Counting sum instead of max.</strong> Reporting peak as the total of all intermediates and concluding the model can't fit. <em>Signal:</em> your estimate is 2–4× the profiler's actual peak — you summed buffers that never coexisted.</li>
+    <li><strong>Ignoring the activation wall in training.</strong> Planning only the forward and being shocked by OOM in the backward. <em>Signal:</em> forward fits comfortably, backward OOMs — activations stayed live across the whole pass.</li>
+    <li><strong>Over-fusing into giant live buffers.</strong> Fusion that keeps a huge intermediate alive longer can <em>raise</em> max-concurrent. <em>Signal:</em> fewer kernels but higher peak — fusion and planning fighting each other.</li>
+  </ul>
+  </div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><strong>Compute liveness first.</strong> [def, last-use] per buffer off the SSA schedule; everything else depends on it.</li>
+    <li><strong>Peak = max-concurrent.</strong> Size the arena to the busiest instant, not the sum of buffers.</li>
+    <li><strong>Color non-overlapping buffers together.</strong> Greedy best-fit over a lifetime sweep; share slots where intervals are disjoint.</li>
+    <li><strong>Prove dead-before-reuse.</strong> In-place and donation are legal only when the donor buffer has no later use.</li>
+    <li><strong>Donate the update step.</strong> Alias params/optimizer-state outputs to their inputs (XLA aliasing / JAX <code>donate_argnums</code>).</li>
+    <li><strong>Allocate one arena.</strong> Bake fixed offsets into the artifact; drive allocator calls toward one.</li>
+  </ul>
+  </div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the widget with everything off and read the peak: six buffers at 64 MB each in their own slots, ≈384 MB, with the naive band as tall as the buffer count. Now flip <strong>reuse</strong> on and watch the stack compress to three slots (192 MB) — that is the max-concurrent bound, reached at the busiest column where <span class="math">{x, b, c}</span> are live together. Confirm the "bytes saved" KPI reads ≈192 MB (the sum-minus-max gap). Then flip <strong>in-place</strong> on and watch one more slot fold away as the elementwise output overwrites its input. Finally, set buffer size to 128 MB and predict the new peak before you read it: every number doubles, because reuse changes <em>how many</em> slots, not how big each one is.</div>
+
+<h2>Where this points next</h2>
+
+<p>You now decide <em>where</em> each buffer lives and <em>when</em> its bytes get recycled, so peak memory tracks the busiest instant instead of the sum, and the runtime makes one allocation instead of thousands. But the plan has been treating a buffer as an opaque blob of <span class="math">N</span> bytes. It is not — a tensor has a physical <strong>layout</strong>: the order its dimensions are stored in memory, whether it is row- or column-major, padded, or tiled to match tensor-core fragments. Two plans with identical byte budgets can be worlds apart in speed, because the wrong layout forces every consuming kernel into strided, uncoalesced access or inserts transposes the planner never accounted for. Deciding each buffer's in-memory shape — and propagating that choice through the graph to cancel transposes — is the next forced step: lesson 07, <strong><a href="07_layout.html">Layout &amp; data formats</a></strong>.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+Fusion left a graph dense with intermediate buffers; allocating each naively makes peak memory the <strong>sum</strong> of every buffer that ever existed and floods the runtime with allocator calls. <strong>Memory planning</strong> fixes both at compile time. <strong>Liveness analysis</strong> gives each buffer a lifetime — first def to last use — and buffers whose lifetimes never overlap don't <strong>interfere</strong>, so they can share storage. Assigning storage is then graph <strong>coloring</strong>, the same algorithm as register allocation: the worked six-op chain drops from ≈384 MB (sum) to 192 MB, the <strong>max-concurrent</strong> bound set by the busiest instant where <span class="math">{x, b, c}</span> coexist. <strong>In-place</strong> ops recycle an input's bytes when it has no other live consumer; <strong>donation/aliasing</strong> (XLA input-output aliasing, JAX <code>donate_argnums</code>) does the same for program inputs — both legal only under the <em>no-later-use</em> guard that is the preserve-semantics motif. An <strong>arena</strong> bakes the whole assignment into one preallocated slab, cutting allocator calls to ≈1. In training the backward pass keeps activations live across the whole pass — the activation-memory wall — so recompute becomes a planning knob (lesson 12). Net: peak collapses from sum toward max-concurrent. What planning still doesn't fix is each buffer's physical shape — the layout — which forces lesson 07.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why does naive per-tensor allocation make peak memory the sum of buffers, and what's the real lower bound? <em>(§1 — a naive allocator can hold non-overlapping buffers in distinct, never-recycled slabs, so the high-water mark drifts toward Σ size(b); the true lower bound is max over time of the bytes live at one instant — max-concurrent — and the gap is what planning recovers.)</em></li>
+  <li>Define liveness for a tensor buffer and how you'd compute it. <em>(§2 — a buffer is live from its defining op to its last consuming op; in SSA / value-semantics IR walk the schedule in execution order and record [def, last-use] per edge.)</em></li>
+  <li>How is buffer reuse the same problem as register allocation? <em>(§3 — build an interference graph with an edge between buffers whose lifetimes overlap, then color so no two interfering buffers share a slot; it's graph coloring scaled from registers to tensor-sized slots, optimal packing NP-hard so greedy best-fit is used.)</em></li>
+  <li>When is an in-place op legal, and how does it differ from donation? <em>(§3–4 — in-place is legal when the op's input has no other live consumer, so the output overwrites it; donation/aliasing is the same idea for a program input the caller won't reuse — both require the donor buffer be provably dead afterward.)</em></li>
+  <li>What are XLA input-output aliasing and JAX donated args, and what's the correctness guard? <em>(§4 — they let an output reuse a dead input's buffer — e.g. the optimizer's in-place params update — legal only if the donated buffer has no later use; frameworks make it an explicit opt-in promise because the compiler can't see the host's later reads.)</em></li>
+  <li>Why does training blow up peak memory more than inference, and what's the compiler's lever? <em>(§5 — the backward needs forward activations, so their lifetimes stretch across the whole pass and max-concurrent balloons — the activation-memory wall; the lever is rematerialization, dropping and recomputing activations to trade FLOPs for bytes, decided by a min-cut partitioner.)</em></li>
+  <li>You fused more aggressively and peak memory went up. How? <em>(§Failure modes — fusion that keeps a large intermediate alive longer raises the max-concurrent live set; fusion and memory planning can fight, so the planner must price the lifetime cost of a fusion choice.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="05_fusion.html"><span class="dir">← Back</span><span class="ttl">05 · Fusion</span></a>
+  <a class="next" href="07_layout.html"><span class="dir">Next →</span><span class="ttl">07 · Layout &amp; data formats</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var cv = document.getElementById('mp-canvas');
+  if (!cv) return;
+  var ctx = cv.getContext('2d');
+
+  var cbReuse   = document.getElementById('mp-reuse');
+  var cbInplace = document.getElementById('mp-inplace');
+  var slSz      = document.getElementById('mp-sz');
+  var vSz       = document.getElementById('mp-szv');
+  var kPeak  = document.getElementById('mp-peak');
+  var kSlots = document.getElementById('mp-slots');
+  var kSaved = document.getElementById('mp-saved');
+  var kBound = document.getElementById('mp-bound');
+  var kpiPeak = document.getElementById('mp-k-peak');
+  var modeEl = document.getElementById('mp-mode');
+
+  // The worked six-op chain from §2. Each buffer: name, def step, last-use step,
+  // and whether it is an elementwise output that can fold in-place onto its input.
+  // steps run 0..5 (6 instants). Lifetime [def, lastUse] inclusive.
+  var BUFS = [
+    { name:'x', def:0, last:3, inplace:false, src:null },
+    { name:'a', def:1, last:2, inplace:false, src:null },
+    { name:'b', def:2, last:3, inplace:true,  src:'a' },  // bias: elementwise, can overwrite a
+    { name:'c', def:3, last:5, inplace:false, src:null }, // gelu+residual: reads x too, keep
+    { name:'d', def:4, last:5, inplace:true,  src:'c' },  // norm: elementwise over c
+    { name:'y', def:5, last:5, inplace:false, src:null }
+  ];
+  var NSTEP = 6;
+
+  function comma(n){ return Math.round(n).toLocaleString('en-US'); }
+  function mb(u){ return comma(u) + ' MB'; }
+
+  function overlap(p, q){
+    // lifetimes are inclusive intervals; they interfere if they share any instant
+    return p.def <= q.last && q.def <= p.last;
+  }
+
+  // assign each (non-folded) buffer to a slot index via greedy coloring over a
+  // lifetime sweep. returns {slotOf, nSlots, foldedOnto}
+  function plan(reuse, inplace){
+    var foldedOnto = {};   // name -> slot it shares (in-place)
+    var active = BUFS.slice();
+
+    // in-place: a buffer marked inplace folds onto its source's slot (no new slot)
+    // we resolve this after slot assignment of the survivors.
+    var survivors = active.filter(function(b){
+      return !(inplace && b.inplace);
+    });
+
+    var slotOf = {};
+    if (!reuse){
+      // naive: one slot per survivor, in order
+      survivors.forEach(function(b, i){ slotOf[b.name] = i; });
+    } else {
+      // greedy: sort by def, place each in lowest slot free of interference
+      var sorted = survivors.slice().sort(function(p,q){ return p.def - q.def; });
+      var slotEnd = []; // slotEnd[s] = last instant currently occupying slot s
+      sorted.forEach(function(b){
+        var s = 0;
+        while (s < slotEnd.length && slotEnd[s] >= b.def) s++;
+        slotOf[b.name] = s;
+        slotEnd[s] = b.last;
+      });
+    }
+    var nSlots = 0;
+    Object.keys(slotOf).forEach(function(n){ nSlots = Math.max(nSlots, slotOf[n]+1); });
+
+    // resolve folded buffers onto their source's slot
+    if (inplace){
+      BUFS.forEach(function(b){
+        if (b.inplace && b.src && slotOf[b.src] !== undefined){
+          foldedOnto[b.name] = slotOf[b.src];
+        }
+      });
+    }
+    return { slotOf:slotOf, nSlots:nSlots, foldedOnto:foldedOnto };
+  }
+
+  function maxConcurrent(){
+    var best = 0;
+    for (var t=0; t<NSTEP; t++){
+      var c = 0;
+      BUFS.forEach(function(b){ if (b.def <= t && t <= b.last) c++; });
+      best = Math.max(best, c);
+    }
+    return best;
+  }
+
+  function draw(){
+    var reuse = cbReuse.checked, inplace = cbInplace.checked;
+    var U = +slSz.value;
+    vSz.textContent = U;
+
+    var p = plan(reuse, inplace);
+    var peakSlots = p.nSlots;                 // distinct physical slots
+    var peakBytes = peakSlots * U;
+    var naivePeak = BUFS.length * U;          // sum of all buffers
+    var bound = maxConcurrent() * U;
+    var saved = naivePeak - peakBytes;
+
+    kPeak.textContent  = mb(peakBytes);
+    kSlots.textContent = peakSlots;
+    kSaved.textContent = saved > 0 ? mb(saved) : '0 MB';
+    kBound.textContent = mb(bound);
+    modeEl.textContent = 'mode: ' + (!reuse && !inplace ? 'naive (sum)' :
+                          (reuse && inplace ? 'reuse + in-place' : (reuse ? 'reuse' : 'in-place')));
+
+    if (peakBytes <= bound){ kpiPeak.classList.add('good'); kpiPeak.classList.remove('over'); }
+    else { kpiPeak.classList.remove('good'); kpiPeak.classList.remove('over'); }
+
+    // ---- render timeline ----
+    var W = cv.width, H = cv.height;
+    ctx.clearRect(0,0,W,H);
+    var padL = 90, padR = 24, padT = 28, padB = 40;
+    var x0 = padL, x1 = W - padR, y0 = padT, y1 = H - padB;
+
+    var nRows = Math.max(peakSlots, 1);
+    var rowH = (y1 - y0) / Math.max(nRows, 1);
+    var colW = (x1 - x0) / NSTEP;
+
+    var cAccent = (getComputedStyle(document.documentElement).getPropertyValue('--accent')||'#5b9dff').trim();
+    var cOk     = (getComputedStyle(document.documentElement).getPropertyValue('--ok')||'#16a34a').trim();
+    var cMute   = 'rgba(140,140,150,0.55)';
+
+    // slot boundary lines + slot labels
+    ctx.font = '11px monospace';
+    for (var s=0; s<nRows; s++){
+      var ry = y0 + s*rowH;
+      ctx.strokeStyle = 'rgba(128,128,128,0.16)';
+      ctx.beginPath(); ctx.moveTo(x0, ry); ctx.lineTo(x1, ry); ctx.stroke();
+      ctx.fillStyle = 'rgba(150,150,150,0.85)';
+      ctx.fillText('slot '+s, 8, ry + rowH/2 + 4);
+    }
+    ctx.strokeStyle='rgba(128,128,128,0.16)';
+    ctx.beginPath(); ctx.moveTo(x0,y1); ctx.lineTo(x1,y1); ctx.stroke();
+
+    // step ticks
+    ctx.fillStyle='rgba(150,150,150,0.85)'; ctx.textAlign='center';
+    for (var t=0;t<NSTEP;t++){
+      ctx.fillText('t'+t, x0 + (t+0.5)*colW, y1+16);
+    }
+    ctx.fillText('execution step  →', (x0+x1)/2, y1+32);
+    ctx.textAlign='start';
+
+    // draw each buffer bar in its assigned slot
+    BUFS.forEach(function(b){
+      var slot, color, label;
+      if (p.foldedOnto[b.name] !== undefined){
+        slot = p.foldedOnto[b.name]; color = cOk; label = b.name+' (in-place)';
+      } else if (p.slotOf[b.name] !== undefined){
+        slot = p.slotOf[b.name]; color = cAccent; label = b.name;
+      } else {
+        return;
+      }
+      var bx = x0 + b.def*colW + 3;
+      var bw = (b.last - b.def + 1)*colW - 6;
+      var by = y0 + slot*rowH + 5;
+      var bh = rowH - 10;
+      ctx.fillStyle = color;
+      ctx.globalAlpha = (color===cOk) ? 0.5 : 0.82;
+      roundRect(ctx, bx, by, Math.max(bw,8), Math.max(bh,8), 5); ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 12px monospace';
+      ctx.fillText(label, bx+8, by + bh/2 + 4);
+    });
+
+    // busiest-column highlight (max-concurrent instant)
+    var bestT=0, bestC=-1;
+    for (var tt=0; tt<NSTEP; tt++){
+      var cc=0; BUFS.forEach(function(b){ if(b.def<=tt&&tt<=b.last)cc++; });
+      if (cc>bestC){bestC=cc;bestT=tt;}
+    }
+    ctx.strokeStyle='rgba(120,160,255,0.5)';
+    ctx.setLineDash([4,4]); ctx.lineWidth=1.5;
+    var hx0 = x0+bestT*colW, hx1 = hx0+colW;
+    ctx.strokeRect(hx0, y0, colW, y1-y0);
+    ctx.setLineDash([]);
+    ctx.fillStyle='rgba(150,170,220,0.9)'; ctx.font='10px monospace'; ctx.textAlign='center';
+    ctx.fillText('max-concurrent', (hx0+hx1)/2, y0-8);
+    ctx.textAlign='start';
+  }
+
+  function roundRect(ctx,x,y,w,h,r){
+    ctx.beginPath();
+    ctx.moveTo(x+r,y);
+    ctx.arcTo(x+w,y,x+w,y+h,r);
+    ctx.arcTo(x+w,y+h,x,y+h,r);
+    ctx.arcTo(x,y+h,x,y,r);
+    ctx.arcTo(x,y,x+w,y,r);
+    ctx.closePath();
+  }
+
+  cbReuse.addEventListener('change', draw);
+  cbInplace.addEventListener('change', draw);
+  slSz.addEventListener('input', draw);
+  draw();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

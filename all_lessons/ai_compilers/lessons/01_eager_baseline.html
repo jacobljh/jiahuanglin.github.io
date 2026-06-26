@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>01 · The eager baseline and its ceiling</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local layout only — failure/checklist columns + the profiler bars */
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; font-size: 15px; }
+  .lesson-card ul { margin: 0; padding-left: 18px; }
+  .lesson-card li { margin: 7px 0; font-size: 13.5px; line-height: 1.5; }
+  .kpi.over .v { color: var(--bad); }
+  .kpi.good .v { color: var(--ok); }
+  .prof-bars { margin: 14px 0 4px; display: grid; gap: 9px; }
+  .prof-row { display: grid; grid-template-columns: 96px 1fr; align-items: center; gap: 10px; }
+  .prof-row .lab { font-family: var(--mono); font-size: 11px; color: var(--text-mute); }
+  .prof-track { position: relative; height: 26px; border: 1px solid var(--border); border-radius: 6px; background: var(--code-bg); overflow: hidden; }
+  .prof-fill { position: absolute; top: 0; left: 0; height: 100%; display: flex; align-items: center; }
+  .prof-fill.launch { background: rgba(220,38,38,0.32); }
+  .prof-fill.mem { background: rgba(22,163,74,0.30); }
+  .prof-fill .tag { font-family: var(--mono); font-size: 10px; color: var(--text); padding: 0 6px; white-space: nowrap; }
+  .prof-split { position: relative; height: 30px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; display: flex; }
+  .prof-split .seg { height: 100%; display: flex; align-items: center; justify-content: center; font-family: var(--mono); font-size: 10px; color: var(--text); }
+  .prof-split .seg.launch { background: rgba(220,38,38,0.45); }
+  .prof-split .seg.mem { background: rgba(22,163,74,0.42); }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } .prof-row { grid-template-columns: 70px 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">ai_compilers / lessons</a><span class="crumb">/</span><span class="crumb">01 · eager baseline</span><span class="step-pill">lesson 2 / 16</span></div></header>
+
+<main>
+
+<p class="kicker">Part I — The gap</p>
+<h1>The eager baseline and its ceiling</h1>
+<p class="subtitle">Lesson 00 made the claim that eager execution wastes the chip: one tidy line <span class="math">y = gelu(x @ w + b)</span> becomes several kernels and several round trips to HBM, and the hardware wanted one fused kernel. A claim is not a number. Before you can trust a single compiler pass, you have to <em>price</em> the thing it replaces — measure where eager's time actually goes — so every later pass has a concrete number to beat. This lesson builds that cost model and shows the two distinct ceilings eager slams into.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>Lesson 00 asserted that the gap between a hardware-agnostic op graph and a chip that only rewards big fused kernels is where performance leaks. But it argued by picture. You cannot optimize what you have not priced, and you cannot tell <em>which</em> optimization to reach for until you know whether you are losing time to launching kernels or to moving bytes — they are different diseases with different cures. So we put a stopwatch on eager: what does one PyTorch op actually cost, and where does the millisecond go when you run a whole block of them one at a time?</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> you cannot optimize what you have not measured — lesson 00's "eager wastes the chip" needs a cost model with real microseconds and bytes.<br><strong>New idea:</strong> the eager cost model = per-op <strong>dispatch overhead</strong> (Python + the C++ dispatcher, ~1–8 µs/op) + <strong>kernel-launch latency</strong> (~3–10 µs) + the usually-dominant <strong>HBM round trip</strong> (bytes ÷ bandwidth). For the memory-bound ops that fill a model, total time ≈ Σ round trips. From it fall the <strong>two ceilings</strong>: <em>launch-bound</em> (many tiny ops, time = launches) and <em>bandwidth-bound</em> (each op re-reads HBM, time = traffic).<br><strong>Forces next:</strong> both ceilings are <em>whole-program</em> faults — fewer launches and one shared round trip can only be found by seeing all the ops at once, which eager Python never hands you. You must first <strong>capture a graph</strong> (lesson 02).</div>
+
+<div class="callout"><div class="label">The plan</div>Five moves. (1) Trace one <code>x @ w</code> from Python down to the kernel launch and HBM, naming each layer's cost. (2) Put microseconds and bytes on it: dispatch ~1–8 µs, launch ~3–10 µs, a 256 MB activation round trip @3.3 TB/s ≈ 160 µs. (3) Recap arithmetic intensity and the ridge point — why most non-GEMM ops sit far below it and are memory-bound. (4) Name the two ceilings — launch-bound vs bandwidth-bound — and why CUDA graphs fix only the first. (5) Lay out the scoreboard (launches · bytes · peak memory) the rest of the track fills in. Then drive the profiler until the same block flips from bandwidth-bound to launch-bound.</div>
+
+<h2>1 · One op, end to end: Python → dispatcher → ATen → kernel → HBM</h2>
+
+<p>Start with the smallest unit: you write <code>y = x @ w</code> and some time later an SM finishes a tensor-core multiply. Between those two events sits a fixed chain of CPU-side work that runs <em>on every single op</em>, no matter how big the tensors are. <strong>Dispatch</strong> is the act of resolving which concrete kernel to run: PyTorch is a thin Python facade over a large C++ dispatcher that, on each call, looks up the right implementation for this device, dtype, memory layout, and autograd state. The library of those concrete tensor kernels is <strong>ATen</strong> (PyTorch's C++ tensor operator library — "A Tensor library"); the dispatcher's job is to map <span class="math">(op, dispatch-key)</span> → an ATen function pointer.</p>
+
+<div class="lesson-flow">
+  <div><strong>Python bytecode</strong><span>CPython resolves <code>__matmul__</code>, pushes args, crosses the pybind11 Python↔C++ boundary. ~1–2 µs.</span></div>
+  <div><strong>autograd layer</strong><span>If <code>requires_grad</code>, record a node for the backward and bump version counters. ~1–3 µs.</span></div>
+  <div><strong>ATen dispatch</strong><span>Look up <span class="math">(matmul, CUDA·bf16·strided)</span> → kernel fn ptr; backend (cuBLAS) picks an algorithm. ~1–4 µs, cached after first call.</span></div>
+  <div><strong>kernel launch</strong><span><code>cudaLaunchKernel</code> enqueues grid + block + args onto a stream. ~3–10 µs of CPU + driver.</span></div>
+  <div><strong>HBM round trip</strong><span>The kernel reads its inputs from HBM, computes, writes the result back. Bytes ÷ bandwidth — usually the dominant term.</span></div>
+</div>
+
+<p>The first four steps are the <strong>per-op tax</strong>: roughly 5–25 µs of CPU-side work, fixed regardless of tensor size. For a 4,096×4,096 GEMM that tax is under 1% of the runtime and vanishes. For a tiny pointwise add on a batch of 1, that tax <em>is</em> the runtime. That single fact — a fixed tax paid per op, against a variable amount of real work — is the seed of both ceilings. This dispatch path is dissected op-by-op in <a href="../../gpu_kernels/18_pytorch_to_kernel.html">gpu_kernels · 18 — PyTorch op → kernel launch</a>; here we lift it to the whole-program cost model.</p>
+
+<h2>2 · Putting microseconds and bytes on it</h2>
+
+<p>Numbers make the tax concrete. Take a residual-stream activation of shape <span class="math">(B, T, d) = (8, 4096, 4096)</span> in bf16 (2 bytes): that is <span class="math">8 · 4,096 · 4,096 · 2 ≈ 256 MB</span>. On an H100 at ≈3.3 TB/s of HBM bandwidth, <em>reading</em> it once costs <span class="math">256 MB ÷ 3.3 TB/s ≈ 80 µs</span>, and a read-plus-write elementwise op costs ≈160 µs. The arithmetic for, say, a bias add and a GELU — a handful of FLOPs per element, <span class="math">≈ 1 GFLOP</span> total — finishes on ~1,000 TFLOP/s tensor cores in well under a microsecond. The op spends ≈99% of its wall-clock waiting on memory.</p>
+
+<table class="trade-table">
+  <thead><tr><th>cost component</th><th>where it lives</th><th>order of magnitude</th><th>scales with</th></tr></thead>
+  <tbody>
+    <tr><td>dispatch overhead</td><td>Python + C++ dispatcher (per op)</td><td>≈1–8 µs / op</td><td>number of ops</td></tr>
+    <tr><td>kernel-launch latency</td><td><code>cudaLaunchKernel</code> + driver (per op)</td><td>≈3–10 µs / op</td><td>number of ops</td></tr>
+    <tr><td>HBM round trip</td><td>read inputs + write output</td><td>≈160 µs / 256 MB op</td><td>bytes moved ÷ bandwidth</td></tr>
+    <tr><td>the math (FLOPs)</td><td>SM tensor/CUDA cores</td><td>&lt; 1 µs for elementwise</td><td>FLOPs ÷ peak FLOP/s</td></tr>
+  </tbody>
+</table>
+
+<p>So a single eager op costs about <span class="math">(dispatch + launch) + (bytes ÷ bandwidth)</span>, and the FLOPs term is, for everything except a large GEMM or conv, negligible. Now chain the ops the way a model does. The toy block <span class="math">gelu(dropout(bias(x @ w)))</span> followed by an add is, eagerly, five separate launches: matmul, bias, GELU, dropout, add. Each non-matmul op reads the whole ≈256 MB activation from HBM and writes it back — four memory-bound ops, ≈4 × 160 µs ≈ 640 µs of pure traffic, plus 5 × ≈15 µs ≈ 75 µs of tax. The math itself, summed across the block, is a rounding error. The wall-clock is <strong>launches + traffic</strong>, not FLOPs — and that is the single sentence the whole track is built to exploit.</p>
+
+<div class="math block">t<sub>eager</sub> ≈ Σ<sub>ops</sub> (dispatch + launch) &nbsp; + &nbsp; Σ<sub>ops</sub> (bytes<sub>op</sub> ÷ bandwidth)</div>
+
+<h2>3 · Why most ops are memory-bound: arithmetic intensity and the ridge point</h2>
+
+<p>Whether an op is limited by the math or by the memory is decided by one ratio: its <strong>arithmetic intensity</strong>, <span class="math">I = FLOPs ÷ bytes moved</span> (FLOPs per byte read+written from HBM). The roofline says an op runs at <span class="math">min(peak FLOP/s, I × bandwidth)</span>. The crossover — the <strong>ridge point</strong> — is where those two are equal, <span class="math">I* = peak FLOP/s ÷ bandwidth</span>. On an H100 that is roughly <span class="math">1,000 TFLOP/s ÷ 3.3 TB/s ≈ 300 FLOPs/byte</span> (bf16). An op below the ridge is <strong>memory-bound</strong> (compute-bound is its complement — limited by FLOP/s); above it, <strong>compute-bound</strong>.</p>
+
+<table class="trade-table">
+  <thead><tr><th>op</th><th>arithmetic intensity (FLOPs/byte)</th><th>vs ridge ≈300</th><th>verdict</th></tr></thead>
+  <tbody>
+    <tr><td>bias add / GELU / dropout (elementwise)</td><td>≈0.5–2</td><td>far below</td><td>memory-bound — pays the round trip, does almost no math</td></tr>
+    <tr><td>LayerNorm / softmax (reduction)</td><td>≈2–10</td><td>far below</td><td>memory-bound</td></tr>
+    <tr><td>large square GEMM (4,096³)</td><td>≈hundreds–thousands</td><td>above</td><td>compute-bound — the one op that uses the tensor cores</td></tr>
+    <tr><td>attention during decode (batch 1)</td><td>≈1</td><td>far below</td><td>memory-bound</td></tr>
+  </tbody>
+</table>
+
+<p>The headline: nearly every op a model runs other than its big matmuls sits an order of magnitude or two <em>below</em> the ridge, so it is memory-bound and its time is set by bytes. A fused version that reads the activation once and does bias + GELU + dropout while the data is hot in SRAM/registers raises the intensity and pays the bytes a single time. This is the same roofline currency that <a href="../../gpu_kernels/10_kernel_first_principles.html">gpu_kernels · 10 — kernels from first principles</a> derives for one kernel and that <a href="../../cs336/lessons/07_kernels.html">cs336 · 07 — kernels &amp; FlashAttention</a> turns into fusion; this track lifts it to the whole program — every byte you avoid re-reading is a byte the compiler is about to save you.</p>
+
+<h2>4 · The two ceilings — and why CUDA graphs fix only one</h2>
+
+<p>Read off the cost model and two distinct failure regimes drop out, depending on which term dominates the sum.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">launch-bound (the GPU bubble)</div><div class="v">Many tiny ops on small tensors. The fixed ≈5–25 µs per-op tax is paid hundreds of times while each kernel's actual work finishes in a microsecond. The GPU sits idle waiting for the CPU to dispatch the next op — "Python is the bottleneck." A transformer layer in eager can launch 80–200 kernels per token; at ≈15 µs each that is ≈1–3 ms of pure overhead per token.</div></div>
+  <div class="topic-card"><div class="k">bandwidth-bound</div><div class="v">A chain of memory-bound ops on big tensors. Each op re-reads the whole activation from HBM and writes it back, so the block pays ≈2 × bytes per op when it could pay ≈2 × bytes for the entire chain. Time = traffic ÷ bandwidth, and the tensor cores starve.</div></div>
+</div>
+
+<p>The two ceilings demand different cures, which is exactly why measuring first matters. <strong>CUDA graphs</strong> — a captured, replayable sequence of kernel launches enqueued in one shot — erase the per-op CPU dispatch/launch tax: capture the launch sequence once, replay it with a single driver call, and the launch-bound bubble collapses. But a CUDA graph replays the <em>same</em> kernels in the <em>same</em> order; it moves the same bytes across HBM. It does nothing for the bandwidth-bound ceiling. To cut traffic you must change which kernels exist — fuse the chain into one round trip — and that is a graph rewrite, not a replay. Two diseases: launch overhead wants <em>fewer launches</em>; traffic wants <em>fused kernels</em>. A compiler does both; CUDA graphs alone do only the first.</p>
+
+<h2>5 · The scoreboard the rest of the track fills in</h2>
+
+<p>The cost model gives us exactly three quantities worth tracking, and every later pass moves at least one of them. This is the scoreboard you will see collapse, line by line, all the way to the capstone.</p>
+
+<div class="position-grid">
+  <div><strong>launches</strong><span>Number of kernels dispatched. Attacked by fusion (05) and graph capture. Sets the launch-bound term.</span></div>
+  <div><strong>HBM bytes</strong><span>Total traffic across HBM. Attacked by fusion (05), layout (07), memory planning (06). Sets the bandwidth-bound term.</span></div>
+  <div><strong>peak memory</strong><span>Max bytes live at once. Attacked by memory planning (06) and the recompute partitioner (12). Decides whether the program fits the device.</span></div>
+</div>
+
+<p>An eager baseline of the toy block reads roughly: <strong>5 launches, ≈10 × the activation in HBM traffic, peak ≈ sum of all live intermediates.</strong> A fully compiled version of the same block reads roughly: <strong>1–2 launches, ≈2 × traffic, peak ≈ the single largest concurrent buffer.</strong> The gap between those two rows — measured here, in microseconds and bytes — is the entire reason the next fifteen lessons exist. Hold the eager numbers; they are the figure every pass is graded against.</p>
+
+<h2>6 · Drive it: the eager cost profiler</h2>
+
+<p>The widget runs the cost model on the fixed toy block — matmul + bias + GELU + dropout + add. Slide the tensor size, the number of elementwise ops in the chain, the per-op dispatch cost, and the HBM bandwidth, and watch the estimated wall-clock split into a <span style="color:var(--bad)">launch</span> bar and a <span style="color:var(--ok)">memory</span> bar. At default (big tensors) the block is bandwidth-bound: memory dwarfs launches. Flip the <strong>small-model regime</strong> toggle — it shrinks the tensors so each round trip is tiny — and the same five ops become launch-bound: the fixed per-op tax now dominates and the bars swap. That swap, with nothing changed but tensor size, is the proof that time is launches + traffic, not FLOPs.</p>
+
+<div class="widget" id="prof">
+  <div class="title">Eager cost profiler — where the block's milliseconds go</div>
+  <div class="hint">The toy block is fixed: <span class="math">add(x, dropout(gelu(bias(x @ w))))</span> = 1 matmul + <em>N</em> elementwise ops, each its own eager kernel. Slide the knobs and watch wall-time split into <span style="color:var(--bad)">launch</span> (dispatch + launch tax × launches) and <span style="color:var(--ok)">memory</span> (Σ HBM round trips ÷ bandwidth). The knob that flips it: turn on <strong>small-model regime</strong> and the same block goes from bandwidth-bound to launch-bound.</div>
+
+  <div class="controls" style="margin-top:4px;">
+    <label class="inline">tensor (M×K elements, ×10⁶): <input type="range" id="pf-sz" min="1" max="64" step="1" value="16"> <span class="val" id="pf-szv">16</span></label>
+    <label class="inline">elementwise ops N: <input type="range" id="pf-ops" min="1" max="8" step="1" value="4"> <span class="val" id="pf-opsv">4</span></label>
+    <label class="inline">dispatch µs/op: <input type="range" id="pf-disp" min="1" max="8" step="1" value="4"> <span class="val" id="pf-dispv">4</span></label>
+    <label class="inline">bandwidth (TB/s): <input type="range" id="pf-bw" min="1" max="6" step="0.1" value="3.3"> <span class="val" id="pf-bwv">3.3</span></label>
+    <label class="inline"><input type="checkbox" id="pf-small"> small-model regime (tiny tensors)</label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">total launches</div><div class="v" id="pf-launches">—</div></div>
+    <div class="kpi"><div class="k">HBM bytes moved</div><div class="v" id="pf-bytes">—</div></div>
+    <div class="kpi"><div class="k">est. wall-time</div><div class="v" id="pf-total">—</div></div>
+    <div class="kpi" id="pf-verdict-kpi"><div class="k">bottleneck</div><div class="v" id="pf-verdict">—</div></div>
+  </div>
+
+  <div class="prof-bars">
+    <div class="prof-row"><span class="lab">launch</span><div class="prof-track"><div class="prof-fill launch" id="pf-bar-launch"><span class="tag" id="pf-tag-launch"></span></div></div></div>
+    <div class="prof-row"><span class="lab">memory</span><div class="prof-track"><div class="prof-fill mem" id="pf-bar-mem"><span class="tag" id="pf-tag-mem"></span></div></div></div>
+  </div>
+  <div class="prof-split" id="pf-split" style="margin-top:8px;">
+    <div class="seg launch" id="pf-seg-launch"></div>
+    <div class="seg mem" id="pf-seg-mem"></div>
+  </div>
+  <p class="hint" id="pf-note" style="margin-top:10px;"></p>
+</div>
+
+<p>Notice what does <em>not</em> move the verdict: the FLOPs. Both regimes run the same arithmetic; only the tensor size changes, and that alone flips which ceiling you hit. That is the cost model's whole thesis, and it is why the rest of the track never optimizes FLOPs — it optimizes launches and bytes.</p>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Counting FLOPs to predict eager time.</strong> The math is nearly free for non-GEMM ops; the wall-clock is launches + traffic. <em>Signal:</em> your FLOP-based estimate is 10–100× too fast, and the profiler shows kernels spending their time on memory, not compute.</li>
+    <li><strong>Reaching for CUDA graphs against a bandwidth-bound block.</strong> Graphs remove launch tax, not traffic. <em>Signal:</em> you captured a graph, the launch bubble vanished, and the step is barely faster because each op still re-reads HBM.</li>
+    <li><strong>A <code>.item()</code> or <code>print(loss)</code> in the loop.</strong> Each forces a sync, serializing the async launch queue. <em>Signal:</em> a 50 ms step balloons to 200 ms with no kernel getting slower — the gaps are sync stalls.</li>
+    <li><strong>Benchmarking without a warmup or sync.</strong> First call pays one-time algo selection and compile; without <code>torch.cuda.synchronize()</code> you time the launch, not the kernel. <em>Signal:</em> impossibly fast or wildly variable numbers.</li>
+    <li><strong>Calling a small-batch model "GPU-bound."</strong> At batch 1 the per-op tax dominates and you are launch-bound. <em>Signal:</em> the GPU utilization is low while the CPU is pinned dispatching.</li>
+  </ul>
+  </div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><strong>Price the op as tax + traffic.</strong> ≈5–25 µs dispatch+launch per op, plus bytes ÷ bandwidth for the round trip.</li>
+    <li><strong>Compute arithmetic intensity first.</strong> Below the ≈300 FLOPs/byte ridge → memory-bound → the cure is fewer bytes.</li>
+    <li><strong>Diagnose the ceiling before the cure.</strong> Launch-bound wants fewer launches; bandwidth-bound wants fusion. Don't apply the wrong one.</li>
+    <li><strong>Always warm up and synchronize</strong> around any GPU timing.</li>
+    <li><strong>Record the baseline scoreboard:</strong> launches, HBM bytes, peak memory — the three numbers every pass is graded against.</li>
+  </ul>
+  </div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the profiler and leave it at the defaults (tensor 16 ×10⁶, N = 4, dispatch 4 µs, 3.3 TB/s). Read the memory bar — it should dwarf the launch bar; this block is bandwidth-bound. Now compute the traffic by hand: a 16 ×10⁶-element bf16 tensor is ≈32 MB; one read+write is ≈64 MB; the matmul moves ≈3× the tensor (read x, read w, write out) and each of the four elementwise ops moves ≈2×, so <span class="math">(3 + 4·2) · 32 MB ≈ 352 MB</span>, and <span class="math">352 MB ÷ 3.3 TB/s ≈ 107 µs</span> — confirm the widget agrees within rounding. Then flip <strong>small-model regime</strong> and watch the bars swap: with tiny tensors the ≈(4 + 6) µs tax × 5 launches ≈ 50 µs now beats the few-µs of traffic. Finally, ask: which knob would a CUDA graph shrink? (The launch bar only.) Which would fusion shrink? (The memory bar — and the launch count.)</div>
+
+<h2>Where this points next</h2>
+
+<p>You now have a priced baseline and a diagnosis. Eager's wall-clock is the sum of a fixed per-op tax (launches) and a per-op HBM round trip (traffic); below the ≈300 FLOPs/byte ridge, traffic wins and the chip starves. The two ceilings — launch-bound and bandwidth-bound — are both <em>whole-program</em> faults: to launch fewer kernels you must know which ops follow which, and to share one round trip you must see a whole chain at once. But eager Python hands the runtime exactly one op at a time and then forgets it; there is no program to optimize, only a stream of isolated calls. The very first thing a compiler must do, before any rewrite, is recover the missing object — a <em>graph</em> of the whole computation. That is lesson 02, <strong><a href="02_capture.html">Capturing the graph</a></strong>.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+You cannot optimize what you have not priced, so we put a stopwatch on eager. Every PyTorch op pays a fixed CPU-side tax — <strong>dispatch</strong> through the C++ dispatcher into the <strong>ATen</strong> kernel library (~1–8 µs) plus a <strong>kernel launch</strong> (~3–10 µs) — and then the usually-dominant <strong>HBM round trip</strong>: a 256 MB activation @3.3 TB/s costs ≈160 µs to read and write while its FLOPs finish in under a microsecond. So eager wall-clock ≈ Σ(dispatch+launch) + Σ(bytes ÷ bandwidth) — <strong>launches + traffic, not FLOPs</strong>. Arithmetic intensity decides which term wins: below the ridge point (≈300 FLOPs/byte on an H100) an op is <strong>memory-bound</strong>, and nearly every non-GEMM op is. From the model fall the two ceilings: <strong>launch-bound</strong> (many tiny ops drowning in the per-op tax) and <strong>bandwidth-bound</strong> (each op re-reading HBM). A <strong>CUDA graph</strong> erases the launch tax but not the traffic, so it fixes only one ceiling — fusing kernels is the other cure. The baseline scoreboard — launches, HBM bytes, peak memory — is the figure the next fifteen lessons drive down. Both ceilings are whole-program problems, which forces the first compiler move: capture the graph.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Decompose the cost of one eager PyTorch op. <em>(§1–2 — fixed per-op tax: Python/pybind11 + autograd + ATen dispatch + <code>cudaLaunchKernel</code> ≈5–25 µs; plus the HBM round trip = bytes ÷ bandwidth, which dominates for memory-bound ops; FLOPs are negligible for non-GEMM.)</em></li>
+  <li>Why is eager sometimes 5× slower than compiled when the same matmul runs at the end? <em>(§1,4 — the extra time is dispatch + launch tax paid per op (launch-bound) and re-reading HBM per op (bandwidth-bound); the compiler fuses many ops into fewer kernels and one round trip, the GEMM is unchanged.)</em></li>
+  <li>What is the ridge point and roughly where is it on an H100? <em>(§3 — I* = peak FLOP/s ÷ bandwidth ≈ 1,000 TFLOP/s ÷ 3.3 TB/s ≈ 300 FLOPs/byte bf16; ops below it are memory-bound, above it compute-bound.)</em></li>
+  <li>Name the two ceilings eager hits and the different cure for each. <em>(§4 — launch-bound (many tiny ops, fixed tax dominates) → fewer launches via CUDA graphs/fusion; bandwidth-bound (each op re-reads HBM) → fusion into one round trip. Wrong cure for the wrong ceiling does little.)</em></li>
+  <li>Do CUDA graphs fix the bandwidth-bound ceiling? <em>(§4 — no; a graph replays the same kernels moving the same bytes, so it only erases the per-op CPU launch tax. Cutting traffic requires changing which kernels exist — fusion.)</em></li>
+  <li>What is MFU and why is an eager small-batch model's MFU low? <em>(MFU = model FLOPs utilization, achieved FLOP/s ÷ peak. It is low when the GPU is starved — launch-bound by dispatch tax or bandwidth-bound re-reading HBM — so the tensor cores sit idle and realized FLOP/s is far below peak.)</em></li>
+  <li>Which three numbers form the baseline scoreboard, and what attacks each? <em>(§5 — launches (fusion, graph capture), HBM bytes (fusion, layout, memory planning), peak memory (memory planning, recompute partitioner).)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="00_orientation.html"><span class="dir">← Back</span><span class="ttl">00 · Orientation</span></a>
+  <a class="next" href="02_capture.html"><span class="dir">Next →</span><span class="ttl">02 · Capturing the graph</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var szEl = document.getElementById('pf-sz');
+  if (!szEl) return;
+  var opsEl = document.getElementById('pf-ops');
+  var dispEl = document.getElementById('pf-disp');
+  var bwEl = document.getElementById('pf-bw');
+  var smallEl = document.getElementById('pf-small');
+
+  var szv = document.getElementById('pf-szv'), opsv = document.getElementById('pf-opsv');
+  var dispv = document.getElementById('pf-dispv'), bwv = document.getElementById('pf-bwv');
+
+  var kL = document.getElementById('pf-launches'), kB = document.getElementById('pf-bytes');
+  var kT = document.getElementById('pf-total'), kV = document.getElementById('pf-verdict');
+  var kVkpi = document.getElementById('pf-verdict-kpi');
+
+  var barL = document.getElementById('pf-bar-launch'), barM = document.getElementById('pf-bar-mem');
+  var tagL = document.getElementById('pf-tag-launch'), tagM = document.getElementById('pf-tag-mem');
+  var segL = document.getElementById('pf-seg-launch'), segM = document.getElementById('pf-seg-mem');
+  var note = document.getElementById('pf-note');
+
+  var BYTES = 2;            // bf16
+  var LAUNCH_US = 6;        // fixed per-op kernel-launch + driver tax (µs)
+  var SMALL_DIV = 5000;     // small-model regime shrinks element count by this factor
+
+  function comma(n){ return Math.round(n).toLocaleString('en-US'); }
+  function us(x){ return x >= 1000 ? (x/1000).toFixed(2)+' ms' : x.toFixed(1)+' µs'; }
+  function gb(b){
+    if (b >= 1e9) return (b/1e9).toFixed(2)+' GB';
+    if (b >= 1e6) return (b/1e6).toFixed(1)+' MB';
+    if (b >= 1e3) return (b/1e3).toFixed(1)+' KB';
+    return Math.round(b)+' B';
+  }
+
+  function compute(){
+    var elems = +szEl.value * 1e6;            // tensor element count
+    var N = +opsEl.value;                     // elementwise ops in the chain
+    var disp = +dispEl.value;                 // dispatch µs/op
+    var bw = +bwEl.value * 1e12;              // bandwidth, bytes/s
+    var small = smallEl.checked;
+
+    szv.textContent = +szEl.value;
+    opsv.textContent = N;
+    dispv.textContent = disp;
+    bwv.textContent = (+bwEl.value).toFixed(1);
+
+    if (small) elems = Math.max(1, elems / SMALL_DIV);
+
+    var tensorBytes = elems * BYTES;
+    var launches = 1 + N;                      // 1 matmul + N elementwise, eager = one kernel each
+
+    // HBM round trips (read+write = 2x tensor) :
+    //   matmul: read x, read w (~x-size), write out  -> ~3x tensor
+    //   each elementwise op: read + write            -> 2x tensor
+    var roundTripBytes = 3 * tensorBytes + N * 2 * tensorBytes;
+
+    var launchTimeUs = launches * (disp + LAUNCH_US);
+    var memTimeUs = (roundTripBytes / bw) * 1e6;
+    var totalUs = launchTimeUs + memTimeUs;
+
+    kL.textContent = comma(launches);
+    kB.textContent = gb(roundTripBytes);
+    kT.textContent = us(totalUs);
+
+    var memBound = memTimeUs >= launchTimeUs;
+    kV.textContent = memBound ? 'bandwidth-bound' : 'launch-bound';
+    if (memBound){ kVkpi.classList.add('good'); kVkpi.classList.remove('over'); }
+    else { kVkpi.classList.add('over'); kVkpi.classList.remove('good'); }
+
+    // proportional bars vs the larger of the two
+    var mx = Math.max(launchTimeUs, memTimeUs, 0.001);
+    barL.style.width = (100 * launchTimeUs / mx) + '%';
+    barM.style.width = (100 * memTimeUs / mx) + '%';
+    tagL.textContent = us(launchTimeUs);
+    tagM.textContent = us(memTimeUs);
+
+    // stacked split (share of total)
+    var pL = 100 * launchTimeUs / totalUs;
+    segL.style.width = pL + '%';
+    segM.style.width = (100 - pL) + '%';
+    segL.textContent = pL > 14 ? 'launch ' + Math.round(pL) + '%' : '';
+    segM.textContent = (100 - pL) > 14 ? 'memory ' + Math.round(100 - pL) + '%' : '';
+
+    note.textContent = memBound
+      ? 'Bandwidth-bound: each of the ' + launches + ' ops re-reads HBM, so traffic (' + gb(roundTripBytes) + ') sets the time. Cure: fusion — one round trip for the whole chain. A CUDA graph would barely help.'
+      : 'Launch-bound: tiny tensors make the round trip cheap, so the fixed ' + (disp + LAUNCH_US) + ' µs/op tax × ' + launches + ' launches dominates. Cure: fewer launches — CUDA graphs erase the tax; fusion also helps.';
+  }
+
+  [szEl, opsEl, dispEl, bwEl].forEach(function(s){ s.addEventListener('input', compute); });
+  smallEl.addEventListener('change', compute);
+  compute();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

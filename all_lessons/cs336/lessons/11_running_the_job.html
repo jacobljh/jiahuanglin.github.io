@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>11 · Running the job — surviving a multi-week run</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local layout only — failure/checklist columns, the dashboard strip,
+     and the run-survival meter. Shared classes (.widget/.kpi/.callout/.math/
+     .topic-grid/.lesson-flow/.trade-table/.budget-meter) come from the sheet. */
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; font-size: 15px; }
+  .lesson-card ul { margin: 0; padding-left: 18px; }
+  .lesson-card li { margin: 7px 0; font-size: 13.5px; line-height: 1.5; }
+  .verdict { font-family: var(--mono); font-size: 12px; padding: 2px 8px; border-radius: 5px; }
+  .verdict.ok  { background: rgba(22,163,74,0.16);  color: #16a34a; }
+  .verdict.bad { background: rgba(220,38,38,0.16);  color: #dc2626; }
+  /* a small "what you watch" dashboard of stat tiles */
+  .dash { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 10px; margin: 14px 0; }
+  .dash .tile { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 11px 12px; }
+  .dash .tile .name { font-family: var(--mono); font-size: 11px; color: var(--accent); letter-spacing: .04em; }
+  .dash .tile .what { font-size: 12.5px; line-height: 1.45; margin-top: 5px; color: var(--text-mute); }
+  .meter-legend { display: flex; flex-wrap: wrap; gap: 12px; margin: 6px 0 2px; font-family: var(--mono); font-size: 11px; color: var(--text-mute); }
+  .meter-legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .meter-legend i { width: 11px; height: 11px; border-radius: 2px; display: inline-block; }
+  .kpi.warnv .v { color: var(--warn); }
+  .kpi.badv .v { color: var(--bad); }
+  @media (max-width: 720px) { .lesson-grid, .dash { grid-template-columns: 1fr; } .dash { grid-template-columns: repeat(2,1fr); } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="index.html">cs336 / lessons</a><span class="crumb">/</span><span class="crumb">11 · running the job</span><span class="step-pill">lesson 12 / 20</span></div></header>
+
+<main>
+
+<p class="kicker">Part II — Systems</p>
+<h1>Running the job — surviving a multi-week run</h1>
+<p class="subtitle">Lessons 06–10 handed you a training machine that <em>fits</em> and runs <em>fast</em>: FlashAttention keeps the GPU fed, FSDP and tensor/pipeline parallelism let any model fit, MoE buys parameters off the cheap axis. On a laptop-scale job you would now just press <code>run</code> and watch the loss fall. But a frontier run is not a laptop job. It is three weeks of wall-clock on a thousand-plus GPUs, and over that span the hardware <em>will</em> fail, the loss <em>will</em> occasionally spike, and a process that simply restarts from step 0 — or, worse, restarts from a checkpoint that doesn't quite match — sets fire to the budget you spent two lessons learning to protect. Executing the run is its own engineering discipline: the job has to be a <strong>fault-tolerant, deterministic, resumable system</strong>, not a script.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>The systems half (06–10) optimized one thing: the <em>throughput</em> of a healthy step. It assumed the run runs. It does not — not for weeks, not at this width. A single H100 has a finite mean time between failures; multiply by a thousand of them held in lockstep by collectives (every all-reduce in lesson 8, every pipeline bubble in lesson 9) and a single dead GPU stalls or crashes <em>all</em> of them. Add the loss spikes lesson 4 warned about, plus host crashes, NCCL hangs, ECC errors, and a flaky network link, and the question is no longer "is each step fast?" but "how much of the budget survives three weeks of things breaking?" Nothing in 06–10 priced a crash. The accounting in lesson 5 assumed every GPU-hour you rent turns into training; in reality a chunk of it is recompute after failures, and an undisciplined run lets that chunk balloon.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> 06–10 give a machine that fits and runs fast, but a frontier run is weeks long on thousands of GPUs where hardware <em>will</em> fail and the loss <em>will</em> spike — and a run that can't resume bit-for-bit, or can't restart itself, burns the budget you spent learning to protect.<br><strong>New idea:</strong> treat the training job as a <strong>fault-tolerant, deterministic, resumable system</strong> — correct checkpoints (every byte of state, not just weights), deterministic sharded data loading, automatic detect-and-restart at scale, an operationalized spike runbook, and the dashboard you actually watch. Wasted GPU-hours, not peak FLOPs, is the metric.<br><strong>Forces next:</strong> you can now <em>run</em> a job and finish it in budget — but you still have not decided <em>how big the model should be</em>, and you get exactly one shot: you cannot afford to run it twice to find out. That forces scaling laws, lesson 12.</div>
+
+<div class="callout"><div class="label">The plan</div>Six moves. (1) The wall: a crash converts GPU-hours straight into burned budget, and at scale it happens repeatedly. (2) The checkpoint: the <em>exact</em> state you must save to resume bit-for-bit — params, optimizer moments, the schedule step, RNG, the data cursor — sized by the lesson-5 ledger, written asynchronously so saving doesn't stall the run. (3) Deterministic sharded data loading so G ranks see disjoint, reproducible, resumable data. (4) Fault tolerance at scale: an MTBF argument that says you <em>will</em> get ~10 failures in three weeks, so you must auto-restart. (5) Spike recovery as a runbook (callback lesson 4). (6) The monitoring dashboard and what each signal means. Then drive the run-survival simulator until "never checkpoint" detonates.</p></div>
+
+<h2>1 · The wall: a crash is budget, not an inconvenience</h2>
+
+<p>Recall the currency from lesson 0: the budget is denominated in <strong>GPU-hours</strong>, and lesson 5's runtime estimate, <span class="math">time ≈ 6ND / (GPUs · peakFLOPs · MFU)</span>, assumed every rented GPU-hour becomes forward progress. A crash breaks that assumption directly. When a process dies, every GPU rolls back to the last checkpoint and <strong>recomputes</strong> everything since — and that recompute is GPU-hours you already paid for, spent buying back progress you already had.</p>
+
+<p>Put numbers on it. You are 200 hours into a run on <strong>1,024 H100s</strong>, and your last checkpoint was written <strong>6 hours ago</strong>. One GPU throws an uncorrectable ECC error and the job dies. To resume you reload the 6-hour-old checkpoint and redo those 6 hours — on all 1,024 GPUs:</p>
+
+<div class="math block">lost ≈ 6 h × 1,024 GPUs = <strong>6,144 GPU-hours</strong> &nbsp; — gone, for one crash</div>
+
+<p>At a representative cloud rate of a few dollars per H100-hour, that single failure is <strong>tens of thousands of dollars</strong> of recompute, and it bought you nothing — you are back where you were six hours ago. Now recall this is not a one-off: section 4 shows a three-week run on this cluster expects roughly <em>ten</em> such failures. Ten times 6,144 is over 60,000 GPU-hours of pure recompute — a real dent in a multi-hundred-thousand GPU-hour budget — and that is the <em>good</em> case, where every crash is detected and restarted promptly. The undisciplined case (rare checkpoints, manual restart, a stale checkpoint that forces you to redo even more) is far worse. The job of this lesson is to shrink that wasted fraction toward zero.</p>
+
+<div class="callout warn"><div class="label">The lever you actually control</div>You cannot make hardware stop failing. The two things you <em>can</em> control are <strong>how much work each crash costs</strong> (checkpoint frequency — the recompute per failure is, on average, half the checkpoint interval × the GPU count) and <strong>how fast you detect-and-restart</strong> (automation — minutes of idle cluster per crash, not the hours a sleeping human costs). Everything below is one of those two levers.</div>
+
+<h2>2 · The checkpoint: what must be saved to resume bit-for-bit</h2>
+
+<p>A checkpoint's job is to let a resumed run continue as if the crash never happened — the loss curve after resume should lie exactly on the curve you would have gotten without the crash. That is a strict requirement, and it is where the naive "just save the weights" instinct fails. Saving only model parameters produces a run that <em>limps</em> after resume: the loss jumps, then slowly re-converges, silently wasting hundreds of steps. The reason is that the optimizer and the schedule carry <em>hidden state</em> that the weights alone don't capture. To resume bit-for-bit you must persist <strong>all five</strong> of these:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">model parameters</div><div class="v">The weights themselves (fp32 master copy — lesson 4). Obvious, and the only thing most people remember to save.</div></div>
+  <div class="topic-card"><div class="k">optimizer moments m &amp; v</div><div class="v">AdamW's first and second moments (lesson 4). Drop these and the optimizer restarts cold: its per-coordinate step sizes are wrong for thousands of steps. This is the single most common cause of a post-resume loss bump.</div></div>
+  <div class="topic-card"><div class="k">LR-schedule step counter</div><div class="v">The global step index <span class="math">t</span>. The warmup→cosine schedule (lesson 4) is a function of <span class="math">t</span>; resume with <span class="math">t = 0</span> and you re-warm-up mid-run, spiking the LR and the loss.</div></div>
+  <div class="topic-card"><div class="k">RNG states</div><div class="v">The PRNG state on <em>every</em> rank — for dropout, any stochastic layers, and (critically) the data shuffle. Miss it and the post-resume randomness diverges from the original trajectory.</div></div>
+  <div class="topic-card"><div class="k">data-loader cursor</div><div class="v">Exactly how far each rank has read into its data shard (§3). Without it, resume either re-reads data already seen (extra epochs on a slice) or skips ahead — either way the data distribution the model trained on no longer matches the intended one.</div></div>
+</div>
+
+<p>Miss any one and the resumed run is no longer the same run. The discipline is blunt: a checkpoint is <strong>the entire training state</strong>, and "the model" is only the first of five parts.</p>
+
+<h3>How big is a checkpoint? The lesson-5 ledger, again</h3>
+
+<p>A checkpoint is dominated by the optimizer/master state, so its size is the <strong>16-bytes-per-parameter</strong> ledger from lesson 5: fp32 master weight (4) + Adam <span class="math">m</span> (4) + Adam <span class="math">v</span> (4) — that is the 12 bytes you <em>must</em> persist — plus the working bf16 copies. For a <strong>7B</strong> model:</p>
+
+<div class="math block">7×10⁹ params × 16 B/param ≈ <strong>112 GB</strong> per checkpoint &nbsp; (the optimizer+master+params state of lesson 5)</div>
+
+<p>That is per checkpoint, and you write many of them. The frequency is a direct trade-off, and it is exactly the knob the widget exposes:</p>
+
+<table class="trade-table"><thead><tr><th>Checkpoint every…</th><th>Expected recompute per crash</th><th>Cost of checkpointing</th></tr></thead><tbody>
+  <tr><td>too often (e.g. 5 min)</td><td>tiny — lose ≤ ~2.5 min × GPUs</td><td><strong>high</strong> — constant I/O stalls / overhead eats throughput</td></tr>
+  <tr><td>sweet spot (~30–60 min)</td><td>small — lose ~½ interval × GPUs</td><td>low — a few % of one step's time, amortized</td></tr>
+  <tr><td>too rarely (e.g. 6 h)</td><td><strong>large</strong> — §1's 6,144 GPU-hours per crash</td><td>negligible — but the recompute dominates</td></tr>
+</tbody></table>
+
+<p>There is a sweet spot because the two costs pull opposite ways: shrinking the interval cuts recompute-per-crash linearly but raises the number of (costly) saves, so total waste is a U-shaped curve with an interior minimum. The widget plots exactly this.</p>
+
+<h3>Why checkpointing must be asynchronous and sharded</h3>
+
+<p>The naive checkpoint <em>stalls the run</em>: every GPU stops, the full state is copied to host and streamed to durable storage, and only then does training resume. At 112 GB (and far more for a frontier model) that stall is minutes — and you pay it on every save, on every GPU. Two techniques make the stall nearly free:</p>
+
+<div class="lesson-flow">
+  <div><strong>sharded (distributed) checkpoint</strong><span>Each FSDP rank (lesson 8) writes only the parameter/optimizer <em>shard it already holds</em>, in parallel, to its own file. No rank gathers the full model; aggregate write bandwidth scales with the GPU count instead of bottlenecking on one rank.</span></div>
+  <div><strong>asynchronous write</strong><span>Snapshot the state to pinned host memory fast (a device-to-host copy), then let a background thread stream that snapshot to durable storage <em>while training continues</em>. The GPUs stall only for the quick copy, not the slow upload.</span></div>
+  <div><strong>in-memory / redundant copies</strong><span>For the fastest restart, also keep a recent checkpoint replicated in the cluster's RAM (on peer nodes), so a single-node failure restores from memory in seconds rather than re-reading the durable store.</span></div>
+</div>
+
+<p>The result: the GPU-visible cost of a checkpoint drops from minutes to a handful of seconds, so you can afford to checkpoint <em>often</em> — which is what pushes the recompute-per-crash term toward zero. It does not vanish entirely, though: each save still costs that brief snapshot-and-barrier, so checkpointing <em>too</em> often spends real throughput on overhead. That residual cost is what gives the wasted-hours curve its sweet spot rather than a free slide to zero — exactly the U the widget plots.</p>
+
+<h2>3 · Deterministic, sharded data loading</h2>
+
+<p>The data loader is where the most insidious bugs live, because they corrupt the <em>training distribution</em> silently — the loss looks fine, the model is quietly worse. The setup: with <span class="math">G</span> data-parallel ranks (lesson 8), each step the global batch is split across ranks, so each rank must stream a <strong>disjoint shard</strong> of the corpus. Two properties are non-negotiable.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">disjoint, balanced shards</div><div class="v">Rank <span class="math">r</span> of <span class="math">G</span> reads a partition no other rank touches (e.g. interleave by index <span class="math">r, r+G, r+2G, …</span>, or hash-assign documents to ranks). Every training example is seen by exactly one rank per epoch.</div></div>
+  <div class="topic-card"><div class="k">a global seed → reproducible order</div><div class="v">One seed determines the shuffle for the whole run. The order in which examples appear is then a deterministic function of (seed, step) — re-runnable, and crucially, <em>recoverable</em> on resume.</div></div>
+</div>
+
+<p>Resume then becomes well-defined: the run records the data-loader cursor (§2) in the checkpoint, and on restart the loader fast-forwards to exactly the next unseen sample of each rank's shard — the very next batch is the one that would have come next had the crash never happened. The classic bugs are both failures of this contract:</p>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Bug A — overlapping shards</h3><ul>
+    <li>Two ranks compute their shard from the same seed but forget to offset by rank, so they stream the <em>same</em> examples.</li>
+    <li>The gradients those ranks contribute are duplicates, so the all-reduced gradient is biased toward the duplicated data — effectively a smaller, skewed batch.</li>
+    <li><em>Signal:</em> throughput looks normal, but the model behaves as if trained on less (or oddly weighted) data; the effective batch is smaller than you think.</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Bug B — reshuffle on resume</h3><ul>
+    <li>The shuffle is re-seeded from wall-clock time (or the cursor isn't saved), so after a restart the order is <em>different</em> from the original.</li>
+    <li>Some examples get seen twice (extra, unintended epochs on a slice → memorization) and others get skipped entirely that epoch.</li>
+    <li><em>Signal:</em> a small loss discontinuity at every resume; over a run with ten restarts, a measurable chunk of data seen the wrong number of times.</li>
+  </ul></div>
+</div>
+
+<p>Both are invisible on the loss curve in the short term and corrosive over a long run. The fix is the same discipline as the checkpoint: the data order is a pure, seeded function of the step, and the cursor is part of the saved state.</p>
+
+<h2>4 · Fault tolerance at scale: you <em>will</em> get ~10 failures</h2>
+
+<p>Here is the argument that forces automation. Suppose a single accelerator (plus its host, network link, power) has a mean time between failures of roughly <span class="math">50,000</span> GPU-hours — optimistic for a healthy fleet. Failures across independent GPUs add: the <em>fleet's</em> expected failures over a run is just total GPU-hours divided by the per-GPU MTBF.</p>
+
+<div class="math block">expected failures ≈ (GPUs × hours) / MTBF</div>
+
+<p>Run the numbers on <strong>1,024 GPUs</strong>. The fleet burns <span class="math">1,024</span> GPU-hours every wall-clock hour, so it accumulates <span class="math">50,000</span> GPU-hours — one expected failure — in about <span class="math">50,000 / 1,024 ≈ 49</span> hours, i.e. <strong>roughly every two days</strong>. A <strong>three-week</strong> (21-day) run therefore expects:</p>
+
+<div class="math block">(1,024 × 21 × 24) / 50,000 = 516,096 / 50,000 ≈ <strong>10.3 failures</strong></div>
+
+<p>Ten interruptions in three weeks, each one freezing all 1,024 GPUs until something acts. If "something" is a human paged at 3 a.m., each failure costs the time-to-notice plus time-to-restart — easily an hour of a fully idle cluster (1,024 idle GPU-hours) on top of the recompute. That is the "babysitting the run" reality teams describe, and it does not scale: at 10,000 GPUs you are failing every few hours, around the clock. The interruptions must be handled <strong>automatically</strong>:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">detect</div><div class="v">A watchdog notices a dead rank — a crashed process, an NCCL collective that hangs past a timeout, a host that stops heartbeating, an ECC/Xid error in the logs.</div></div>
+  <div class="topic-card"><div class="k">restart elastically</div><div class="v"><strong>Elastic training</strong> (e.g. torchrun elastic): the launcher tears down the broken process group and re-forms it on the survivors (or after swapping in a spare), every rank reloads the last checkpoint, and the run continues — no human in the loop.</div></div>
+  <div class="topic-card"><div class="k">hot spares</div><div class="v">Keep a few idle nodes provisioned so a failed node is <em>replaced</em>, not just dropped — preserving the parallelism layout (the DP×TP×PP mesh of lesson 9 often needs its shape back).</div></div>
+</div>
+
+<p>This is precisely what cluster orchestration layers are built to provide. The deeper machinery — how a scheduler detects dead workers, reconstitutes a process group, and reschedules onto spares — is treated in the <a href="../../ray/lessons/index.html"><strong>Ray track</strong></a> (distributed execution and fault-tolerant actors) and in the <a href="../../reinforcement_learning/lessons/index.html"><strong>reinforcement-learning track's distributed-topology lessons</strong></a>, where the same detect-and-restart loop wraps a far more dynamic (rollout + train) workload. The principle is identical: <em>a long job on many machines must assume machines die and recover without you.</em></p>
+
+<h2>5 · Spike recovery, operationalized (the lesson-4 runbook)</h2>
+
+<p>Lesson 4 taught <em>why</em> loss spikes happen (heavy-tailed gradients, a pathological batch, too-hot an LR) and the levers that prevent most of them (warmup, global-norm clipping at 1.0, a sane peak LR, β₂ = 0.95). But on a frontier run, even with all four levers on, a spike eventually gets through — a genuinely bad document, a rare numerical event. Prevention is lesson 4; this is the <strong>runbook for when it happens anyway</strong>, in increasing order of cost:</p>
+
+<div class="lesson-flow">
+  <div><strong>1 · detect</strong><span>The monitor (next section) flags a loss jump or a gradient-norm spike that clipping didn't fully absorb. Catch it early — a spike heading toward NaN is unrecoverable once weights go inf.</span></div>
+  <div><strong>2 · rewind</strong><span>Roll back to the last <em>good</em> checkpoint — the last one written before the spike. This is why frequent checkpoints matter: you lose only the work since that checkpoint, not the run.</span></div>
+  <div><strong>3 · skip the offending batches</strong><span>A specific span of data often causes the spike. Resume from the good checkpoint but advance the data cursor (§3) <em>past</em> the offending batches so the optimizer never sees them again.</span></div>
+  <div><strong>4 · soften, if it recurs</strong><span>If skipping isn't enough, lower the peak LR a notch and/or tighten gradient clipping (and optionally lower β₂), then resume. A small, deliberate stability tax beats another spike.</span></div>
+</div>
+
+<p>Every step here <em>depends</em> on §2 and §3 being correct: rewinding needs a recent, bit-for-bit checkpoint, and skipping batches needs a deterministic, addressable data cursor. The spike runbook is not a separate system — it is what a correctly resumable run lets you <em>do</em>. A run that can't resume cleanly can't execute this playbook, and a spike that would have cost an hour costs the run.</p>
+
+<h2>6 · Monitoring: the dashboard you actually watch</h2>
+
+<p>You cannot fix what you cannot see, and a run is mostly invisible — a thousand GPUs grinding in a datacenter. The instrument is a live dashboard, and four signals carry almost all the information. Each one tells you about a different failure class from the lessons above.</p>
+
+<div class="dash">
+  <div class="tile"><div class="name">loss</div><div class="what">The primary instrument (lesson 4 §8). Smooth descent = healthy; a vertical jump = a spike (run the §5 runbook); a flat line or NaN = diverged or dead. The first thing your eyes go to.</div></div>
+  <div class="tile"><div class="name">gradient norm</div><div class="what">‖g‖ before clipping. A sudden upward spike is the <em>earliest</em> warning of instability — it moves before the loss does, so it's your leading indicator. Persistent growth means the run is going unstable.</div></div>
+  <div class="tile"><div class="name">throughput / MFU</div><div class="what">Tokens/s and achieved-vs-peak FLOPs (lesson 5–6). A sudden drop means a straggler GPU, a degraded network link, or comm not overlapping — money leaking even though nothing has crashed.</div></div>
+  <div class="tile"><div class="name">hardware health</div><div class="what">Per-GPU temperature, power, ECC error counts, Xid errors, link bandwidth. A climbing ECC count predicts the crash from §1 <em>before</em> it happens — so you can checkpoint and pre-empt it.</div></div>
+</div>
+
+<p>Read together they localize a problem fast: loss spike with a gradient-norm spike → data/optimizer event (runbook §5); MFU drop with one GPU's health degrading → straggler, drain that node; loss flat and a rank stopped heartbeating → a crash, confirm the auto-restart (from §4) fired. The dashboard is how the human supervises a system that is <em>mostly</em> automated — watching the signals that automation can't yet act on, and confirming that it acted on the ones it can.</p>
+
+<h2>7 · Drive the run-survival simulator</h2>
+
+<p>The widget turns this whole lesson into one number you care about — <strong>GPU-hours wasted</strong> — and shows the checkpoint-frequency sweet spot directly. Set the cluster size, the per-GPU MTBF, the checkpoint interval, and the run length. It computes (deterministically — these are <em>expectations</em>, not a dice roll) the expected failures from §4, the recompute lost per crash from §1, and the checkpointing overhead from §2, and reports the effective MFU you keep. Two things to make happen:</p>
+
+<ul>
+  <li><strong>Find the U.</strong> At 1,024 GPUs and a 21-day run, sweep the checkpoint interval from 5 min upward. Very short intervals waste GPU-hours on <em>checkpointing overhead</em>; very long intervals waste them on <em>recompute per crash</em>. The wasted-hours readout bottoms out in the middle — the sweet spot the §2 table described.</li>
+  <li><strong>Break it.</strong> Drag the checkpoint interval all the way to <strong>"never"</strong>. Now every crash rewinds to step 0, so each of the ~10 expected failures costs <em>half the run on average</em> — wasted hours explode and effective MFU collapses. That is the catastrophe the entire lesson exists to prevent.</li>
+</ul>
+
+<div class="widget" id="run-widget">
+  <div class="title">Run-survival simulator — wasted GPU-hours vs the checkpoint sweet spot</div>
+  <div class="hint">Expected failures ≈ (GPUs × days × 24) / MTBF (§4). Recompute per crash ≈ ½ × checkpoint-interval × GPUs (§1). Overhead ≈ (#checkpoints) × (a few-second sharded-async stall) × GPUs (§2). <strong>Shrink the interval and overhead climbs; grow it and recompute climbs — wasted hours are U-shaped with an interior sweet spot near ~30 min.</strong> Push the interval to <strong>"never"</strong> at 1,024 GPUs and each crash rewinds to step 0 → catastrophic loss. All values are deterministic expectations (no randomness).</div>
+
+  <div class="controls">
+    <label class="inline"># GPUs: <input type="range" id="rn-g" min="64" max="8192" step="64" value="1024"> <span class="val" id="rn-g-v">1024</span></label>
+    <label class="inline">per-GPU MTBF (h): <input type="range" id="rn-mtbf" min="10000" max="150000" step="5000" value="50000"> <span class="val" id="rn-mtbf-v">50000</span></label>
+    <label class="inline">checkpoint interval: <input type="range" id="rn-ckpt" min="0" max="360" step="5" value="60"> <span class="val" id="rn-ckpt-v">60 min</span></label>
+    <label class="inline">run length (days): <input type="range" id="rn-days" min="1" max="60" step="1" value="21"> <span class="val" id="rn-days-v">21</span></label>
+  </div>
+
+  <div class="budget-meter" id="rn-meter" style="height:30px;"></div>
+  <div class="meter-legend">
+    <span><i style="background:var(--ok)"></i> useful training</span>
+    <span><i style="background:var(--bad)"></i> recompute after crashes</span>
+    <span><i style="background:var(--accent-2)"></i> checkpointing overhead</span>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">Expected failures</div><div class="v" id="rn-k-fail">—</div></div>
+    <div class="kpi"><div class="k">GPU-hours wasted</div><div class="v" id="rn-k-waste">—</div></div>
+    <div class="kpi"><div class="k">Effective MFU kept</div><div class="v" id="rn-k-mfu">—</div></div>
+  </div>
+  <div class="kpi-grid" style="margin-top:8px;">
+    <div class="kpi"><div class="k">Lost per crash</div><div class="v" id="rn-k-percrash">—</div></div>
+    <div class="kpi"><div class="k">Checkpoint overhead</div><div class="v" id="rn-k-ovh">—</div></div>
+    <div class="kpi"><div class="k">Verdict</div><div class="v" id="rn-k-verdict">—</div></div>
+  </div>
+</div>
+
+<p>The reading to internalize: <strong>wasted hours = recompute + overhead</strong>, and the only free lunch is making checkpoints <em>cheap</em> (the sharded-async trick of §2) so you can afford to take them often, pushing the sweet spot left toward zero recompute without the overhead arm rising to meet it. Everything else is a trade. And note what the widget does <em>not</em> let you do: set MTBF to infinity. Hardware fails; the question is only how much of the budget you let each failure take.</p>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Checkpointing only the weights.</strong> Optimizer moments, schedule step, RNG, and data cursor are dropped. <em>Signal:</em> a loss bump every time you resume, then slow re-convergence — hundreds of wasted steps per restart.</li>
+    <li><strong>Checkpoint interval too long.</strong> Saving rarely "to avoid overhead." <em>Signal:</em> each crash costs many GPU-hours (§1); cumulative recompute is a large fraction of the run.</li>
+    <li><strong>Synchronous, unsharded checkpoints.</strong> The whole cluster stalls for minutes on every save. <em>Signal:</em> periodic throughput dips exactly at the checkpoint cadence; you respond by checkpointing <em>less</em> — straight into the previous failure.</li>
+    <li><strong>Overlapping or reshuffling data shards.</strong> Ranks see duplicate data, or the order changes on resume. <em>Signal:</em> effective batch smaller than intended, or a small loss discontinuity at every restart; quietly worse model.</li>
+    <li><strong>No automatic restart.</strong> A human babysits the run. <em>Signal:</em> hours of fully idle cluster per failure; with ~10 failures over three weeks, the idle time alone is thousands of GPU-hours.</li>
+    <li><strong>No leading indicators on the dashboard.</strong> Watching only the loss. <em>Signal:</em> you catch spikes late (loss lags gradient norm) and crashes late (after the collective times out, not when ECC errors started climbing).</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><strong>Save all five state pieces</strong> — params, optimizer m/v, schedule step, RNG (every rank), data cursor — and verify by resuming and confirming the loss curve is continuous.</li>
+    <li><strong>Checkpoint asynchronously and sharded</strong> so a save costs ~seconds, then checkpoint <em>often</em> (≈ every 15–60 min) to shrink recompute-per-crash.</li>
+    <li><strong>Make data order a pure seeded function of the step</strong>; shard disjointly by rank; persist and fast-forward the cursor on resume.</li>
+    <li><strong>Run elastically with hot spares</strong> — auto-detect dead ranks, re-form the group, reload, continue; no 3 a.m. page.</li>
+    <li><strong>Keep the spike runbook ready</strong> — rewind to last good checkpoint, skip the offending batches, soften LR/clip if it recurs (lesson 4).</li>
+    <li><strong>Watch loss, gradient norm, MFU, and hardware health</strong> together; treat a climbing ECC count as a checkpoint-now signal.</li>
+  </ul></div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the widget at the defaults (1,024 GPUs, MTBF 50,000 h, 60-min checkpoints, 21 days). Confirm the expected-failures readout is ≈10.3 (the §4 number) and note the GPU-hours wasted and effective MFU. (a) Sweep the checkpoint interval from 5 min up to 360 min and find the value that <em>minimizes</em> wasted hours — that is the sweet spot; note how the wasted total rises on <em>both</em> sides of it. (b) From the sweet spot, drag the interval to <strong>"never"</strong> and read the new wasted hours and effective MFU — explain in one sentence why one design choice can turn a ~2% tax into a budget-ending one. (c) Raise the cluster to 8,192 GPUs at the same interval: confirm expected failures scale ≈8× and that you now want to checkpoint <em>more</em> often. Finally, by hand: at 1,024 GPUs with the last checkpoint 6 hours ago, reproduce §1's 6,144 GPU-hours-per-crash figure, and say which of the two levers (frequency vs auto-restart) that number is about.</div>
+
+<h2>Where this points next</h2>
+
+<p>You can now <em>execute</em> a frontier run: it survives dead GPUs because it auto-restarts and resumes bit-for-bit from cheap, frequent, complete checkpoints; it survives loss spikes because the runbook can rewind and skip; and you can watch it stay healthy on a dashboard whose signals you can read. The wasted-GPU-hours fraction is small and bounded, so the lesson-5 runtime estimate is now <em>honest</em> — the budget you planned is roughly the budget you spend. But that only sharpens the question this whole part has been deferring. You can run <em>a</em> job, end to end, without burning the budget — yet nothing has told you <strong>how big the model should be</strong>: how to split your fixed compute between parameters <span class="math">N</span> and tokens <span class="math">D</span>, with the MoE knobs from lesson 10 layered on top. And the cruelty established here makes it acute: a frontier run is millions of GPU-hours and you get <em>one</em> attempt — you cannot run it twice to see which size was right. So you must <em>predict</em> the best configuration before you spend a FLOP, from cheap small-scale experiments. That is the entire subject of the next part. Next: <a href="12_scaling_laws.html"><strong>12 · Scaling laws — Chinchilla-optimal</strong></a>.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>A frontier run is weeks of wall-clock on thousands of GPUs, and over that span hardware <em>will</em> fail and the loss <em>will</em> occasionally spike — so the systems half's fast, fitting machine (06–10) is not enough; the run itself must be a <strong>fault-tolerant, deterministic, resumable system</strong>, or it burns the very budget you learned to protect. A crash converts GPU-hours straight into recompute: a 6-hour-old checkpoint on 1,024 GPUs costs <span class="math">6 × 1,024 = 6,144</span> GPU-hours per crash, and a 21-day run on that cluster expects ≈<span class="math">(1,024 × 21 × 24)/50,000 ≈ 10</span> crashes. You attack this with two levers: <strong>cheap, frequent, complete checkpoints</strong> — all five of params, optimizer <span class="math">m</span>/<span class="math">v</span>, the schedule step, RNG, and the data cursor (miss one and resume isn't bit-for-bit), sized by the lesson-5 16-B/param ledger (≈112 GB for 7B), written <em>sharded and asynchronously</em> so a save costs seconds — and <strong>automatic detect-and-restart</strong> (elastic training + hot spares) so no human babysits the cluster. Deterministic, disjoint, seeded data shards with a saved cursor keep resume from duplicating or skipping data; the lesson-4 spike runbook (rewind → skip batches → soften LR/clip) is what a resumable run lets you <em>do</em>; and a dashboard of loss, gradient norm, MFU, and hardware health is how you supervise it, with gradient norm and ECC counts as the leading indicators. Done right, the wasted fraction is a couple of percent and the lesson-5 runtime estimate is honest. But you still haven't chosen <span class="math">N</span> and <span class="math">D</span>, and you get one shot — so you must predict the right size before spending it: scaling laws, lesson 12.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>Exactly what state must a checkpoint contain to resume bit-for-bit, and what breaks if you save only the weights? <em>(§2 — model params, AdamW moments <span class="math">m</span> &amp; <span class="math">v</span>, the LR-schedule step counter, RNG state on every rank, and the data-loader cursor. Save only weights and the optimizer restarts cold, the schedule re-warms-up, and the data order desyncs — the loss bumps on resume and re-converges slowly instead of continuing on the original curve.)</em></li>
+  <li>Estimate the budget a single crash costs and how often crashes happen at scale. <em>(§1, §4 — recompute ≈ time-since-checkpoint × GPUs: a 6-hour-old checkpoint on 1,024 GPUs is 6,144 GPU-hours per crash. Expected failures ≈ GPUs×hours/MTBF; at MTBF≈50,000 h a 21-day 1,024-GPU run expects ≈10 failures — one roughly every two days.)</em></li>
+  <li>How should checkpoint frequency be chosen, and why is there a sweet spot? <em>(§2 — recompute-per-crash ≈ ½ × interval × GPUs falls as the interval shrinks, but the number of (costly) saves rises, so total wasted hours are U-shaped with an interior minimum. Making saves cheap — sharded + async — pushes the optimum toward frequent checkpoints and near-zero recompute.)</em></li>
+  <li>Why must checkpointing be asynchronous and sharded, and how does each part help? <em>(§2 — sharded: each FSDP rank writes only the shard it holds, in parallel, so write bandwidth scales with GPU count instead of bottlenecking one rank. Async: snapshot to pinned host memory fast, then stream to durable storage in the background while training continues — the GPU stall drops from minutes to ~a second.)</em></li>
+  <li>Name the two classic data-loader bugs in a sharded run and how each corrupts training. <em>(§3 — overlapping shards: ranks stream the same examples, so all-reduced gradients are duplicated/biased and the effective batch is smaller and skewed. Reshuffle-on-resume: the order changes after a restart, so some data is seen twice (extra epochs → memorization) and some skipped. Fix: data order is a pure seeded function of the step; persist and fast-forward the cursor.)</em></li>
+  <li>What is the operational runbook when the loss spikes mid-run, and what does it depend on? <em>(§5 — detect early (gradient norm leads loss), rewind to the last good checkpoint, skip the offending data batches via the cursor, and if it recurs lower peak LR / tighten clip (lesson 4). It depends entirely on §2–§3: a recent bit-for-bit checkpoint and a deterministic, addressable data cursor.)</em></li>
+  <li>Which four signals do you watch on the run dashboard, and what failure does each catch? <em>(§6 — loss (spikes/divergence, but lagging), gradient norm (the leading indicator of instability, moves before loss), throughput/MFU (stragglers, degraded links, lost overlap — money leaking with no crash), and hardware health/ECC (predicts the crash before it happens, so you checkpoint and pre-empt).)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="10_moe.html"><span class="dir">← Back</span><span class="ttl">10 · Mixture of Experts</span></a>
+  <a class="next" href="12_scaling_laws.html"><span class="dir">Next →</span><span class="ttl">12 · Scaling laws</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var elG    = document.getElementById('rn-g'),    elGv    = document.getElementById('rn-g-v');
+  var elMtbf = document.getElementById('rn-mtbf'), elMtbfv = document.getElementById('rn-mtbf-v');
+  var elCkpt = document.getElementById('rn-ckpt'), elCkptv = document.getElementById('rn-ckpt-v');
+  var elDays = document.getElementById('rn-days'), elDaysv = document.getElementById('rn-days-v');
+  var meter  = document.getElementById('rn-meter');
+  var kFail  = document.getElementById('rn-k-fail');
+  var kWaste = document.getElementById('rn-k-waste');
+  var kMfu   = document.getElementById('rn-k-mfu');
+  var kPer   = document.getElementById('rn-k-percrash');
+  var kOvh   = document.getElementById('rn-k-ovh');
+  var kVerd  = document.getElementById('rn-k-verdict');
+  if (!meter) return;
+
+  var STALL_S = 8;     // sharded+async checkpoint: GPUs stall ~a few s per save (§2)
+                       // (device-to-host snapshot of the state + a barrier across all
+                       // ranks; the slow durable upload is backgrounded). Small enough
+                       // that frequent checkpoints are affordable, large enough that
+                       // *too*-frequent saves cost real throughput — so wasted hours
+                       // are U-shaped with an interior sweet spot near ~30 min.
+
+  function fmtH(h){
+    if (h >= 1e6) return (h/1e6).toFixed(2) + 'M GPU-h';
+    if (h >= 1e3) return (h/1e3).toFixed(1) + 'K GPU-h';
+    return h.toFixed(0) + ' GPU-h';
+  }
+
+  function recompute(){
+    var G    = +elG.value;
+    var mtbf = +elMtbf.value;
+    var ckpt = +elCkpt.value;          // minutes; 0 means "never"
+    var days = +elDays.value;
+    var never = (ckpt === 0);
+
+    elGv.textContent    = G;
+    elMtbfv.textContent = mtbf;
+    elCkptv.textContent = never ? 'never' : (ckpt + ' min');
+    elDaysv.textContent = days;
+
+    var runHours = days * 24;          // wall-clock hours
+    var totalGpuH = G * runHours;      // total rented GPU-hours (the budget)
+    var failures = totalGpuH / mtbf;   // §4: expected failures (deterministic expectation)
+
+    // §1: recompute lost per crash ≈ ½ × interval × GPUs (avg work since last ckpt).
+    // "never" → on average half the run-so-far is lost each crash → catastrophic.
+    var intervalH = never ? (runHours / 2) : (ckpt / 60);
+    var lostPerCrashH = 0.5 * intervalH * G;          // GPU-hours per crash
+    if (never) lostPerCrashH = intervalH * G;         // already the ½·runHours mean
+    var recomputeH = failures * lostPerCrashH;
+
+    // §2: checkpointing overhead = (#checkpoints) × stall × GPUs.
+    var nCkpts = never ? 0 : Math.floor((runHours * 60) / ckpt);
+    var overheadH = nCkpts * (STALL_S / 3600) * G;
+
+    var wastedH = recomputeH + overheadH;
+    if (wastedH > totalGpuH) wastedH = totalGpuH;     // clamp (degenerate "never" cases)
+    var usefulH = Math.max(0, totalGpuH - wastedH);
+    var effMfu = 100 * usefulH / totalGpuH;           // fraction of budget that is real training
+
+    // meter: useful (green) | recompute (red) | overhead (amber), as % of budget.
+    // Build segments explicitly so the colors map to the legend.
+    var pUse = 100 * usefulH / totalGpuH;
+    var pRec = 100 * Math.min(recomputeH, totalGpuH) / totalGpuH;
+    var pOvh = 100 * Math.min(overheadH, totalGpuH) / totalGpuH;
+    meter.innerHTML =
+      '<span style="width:' + pUse.toFixed(2) + '%;background:var(--ok)"></span>' +
+      '<span style="width:' + pRec.toFixed(2) + '%;background:var(--bad)"></span>' +
+      '<span style="width:' + pOvh.toFixed(2) + '%;background:var(--accent-2)"></span>';
+
+    kFail.textContent  = failures.toFixed(1);
+    kWaste.textContent = fmtH(wastedH);
+    kMfu.textContent   = effMfu.toFixed(1) + '%';
+    kPer.textContent   = fmtH(lostPerCrashH);
+    kOvh.textContent   = fmtH(overheadH);
+
+    // verdict + KPI coloring
+    var waste = kWaste.parentElement, mfu = kMfu.parentElement;
+    waste.classList.remove('warnv','badv'); mfu.classList.remove('warnv','badv');
+    var wastedPct = 100 - effMfu;
+    if (never || wastedPct >= 25){
+      kVerd.innerHTML = '<span class="verdict bad">' + (never ? 'CATASTROPHIC' : 'BLEEDING BUDGET') + '</span>';
+      waste.classList.add('badv'); mfu.classList.add('badv');
+    } else if (wastedPct >= 8){
+      kVerd.innerHTML = '<span class="verdict bad" style="background:rgba(217,119,6,0.16);color:#d97706">WASTEFUL</span>';
+      waste.classList.add('warnv'); mfu.classList.add('warnv');
+    } else {
+      kVerd.innerHTML = '<span class="verdict ok">HEALTHY</span>';
+    }
+  }
+
+  [elG, elMtbf, elCkpt, elDays].forEach(function(e){ e.addEventListener('input', recompute); });
+  recompute();
+})();
+</script>
+
+<!-- reviewed:v3 -->
+</body>
+</html>

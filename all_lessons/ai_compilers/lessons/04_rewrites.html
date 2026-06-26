@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>04 · Rewrites &amp; canonicalization</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local layout only — failure/checklist columns + the rewrite-playground graph */
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; font-size: 15px; }
+  .lesson-card ul { margin: 0; padding-left: 18px; }
+  .lesson-card li { margin: 7px 0; font-size: 13.5px; line-height: 1.5; }
+  .rw-wrap { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 14px; align-items: start; }
+  .rw-btns { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 2px; }
+  .rw-btns button { font-family: var(--mono); font-size: 12px; padding: 7px 10px; border: 1px solid var(--border);
+                    border-radius: 6px; background: var(--bg-elev); color: var(--text); cursor: pointer; }
+  .rw-btns button:hover { border-color: var(--accent); }
+  .rw-btns button:disabled { opacity: 0.4; cursor: default; }
+  .rw-log { font-family: var(--mono); font-size: 11.5px; color: var(--text-mute); line-height: 1.5;
+            max-height: 168px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px;
+            background: var(--code-bg); padding: 8px 10px; margin-top: 8px; }
+  .rw-log .dead { color: var(--bad); text-decoration: line-through; }
+  .rw-log .new { color: var(--ok); }
+  .warn-row { font-family: var(--mono); font-size: 12px; color: var(--bad); margin: 8px 0 2px; min-height: 18px; }
+  .kpi.good .v { color: var(--ok); }
+  @media (max-width: 820px) { .lesson-grid, .rw-wrap { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">ai_compilers / lessons</a><span class="crumb">/</span><span class="crumb">04 · rewrites</span><span class="step-pill">lesson 5 / 16</span></div></header>
+
+<main>
+
+<p class="kicker">Part III — Middle end</p>
+<h1>Rewrites &amp; canonicalization</h1>
+<p class="subtitle">Lesson 03 handed you a typed SSA dataflow graph: every value defined once, every tensor carrying its shape, dtype, and device, every op drawn from a small, well-defined set. That representation has <em>rules</em> — which is precisely what makes it safe to rewrite. But a freshly captured graph is a mess: constants you could have folded at compile time, the same subexpression computed twice, nodes whose results nobody reads, and dozens of <span class="math">x + 0</span> / <span class="math">x · 1</span> spelled forty different ways. This lesson builds the <strong>engine</strong> that cleans all of that up — match a subgraph, replace it with an equivalent one, repeat until nothing changes — and the catalog of cheap, always-valid passes it drives. None of these are the big win. They are the setup: every one of them shrinks the graph and normalizes its shape so the high-leverage pass next door — fusion — has clean, matchable patterns to grab.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>You now have a principled IR — typed, single-assignment, a dataflow DAG you can transform locally and soundly. What you do <em>not</em> have is anything that transforms it. The captured graph is whatever the front end emitted: a trace will have baked <span class="math">scale = 1 / √64</span> as a live <code>div</code> node instead of the constant <code>0.125</code>; the residual block recomputes <code>x + bias</code> in two places; a debugging <code>print</code> branch left a whole subgraph dangling with no consumer; and a generic <code>Linear</code> emitted <code>matmul; add(bias); mul(1.0)</code> where the <code>mul(1.0)</code> does nothing. Hand that graph to a fusion pass and it will choke — it can't recognize patterns that appear in five spellings, and it will dutifully fuse dead nodes and redundant copies into kernels that never needed to exist. Before you can do anything clever, you need the boring, correct machinery that puts the graph into one normal form and deletes everything pointless.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> a raw captured SSA graph is full of redundancy (repeated subexprs, dead nodes, foldable constants) and non-canonical spellings (<span class="math">x·1</span>, <span class="math">0+x</span>, <code>div</code>-by-a-constant) that block every later pass from matching what it's looking for.<br><strong>New idea:</strong> the <strong>pass / pattern-rewrite engine</strong> — match a subgraph, replace it with a provably-equivalent one, iterate to a <strong>fixed point</strong> — driving the staple cleanups: <strong>constant folding</strong>, <strong>common-subexpression elimination (CSE)</strong>, <strong>dead-code elimination (DCE)</strong>, <strong>algebraic simplification</strong>, all funneled through <strong>canonicalization</strong> into one normal form. The hard invariant: every rewrite must <strong>preserve semantics</strong> — and floating-point is <em>not</em> associative, so reassociation is only legal under fast-math.<br><strong>Forces next:</strong> these cleanups still leave one kernel per op — each surviving node is its own HBM round trip. The highest-leverage rewrite is to <em>merge</em> ops into one kernel: fusion (lesson 05).</div>
+
+<div class="callout"><div class="label">The plan</div>Five moves. (1) Build the rewrite engine: pattern → replacement → iterate to a fixed point, and what makes a rewrite legal. (2) The staples with tiny before→after IR — constant folding, CSE, DCE. (3) Algebraic simplification, and the float-associativity caveat made concrete (a reassociation that changes the answer; fast-math). (4) Canonicalization — why one normal form multiplies the value of every pattern. (5) Phase ordering: passes interact, greedy order isn't optimal, and e-graphs / equality saturation as the principled escape. Then drive the playground until the graph hits its fixed point.</div>
+
+<h2>1 · The rewrite engine: match, replace, iterate to a fixed point</h2>
+
+<p>Every middle-end optimization in this lesson is the same shape. A <strong>rewrite rule</strong> is a pair: a <em>pattern</em> — a small subgraph template, possibly with wildcards (&ldquo;any value <span class="math">a</span> times a constant <span class="math">1</span>&rdquo;) — and a <em>replacement</em> — the equivalent subgraph to splice in (&ldquo;just <span class="math">a</span>&rdquo;). The engine walks the IR, finds where a pattern matches, swaps in the replacement, and rewires the SSA edges so every consumer of the old result now reads the new one. Because the IR is single-assignment with value semantics (lesson 03), that rewire is purely local: no aliasing, no hidden mutation, nothing downstream silently changes meaning.</p>
+
+<p>The catch is that one rewrite enables another. Fold a constant and a subexpression two nodes over suddenly becomes a duplicate that CSE can collapse; collapse it and a third node loses its last consumer and becomes dead. So the engine doesn't run each pass once — it iterates the whole rule set until a full sweep changes nothing. That terminal state is a <strong>fixed point</strong>: applying any rule produces a graph identical to the one you have. <code>f(g) = g</code>. As long as every rule strictly simplifies (fewer nodes, or a canonical form that's never undone), the iteration is guaranteed to terminate — there's a finite amount of graph to shrink.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">rewrite rule</div><div class="v">A pattern (subgraph template + wildcards) paired with an equivalent replacement. <code>mul(a, 1) → a</code>. Must be a provable no-op on the math.</div></div>
+  <div class="topic-card"><div class="k">fixed point</div><div class="v">The state where no rule fires anymore — one full sweep leaves the graph unchanged. The engine loops until it reaches it.</div></div>
+  <div class="topic-card"><div class="k">worklist</div><div class="v">In practice you don't re-scan the whole graph each sweep; you queue only the nodes whose inputs just changed, so the engine touches each node ≈ once per enabling event.</div></div>
+</div>
+
+<p>This is not exotic. It is exactly what MLIR's <code>PatternRewriter</code> and <code>applyPatternsAndFoldGreedily</code> do over a set of <code>RewritePattern</code>s; what XLA's HLO passes do as an algebraic-simplifier fixpoint; and what <code>torch.compile</code>'s Inductor does with its declarative pattern matcher (<code>register_replacement</code>) before it lowers to Triton. Different IRs, identical engine: match a subgraph, replace it with an equivalent, iterate.</p>
+
+<h2>2 · The staples: constant folding, CSE, DCE</h2>
+
+<p><strong>Constant folding</strong> evaluates, at compile time, any op whose inputs are all known constants, and replaces the op with its result. The trace baked <span class="math">1 / √64</span> as a live computation; folding turns it into the literal <code>0.125</code> so it costs nothing at run time. It cascades: fold one node and its constant output may make the next node foldable too.</p>
+
+<pre class="ascii">before                              after constant folding
+  %a = const 64                       %a = const 64        (now dead — see DCE)
+  %b = sqrt %a        ; = 8.0         %scale = const 0.125
+  %s = div 1.0, %b    ; = 0.125
+  %y = mul %x, %s                     %y = mul %x, 0.125</pre>
+
+<p><strong>Common-subexpression elimination (CSE)</strong> finds two nodes that compute the same op on the same inputs and keeps one, redirecting all consumers of the second to the first. Trivial in SSA: hash each node by <span class="math">(op, input-ids, attrs)</span>; equal hashes with equal inputs are the same value. The residual block that recomputed <code>x + bias</code> twice now computes it once.</p>
+
+<pre class="ascii">before                              after CSE
+  %h1 = add %x, %bias                 %h1 = add %x, %bias
+  %h2 = add %x, %bias    ; dup        ; %h2 removed; its uses point to %h1
+  %p  = relu %h1                       %p = relu %h1
+  %q  = gelu %h2                       %q = gelu %h1</pre>
+
+<p><strong>Dead-code elimination (DCE)</strong> deletes any node whose result has no consumers and no side effect — the leftover <code>print</code>-branch subgraph, the constant <code>%a = 64</code> that folding orphaned, the second <code>add</code> that CSE just disconnected. In an SSA DAG this is one reverse sweep: anything not reachable backward from the graph's outputs is dead. DCE is what makes folding and CSE pay off — they <em>disconnect</em> nodes; DCE actually removes them so the kernel count and memory plan shrink.</p>
+
+<pre class="ascii">before                              after DCE
+  %a = const 64        ; no uses      ; %a removed
+  %dbg = sum %x        ; no uses      ; %dbg removed
+  %y = mul %x, 0.125                  %y = mul %x, 0.125
+  return %y                           return %y</pre>
+
+<p>The three run as a fixpoint loop, not once each, because they feed each other: <em>fold → orphans constants → DCE; CSE → disconnects a node → DCE; DCE → exposes a now-single-use node → in-place fusion later.</em> Run them to a fixed point and the graph contains exactly the live, distinct computation and nothing else.</p>
+
+<h2>3 · Algebraic simplification — and the float-associativity trap</h2>
+
+<p><strong>Algebraic simplification</strong> rewrites a subgraph into a cheaper algebraically-equal one. These are the identity rules every compiler ships:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">identity elements</div><div class="v"><span class="math">x + 0 → x</span>, <span class="math">x · 1 → x</span>, <span class="math">x · 0 → 0</span>, <span class="math">x / 1 → x</span>. The generic <code>Linear</code>'s leftover <code>mul(1.0)</code> just vanishes.</div></div>
+  <div class="topic-card"><div class="k">strength reduction</div><div class="v"><span class="math">a / √b → a · rsqrt(b)</span> (one <code>rsqrt</code> beats a <code>sqrt</code> + <code>div</code>); <span class="math">x / c → x · (1/c)</span> for constant <span class="math">c</span>; <span class="math">x²</span> as <code>mul(x,x)</code>.</div></div>
+  <div class="topic-card"><div class="k">structural cancels</div><div class="v">two consecutive <code>transpose</code>s that invert each other → drop both; <code>reshape</code> to the same shape → drop; <code>cast</code> to the current dtype → drop; <span class="math">exp(log x) → x</span>.</div></div>
+</div>
+
+<pre class="ascii">before                              after algebraic simplify
+  %t1 = transpose %w  (0,1)→(1,0)     ; both transposes removed
+  %t2 = transpose %t1 (1,0)→(0,1)     %y = mul %x, %w        ; (uses %w directly)
+  %r  = div %a, sqrt(%b)              %r = mul %a, rsqrt(%b)
+  %z  = mul %r, 1.0                   ; mul-by-1 removed</pre>
+
+<p>Every rule above is an <em>exact</em> identity on real numbers — that's the license to apply it. But tensors are floating-point, and floating-point is not the real numbers. The one rule that looks just as innocent and <strong>is not safe</strong> is <strong>reassociation</strong>: <span class="math">(a + b) + c → a + (b + c)</span>. Over reals these are equal; over IEEE-754 they are not, because each <code>+</code> rounds.</p>
+
+<div class="math block">(1×10²⁰ + (−1×10²⁰)) + 1.0  =  0.0 + 1.0  =  1.0</div>
+<div class="math block">1×10²⁰ + ((−1×10²⁰) + 1.0)  =  1×10²⁰ + (−1×10²⁰)  =  0.0</div>
+
+<p>Same three numbers, different grouping, answers that differ by 1.0 — because in the second grouping the <code>1.0</code> is swallowed by the rounding of a number 20 orders of magnitude larger. Reassociation can also create or destroy overflow/<code>NaN</code>/<code>Inf</code>. So a correct compiler treats <code>+</code> and <code>·</code> on floats as <strong>non-associative and non-distributive</strong> by default: it will <em>not</em> reorder a reduction, balance a sum tree, or distribute <span class="math">a·(b+c) → a·b + a·c</span> unless you opt in. That opt-in is <strong>fast-math</strong> — <code>--ffast-math</code>, XLA's <code>xla_allow_excess_precision</code> / reduced-precision-reassociation, the LLVM <code>fast</code> / <code>reassoc</code> / <code>contract</code> flags, PyTorch's TF32 and reduced-precision-reduction toggles. Fast-math says &ldquo;I accept that the compiler may reassociate and contract, and my result may differ in the last bits.&rdquo; It is the explicit boundary of the <em>preserve-semantics</em> invariant: every other rule in this lesson is bit-exact; reassociation trades a few ulps of accuracy for the freedom to reorder. Know which side of that line a rewrite sits on, because a silent reassociation is how a model's loss curve quietly diverges from the reference run.</p>
+
+<h2>4 · Canonicalization: one normal form so patterns match</h2>
+
+<p>Here is the move that makes everything above worth more than the sum of its parts. <strong>Canonicalization</strong> rewrites every equivalent spelling of a thing into one chosen <strong>canonical form</strong> — a single normal form. Commutative ops get their operands sorted into a fixed order (constant on the right: <code>add(2, x) → add(x, 2)</code>); <code>x - c</code> becomes <code>add(x, -c)</code>; <code>div</code>-by-constant becomes <code>mul</code> by the reciprocal; subtraction folds into addition; a chain of reshapes collapses to one. The point is not that the canonical form is faster — it's that it is <em>unique</em>.</p>
+
+<p>Why does uniqueness matter so much? Because every later pass is a pattern matcher, and a pattern matcher only fires when the IR looks like its template. Without canonicalization, a fusion rule that wants &ldquo;<code>matmul</code> followed by <code>add(bias)</code>&rdquo; would need to also spell out <code>add(bias, matmul)</code>, <code>matmul</code> then <code>add</code>-via-<code>sub</code>-of-negative, and every other variant — a combinatorial explosion of near-duplicate patterns, most of which someone forgets to write. Canonicalize first and you write the pattern <em>once</em>, against the one form the IR is guaranteed to be in. Canonicalization doesn't optimize; it makes optimization <em>matchable</em>. In MLIR it's literally a built-in pass (<code>-canonicalize</code>) that ops register <code>getCanonicalizationPatterns</code> into; XLA folds it into the algebraic simplifier; Inductor normalizes before its pattern matcher runs. The discipline: canonicalize → fold → CSE → DCE, iterate, and only then reach for the passes that actually move bytes.</p>
+
+<svg class="diagram" viewBox="0 0 720 150" width="100%" role="img" aria-label="Many spellings canonicalize to one form, which a single pattern matches">
+  <defs>
+    <marker id="arr04" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" class="edge"></path>
+    </marker>
+  </defs>
+  <g font-family="var(--mono)" font-size="11">
+    <rect class="node-bg" x="8"  y="10"  width="150" height="26" rx="5"></rect><text x="83"  y="27" text-anchor="middle">add(2, x)</text>
+    <rect class="node-bg" x="8"  y="48"  width="150" height="26" rx="5"></rect><text x="83"  y="65" text-anchor="middle">x · 1 + 2</text>
+    <rect class="node-bg" x="8"  y="86"  width="150" height="26" rx="5"></rect><text x="83"  y="103" text-anchor="middle">2 + x · 1.0</text>
+    <rect class="node-bg" x="8"  y="124" width="150" height="26" rx="5"></rect><text x="83"  y="141" text-anchor="middle">x − (−2)</text>
+
+    <rect class="node-bg" x="300" y="62" width="160" height="30" rx="6" style="stroke:var(--accent)"></rect>
+    <text x="380" y="81" text-anchor="middle" fill="var(--accent)">add(x, 2)  ⟵ canonical</text>
+
+    <rect class="node-bg" x="560" y="62" width="150" height="30" rx="6" style="stroke:var(--ok)"></rect>
+    <text x="635" y="81" text-anchor="middle" fill="var(--ok)">1 pattern matches</text>
+
+    <line class="edge" x1="160" y1="23"  x2="298" y2="70" marker-end="url(#arr04)"></line>
+    <line class="edge" x1="160" y1="61"  x2="298" y2="74" marker-end="url(#arr04)"></line>
+    <line class="edge" x1="160" y1="99"  x2="298" y2="80" marker-end="url(#arr04)"></line>
+    <line class="edge" x1="160" y1="137" x2="298" y2="84" marker-end="url(#arr04)"></line>
+    <line class="edge" x1="462" y1="77"  x2="558" y2="77" marker-end="url(#arr04)"></line>
+  </g>
+</svg>
+
+<h2>5 · Phase ordering, and the e-graph escape</h2>
+
+<p>There's a worm in the greedy fixpoint. Passes interact, and the <strong>order</strong> you run them in changes the result — this is the <strong>phase-ordering</strong> problem. A rewrite that looks like a win locally can block a much bigger win two passes later. Classic case: greedily fold <span class="math">a·b + a·c</span> down by some local rule and you may destroy the <code>a·(b+c)</code> factoring that fusion wanted; canonicalize a transpose away and you might forfeit a layout that a later pass could have exploited. Greedy rewriting commits to the first improvement it sees and can never take a step that's temporarily worse to reach a better global form. No fixed pass order is optimal for all graphs, and finding the best sequence is, in general, intractable.</p>
+
+<p>The principled escape is <strong>equality saturation</strong> over an <strong>e-graph</strong> (equality graph). Instead of destructively replacing the matched subgraph — throwing away the original — you <em>add</em> the equivalent form and record that the two are equal. An e-graph compactly represents <em>all</em> the equivalent programs you've discovered at once: nodes are grouped into equivalence classes (&ldquo;e-classes&rdquo;), and a rewrite just merges classes rather than mutating the graph. You apply every rule everywhere, repeatedly, until the e-graph <em>saturates</em> (no rule adds anything new — a fixed point over the whole space of rewrites), and only <em>then</em> run a cost-model-driven <strong>extraction</strong> that picks the single cheapest program out of the exponentially many the e-graph encodes. Because nothing was ever destroyed, you sidestep phase ordering entirely: the engine never had to choose an order, it kept everything.</p>
+
+<p>This is the idea behind <strong>TASO</strong> and <strong>PET</strong> (superoptimizing tensor graphs by exploring equivalent subgraphs) and the <strong>egg</strong> library (fast, general e-graphs and equality saturation) now used in several ML and DSL compilers. The cost is real — the e-graph can blow up in memory, and extraction with a realistic cost model (one that accounts for fusion, layout, and traffic, not just node count) is itself hard. So today's production stacks are mostly greedy-fixpoint with carefully tuned phase orders, and equality saturation is the frontier you reach for when the greedy order leaves measurable speed on the table. Either way, the engine's job is done: a clean, canonical, redundancy-free graph — handed to the pass that actually collapses the bytes.</p>
+
+<h2>6 · Drive it: the rewrite playground</h2>
+
+<p>The graph below is a deliberately messy little program with one of each problem: a constant expression (<code>1/√64</code>), a repeated subexpression (<code>x + bias</code> twice), a dead node (an unused debug <code>sum</code>), and a no-op <code>mul</code> by <code>1.0</code>. Apply the passes in any order and watch <strong>#nodes</strong>, <strong>#ops</strong> (the kernels you'd launch), and <strong>est. cost</strong> shrink toward a fixed point — when every button is disabled, the graph is saturated. Then flip <strong>&ldquo;reassociate floats?&rdquo;</strong>: it offers an extra reduction-reordering rewrite, and warns you that it may change the result in the last bits. That toggle is the preserve-semantics line drawn as a switch.</p>
+
+<div class="widget" id="rw">
+  <div class="title">Rewrite playground — clean a messy graph to its fixed point</div>
+  <div class="hint">Each pass matches a subgraph and replaces it with an equivalent. Apply them in any order; the order can differ but the fixed point is the same (for these exact-identity rules). The knob that breaks: turn on <strong>reassociate floats</strong> and the engine offers a rewrite that is <em>not</em> bit-exact — fast-math only.</div>
+
+  <div class="rw-wrap">
+    <div>
+      <div class="rw-btns">
+        <button id="rw-fold">constant fold</button>
+        <button id="rw-cse">CSE</button>
+        <button id="rw-dce">DCE</button>
+        <button id="rw-alg">algebraic</button>
+        <button id="rw-reset">reset</button>
+      </div>
+      <label class="inline" style="font-size:13px;"><input type="checkbox" id="rw-reassoc"> reassociate floats? (fast-math, may change result)</label>
+      <div class="warn-row" id="rw-warn"></div>
+      <div class="kpi-grid">
+        <div class="kpi"><div class="k">#nodes</div><div class="v" id="rw-nodes">—</div></div>
+        <div class="kpi"><div class="k">#ops (kernels)</div><div class="v" id="rw-ops">—</div></div>
+        <div class="kpi"><div class="k">est. cost</div><div class="v" id="rw-cost">—</div></div>
+        <div class="kpi" id="rw-fpk"><div class="k">at fixed point?</div><div class="v" id="rw-fp">no</div></div>
+      </div>
+    </div>
+    <div>
+      <div class="rw-log" id="rw-ir"></div>
+    </div>
+  </div>
+</div>
+
+<p>Notice what the scoreboard cannot do: it bottoms out with one live op per surviving node. Constant fold deleted compute, CSE deleted a duplicate, DCE deleted the dead, algebraic deleted the no-ops — but <code>matmul</code>, <code>add(bias)</code>, and <code>gelu</code> all remain as separate ops, and in eager execution that's three kernels and three HBM round trips. Cheap rewrites shrink the graph; they don't merge the survivors. That's the wall this lesson hands off.</p>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Reassociating floats by default.</strong> Treating <span class="math">(a+b)+c = a+(b+c)</span> as always-safe to reorder a reduction or balance a sum tree. <em>Signal:</em> compiled loss curve drifts from the eager reference, worse in fp16/bf16; differences vanish when you disable fast-math.</li>
+    <li><strong>Distributing over floats.</strong> Rewriting <span class="math">a·(b+c) → a·b + a·c</span> &ldquo;to expose fusion.&rdquo; <em>Signal:</em> last-bit numerical mismatches and occasional new overflow/<code>NaN</code> that the original grouping never produced.</li>
+    <li><strong>Skipping canonicalization.</strong> Writing fusion/layout patterns directly against raw captured IR. <em>Signal:</em> a pattern that &ldquo;sometimes&rdquo; fires — it matches <code>add(matmul, bias)</code> but misses <code>add(bias, matmul)</code>; speedups are flaky across models.</li>
+    <li><strong>Folding a non-constant.</strong> Evaluating an op at compile time whose input only <em>looks</em> constant (a buffer mutated elsewhere, a shaped-but-dynamic value). <em>Signal:</em> wrong results that depend on runtime data the compiler baked in.</li>
+    <li><strong>No fixed point / oscillation.</strong> Two rules undo each other (canonicalize <code>x-c → x+(-c)</code> while another rewrites the reverse). <em>Signal:</em> the fixpoint loop never terminates or hits its iteration cap.</li>
+    <li><strong>DCE deleting a side effect.</strong> Removing a node with no SSA consumer that nonetheless has an effect (RNG state advance, collective, in-place write). <em>Signal:</em> dropout stops being random, or a missing all-reduce corrupts a distributed run.</li>
+  </ul>
+  </div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><strong>Canonicalize first.</strong> One normal form, then fold/CSE/DCE/algebraic — so every later pattern is written once.</li>
+    <li><strong>Iterate to a fixed point.</strong> Run the rule set in a worklist loop until a full sweep changes nothing; don't run each pass once.</li>
+    <li><strong>Prove each rule exact, or gate it.</strong> Bit-exact identities run by default; reassociation/distribution/contraction only under an explicit fast-math flag.</li>
+    <li><strong>DCE only the truly dead.</strong> No SSA consumer <em>and</em> no side effect; treat RNG, collectives, and in-place writes as effectful.</li>
+    <li><strong>Hash CSE by (op, inputs, attrs).</strong> Equal hash + equal inputs ⇒ same value in SSA; redirect uses, then let DCE remove the duplicate.</li>
+    <li><strong>Reach for e-graphs when greedy stalls.</strong> If phase ordering is leaving speed on the table, equality saturation + cost-model extraction is the principled fix.</li>
+  </ul>
+  </div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the playground and apply the passes in the order <strong>fold → CSE → DCE → algebraic</strong>; record the #nodes after each. Reset, then run <strong>algebraic → DCE → fold → CSE</strong> and confirm you reach the <em>same</em> fixed point — different path, identical destination, because every rule here is an exact identity. Now reset and turn on <strong>reassociate floats</strong>: a new rewrite becomes available and the warning lights up. Apply it and note that #ops drops further — the standalone scale multiply is contracted into a reordered (<code>scaled_reduce</code>) reduction, so the separately-computed scale becomes dead — but you've left the bit-exact regime, because reordering the reduction rounds differently. This is the rewrite a default-correct compiler refuses without fast-math. Finally, read the floor: the graph stalls at <code>matmul · add(bias) · gelu</code>, three separate ops. Predict the kernel count and HBM round trips an eager run pays for that floor, then read lesson 05 to see fusion collapse it to one.</div>
+
+<h2>Where this points next</h2>
+
+<p>The engine did its job: a typed SSA graph is now canonical, constant-folded, free of duplicates and dead nodes, and algebraically tightened — and crucially, it's in the one normal form that later pattern matchers expect. But look at what survives. Every cleanup in this lesson <em>deleted</em> work; none of them <em>merged</em> work. The graph still runs as one kernel per op, and from lesson 01 we know that's the expensive part: each surviving memory-bound op pays its own HBM round trip, loading and storing the whole activation just to do a few FLOPs per element. Constant folding and CSE removed nodes that never needed a kernel; they did nothing about the kernels that remain. The single highest-leverage rewrite left is categorically different — instead of removing a node, <em>fuse</em> a chain of them into one kernel that reads from HBM once, does all the math while the data is hot in registers, and writes once. Everything in this lesson was setup: a clean, canonical graph is exactly what makes fusion patterns findable. That is lesson 05, <strong><a href="05_fusion.html">Operator fusion — the central win</a></strong>.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+A captured SSA graph arrives full of redundancy and a dozen spellings of the same thing, which blocks every later pass from matching what it wants. The fix is one reusable <strong>engine</strong>: a <strong>rewrite rule</strong> = pattern + equivalent replacement; run the rule set in a worklist loop until a <strong>fixed point</strong> where nothing fires. The staples — <strong>constant folding</strong> (evaluate all-constant ops at compile time), <strong>CSE</strong> (collapse duplicate subexpressions, trivial in SSA via a <span class="math">(op, inputs, attrs)</span> hash), <strong>DCE</strong> (delete results with no consumer and no side effect), and <strong>algebraic simplification</strong> (<span class="math">x·1→x</span>, <span class="math">a/√b → a·rsqrt(b)</span>, cancel consecutive transposes) — feed each other and run together. <strong>Canonicalization</strong> drives them all into one normal form so each downstream pattern is written once instead of in every variant; it doesn't optimize, it makes optimization matchable. The bounding invariant is <strong>preserve semantics</strong>: every rule here is bit-exact <em>except reassociation</em> — floats are non-associative (<span class="math">(1e20 + −1e20) + 1 = 1</span> but <span class="math">1e20 + (−1e20 + 1) = 0</span>), so reordering reductions is legal only under explicit <strong>fast-math</strong>. Greedy fixpoint order isn't optimal (<strong>phase ordering</strong>); the principled escape is <strong>equality saturation</strong> over an <strong>e-graph</strong> (TASO, egg) — keep all equivalent forms, then extract the cheapest. And yet every cleanup only <em>deleted</em> work; the survivors still run one kernel per op, each paying its own HBM round trip — which forces the rewrite that <em>merges</em> ops: fusion.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>What is a rewrite rule and when does the engine stop? <em>(§1 — a pattern (subgraph template + wildcards) paired with a provably-equivalent replacement; the engine matches, splices in the replacement, rewires SSA uses, and iterates the whole rule set in a worklist loop until a fixed point — a full sweep that changes nothing — guaranteed to terminate if every rule strictly simplifies.)</em></li>
+  <li>Why is CSE almost free in an SSA/value-semantics IR? <em>(§2 — no aliasing or hidden mutation, so two nodes with the same op, inputs, and attrs are provably the same value; hash by <span class="math">(op, input-ids, attrs)</span>, redirect all consumers of the duplicate to the original, then let DCE remove it.)</em></li>
+  <li>Give a concrete case where reassociating floats changes the answer, and how compilers gate it. <em>(§3 — <span class="math">(1e20 + −1e20) + 1 = 1</span> vs <span class="math">1e20 + (−1e20 + 1) = 0</span>: the +1 is swallowed by rounding; floats are non-associative, so reassociation/distribution is off by default and only enabled under fast-math flags, which trade ulps of accuracy for reorder freedom.)</em></li>
+  <li>What does canonicalization buy you if it doesn't make the code faster? <em>(§4 — uniqueness: it maps every equivalent spelling to one normal form, so every downstream pattern (fusion, layout) is written once against the guaranteed form instead of as a combinatorial set of near-duplicate patterns; it makes optimization matchable.)</em></li>
+  <li>What is the phase-ordering problem and how do e-graphs sidestep it? <em>(§5 — passes interact and no fixed order is globally optimal because greedy rewriting destroys the matched form and can't take a temporarily-worse step; equality saturation over an e-graph adds equivalent forms instead of replacing, saturates the whole rewrite space, then extracts the cheapest by cost model — order never has to be chosen.)</em></li>
+  <li>When is it unsafe to constant-fold, and when is DCE wrong? <em>(§2, Failure modes — don't fold an op whose input only looks constant (dynamic/shaped value, externally mutated buffer); don't DCE a node that has no SSA consumer but does have a side effect — RNG advance, a collective, an in-place write — or you silently break correctness.)</em></li>
+  <li>After all these cleanups, why is the graph still slow? <em>(Where this points next — every pass here only deleted nodes; it never merged the survivors, so the graph still runs one kernel per op and each memory-bound op pays its own HBM round trip. The high-leverage rewrite is fusion, lesson 05.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="03_ir.html"><span class="dir">← Back</span><span class="ttl">03 · The intermediate representation</span></a>
+  <a class="next" href="05_fusion.html"><span class="dir">Next →</span><span class="ttl">05 · Operator fusion</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var irEl = document.getElementById('rw-ir');
+  if (!irEl) return;
+  var nNodes = document.getElementById('rw-nodes'),
+      nOps   = document.getElementById('rw-ops'),
+      nCost  = document.getElementById('rw-cost'),
+      fpEl   = document.getElementById('rw-fp'),
+      fpK    = document.getElementById('rw-fpk'),
+      warn   = document.getElementById('rw-warn');
+  var bFold = document.getElementById('rw-fold'),
+      bCse  = document.getElementById('rw-cse'),
+      bDce  = document.getElementById('rw-dce'),
+      bAlg  = document.getElementById('rw-alg'),
+      bReset= document.getElementById('rw-reset'),
+      cReas = document.getElementById('rw-reassoc');
+
+  // node: {id, op, ins:[ids], attr, kind, isConst, val, cost, dead, note}
+  // cost is an illustrative est. of relative kernel/op expense.
+  function fresh(){
+    return [
+      {id:'c64',   op:'const 64',          ins:[],            cost:0, isConst:true,  val:64},
+      {id:'sq',    op:'sqrt %c64',         ins:['c64'],       cost:1, isConst:false},
+      {id:'sc',    op:'div 1.0, %sq',      ins:['sq'],        cost:1, isConst:false},
+      {id:'mm',    op:'matmul %x, %w',     ins:[],            cost:8, isConst:false},
+      {id:'h1',    op:'add %mm, %bias',    ins:['mm'],        cost:1, isConst:false},
+      {id:'h2',    op:'add %mm, %bias',    ins:['mm'],        cost:1, isConst:false}, // dup of h1
+      {id:'m1',    op:'mul %h1, 1.0',      ins:['h1'],        cost:1, isConst:false}, // x*1 no-op
+      {id:'gl',    op:'gelu %m1',          ins:['m1'],        cost:2, isConst:false},
+      {id:'dbg',   op:'sum %h2  (debug)',  ins:['h2'],        cost:2, isConst:false}, // dead: no consumer
+      {id:'sc2',   op:'mul %gl, %sc',      ins:['gl','sc'],   cost:1, isConst:false},
+      {id:'ret',   op:'return %sc2',       ins:['sc2'],       cost:0, isConst:false, isRoot:true}
+    ];
+  }
+  var G = fresh();
+
+  function byId(id){ for (var i=0;i<G.length;i++) if (G[i].id===id) return G[i]; return null; }
+  function consumersOf(id){
+    var c=[]; for (var i=0;i<G.length;i++){ if (G[i].ins.indexOf(id)>=0) c.push(G[i]); } return c;
+  }
+  function replaceUses(oldId,newId){
+    for (var i=0;i<G.length;i++){
+      var ins=G[i].ins; for (var j=0;j<ins.length;j++) if (ins[j]===oldId) ins[j]=newId;
+    }
+  }
+  function comma(n){ return Math.round(n).toLocaleString('en-US'); }
+
+  // ---- passes. each returns true if it changed the graph. ----
+  function pass_fold(){
+    var changed=false;
+    // sqrt of const -> const ; div 1.0, const -> const : collapse sq+sc into one scale const
+    var sq=byId('sq'), sc=byId('sc');
+    if (sq && sc){
+      // fold: replace sc with a const 0.125, drop sq (becomes orphan), c64 orphan
+      G = G.filter(function(n){ return n.id!=='sq'; });
+      var idx; for (idx=0; idx<G.length; idx++) if (G[idx].id==='sc') break;
+      G[idx] = {id:'sc', op:'const 0.125', ins:[], cost:0, isConst:true, val:0.125, note:'folded'};
+      changed=true;
+    }
+    return changed;
+  }
+  function pass_cse(){
+    var changed=false;
+    // hash live nodes by op+ins; merge duplicates
+    var seen={};
+    for (var i=0;i<G.length;i++){
+      var n=G[i]; if (n.isRoot) continue;
+      var key=n.op.replace(/%\w+/g, function(m){return m;}) + '|' + n.ins.join(',');
+      if (seen[key] && seen[key]!==n.id){
+        replaceUses(n.id, seen[key]);
+        n.ins=[]; n._merged=true; changed=true; // disconnect; DCE will reap
+      } else if (!seen[key]) {
+        seen[key]=n.id;
+      }
+    }
+    return changed;
+  }
+  function pass_dce(){
+    // keep only nodes reachable backward from roots
+    var live={}; var stack=[];
+    for (var i=0;i<G.length;i++) if (G[i].isRoot){ live[G[i].id]=true; stack.push(G[i]); }
+    while(stack.length){
+      var n=stack.pop();
+      for (var j=0;j<n.ins.length;j++){ var p=byId(n.ins[j]); if (p && !live[p.id]){ live[p.id]=true; stack.push(p); } }
+    }
+    var before=G.length;
+    G = G.filter(function(n){ return live[n.id]; });
+    return G.length!==before;
+  }
+  function pass_alg(){
+    var changed=false;
+    // mul %h1, 1.0 -> identity: rewire consumers of m1 to h1, drop m1
+    var m1=byId('m1');
+    if (m1 && /mul .*, 1\.0/.test(m1.op)){
+      replaceUses('m1', m1.ins[0]); m1.ins=[]; m1._merged=true; changed=true;
+    }
+    return changed;
+  }
+  function pass_reassoc(){
+    // fast-math only: reorder the trailing scaled reduction so the scale is contracted
+    // into it. Over the reals this is exact; over IEEE-754 floats reassociating the
+    // reduction changes the rounding, so it is gated behind the fast-math toggle.
+    // Available on the captured graph regardless of folding (the scale need not be a
+    // resolved literal — fast-math may reassociate around it either way).
+    var sc2=byId('sc2');
+    if (sc2 && /^mul /.test(sc2.op) && !sc2._reassoc){
+      var src = byId('gl') ? 'gl' : sc2.ins[0];
+      sc2.op='scaled_reduce %'+(src||'gl')+'  (reassoc reduction, fast-math)';
+      sc2.ins=[src].filter(Boolean);   // drop the standalone scale dependence
+      sc2.cost=1; sc2._reassoc=true;
+      pass_dce();                       // the orphaned scale chain (sqrt/div) is now dead
+      return true;
+    }
+    return false;
+  }
+
+  function liveOps(){ var k=0; for(var i=0;i<G.length;i++){ var n=G[i]; if(!n.isConst && !n.isRoot && n.cost>0) k++; } return k; }
+  function totalCost(){ var c=0; for(var i=0;i<G.length;i++) c+=G[i].cost||0; return c; }
+
+  function anyApplies(){
+    // cheap dry-run check on a clone to decide fixed point / button enablement
+    function clone(){ return G.map(function(n){ return {id:n.id,op:n.op,ins:n.ins.slice(),cost:n.cost,isConst:n.isConst,val:n.val,isRoot:n.isRoot,_merged:n._merged,_reassoc:n._reassoc}; }); }
+    var snap=clone(), res={};
+    var save=G;
+    G=clone(); res.fold = pass_fold(); G=save;
+    G=clone(); res.cse  = pass_cse();  G=save;
+    G=clone(); res.dce  = pass_dce();  G=save;
+    G=clone(); res.alg  = pass_alg();  G=save;
+    G=clone(); res.reas = pass_reassoc(); G=save;
+    G=snap; // restore exact
+    return res;
+  }
+
+  function render(){
+    var applic = anyApplies();
+    bFold.disabled = !applic.fold;
+    bCse.disabled  = !applic.cse;
+    bDce.disabled  = !applic.dce;
+    bAlg.disabled  = !applic.alg;
+    cReas.parentElement.style.opacity = applic.reas ? '1' : '0.45';
+
+    nNodes.textContent = comma(G.length);
+    nOps.textContent   = comma(liveOps());
+    nCost.textContent  = comma(totalCost());
+
+    var fixedExact = !(applic.fold||applic.cse||applic.dce||applic.alg);
+    fpEl.textContent = fixedExact ? 'yes — exact fixed point' : 'no';
+    fpK.classList.toggle('good', fixedExact);
+
+    warn.textContent = cReas.checked
+      ? '⚠ reassociation enabled — result may differ in the last bits (fast-math only).'
+      : '';
+
+    // IR dump
+    var lines = G.map(function(n){
+      var cls = n.isConst ? '' : '';
+      var label = '  %'+pad(n.id)+' = '+n.op + (n.note? '   ; '+n.note : '');
+      return '<div>'+escape(label)+'</div>';
+    });
+    irEl.innerHTML = lines.join('');
+  }
+  function pad(s){ return (s+'      ').slice(0,6); }
+  function escape(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+  function run(fn){ if (fn()) render(); }
+
+  bFold.addEventListener('click', function(){ run(pass_fold); });
+  bCse .addEventListener('click', function(){ run(pass_cse);  });
+  bDce .addEventListener('click', function(){ run(pass_dce);  });
+  bAlg .addEventListener('click', function(){ run(pass_alg);  });
+  bReset.addEventListener('click', function(){ G=fresh(); cReas.checked=false; render(); });
+  cReas.addEventListener('change', function(){
+    if (cReas.checked){ if (pass_reassoc()) {} }
+    render();
+  });
+
+  render();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

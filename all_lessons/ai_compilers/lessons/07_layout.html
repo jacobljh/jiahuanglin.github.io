@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>07 · Layout &amp; data formats</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local layout only — failure/checklist columns + the layout-chooser chain */
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; font-size: 15px; }
+  .lesson-card ul { margin: 0; padding-left: 18px; }
+  .lesson-card li { margin: 7px 0; font-size: 13.5px; line-height: 1.5; }
+  .kpi.over .v { color: var(--bad); }
+  .kpi.good .v { color: var(--ok); }
+  /* the op chain visual inside the widget */
+  .chain { display: flex; flex-wrap: wrap; gap: 8px; align-items: stretch; margin: 14px 0 6px; }
+  .chain .op { flex: 1 1 0; min-width: 96px; border: 1px solid var(--border); border-radius: 8px; background: var(--code-bg); padding: 9px 10px; position: relative; }
+  .chain .op .nm { display: block; font-family: var(--mono); font-size: 12px; color: var(--accent); margin-bottom: 3px; }
+  .chain .op .lay { display: block; font-family: var(--mono); font-size: 11px; color: var(--text-mute); }
+  .chain .xfer { align-self: center; font-family: var(--mono); font-size: 11px; color: var(--text-dim); }
+  .chain .xfer.tx { color: var(--bad); font-weight: 700; }
+  .chain .op.tc { border-color: var(--ok); box-shadow: 0 0 0 1px var(--ok) inset; }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } .chain { flex-direction: column; } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">ai_compilers / lessons</a><span class="crumb">/</span><span class="crumb">07 · layout</span><span class="step-pill">lesson 8 / 16</span></div></header>
+
+<main>
+
+<p class="kicker">Part III — Middle end</p>
+<h1>Layout &amp; data formats</h1>
+<p class="subtitle">Lesson 06 decided <em>where</em> every buffer lives and <em>when</em> — it collapsed peak memory by reusing storage across non-overlapping lifetimes. What it never touched is the <em>shape</em> of the bytes inside each buffer: given a 4-D activation, which index runs fastest in memory? That choice is invisible to the math and decisive for the hardware. The wrong physical layout makes every downstream kernel read HBM in a strided, uncoalesced pattern, locks you out of the tensor cores, and — worst of all — forces the compiler to splice in <strong>transpose</strong> kernels between ops that disagree, each one a full extra HBM round trip. This lesson assigns a physical format to every tensor and then <em>propagates</em> those choices across the graph so adjacent transposes cancel.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>Memory planning treats a tensor as an opaque blob of <span class="math">N</span> bytes with a lifetime — it answers "does buffer A's slot overlap buffer B's?" and packs them into one arena. But a tensor of shape <span class="math">(N, C, H, W)</span> is not a blob; it is a multi-dimensional array that must be flattened into linear addresses, and there are many ways to do it. Store it <strong>NCHW</strong> (channel-major) and a convolution reads one channel-plane at a time; store it <strong>NHWC</strong> (channel-last) and the same conv reads all channels of one pixel contiguously. The math is identical — same numbers, same result — but the address pattern a kernel issues, whether a warp's 32 loads coalesce into one transaction, and whether the data even lands in a tensor-core fragment, all hinge on which axis is innermost. The planner left every buffer's <em>internal stride order</em> unspecified, so each kernel is free to want a different one, and the compiler must reconcile them.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> a buffer's physical layout — which axis is contiguous — decides coalescing, tensor-core eligibility, and how many transpose kernels get inserted between ops; planning never set it.<br><strong>New idea:</strong> <strong>layout assignment</strong> — pick each tensor's physical format (NCHW vs NHWC, row- vs column-major, tiled/blocked layouts that match tensor-core fragments, packed/padded for alignment) to maximize coalesced access and tensor-core use, and then <strong>propagate</strong> layouts through the graph so adjacent transposes cancel. It is a <em>global</em> assignment problem: the locally best layout for one op can force an expensive reformat for the next.<br><strong>Forces next:</strong> the graph is now optimized, fused, planned, and laid out — but it is still <em>abstract</em>. It says <em>what</em> to compute on which bytes, not the loop nest — tile sizes, loop order, what stages to SRAM — that actually runs it on the chip. That is <strong>scheduling</strong> (lesson 08).</div>
+
+<div class="callout"><div class="label">The plan</div>Five moves. (1) Why layout decides coalescing and tensor-core eligibility — the hardware facts, cross-linked to the kernel track. (2) NCHW vs NHWC for convolution, and why the disagreement between frameworks and hardware breeds transposes. (3) Tiled/blocked and packed layouts, plus padding for alignment and what it costs. (4) <strong>Layout propagation</strong> as a global min-cost assignment — why locally good ≠ globally good, and why it is NP-ish. (5) How XLA, TVM, and cuDNN actually pick layouts, and the transpose-elimination pass. Then drive the widget until a locally-greedy choice litters the chain with transposes and propagation wipes them out.</div>
+
+<h2>1 · Why layout decides speed: coalescing and tensor-core fragments</h2>
+
+<p>A <strong>layout</strong> is the rule that maps a tensor's logical indices to linear memory addresses — concretely, the <em>strides</em>: for a 2-D tensor, row-major means address <span class="math">= i·stride_row + j</span> with <span class="math">stride_row = ncols</span> (the <span class="math">j</span> axis is contiguous); column-major makes <span class="math">i</span> contiguous instead. The numbers stored are identical; only the order on the wire changes. Two hardware facts make that order decisive.</p>
+
+<p><strong>Coalescing.</strong> HBM is read in 128-byte cache lines, and a warp's 32 threads issue 32 loads at once. If those addresses fall in one line, the controller serves them in <em>one</em> transaction at peak bandwidth; if they are scattered across 32 lines, you pay up to <span class="math">32×</span> the transactions for the same data (<a href="../../gpu_kernels/04_coalesced_access.html">gpu_kernels · 04 coalesced access</a>, <a href="../../gpu_kernels/02_memory_hierarchy.html">gpu_kernels · 02 memory hierarchy</a>). Whether a kernel's threads stride contiguously is a direct consequence of which axis the layout put innermost. A reduction over channels wants channels contiguous; if the layout buried channels behind <span class="math">H·W</span>, every load jumps a full plane and bandwidth craters.</p>
+
+<p><strong>Tensor-core fragments.</strong> An <code>mma.sync</code> instruction multiplies a small fixed-shape fragment — for bf16 the canonical tile is <span class="math">16×8×16</span>, distributed as 8 elements per thread across the 32-lane warp in a <em>specific</em> register layout the hardware expects (<a href="../../gpu_kernels/09_tensor_cores.html">gpu_kernels · 09 tensor cores</a>). The fast path that loads those fragments, <code>ldmatrix</code>, assumes the operand tile sits contiguously in shared memory in a known order. If your global layout doesn't let the kernel stage a contiguous, aligned tile into SRAM, it either falls back to the ~15× slower CUDA-core path or inserts a reformat first. <strong>Tensor-core eligibility is a layout property, not just a dtype property.</strong></p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">contiguous axis</div><div class="v">The innermost (stride-1) axis. A warp reading along it coalesces into one transaction; reading across it pays up to 32× the transactions.</div></div>
+  <div class="topic-card"><div class="k">fragment-friendly</div><div class="v">A layout that lets a kernel stage a 16×8×16-shaped, 128-bit-aligned tile into SRAM for <code>ldmatrix</code> → <code>mma</code>. Otherwise: no tensor cores.</div></div>
+  <div class="topic-card"><div class="k">the cost unit</div><div class="v">A wrong layout is paid in bytes moved — strided reads multiply transactions, and a fix-up transpose is a full extra HBM read + write of the whole tensor.</div></div>
+</div>
+
+<h2>2 · NCHW vs NHWC: where transposes come from</h2>
+
+<p>A 4-D convolution activation has axes <span class="math">N</span> (batch), <span class="math">C</span> (channels), <span class="math">H</span>, <span class="math">W</span> (spatial). Two layouts dominate, named by their axis order from outermost to innermost:</p>
+
+<ul>
+  <li><strong>NCHW</strong> (channels-major, "channels-first"): the <span class="math">W</span> axis is contiguous, then <span class="math">H</span>, then <span class="math">C</span>. PyTorch's historical default and what many CPU/cuDNN kernels were first written for.</li>
+  <li><strong>NHWC</strong> (channels-last): the <span class="math">C</span> axis is contiguous. This is what NVIDIA tensor cores want for convolution — a conv is implicitly a matmul over channels, so making <span class="math">C</span> innermost lets the kernel load a fragment of <span class="math">C</span> values per spatial position straight into an <code>mma</code> tile. cuDNN's fastest conv algorithms and TensorRT default to NHWC; PyTorch exposes it as <code>channels_last</code> and it is the recommended format for mixed-precision conv nets.</li>
+</ul>
+
+<p>Here is the trap. Suppose your graph is <code>conv → batchnorm → conv</code>. BatchNorm is a per-channel scale-and-shift; it is happiest with channels contiguous (NHWC) so each channel's mean/var streams in coalesced. The convs, on tensor cores, also want NHWC. So far so good — one global NHWC and everyone is happy. But now imagine a stray op in the chain that the compiler only has an NCHW kernel for (an older custom op, a pooling variant, a framework default). The compiler cannot run an NCHW kernel on NHWC bytes, so it splices in a <strong>transpose</strong>: a full kernel that reads the whole tensor in one order and writes it back in another. A transpose of a 256 MB activation is a 256 MB read plus a 256 MB write — ≈160 µs on an H100 at ≈3.3 TB/s — to move <em>zero</em> useful FLOPs. Do this between every pair of disagreeing ops and the transposes can cost more than the convs.</p>
+
+<pre class="ascii">eager / naive layout — each op gets its locally preferred format:
+
+  conv(NHWC) --[T]--> bn(NCHW) --[T]--> conv(NHWC)
+              ^^^                ^^^
+        transpose 256MB     transpose 256MB     ← 2 extra HBM round trips,
+        (read+write)        (read+write)          zero useful FLOPs
+
+propagated layout — pick ONE format the whole region tolerates:
+
+  conv(NHWC) -------> bn(NHWC) -------> conv(NHWC)
+        no transposes; convs hit tensor cores; bn coalesces on C</pre>
+
+<p>The two transposes are not in the math — the model never asked for them. They are an artifact of letting each op choose its layout in isolation. That is the disagreement layout assignment exists to resolve.</p>
+
+<h2>3 · Tiled, blocked, and packed layouts; padding for alignment</h2>
+
+<p>NCHW/NHWC are only the row/column-major story lifted to 4-D. Two further families matter for the metal.</p>
+
+<p><strong>Tiled / blocked layouts.</strong> Instead of a flat row-major sheet, store the tensor as a grid of small contiguous tiles — e.g. break the channel axis into blocks of 8 and store <strong>NCHWc</strong> (oneDNN's notation: an outer channel-block axis, spatial, then an inner block of 8 channels contiguous). Each tile then matches the shape a kernel stages into SRAM or feeds to an <code>mma</code>, so the innermost block is exactly fragment-sized and 128-bit-aligned. <strong>Tiling</strong> the storage means the kernel's natural working set is already contiguous — no gather to assemble a fragment. cuDNN's NC/32HW32 (int8) and the blocked formats in oneDNN/XLA are exactly this: the physical layout is pre-shaped to the consuming instruction.</p>
+
+<p><strong>Packing.</strong> <strong>Packing</strong> reorders/copies a tensor into the exact byte arrangement a kernel's inner loop wants ahead of time — the classic example is GEMM, which packs panels of A and B into contiguous, aligned strips so the microkernel streams them with no stride arithmetic. The pack is a one-time copy whose cost amortizes over the matmul's <span class="math">O(M·N·K)</span> FLOPs; for a weight it can be done once at compile time and reused every inference.</p>
+
+<p><strong>Padding for alignment.</strong> Tensor cores and vector loads want dimensions that are multiples of the fragment/transaction size — e.g. an inner dim that is a multiple of 8 (bf16) or 16, and base addresses on 128-byte boundaries. A channel count of 130 is awful: the last fragment is ragged, the kernel either masks (slow) or falls off the tensor-core path. <strong>Padding</strong> rounds 130 up to 136 (multiple of 8) or 256 with zeros so every tile is full and aligned. The cost is real and must be priced: padding 130→256 channels nearly doubles the bytes moved and the FLOPs computed on garbage zeros. The compiler pads only when the alignment win beats the wasted-traffic cost — small over-pad to hit a fragment boundary, yes; doubling the tensor, usually no.</p>
+
+<table class="trade-table">
+  <thead><tr><th>layout family</th><th>what it optimizes</th><th>the cost it pays</th></tr></thead>
+  <tbody>
+    <tr><td>row/col-major (NCHW/NHWC)</td><td>pick the contiguous axis to match the consumer's reduction / fragment</td><td>a transpose when consumers disagree</td></tr>
+    <tr><td>tiled / blocked (NCHWc, NC/32HW32)</td><td>storage pre-shaped to the SRAM tile / mma fragment</td><td>reformat cost at layout boundaries; more bookkeeping</td></tr>
+    <tr><td>packed (GEMM panels)</td><td>stride-free streaming in the microkernel</td><td>a one-time copy (amortized over the matmul)</td></tr>
+    <tr><td>padded</td><td>full, aligned fragments → tensor-core eligibility</td><td>extra bytes + FLOPs on padding; OOM if over-padded</td></tr>
+  </tbody>
+</table>
+
+<h2>4 · Layout propagation: a global, not local, assignment</h2>
+
+<p>The naive algorithm is greedy: ask each op for its single favorite layout and grant it. That is <em>locally</em> optimal and <em>globally</em> terrible, because every boundary where two neighbors' favorites disagree becomes a transpose. The real objective is to assign a layout to every tensor (every graph edge) so that the total cost — kernel slowdown from non-ideal layouts <em>plus</em> the transposes inserted at every mismatch — is minimized over the whole graph.</p>
+
+<p>Model the graph as nodes (ops) and edges (tensors). Each op has a cost function over the layout of each of its operands and result: a conv is cheap in NHWC, costly in NCHW; a transpose between adjacent edges costs the bytes of the tensor. Choosing a layout for one edge constrains its neighbors, so you cannot decide edges independently — this is a combinatorial assignment over a graph, equivalent in spirit to a min-cost labeling / graph-coloring problem, and it is <strong>NP-hard in general</strong>. Compilers do not solve it exactly; they use heuristics:</p>
+
+<div class="lesson-flow">
+  <div><strong>anchor</strong><span>Fix the layout of the ops with the strongest preference and largest cost — the convs and GEMMs that must hit tensor cores. They are the immovable constraints.</span></div>
+  <div><strong>propagate</strong><span>Flow each anchor's layout outward along edges to its neighbors: a layout-agnostic elementwise op (relu, add) inherits its producer's layout for free, extending a region of one format.</span></div>
+  <div><strong>resolve conflicts</strong><span>Where two propagated layouts meet at an op that disagrees, decide: convert one side (insert a transpose) or pick the cheaper compromise. Greedily cut at the lowest-cost edge.</span></div>
+  <div><strong>cancel adjacencies</strong><span>Run <strong>transpose elimination</strong>: two transposes back to back collapse to one (or to none if they invert); a transpose feeding a layout-agnostic op gets pushed through and absorbed into a neighbor.</span></div>
+</div>
+
+<p><strong>Transpose elimination</strong> is the payoff pass. Algebraically, <code>transpose(transpose(x))</code> with inverse permutations is the identity and is deleted outright; a transpose that meets a commuting elementwise op can be hoisted past it so it merges with the next transpose, and the pair then cancels. After propagation has chosen consistent layouts for long stretches of the graph, elimination sweeps up the few remaining transposes the conflict-resolution step left behind. The conv→bn→conv chain that had two transposes under greedy assignment ends with zero. This is the same correctness invariant from lessons 03–04: a layout change plus its inverse is a provable no-op on the math, which is exactly why the compiler is allowed to delete it.</p>
+
+<h2>5 · How XLA, TVM, and cuDNN actually pick layouts</h2>
+
+<p>Every production stack runs some version of this assignment-then-eliminate pipeline:</p>
+
+<ul>
+  <li><strong>XLA</strong> runs a layout-assignment pass over HLO: it seeds layouts from layout-constrained ops (custom calls, convolutions, the entry/exit of the computation) and propagates them through the graph to minimize copies, then a later algebraic-simplifier/transpose-folding pass removes the transposes that became redundant. Layout is a first-class part of an HLO tensor's type.</li>
+  <li><strong>TVM</strong> exposes it as the <code>ConvertLayout</code> pass: you name a desired layout for heavy ops (e.g. NHWC for conv), and the pass walks the graph inserting the minimum layout transforms and folding consecutive ones, so the rest of the network is pulled into a consistent format around the anchors.</li>
+  <li><strong>cuDNN / TensorRT</strong> sit at the kernel level: cuDNN's fastest conv algorithms require NHWC (or blocked int8 formats like NC/32HW32), so the framework's job is to feed them tensors already in that layout — PyTorch's <code>channels_last</code> memory format exists precisely so the whole conv net stays NHWC end-to-end and no per-op transpose is needed. TensorRT chooses per-layer formats during its build/optimization phase and reconciles them, inserting reformat layers only where unavoidable.</li>
+</ul>
+
+<p>The verdict the field has converged on: <strong>pick layouts globally around the tensor-core-bound anchors, make everything else conform, and treat a surviving transpose as a bug to be eliminated, not a cost to be tolerated.</strong></p>
+
+<h2>6 · Drive it: the layout chooser</h2>
+
+<p>The widget below is the <code>conv → bn → conv</code> chain. Each op has a locally preferred layout (the convs want NHWC for tensor cores; toggle BatchNorm to prefer the other format to manufacture a conflict). Choose a single global layout, or flip on <strong>propagate to cancel transposes</strong> to let the assignment pass conform the agnostic ops and run transpose elimination. Watch the KPIs: with greedy local choices the chain sprouts transposes (red arrows), bandwidth balloons with the extra round trips, and a wrong global format drops the convs off the tensor-core path. Propagation collapses the transposes to zero and the convs light up green.</p>
+
+<div class="widget" id="layout-chooser">
+  <div class="title">Layout chooser — propagate to cancel transposes</div>
+  <div class="hint">A locally-good layout for one op forces a transpose at the next disagreement, and each transpose is a full extra HBM read+write. The knob that proves it: pick a global layout that disagrees with the tensor-core ops, or turn on <strong>propagate</strong> and watch the inserted transposes drop to zero while the convs become tensor-core eligible.</div>
+
+  <div class="controls" style="margin-top:4px;">
+    <label class="inline">global layout:
+      <select id="lc-global">
+        <option value="NHWC" selected>NHWC (channels-last)</option>
+        <option value="NCHW">NCHW (channels-first)</option>
+        <option value="greedy">greedy — each op's local favorite</option>
+      </select>
+    </label>
+    <label class="inline">tensor size: <input type="range" id="lc-size" min="32" max="512" step="32" value="256"> <span class="val" id="lc-sizev">256 MB</span></label>
+    <label class="inline"><input type="checkbox" id="lc-bn"> BatchNorm prefers NCHW (manufacture a conflict)</label>
+    <label class="inline"><input type="checkbox" id="lc-prop"> propagate to cancel transposes</label>
+  </div>
+
+  <div class="chain" id="lc-chain"></div>
+
+  <div class="kpi-grid">
+    <div class="kpi" id="lc-k-tx"><div class="k">transposes inserted</div><div class="v" id="lc-tx">—</div></div>
+    <div class="kpi"><div class="k">est. HBM traffic</div><div class="v" id="lc-bw">—</div></div>
+    <div class="kpi" id="lc-k-tc"><div class="k">convs tensor-core eligible?</div><div class="v" id="lc-tc">—</div></div>
+    <div class="kpi"><div class="k">overhead vs no-transpose</div><div class="v" id="lc-ovh">—</div></div>
+  </div>
+</div>
+
+<p>The shape of the result is the whole lesson: a layout chosen op-by-op looks fine locally and is riddled with hidden transposes globally; one consistent layout, propagated around the tensor-core anchors, pays the data movement exactly once. Notice the conflict toggle — when BatchNorm wants the opposite format, a pure global pick still costs <em>some</em> transpose, but propagation places it where one conversion serves the whole region instead of one per boundary.</p>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Greedy per-op layout.</strong> Granting each op its local favorite. <em>Signal:</em> the profiler is full of <code>permute</code>/<code>transpose</code>/<code>copy</code> kernels between your real ops, each moving a full tensor for zero FLOPs.</li>
+    <li><strong>Right dtype, wrong layout, no tensor cores.</strong> Running bf16 convs in NCHW and wondering why MFU is low. <em>Signal:</em> the conv shows on the CUDA-core path or with a reformat prologue; switching to <code>channels_last</code> jumps it onto <code>mma</code>.</li>
+    <li><strong>Strided reduction.</strong> A per-channel op (norm, bias) on a layout where channels are the outer axis. <em>Signal:</em> the kernel is bandwidth-bound at a fraction of peak — its loads are scattered, not coalesced.</li>
+    <li><strong>Over-padding.</strong> Padding 130→256 channels to "be aligned." <em>Signal:</em> memory and FLOPs nearly double and peak goes up — the pad cost dwarfed the alignment win.</li>
+    <li><strong>Treating a transpose as free.</strong> Assuming the layout change is bookkeeping. <em>Signal:</em> wall-time doesn't match FLOP estimates because invisible read+write transposes are eating bandwidth.</li>
+  </ul>
+  </div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><strong>Anchor on the heavy ops.</strong> Fix conv/GEMM layouts to the tensor-core-preferred format first; conform everything else.</li>
+    <li><strong>Propagate, don't pick per-op.</strong> Let layout-agnostic ops inherit their producer's format to grow single-format regions.</li>
+    <li><strong>Count surviving transposes.</strong> Each one is a full HBM round trip; a clean graph after elimination has near zero.</li>
+    <li><strong>Pad to the fragment, not beyond.</strong> Round inner dims up to the mma/transaction multiple; reject pads that bloat the tensor.</li>
+    <li><strong>Verify coalescing on reductions.</strong> Per-channel ops want channels contiguous; check the stride before blaming the kernel.</li>
+    <li><strong>Use the framework's hint.</strong> <code>torch channels_last</code>, XLA layout assignment, TVM <code>ConvertLayout</code> — let the stack carry the format end-to-end.</li>
+  </ul>
+  </div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the widget with global layout <strong>NHWC</strong> and the conflict toggle off: zero transposes, both convs tensor-core eligible — the ideal. Now switch global layout to <strong>NCHW</strong>: the convs drop off the tensor-core path (channels are no longer the fast fragment axis) and you may see a reformat appear. Set it back to NHWC and turn on the <strong>BatchNorm prefers NCHW</strong> conflict: under <strong>greedy</strong> the chain shows two transposes (one each side of BN); now flip on <strong>propagate to cancel transposes</strong> and watch the count fall to one or zero as the pass conforms the region and eliminates back-to-back transposes. At tensor size 256 MB, compute by hand what two transposes cost on a 3.3 TB/s GPU (each is read+write ≈ 2 × 256 MB / 3.3 TB/s ≈ 155 µs, so ≈310 µs of pure data movement) — then confirm propagation buys that time back.</div>
+
+<h2>Where this points next</h2>
+
+<p>You now have a graph that is canonicalized, fused, memory-planned, and laid out: every tensor has a physical format chosen to coalesce, feed the tensor cores, and avoid transposes, with the few unavoidable reformats placed where one conversion serves a whole region. But everything so far is still <em>declarative</em> — it specifies what to compute on which bytes, not <em>how the loops run</em>. A single laid-out matmul still has astronomically many loop nests that compute it: which axis is the outer loop, how big are the tiles, what gets staged into SRAM, where do you vectorize and unroll. Those choices vary performance by 10–100× for identical FLOPs and an identical layout. Picking them is <strong>scheduling</strong> — the algorithm/schedule split, tiling for the memory hierarchy, the loop-nest knobs. That is lesson 08, <strong><a href="08_scheduling.html">Scheduling — the loop nest</a></strong>.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+A <strong>layout</strong> is the index-to-address map — which axis is contiguous — and although it is a no-op on the math it decides everything the hardware cares about: whether a warp's loads <strong>coalesce</strong> into one 128-byte transaction or scatter into 32, and whether a tile can be staged as a <strong>tensor-core fragment</strong> or falls to the ~15× slower path. For convolution this is the <strong>NCHW vs NHWC</strong> choice — tensor cores want channels-last — and wherever two neighboring ops disagree the compiler must splice in a <strong>transpose</strong>, a full HBM read+write (≈160 µs for a 256 MB tensor) that moves zero FLOPs. Beyond row/col-major there are <strong>tiled/blocked</strong> layouts pre-shaped to the SRAM tile or mma fragment, <strong>packed</strong> GEMM panels for stride-free streaming, and <strong>padding</strong> to hit alignment (priced against the wasted bytes). Picking layouts op-by-op is locally fine and globally disastrous because every disagreement is a transpose, so it is a <strong>global min-cost assignment</strong> — NP-hard, solved heuristically: anchor on the tensor-core ops, <strong>propagate</strong> their layouts to agnostic neighbors, resolve conflicts at the cheapest edge, then run <strong>transpose elimination</strong> to cancel adjacencies — exactly what XLA layout-assignment, TVM <code>ConvertLayout</code>, and PyTorch <code>channels_last</code> do. The graph is now optimized and laid out but still abstract: it says what to compute, not the loop nest — that forces scheduling.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>What is a tensor's "layout" and why does it matter if the math is identical? <em>(§1 — it's the index→address stride map, e.g. row- vs column-major / NCHW vs NHWC; it decides which warp loads coalesce into one 128-byte transaction and whether a tile can become a tensor-core fragment, so it sets bandwidth and tensor-core eligibility despite being a no-op on the numbers.)</em></li>
+  <li>Why do NVIDIA tensor cores prefer NHWC for convolution? <em>(§2 — a conv is implicitly a matmul over channels; making C the contiguous axis lets the kernel load a fragment of channel values per spatial position straight into an mma tile, so cuDNN's fastest conv algos and channels_last want C innermost.)</em></li>
+  <li>Where do transpose kernels come from, and what do they cost? <em>(§2 — from two neighboring ops disagreeing on layout; the compiler inserts a reformat that reads the whole tensor in one order and writes it in another — a full HBM round trip, ≈160 µs for 256 MB — for zero useful FLOPs.)</em></li>
+  <li>Why is layout assignment a global problem rather than per-op? <em>(§4 — granting each op its local favorite is locally optimal but makes every disagreement a transpose; minimizing total cost = kernel slowdown + transposes over all edges is a combinatorial min-cost graph labeling, NP-hard, so compilers anchor-and-propagate heuristically.)</em></li>
+  <li>What is transpose elimination and why is it legal? <em>(§4 — a pass that deletes a transpose composed with its inverse (identity) and pushes transposes through commuting elementwise ops so adjacent ones cancel; legal because a permutation plus its inverse provably preserves the math.)</em></li>
+  <li>When should the compiler pad a dimension, and when not? <em>(§3 — pad a small ragged inner dim up to the mma/transaction multiple to keep fragments full and aligned (cheap win); refuse pads like 130→256 channels that nearly double bytes and FLOPs — the wasted traffic dwarfs the alignment benefit.)</em></li>
+  <li>How do XLA / TVM / cuDNN assign layouts in practice? <em>(§5 — XLA's layout-assignment pass seeds from layout-constrained ops and propagates to minimize copies, then folds transposes; TVM's ConvertLayout pulls the graph into a named format around anchors; cuDNN/TensorRT pick per-kernel formats and rely on the framework (channels_last) to feed them, inserting reformats only where unavoidable.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="06_memory_planning.html"><span class="dir">← Back</span><span class="ttl">06 · Memory planning</span></a>
+  <a class="next" href="08_scheduling.html"><span class="dir">Next →</span><span class="ttl">08 · Scheduling</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var sel = document.getElementById('lc-global');
+  if (!sel) return;
+  var slSize = document.getElementById('lc-size');
+  var togBN  = document.getElementById('lc-bn');
+  var togProp= document.getElementById('lc-prop');
+  var vSize  = document.getElementById('lc-sizev');
+  var chainEl= document.getElementById('lc-chain');
+  var kTx = document.getElementById('lc-tx'), kBw = document.getElementById('lc-bw');
+  var kTc = document.getElementById('lc-tc'), kOvh = document.getElementById('lc-ovh');
+  var kpiTx = document.getElementById('lc-k-tx'), kpiTc = document.getElementById('lc-k-tc');
+
+  var BW = 3.3e12; // 3.3 TB/s
+
+  function comma(n){ return Math.round(n).toLocaleString('en-US'); }
+
+  // ops in the chain; each has a "preferred" layout. convs always prefer NHWC (tensor cores).
+  // bn prefers NHWC unless the conflict toggle is on. relu is layout-agnostic.
+  function ops(){
+    var bnPref = togBN.checked ? 'NCHW' : 'NHWC';
+    return [
+      {nm:'conv', pref:'NHWC', agnostic:false, tc:true},
+      {nm:'bn',   pref:bnPref, agnostic:false, tc:false},
+      {nm:'conv', pref:'NHWC', agnostic:false, tc:true}
+    ];
+  }
+
+  function assign(list, mode, propagate){
+    // decide each op's running layout + whether a transpose is inserted before it
+    var layouts = [];
+    if (mode === 'greedy' && !propagate){
+      // each op gets its own preferred layout; transpose whenever neighbor differs
+      list.forEach(function(o){ layouts.push(o.pref); });
+    } else if (propagate){
+      // anchor on tensor-core ops (convs -> NHWC), conform agnostic, keep a
+      // disagreeing non-agnostic op only if it truly differs (bn under conflict).
+      // propagation makes the whole region NHWC except a genuinely-conflicting bn,
+      // which transpose-elimination collapses to a single conversion.
+      list.forEach(function(o){
+        if (o.tc) layouts.push('NHWC');
+        else if (o.pref === 'NHWC') layouts.push('NHWC');  // conforms
+        else layouts.push('NHWC');  // conformed to region; one conversion handled inside, see below
+      });
+    } else {
+      // a fixed global layout for every op
+      list.forEach(function(){ layouts.push(mode); });
+    }
+    return layouts;
+  }
+
+  function compute(){
+    var sizeMB = +slSize.value;
+    vSize.textContent = sizeMB + ' MB';
+    var bytes = sizeMB * 1e6;
+    var mode = sel.value;
+    var propagate = togProp.checked;
+    var list = ops();
+    var layouts = assign(list, mode, propagate);
+
+    // count transposes: a transpose sits between op i-1 and op i when their layouts differ.
+    // For propagate-with-conflict, the genuinely-conflicting bn needs one conversion in+out,
+    // but transpose-elimination merges the two convs' NHWC region so net cost is one transpose.
+    var tx = 0;
+    var conflict = togBN.checked;
+    if (propagate){
+      tx = conflict ? 1 : 0;     // elimination collapses the region to a single (or zero) reformat
+    } else {
+      for (var i=1;i<list.length;i++){ if (layouts[i] !== layouts[i-1]) tx++; }
+    }
+
+    // tensor-core eligibility: a conv is eligible iff its assigned layout is NHWC
+    var tcEligible = true;
+    list.forEach(function(o,i){ if (o.tc && layouts[i] !== 'NHWC') tcEligible = false; });
+
+    // traffic: convs read+write their activation once (2x bytes each useful op),
+    // each transpose is an extra read+write (2x bytes). Baseline useful = 2 convs + bn.
+    var usefulRW = 3 * 2 * bytes;          // 3 ops, each read+write
+    var txRW = tx * 2 * bytes;
+    var totalBytes = usefulRW + txRW;
+    var totalUs = (totalBytes / BW) * 1e6;
+    var baseUs  = (usefulRW  / BW) * 1e6;
+    var ovh = baseUs > 0 ? ((totalUs - baseUs)/baseUs)*100 : 0;
+
+    // render chain
+    chainEl.innerHTML = '';
+    list.forEach(function(o,i){
+      if (i>0){
+        var needTx;
+        if (propagate){ needTx = (conflict && i===1); } // single conversion sits before bn under conflict
+        else { needTx = layouts[i] !== layouts[i-1]; }
+        var arr = document.createElement('div');
+        arr.className = 'xfer' + (needTx ? ' tx' : '');
+        arr.textContent = needTx ? '→[T]→' : '→';
+        chainEl.appendChild(arr);
+      }
+      var d = document.createElement('div');
+      d.className = 'op' + (o.tc && layouts[i]==='NHWC' ? ' tc' : '');
+      d.innerHTML = '<span class="nm">'+o.nm+'</span><span class="lay">'+layouts[i]+'</span>';
+      chainEl.appendChild(d);
+    });
+
+    kTx.textContent = tx;
+    kBw.textContent = (totalBytes/1e6).toFixed(0) + ' MB  (' + totalUs.toFixed(0) + ' µs)';
+    kTc.textContent = tcEligible ? 'yes' : 'no — CUDA-core path';
+    kOvh.textContent = ovh.toFixed(0) + '%';
+
+    if (tx > 0){ kpiTx.classList.add('over'); } else { kpiTx.classList.remove('over'); }
+    if (tcEligible){ kpiTc.classList.add('good'); kpiTc.classList.remove('over'); }
+    else { kpiTc.classList.remove('good'); kpiTc.classList.add('over'); }
+  }
+
+  [sel, slSize].forEach(function(e){ e.addEventListener('input', compute); });
+  sel.addEventListener('change', compute);
+  togBN.addEventListener('change', compute);
+  togProp.addEventListener('change', compute);
+  compute();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>10 · Autotuning &amp; cost models</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local layout only — failure/checklist columns + the search-surface grid */
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; font-size: 15px; }
+  .lesson-card ul { margin: 0; padding-left: 18px; }
+  .lesson-card li { margin: 7px 0; font-size: 13.5px; line-height: 1.5; }
+  .kpi.over .v { color: var(--bad); }
+  .kpi.good .v { color: var(--ok); }
+  #at-grid { display: grid; gap: 3px; margin: 12px 0 6px; }
+  #at-grid .cell { aspect-ratio: 1 / 1; border-radius: 4px; position: relative; cursor: default; }
+  #at-grid .cell.measured { outline: 2px solid var(--text); outline-offset: -2px; }
+  #at-grid .cell.best { outline: 2px solid var(--ok); outline-offset: -2px; }
+  #at-grid .cell.opt::after { content: "★"; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 12px; color: #fff; }
+  .surf-legend { display: flex; flex-wrap: wrap; gap: 16px; margin: 6px 0 2px; font-family: var(--mono); font-size: 11px; color: var(--text-mute); align-items: center; }
+  .surf-legend .bar { width: 120px; height: 10px; border-radius: 3px; background: linear-gradient(90deg,#16a34a,#eab308,#ef4444); }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">ai_compilers / lessons</a><span class="crumb">/</span><span class="crumb">10 · autotuning</span><span class="step-pill">lesson 11 / 16</span></div></header>
+
+<main>
+
+<p class="kicker">Part IV — Back end</p>
+<h1>Autotuning &amp; cost models</h1>
+<p class="subtitle">Lesson 09 handed you a code generator that will faithfully emit any schedule you point it at — pick a tile shape, a <code>num_warps</code>, a <code>num_stages</code>, and out comes a working Triton or PTX kernel. But it answered <em>how to emit</em>, not <em>what to emit</em>. The schedule space it can target is combinatorial, and the fastest point in it is different for every shape and every chip. Hand-picking does not scale past a handful of kernels. This lesson is the missing decision procedure: define a search space, then <em>search</em> it — either by benchmarking real candidates on the device, or by <em>predicting</em> their latency with a learned cost model so you can prune the space before you ever launch a kernel.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>Codegen (lesson 09) can lower one schedule to one kernel, but it has no opinion about <em>which</em> schedule. The knobs are real and they interact: a matmul kernel alone has tile sizes <span class="math">(BLOCK_M, BLOCK_N, BLOCK_K)</span>, <code>num_warps</code> (1, 2, 4, 8), <code>num_stages</code> (the software-pipelining depth, 1–5), loop unroll factors, and the layout choices from lesson 07. Even a modest grid — say 6 × 6 × 4 tile choices × 4 warp counts × 4 stage counts ≈ 2,300 configurations — is far too many to compile and time by hand, and the winner for a <span class="math">(4096, 4096, 4096)</span> GEMM on an H100 is a <em>different</em> point than the winner for a <span class="math">(8, 4096, 64)</span> decode GEMM on an A10. The scheduling lesson told you the schedule sets speed by 10–100×; codegen can hit any of them; nobody has picked the right one.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> a huge, combinatorial, shape- and hardware-dependent schedule space that no human picks per kernel.<br><strong>New idea:</strong> <strong>autotuning</strong> — define a <em>search space</em> of legal schedules, then either <strong>benchmark</strong> candidates on the device (Triton <code>@triton.autotune</code> over a config list; AutoTVM templates) or <strong>predict</strong> their latency with a <strong>learned cost model</strong> to prune (Ansor / auto-scheduler, the XLA latency model), keeping the best. The core trade is <em>compile-time search cost</em> vs <em>run-time speedup</em> — and it pays because the same kernel runs millions of times, so you <strong>cache</strong> the winner under a key.<br><strong>Forces next:</strong> every pass so far — fusion, planning, layout, and now tuning — quietly assumed <em>static shapes</em> to search against. The autotune cache is keyed on shapes; production inference has <em>dynamic</em> shapes, which shatters the key and forces lesson 11.</div>
+
+<div class="callout"><div class="label">The plan</div>Five moves. (1) Size the space and see why enumeration is hopeless. (2) Templates + tuning — AutoTVM: a human writes the template, the machine fills the knobs. (3) Auto-schedulers (Ansor) that <em>generate</em> the space too, plus learned cost models that predict latency from features so you don't have to measure every candidate. (4) Triton's pragmatic autotune over a config list, cached by key. (5) The economics — pay search once, amortize over a million runs; AOT vs JIT; and the cache-key crack that becomes lesson 11. Then drive the widget until a cost model finds near-optimum with a tenth of the measurements.</div>
+
+<h2>1 · The space is combinatorial — you cannot enumerate it</h2>
+
+<p>A <strong>search space</strong> is the set of legal schedules the back end could emit for one operator on one target. Start with a single tiled matmul. The schedule knobs from lesson 08, made concrete for a GPU kernel:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">tile shape</div><div class="v"><span class="math">(BLOCK_M, BLOCK_N, BLOCK_K)</span> — how much of the output one thread block computes and how deep the K-loop reduction tile is. Sets register/SRAM pressure and reuse.</div></div>
+  <div class="topic-card"><div class="k">num_warps</div><div class="v">Threads per block (warps × 32). Trades occupancy against per-thread registers — typically 1, 2, 4, or 8.</div></div>
+  <div class="topic-card"><div class="k">num_stages</div><div class="v">Software-pipelining depth: how many K-tiles are prefetched into SRAM ahead of compute to hide HBM latency. Usually 1–5.</div></div>
+  <div class="topic-card"><div class="k">unroll / layout</div><div class="v">Loop unroll factor (ILP vs code size) and the operand layouts from lesson 07 (tensor-core fragment eligibility).</div></div>
+</div>
+
+<p>Multiply it out. Six choices of <span class="math">BLOCK_M</span> × six of <span class="math">BLOCK_N</span> × four of <span class="math">BLOCK_K</span> × four <code>num_warps</code> × four <code>num_stages</code> is <span class="math">6 · 6 · 4 · 4 · 4 = 2,304</span> configurations <em>for one operator on one shape</em>. Add unroll and layout and it is tens of thousands. A real model has dozens of distinct GEMMs, convolutions, and fused reductions, each with several shapes seen in practice. Benchmarking one config means: generate the code, compile it (often hundreds of milliseconds to seconds), launch it many times to get a stable median, and clean up. Call that ≈0.5 s amortized per candidate. Brute-forcing 2,304 candidates is ≈19 minutes <em>for a single kernel/shape pair</em>. For a whole model that is days. And the space is not smooth: latency as a function of tile size has cliffs (a tile one element too big spills registers to local memory and collapses; one too small underutilizes the tensor cores), so you cannot just hill-climb naively from a guess. This is the wall: codegen can emit any point, but the right point is buried in a jagged, high-dimensional space.</p>
+
+<h2>2 · Templates + tuning — AutoTVM, the human writes the shape of the search</h2>
+
+<p><strong>AutoTVM</strong> is the first disciplined answer: split the work between human and machine. A human writes a <em>schedule template</em> for an operator class — the loop structure, where the tiling happens, which axes get split — but leaves the actual values as <em>tunable knobs</em> (TVM calls them <code>cfg.define_split</code>, <code>cfg.define_knob</code>). The template fixes the <em>structure</em> of the search space; the autotuner fills the <em>values</em>.</p>
+
+<pre class="ascii">human template (TVM):              machine fills the knobs:
+  schedule conv2d:                   tile_f  ∈ {1,2,4,8,16,32}
+    split output by tile_f           tile_y  ∈ {1,2,4,7}
+    split spatial by tile_y, tile_x  tile_x  ∈ {1,2,4,7}
+    reorder, vectorize, unroll       num_threads, unroll ∈ {...}
+    cache_read to shared             →  search picks one assignment</pre>
+
+<p>The tuner then explores the value space guided by a <em>cost model trained on the fly</em>: it measures a batch of configs on the device, fits a model (XGBoost over hand-engineered schedule features in classic AutoTVM) to predict latency, uses the model to propose promising next configs (simulated annealing over the predicted surface), measures those, and repeats. The win is that the human supplies the inductive bias — the template rules out illegal or absurd schedules up front — so the machine searches a far smaller, all-legal space. The cost: someone has to write and maintain a template per operator class, and a template that is too rigid hides the global optimum. That maintenance burden is exactly what the next idea removes.</p>
+
+<h2>3 · Auto-schedulers + learned cost models — generate the space, predict the latency</h2>
+
+<p><strong>Ansor</strong> (TVM's auto-scheduler, also called Auto-scheduler) drops the human template entirely. From the operator's mathematical definition it <em>generates</em> the search space itself — it derives a hierarchy of possible loop structures (sketches) and then samples concrete schedules (annotations) within them. This widens coverage dramatically: Ansor routinely finds schedules a human template author never wrote, often beating hand-tuned libraries.</p>
+
+<p>But generating a bigger space makes the measurement problem worse, not better — now there are even more candidates. The lever that makes it tractable is the <strong>cost model</strong>: a learned function that <em>predicts</em> a schedule's latency from cheap-to-extract features — tile sizes, estimated bytes moved, arithmetic intensity, vectorization width, occupancy proxies — <em>without launching the kernel</em>. A prediction costs microseconds; a real benchmark costs ~0.5 s. So the loop becomes: generate thousands of candidates, score all of them with the cost model in milliseconds, then <em>measure only the top few dozen</em> on the device to correct the model's errors and feed those true latencies back as training data. You measure tens of kernels instead of thousands and still land near the optimum.</p>
+
+<div class="lesson-flow">
+  <div><strong>generate</strong><span>Ansor derives sketches from the op definition and samples concrete schedules — thousands of candidates, no human template.</span></div>
+  <div><strong>predict</strong><span>The learned cost model scores every candidate's latency from features in microseconds each — no device launch. Prune to the promising top-k.</span></div>
+  <div><strong>measure</strong><span>Benchmark only the top-k on the real device. These few true latencies are the ground truth.</span></div>
+  <div><strong>retrain</strong><span>Feed the measured latencies back; the cost model gets sharper each round, so later predictions need fewer corrective measurements.</span></div>
+</div>
+
+<p>The same idea lives inside production compilers under different names. <strong>XLA</strong> uses an analytical/learned <em>latency-estimating cost model</em> to drive fusion and layout decisions and to rank autotuned GEMM/convolution algorithms, so most of its choices are made by prediction with a thin layer of real autotuning on top for the hot kernels. The frontier — "ML for ML compilers" — is making these cost models good enough that on-device measurement becomes the exception, because measurement is the only slow part of the loop.</p>
+
+<table class="trade-table">
+  <thead><tr><th>strategy</th><th>who builds the space</th><th>how candidates are ranked</th><th>device measurements</th><th>cost / risk</th></tr></thead>
+  <tbody>
+    <tr><td>brute force</td><td>fixed grid</td><td>measure all</td><td>thousands</td><td>finds the true best; absurdly slow</td></tr>
+    <tr><td>AutoTVM (template + tune)</td><td>human template</td><td>on-the-fly model + anneal, measured</td><td>hundreds</td><td>good; template authoring &amp; maintenance</td></tr>
+    <tr><td>Ansor (auto-scheduler)</td><td>generated from op def</td><td>learned cost model prunes, then measure top-k</td><td>tens</td><td>wide coverage; long offline search</td></tr>
+    <tr><td>XLA latency model</td><td>compiler-internal</td><td>predicted, sparse autotuning on hot kernels</td><td>few</td><td>fast compile; model error can mispick</td></tr>
+    <tr><td>Triton <code>@autotune</code></td><td>human config list</td><td>measure each listed config, cached</td><td>= list length</td><td>pragmatic; only as good as the list</td></tr>
+  </tbody>
+</table>
+
+<h2>4 · Triton's pragmatic autotune — a config list, measured once, cached by key</h2>
+
+<p>The most common autotuner an ML engineer actually touches is the simplest one on the table. Triton's <code>@triton.autotune</code> takes you at your word: <em>you</em> hand it a short list of <strong>autotune configs</strong> (each a tuple of meta-parameters — block sizes, <code>num_warps</code>, <code>num_stages</code>), and on the first call for a given input it benchmarks every config in the list and remembers the winner. There is no generated space and no learned model — just a curated handful of points you believe span the good region, measured for real.</p>
+
+<pre><code>@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 256, 'BLOCK_K': 32}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=4, num_stages=5),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=2, num_stages=2),
+    ],
+    key=['M', 'N', 'K'],          # re-tune only when these change; otherwise reuse the cached winner
+)
+@triton.jit
+def matmul_kernel(A, B, C, M, N, K, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    ...</code></pre>
+
+<p>The decisive line is <code>key=['M', 'N', 'K']</code>. The <strong>cache key</strong> is the set of properties that, if unchanged, mean the previously-found winner is still valid: here the problem dimensions (and implicitly the dtypes and device). On the first call for a new <span class="math">(M, N, K)</span> Triton pays the full benchmark sweep — the compile-time cost — and stores the best config; every subsequent call with the same key skips straight to the cached kernel for free. Pick the key too narrow (omit dtype) and you serve a kernel tuned for the wrong precision; pick it too wide (include the exact pointer values) and you re-tune on every call and never amortize. The key <em>is</em> the amortization contract — and, as section 5 shows, it is also the exact place dynamic shapes break.</p>
+
+<p>For the full mechanics of building a config list, sizing the sweep, and wiring autotune into a real kernel pipeline, see <a href="../../triton_kernels/lessons/13_autotune_pipeline.html">triton_kernels · 13 the autotune pipeline</a>; this lesson is the why, that one is the how.</p>
+
+<h2>5 · The economics — pay once, amortize a million times</h2>
+
+<p>Autotuning only makes sense because of a property unique to ML workloads: the <em>same kernel on the same shapes runs astronomically often</em>. A served model executes its core GEMMs on every token of every request, billions of times over the deployment's life; a training run does millions of identical steps. So the trade is starkly asymmetric. Let search cost <span class="math">T<sub>search</sub></span> seconds once, and let the tuned kernel save <span class="math">Δt</span> per invocation over an untuned default across <span class="math">N</span> runs. <strong>Amortization</strong> says you win whenever:</p>
+
+<div class="math block">N · Δt &gt; T<sub>search</sub></div>
+
+<p>Plug in numbers. Suppose tuning a kernel costs <span class="math">T<sub>search</sub> ≈ 60 s</span> and the winner is <span class="math">Δt ≈ 50 µs</span> faster per call. Break-even is <span class="math">N = 60 / 50×10⁻⁶ = 1.2 million</span> calls — which a served model crosses in <em>minutes</em>. After that, every call is pure profit. This is why heavy compile-time search is rational here and would be insane for, say, a script you run once.</p>
+
+<p>The break-even math also dictates <em>when</em> you tune:</p>
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">AOT / offline tuning</div><div class="v">Search ahead of deployment, ship a database of winning configs (TVM's tuning log, XLA's autotune cache). Compile time is free at serve time; needs the shapes known in advance.</div></div>
+  <div class="topic-card"><div class="k">JIT / online tuning</div><div class="v">Tune on first encounter at run time (Triton <code>@autotune</code>, <code>torch.compile</code>). Zero offline step, but the first call for each new key pays a latency spike — the <em>cold-start</em>.</div></div>
+</div>
+
+<p>Either way the winner is written to a <strong>cache</strong> keyed by shape, dtype, and device, so the cost is paid once per distinct key. And there is the crack. The entire economic argument rests on <em>the same key recurring millions of times</em>. That holds for training (fixed batch, fixed sequence length, fixed shapes every step) and for static-shape inference. It does <strong>not</strong> hold when the batch size, the sequence length, or a ragged input varies request to request: every new shape is a fresh key, a cache miss, and a cold-start re-tune. A serving system that sees a hundred distinct sequence lengths gets a hundred compile storms and amortizes nothing. The cache key that made autotuning pay is exactly what dynamic shapes shatter — which is the subject of the next lesson.</p>
+
+<h2>6 · Drive it: search strategies on a hidden latency surface</h2>
+
+<p>The widget below is a 2-D slice of the schedule space: <span class="math">tile_m</span> × <span class="math">tile_n</span>, each a grid of configs, with a hidden "true" latency surface (a smooth basin plus a jagged cliff where tiles spill registers, marked in red). The ★ is the true optimum. Pick a strategy and a measurement budget. <strong>Exhaustive</strong> measures every cell — it always finds the ★ but spends the whole budget. <strong>Random-k</strong> samples cells blindly. <strong>Cost-model-guided</strong> scores every cell with a cheap (noisy) predictor first, then spends its budget measuring only the predicted-best cells — watch it land near the ★ with a fraction of the measurements. The KPIs make the trade explicit: how many real measurements you spent, the best latency you found, the search time, and what percent of the true optimum that is.</p>
+
+<div class="widget" id="at">
+  <div class="title">Autotune search: measure vs predict</div>
+  <div class="hint">Same hidden latency surface, three strategies. The knob that proves it: drop the <strong>budget</strong> low and compare strategies — exhaustive can't finish, random-k gambles, but cost-model-guided still finds ≥95% of optimum because it spends its few measurements where the predictor says to look. Search time ∝ measurements (each ≈0.5 s); predictions are nearly free.</div>
+
+  <div class="controls" style="margin-top: 4px;">
+    <label class="inline">strategy:
+      <select id="at-strat">
+        <option value="exhaustive">exhaustive (measure all)</option>
+        <option value="random">random-k</option>
+        <option value="cost" selected>cost-model-guided</option>
+      </select>
+    </label>
+    <label class="inline">measurement budget: <input type="range" id="at-budget" min="1" max="64" step="1" value="10"> <span class="val" id="at-budgetv">10</span></label>
+    <button id="at-run" type="button">run search</button>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">candidates measured</div><div class="v" id="at-meas">—</div></div>
+    <div class="kpi good"><div class="k">best latency found</div><div class="v" id="at-best">—</div></div>
+    <div class="kpi"><div class="k">search time</div><div class="v" id="at-time">—</div></div>
+    <div class="kpi"><div class="k">% of optimum</div><div class="v" id="at-pct">—</div></div>
+  </div>
+
+  <div id="at-grid"></div>
+  <div class="surf-legend">
+    <span>fast</span><span class="bar"></span><span>slow</span>
+    <span>★ true optimum</span>
+    <span>□ measured</span>
+    <span style="color:var(--ok)">▢ best found</span>
+  </div>
+</div>
+
+<p>The shape of the result is the lesson. Exhaustive is a flat line at 100% of optimum and maximum search time — correct and unaffordable. Random-k's quality rises with budget but jumps around. Cost-model-guided beats random at every budget and nearly matches exhaustive's quality at a tenth of its measurements: <em>search buys speed; the cost model buys cheaper search.</em></p>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Re-tuning on every call.</strong> A cache key that includes something that changes constantly (a pointer, a batch dim that varies) so the cache never hits. <em>Signal:</em> steady-state latency dominated by compile time; profiler shows the autotuner running mid-serving, not once.</li>
+    <li><strong>Cache key too narrow.</strong> Keying on shape but not dtype/device, so an fp16 call reuses a bf16-tuned kernel — wrong or slow. <em>Signal:</em> a config that benchmarked great on one path is mysteriously bad on another that "looks the same."</li>
+    <li><strong>Trusting the cost model blindly.</strong> Shipping the model's top pick without measuring it; the predictor mis-ranks the jagged cliff region. <em>Signal:</em> the "tuned" kernel is slower than a default — the model never saw a real measurement near that point.</li>
+    <li><strong>Tuning the wrong shapes.</strong> Offline-tuning shapes that don't match production traffic. <em>Signal:</em> great benchmark numbers, no real-world speedup; the served shapes all miss the cache.</li>
+    <li><strong>A config list that misses the good region.</strong> Triton autotune is only as good as the list; four mediocre configs find a mediocre winner. <em>Signal:</em> the "best" config is far from a reference library's throughput.</li>
+  </ul>
+  </div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><strong>Define the space, then the strategy.</strong> Know your knobs (tiles, warps, stages, layout) before choosing measure-all vs predict-and-prune.</li>
+    <li><strong>Key the cache correctly.</strong> Include shape, dtype, and device — nothing that varies per call. The key is the amortization contract.</li>
+    <li><strong>Always measure the cost model's picks.</strong> Predict to prune, measure to decide; never ship an unmeasured winner.</li>
+    <li><strong>Do the amortization math.</strong> Tune only when <span class="math">N · Δt &gt; T<sub>search</sub></span> — heavy search for hot kernels, defaults for cold ones.</li>
+    <li><strong>Prefer AOT for known shapes.</strong> Build a tuning log offline so serve-time compile is free; reserve JIT for genuinely unpredictable shapes.</li>
+    <li><strong>Watch the cold-start.</strong> Warm the cache before traffic, or the first request of each new key eats a tuning spike.</li>
+  </ul>
+  </div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the widget, set the budget to <strong>8</strong>, and run each strategy. Note the "% of optimum" and "search time" for random-k vs cost-model-guided at the same budget — the cost model should be markedly closer to 100% for the same eight measurements. Now compute the amortization break-even by hand for a kernel where exhaustive took the full 64 measurements at ≈0.5 s each (<span class="math">T<sub>search</sub> ≈ 32 s</span>) and the tuned kernel saves <span class="math">Δt ≈ 40 µs</span> per call: break-even is <span class="math">N = 32 / 40×10⁻⁶ = 800,000</span> calls. Then ask the bridge question: if production sends 50 distinct sequence lengths and each is a separate cache key, how many of those 32-second searches do you pay, and how many of the per-key call counts are large enough to clear 800,000? (That mismatch is lesson 11.)</div>
+
+<h2>Where this points next</h2>
+
+<p>You now have the full back end: lesson 08 chose a schedule, lesson 09 emitted it as code, and lesson 10 searched the schedule space — cheaply, via cost models — and cached the winner so the search amortizes over millions of identical runs. The whole pipeline is finally complete for a fixed problem. But notice the load-bearing word in that sentence: <em>fixed</em>. Fusion grouped a graph of known buffer sizes; memory planning packed lifetimes of known extents; layout assignment optimized concrete tensors; and autotuning just keyed its entire cache on the shape. Every middle-end and back-end pass quietly assumed <strong>static shapes</strong>. Production inference does not oblige: batch size varies request to request, sequence length grows every decode step as the KV cache extends, MoE routing produces ragged tensors, and data-dependent control flow changes the graph itself. Each new shape is a fresh cache key, a cache miss, and a fresh compile — a compile storm that amortizes nothing. The assumption that made the whole stack tractable is the one reality breaks first. That is lesson 11, <strong><a href="11_dynamic_shapes.html">Dynamic shapes &amp; control flow</a></strong>.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+Codegen can emit any schedule, but the fastest one lives in a combinatorial, shape- and hardware-dependent space — a single matmul has thousands of tile×warp×stage×layout configs, with latency cliffs that defeat hand-tuning. <strong>Autotuning</strong> defines a <strong>search space</strong> and finds the best point two ways: <strong>measure</strong> real candidates on device (AutoTVM fills a human template's knobs; Triton <code>@autotune</code> benchmarks a config list) or <strong>predict</strong> with a learned <strong>cost model</strong> that scores candidates from features in microseconds so you measure only the top-k (Ansor generates the space too; the XLA latency model drives fusion/layout). The core trade is compile-time search vs run-time speedup, and it pays because of <strong>amortization</strong> — the same kernel runs millions of times, so you win whenever <span class="math">N · Δt &gt; T<sub>search</sub></span> (break-even in minutes for a served model), and you tune <strong>AOT</strong> offline or <strong>JIT</strong> on first use, writing the winner to a <strong>cache keyed by shape, dtype, and device</strong>. That cache key is the amortization contract — and the exact thing dynamic shapes will shatter, because every new shape is a fresh key, a miss, and a cold-start re-tune.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why does autotuning make economic sense for an ML kernel but not for general code? <em>(§5 — the same kernel on the same shapes runs millions of times, so a one-time search cost <span class="math">T<sub>search</sub></span> amortizes whenever <span class="math">N·Δt &gt; T<sub>search</sub></span>; for a served model that break-even is minutes, after which every call is profit. A run-once program never recoups the search.)</em></li>
+  <li>What's the difference between AutoTVM and Ansor? <em>(§2–3 — AutoTVM needs a human-written template that fixes the schedule structure and exposes tunable knobs the machine fills; Ansor generates the search space from the op definition itself, so it needs no template and finds schedules a human wouldn't write, at the cost of longer search.)</em></li>
+  <li>What does a learned cost model buy you, and why still measure on device? <em>(§3 — a prediction costs microseconds vs ~0.5 s for a real benchmark, so the model prunes thousands of candidates to a top-k; you still measure the top-k because the model has error, especially near latency cliffs, and those true latencies retrain it.)</em></li>
+  <li>Explain Triton's <code>@autotune</code> and the role of the <code>key</code> argument. <em>(§4 — it benchmarks a user-supplied config list on first call and caches the winner; <code>key=['M','N','K']</code> says re-tune only when those change, otherwise reuse the cached kernel. The key is the amortization contract — too narrow serves a wrong kernel, too wide re-tunes every call.)</em></li>
+  <li>AOT vs JIT autotuning — when would you pick each? <em>(§5 — AOT/offline when shapes are known ahead: ship a tuning log so serve-time compile is free; JIT/online when shapes are unpredictable: tune on first encounter, accepting a cold-start spike per new key.)</em></li>
+  <li>Your autotuned serving kernel shows compile time in steady-state latency. What's wrong? <em>(§Failure modes — the cache key includes something that varies per call (e.g. a varying batch/seq dim or a pointer), so it never hits and re-tunes constantly; fix the key to shape+dtype+device, or pre-warm the cache.)</em></li>
+  <li>Why does autotuning's whole premise crack under dynamic shapes? <em>(§5 / Where next — the cache amortizes only when the same key recurs millions of times; variable batch/sequence length makes every shape a new key, a cache miss, and a fresh compile, so you pay search repeatedly and amortize nothing — forcing the dynamic-shape handling of lesson 11.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="09_codegen.html"><span class="dir">← Back</span><span class="ttl">09 · Code generation</span></a>
+  <a class="next" href="11_dynamic_shapes.html"><span class="dir">Next →</span><span class="ttl">11 · Dynamic shapes</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var grid = document.getElementById('at-grid');
+  if (!grid) return;
+  var N = 8;                 // 8x8 config grid (tile_m x tile_n)
+  var strat = document.getElementById('at-strat');
+  var budget = document.getElementById('at-budget');
+  var budgetv = document.getElementById('at-budgetv');
+  var runBtn = document.getElementById('at-run');
+  var kMeas = document.getElementById('at-meas'), kBest = document.getElementById('at-best');
+  var kTime = document.getElementById('at-time'), kPct = document.getElementById('at-pct');
+
+  // hidden TRUE latency surface (lower = faster). Smooth basin + a jagged spill cliff.
+  var lat = [], cells = [], optIdx = 0, optVal = Infinity, maxVal = -Infinity;
+  function build(){
+    lat = []; optVal = Infinity; maxVal = -Infinity; optIdx = 0;
+    for (var i=0;i<N;i++){ lat[i]=[]; for (var j=0;j<N;j++){
+      // basin centered near (5,3): big tiles reuse well
+      var bx = i-5, by = j-3;
+      var v = 40 + 3.2*(bx*bx) + 4.0*(by*by);
+      // register-spill cliff: very large tiles (top-right) blow up
+      if (i+j > 11) v += 90 + 22*(i+j-11);
+      // mild noise so it isn't a perfect bowl
+      v += ((i*7+j*13)%5)*1.5;
+      lat[i][j] = v;
+      if (v < optVal){ optVal = v; optIdx = i*N+j; }
+      if (v > maxVal) maxVal = v;
+    }}
+  }
+  build();
+
+  // cost-model PREDICTION = true surface + noise (so it's useful but imperfect)
+  function predict(i,j){
+    var n = (((i*131+j*977)%23)-11) * 4.0;   // deterministic pseudo-noise ±~44
+    return lat[i][j] + n;
+  }
+
+  function color(v){
+    var t = (v - optVal)/(maxVal - optVal);   // 0 fast .. 1 slow
+    t = Math.max(0, Math.min(1, t));
+    // green -> yellow -> red
+    var r,g,b;
+    if (t < 0.5){ var u=t/0.5; r=Math.round(22+(234-22)*u); g=Math.round(163+(179-163)*u); b=Math.round(74+(8-74)*u); }
+    else { var u2=(t-0.5)/0.5; r=Math.round(234+(239-234)*u2); g=Math.round(179+(68-179)*u2); b=Math.round(8+(68-8)*u2); }
+    return 'rgb('+r+','+g+','+b+')';
+  }
+
+  function render(measuredSet, bestIdx){
+    grid.innerHTML = '';
+    grid.style.gridTemplateColumns = 'repeat('+N+', 1fr)';
+    for (var i=0;i<N;i++) for (var j=0;j<N;j++){
+      var idx = i*N+j;
+      var c = document.createElement('div');
+      c.className = 'cell';
+      c.style.background = color(lat[i][j]);
+      c.title = 'tile_m='+(32*(i+1))+' tile_n='+(32*(j+1))+'  latency≈'+lat[i][j].toFixed(0)+'µs';
+      if (idx === optIdx) c.classList.add('opt');
+      if (measuredSet && measuredSet.has(idx)) c.classList.add('measured');
+      if (idx === bestIdx) c.classList.add('best');
+      grid.appendChild(c);
+    }
+  }
+
+  function run(){
+    var B = +budget.value;
+    var s = strat.value;
+    var order = [];
+    if (s === 'exhaustive'){
+      for (var k=0;k<N*N;k++) order.push(k);
+      B = N*N;                                  // exhaustive ignores budget, measures all
+    } else if (s === 'random'){
+      for (var k=0;k<N*N;k++) order.push(k);
+      // deterministic shuffle (seeded) for reproducibility
+      var seed = 12345;
+      for (var a=order.length-1;a>0;a--){ seed=(seed*1103515245+12345)&0x7fffffff; var r=seed%(a+1); var tmp=order[a]; order[a]=order[r]; order[r]=tmp; }
+    } else { // cost-model-guided: rank ALL cells by prediction (free), measure best B
+      var ranked = [];
+      for (var k=0;k<N*N;k++){ var i=Math.floor(k/N), j=k%N; ranked.push([k, predict(i,j)]); }
+      ranked.sort(function(p,q){ return p[1]-q[1]; });
+      order = ranked.map(function(p){ return p[0]; });
+    }
+
+    var measured = new Set();
+    var bestIdx = -1, bestVal = Infinity;
+    var lim = Math.min(B, order.length);
+    for (var t=0;t<lim;t++){
+      var idx = order[t];
+      measured.add(idx);
+      var i=Math.floor(idx/N), j=idx%N;
+      if (lat[i][j] < bestVal){ bestVal = lat[i][j]; bestIdx = idx; }
+    }
+
+    render(measured, bestIdx);
+    kMeas.textContent = measured.size + ' / ' + (N*N);
+    kBest.textContent = bestVal.toFixed(0) + ' µs';
+    var secs = measured.size * 0.5;             // ≈0.5 s per real measurement
+    kTime.textContent = secs.toFixed(1) + ' s';
+    var pct = optVal / bestVal * 100;           // lower latency is better; 100% = found optimum
+    kPct.textContent = pct.toFixed(0) + ' %';
+    kPct.parentNode.classList.toggle('good', pct >= 95);
+    kPct.parentNode.classList.toggle('over', pct < 80);
+  }
+
+  budget.addEventListener('input', function(){ budgetv.textContent = budget.value; });
+  budget.addEventListener('change', run);
+  strat.addEventListener('change', run);
+  runBtn.addEventListener('click', run);
+  render(null, -1);
+  run();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

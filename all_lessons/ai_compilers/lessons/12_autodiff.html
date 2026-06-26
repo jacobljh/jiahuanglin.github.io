@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>12 · Autodiff as a compiler pass</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local layout only — failure/checklist columns + the partitioner chain view */
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; font-size: 15px; }
+  .lesson-card ul { margin: 0; padding-left: 18px; }
+  .lesson-card li { margin: 7px 0; font-size: 13.5px; line-height: 1.5; }
+  .kpi.over .v { color: var(--bad); }
+  .kpi.good .v { color: var(--ok); }
+  /* the recompute partitioner chain */
+  .rp-chain { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 6px; }
+  .rp-node {
+    flex: 1 1 0; min-width: 84px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--bg-elev); padding: 9px 8px; text-align: center; cursor: pointer;
+    user-select: none; transition: border-color .12s, background .12s;
+  }
+  .rp-node .nm { font-family: var(--mono); font-size: 12px; color: var(--text); }
+  .rp-node .sz { font-family: var(--mono); font-size: 10.5px; color: var(--text-mute); margin-top: 3px; }
+  .rp-node .tag { font-family: var(--mono); font-size: 10px; margin-top: 5px; letter-spacing: .04em; }
+  .rp-node.save  { border-color: var(--ok);  box-shadow: 0 0 0 1px var(--ok) inset; }
+  .rp-node.save  .tag { color: var(--ok); }
+  .rp-node.recmp { border-color: var(--accent-2); }
+  .rp-node.recmp .tag { color: var(--accent-2); }
+  .rp-presets { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 2px; }
+  .rp-presets button {
+    font-family: var(--mono); font-size: 12px; padding: 6px 11px; cursor: pointer;
+    border: 1px solid var(--border); border-radius: 6px; background: var(--bg-elev); color: var(--text);
+  }
+  .rp-presets button:hover { border-color: var(--accent); }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">ai_compilers / lessons</a><span class="crumb">/</span><span class="crumb">12 · autodiff</span><span class="step-pill">lesson 13 / 16</span></div></header>
+
+<main>
+
+<p class="kicker">Part V — The hard parts</p>
+<h1>Autodiff as a compiler pass</h1>
+<p class="subtitle">Lesson 11 taught the compiler to survive variable shapes and data-dependent control flow, so it can now capture, fuse, plan, and tune a real serving graph that changes size every request. But everything up to here has compiled the <em>forward</em> graph — inference. Training needs the <em>backward</em> graph too, and that backward must match a forward you have already fused, re-laid-out, and rewritten beyond recognition. Hand-writing backward kernels for an optimized graph is hopeless: the optimizer is allowed to delete, merge, and reorder ops you never see. The fix is the cleanest idea in the track — make differentiation itself a graph-to-graph pass, so the compiler <em>builds</em> the backward and then optimizes it with the exact same machinery it used on the forward.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>By lesson 11 the compiler owns the full inference pipeline: capture (02), typed SSA IR (03), rewrites (04), fusion (05), memory planning (06), layout (07), scheduling/codegen/tuning (08–10), guarded by dynamic shapes (11). None of it produced gradients. Training needs <span class="math">∂loss/∂θ</span> for every parameter, which means a backward graph — and that graph cannot be written by hand against the <em>compiled</em> forward, because by the time fusion has merged <code>bias+gelu</code> into a matmul epilogue and planning has reused buffers, the ops you would differentiate no longer exist as separate ops. Worse, framework code mutates tensors in place and aliases views, which silently breaks both differentiation and every rewrite from 03–06 (all of which assumed value semantics). You need the compiler to generate the backward itself, from clean value-semantics ops, and then hand the result to the same passes.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> training needs a backward graph the optimizer never wrote, and the compiled forward is unrecognizable to a human writing backward kernels.<br><strong>New idea:</strong> <strong>automatic differentiation as a graph-to-graph transformation</strong> — reverse-mode AD builds the backward from the forward by applying each op's <strong>vjp</strong> rule in reverse topological order, yielding a <em>joint forward+backward graph</em> that the <em>same</em> passes (fusion, planning, layout) then optimize. Two enabling passes make it sound and cheap: <strong>functionalization</strong> (remove in-place/aliasing so AD and rewrites are legal — paying back the SSA motif from <a href="03_ir.html">lesson 03</a>) and a <strong>min-cut partitioner</strong> that chooses, per activation, save-in-HBM vs recompute-in-backward.<br><strong>Forces next:</strong> the joint graph is optimized for <em>one</em> device, but a frontier model's parameters, optimizer state, and activations do not fit or finish on a single GPU — the compiler must partition the graph across many (<a href="13_distributed.html">lesson 13</a>).</div>
+
+<div class="callout"><div class="label">The plan</div>Five moves. (1) Recap reverse-mode AD as a graph transform — a vjp rule per op, swept in reverse — and contrast it with eager autograd's runtime tape. (2) Walk the <strong>AOTAutograd</strong> pipeline: capture → functionalize → autodiff → min-cut partition → compile each half. (3) Functionalization: turn mutation and views into pure ops so the 03–06 passes apply. (4) The partitioner: save-vs-recompute as a min-cut, what stays in HBM vs what is regenerated. (5) Why the same middle-end now runs unchanged on the joint graph. Then drive the recompute partitioner until save-everything OOMs and recompute-everything crawls.</div>
+
+<h2>1 · Reverse-mode AD is a graph transform, not runtime magic</h2>
+
+<p><strong>Automatic differentiation (AD)</strong> computes exact derivatives of a program by composing the known derivatives of its primitive ops via the chain rule — not symbolically (no expression blowup) and not numerically (no finite-difference error). For deep learning we want the gradient of one scalar loss with respect to millions of parameters, so we use <strong>reverse mode</strong>: one forward sweep to compute values, one backward sweep that propagates the gradient of the loss back through every op. Reverse mode costs ≈1 backward for <em>all</em> inputs at once, versus forward mode's one pass per input — for <span class="math">θ ∈ ℝ⁷ᴮ → loss ∈ ℝ</span>, that is the difference between two sweeps and seven billion.</p>
+
+<p>The atom of reverse mode is the <strong>vjp</strong> — the <em>vector-Jacobian product</em>. Every primitive op <span class="math">y = f(x)</span> ships a rule that, given the incoming gradient <span class="math">ḡ = ∂loss/∂y</span>, returns <span class="math">∂loss/∂x = Jᶠᵀ · ḡ</span> <em>without ever forming the Jacobian</em> <span class="math">J</span>. The vjp is a small graph of ops, so differentiation is just substitution:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">matmul · <span class="math">y = x·W</span></div><div class="v">vjp: <span class="math">x̄ = ȳ·Wᵀ</span>, <span class="math">W̄ = xᵀ·ȳ</span>. Two matmuls — and they need <span class="math">x</span> and <span class="math">W</span> from the forward.</div></div>
+  <div class="topic-card"><div class="k">gelu · <span class="math">y = gelu(x)</span></div><div class="v">vjp: <span class="math">x̄ = ȳ ⊙ gelu′(x)</span>. Needs <span class="math">x</span> (or a cached intermediate) to evaluate the derivative.</div></div>
+  <div class="topic-card"><div class="k">add · <span class="math">y = a + b</span></div><div class="v">vjp: <span class="math">ā = ȳ</span>, <span class="math">b̄ = ȳ</span>. Needs nothing from the forward — gradient just flows through.</div></div>
+</div>
+
+<p>To differentiate a whole graph, walk it in <strong>reverse topological order</strong>: seed the output with <span class="math">∂loss/∂loss = 1</span>, then for each op apply its vjp to the gradient flowing back into its outputs, summing contributions where a value fanned out to multiple consumers. The result is a brand-new subgraph of vjp ops — the <strong>backward graph</strong>. Critically, this transformation happens <em>at compile time</em> on the IR: you give it a forward graph, it hands back a forward+backward graph. There is no Python running, no objects, no interpreter in the loop.</p>
+
+<p>Contrast eager PyTorch. Eager autograd is a <strong>runtime tape</strong>: as each op executes, it pushes a backward closure (a Python/C++ object holding saved tensors) onto a graph, and <code>loss.backward()</code> later walks that tape calling each closure. That works, but the tape is built and torn down every iteration, it is opaque to any graph optimizer, and the saved tensors it pins are whatever the op author chose — there is no pass that can fuse a backward op into a forward one or trade memory for recompute, because there is no graph to rewrite. Turning AD into a compile-time graph transform is exactly what unlocks the rest of this lesson: once the backward is <em>in the IR</em>, fusion, planning, and layout treat it like any other ops.</p>
+
+<pre class="ascii">eager autograd                          AD as a compiler pass
+--------------                          ---------------------
+run op  → push backward closure         forward graph  (IR)
+run op  → push backward closure                 |  apply vjp per op, reverse sweep
+   ...     (a runtime tape)                      v
+loss.backward(): walk tape, call         forward + backward graph  (IR)
+  each closure in reverse                        |  fuse / plan / layout / tune
+                                                  v
+opaque to the optimizer                  one compiled artifact, backward optimized too</pre>
+
+<h2>2 · AOTAutograd: trace once, differentiate, partition, compile both halves</h2>
+
+<p>In <code>torch.compile</code>, the pass that does this is <strong>AOTAutograd</strong> (ahead-of-time autograd). After Dynamo (lesson 02) captures a forward FX graph, AOTAutograd takes over and runs a fixed pipeline that produces two compiled functions — one for the forward, one for the backward — wired together by a small set of saved tensors:</p>
+
+<div class="lesson-flow">
+  <div><strong>capture</strong><span>Receive the forward FX graph from Dynamo, with example inputs (real or symbolic, lesson 11) so every shape and dtype is known.</span></div>
+  <div><strong>functionalize</strong><span>Rewrite all in-place ops and view aliasing into pure, value-semantics ops (§3). Now every value is defined once — the SSA precondition the 03–06 passes assume.</span></div>
+  <div><strong>autodiff</strong><span>Trace the backward by applying each op's vjp in reverse, producing one <em>joint</em> graph that contains the forward and the backward together, sharing intermediate values.</span></div>
+  <div><strong>partition</strong><span>Split the joint graph into a forward subgraph and a backward subgraph, choosing which forward activations to <em>save</em> (carry across the boundary in HBM) vs <em>recompute</em> in the backward — a min-cut (§4).</span></div>
+  <div><strong>compile each half</strong><span>Hand both subgraphs to the backend (Inductor → Triton). Each is fused, memory-planned, laid out, and tuned independently — the backward gets the same treatment as the forward.</span></div>
+</div>
+
+<p>The payoff is that the backward is a <em>first-class graph</em>. When Inductor fuses <code>bias+gelu</code> into the matmul epilogue in the forward, it independently fuses the corresponding <code>gelu′ ⊙ ȳ</code> and <span class="math">Wᵀ</span>-matmul cluster in the backward. The reason hand-writing backward kernels for an optimized forward is hopeless — the forward op boundaries are gone — is exactly why generating it works: the compiler differentiates the <em>clean</em> graph first, then optimizes forward and backward in lockstep. JAX takes the same stance with <code>grad</code>/<code>vjp</code> as program transformations over jaxprs, lowered through XLA.</p>
+
+<h2>3 · Functionalization: kill mutation and aliasing so the passes are legal</h2>
+
+<p>Reverse-mode AD and every rewrite from lessons 03–06 share one precondition: <strong>value semantics</strong>. A vjp rule for <code>add</code> assumes its inputs still hold their forward values when the backward runs; CSE assumes that two reads of the same value return the same thing; buffer reuse assumes a value is dead after its last read. In-place mutation and view aliasing violate all three. If <code>x.add_(1)</code> overwrites <code>x</code>, then a later op that wanted the <em>old</em> <code>x</code> for its vjp silently gets the wrong value. If <code>y = x[2:]</code> is a view and someone writes through <code>y</code>, <code>x</code> changes under the rewriter's feet.</p>
+
+<p><strong>Functionalization</strong> is the pass that removes this. It rewrites every mutating or aliasing op into a pure op that returns a new value, threading the new value forward to all subsequent uses:</p>
+
+<table class="trade-table">
+  <thead><tr><th>mutating / aliasing form</th><th>functionalized (pure) form</th><th>why AD & passes now work</th></tr></thead>
+  <tbody>
+    <tr><td><code>x.add_(1)</code> &nbsp;(overwrites x)</td><td><code>x2 = add(x, 1)</code>; later uses read <code>x2</code></td><td><code>x</code> is still available for any vjp that needs it; value defined once.</td></tr>
+    <tr><td><code>y = x.view(...)</code>; <code>y.mul_(2)</code></td><td><code>x2 = mul(x, 2)</code> applied to the slice, recomposed</td><td>no hidden alias; the rewriter sees a real dataflow edge, not a pointer.</td></tr>
+    <tr><td><code>buf[i] = v</code> &nbsp;(index_put_)</td><td><code>buf2 = index_put(buf, i, v)</code></td><td>liveness (06) can prove <code>buf</code> dead and reuse its storage safely.</td></tr>
+  </tbody>
+</table>
+
+<p>This is the <a href="03_ir.html">lesson 03</a> SSA motif paying back exactly when promised: lesson 03 argued value semantics make rewriting <em>local and sound</em> and flagged that mutation would have to be removed before AD. Functionalization is that removal. After it runs, the joint graph is pure SSA, so AD's vjp substitution is correct and fusion/CSE/DCE/planning all apply unchanged. The in-place ops are not gone forever — memory planning (06) <em>reintroduces</em> safe in-place updates later, but only where it can <em>prove</em> via liveness that no other consumer needs the old value. The discipline is: be pure for analysis, be in-place for execution, and let the compiler decide which is provably safe.</p>
+
+<h2>4 · The partitioner: save-vs-recompute as a min-cut</h2>
+
+<p>The backward needs forward intermediates — the matmul vjp needs <span class="math">x</span> and <span class="math">W</span>, gelu's vjp needs its input. The naive choice is to <strong>save every</strong> forward activation in HBM and read it back in the backward. That is the activation-memory wall: for a deep model the saved activations dwarf the parameters, and you OOM (the same ledger as <a href="../../cs336/lessons/05_accounting.html">cs336 · 05 accounting</a>). The opposite extreme — <strong>recompute everything</strong>, saving only the inputs and regenerating each activation from scratch in the backward — costs almost a second full forward pass in FLOPs. Neither extreme is right; the answer is a per-activation choice, and the compiler makes it.</p>
+
+<p>The <strong>partitioner</strong> formalizes it as a graph <strong>min-cut</strong>. Picture the joint graph with the forward on one side and the backward on the other; every forward value the backward consumes is an edge crossing the boundary. Each crossing edge can be paid for two ways: <em>save</em> it (cost = its bytes in HBM, carried across the cut) or <em>recompute</em> it (cost = the FLOPs of the ops that regenerate it from things already on the backward side). The partitioner picks the cut — the set of values to save — that minimizes total cost under the memory budget. <strong>Rematerialization</strong> is the general name for recompute-instead-of-store; activation checkpointing is the manual version (<a href="../../cs336/lessons/05_accounting.html">cs336 · 05</a>), and the compiler partitioner is the automatic one.</p>
+
+<div class="math block">cost(activation) = min( bytes_in_HBM , FLOPs_to_recompute )  &nbsp;→&nbsp; cut minimizes Σ cost under peak-memory ≤ budget</div>
+
+<p>The heuristics the real <code>min_cut_rematerialization_partition</code> uses are intuitive once you see the cost model. <strong>Cheap-and-big → recompute:</strong> elementwise ops (gelu, dropout mask, bias) are nearly free in FLOPs but their outputs are large, so regenerating them is far cheaper than the bytes. <strong>Expensive-and-shared → save:</strong> a matmul output is costly to recompute and often feeds several backward ops, so save it once. This is precisely FlashAttention's trade made by a compiler instead of by hand: <a href="../../cs336/lessons/07_kernels.html">cs336 · 07 kernels</a> derives why attention <em>recomputes</em> the <span class="math">T×T</span> scores in the backward rather than storing the <span class="math">O(T²)</span> matrix — cheap FLOPs to save scarce HBM. The partitioner generalizes that single hand-tuned decision to every activation in the graph, automatically.</p>
+
+<h2>5 · The same middle-end runs on the joint graph</h2>
+
+<p>The quiet, important fact: once AD has produced the joint graph and the partitioner has split it, <strong>nothing downstream needs to know it is a backward.</strong> Fusion (05) sees a chain of memory-bound elementwise ops and fuses them whether they compute activations or gradients. Memory planning (06) computes liveness and reuses buffers across forward and backward alike — and the partitioner's save/recompute choice is literally <em>input</em> to that liveness analysis (a recomputed value is born late and dies fast; a saved value lives across the whole backward). Layout (07) propagates the same tensor-core-friendly formats. This is the reuse dividend of treating AD as a graph transform: you wrote the optimization passes once, for forward inference, and they pay off again, unchanged, for training. The compiler did not learn calculus; it learned to rewrite a graph, and gradients are just more graph.</p>
+
+<h2>6 · Drive it: the recompute partitioner</h2>
+
+<p>The widget is a small forward chain — <code>x → matmul → gelu → dropout → matmul → norm → loss</code>. Each box is an activation the backward will need; click it to toggle <strong>save</strong> (kept in HBM, green) vs <strong>recompute</strong> (regenerated in the backward, blue). The KPIs are the three numbers the partitioner trades: saved-activation memory, extra backward FLOPs from recompute, and peak memory (saved activations + the working set). The dashed budget is one device. Try the presets: <em>save everything</em> minimizes FLOPs but blows past the memory budget (OOM); <em>recompute everything</em> fits easily but pays nearly a second forward in FLOPs; the <em>min-cut</em> preset saves the expensive matmul outputs and recomputes the cheap-but-big elementwise ones — fitting the budget at a tiny FLOPs premium.</p>
+
+<div class="widget" id="rp">
+  <div class="title">Recompute partitioner — save vs recompute per activation</div>
+  <div class="hint">Click a box to flip it between <strong style="color:var(--ok)">save</strong> (HBM) and <strong style="color:var(--accent-2)">recompute</strong> (regenerate in backward). The knob that breaks: <em>save everything</em> → OOM; <em>recompute everything</em> → wasted FLOPs. The min-cut saves expensive-and-shared outputs, recomputes cheap-and-big ones. Numbers are illustrative, order-of-magnitude.</div>
+
+  <div class="rp-presets">
+    <button id="rp-save">save everything</button>
+    <button id="rp-recmp">recompute everything</button>
+    <button id="rp-mincut">min-cut (compiler choice)</button>
+  </div>
+
+  <div class="rp-chain" id="rp-chain"></div>
+
+  <div class="kpi-grid">
+    <div class="kpi" id="rp-k-mem"><div class="k">saved-activation memory</div><div class="v" id="rp-mem">—</div></div>
+    <div class="kpi"><div class="k">extra backward FLOPs (recompute)</div><div class="v" id="rp-flops">—</div></div>
+    <div class="kpi" id="rp-k-peak"><div class="k">peak memory</div><div class="v" id="rp-peak">—</div></div>
+    <div class="kpi"><div class="k">fits 16 GB budget?</div><div class="v" id="rp-fit">—</div></div>
+  </div>
+</div>
+
+<p>The shape of the trade is the lesson: peak memory and extra FLOPs pull in opposite directions, and the partitioner finds the cut that fits the budget for the fewest extra FLOPs. Save-everything is the eager-PyTorch default that OOMs at scale; recompute-everything is gradient checkpointing taken to its wasteful extreme; the min-cut is what the compiler picks for you — and it picks it again, automatically, every time shapes change.</p>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Differentiating a non-functionalized graph.</strong> Running AD before functionalization, so an in-place op clobbers a value a vjp still needs. <em>Signal:</em> gradients that are subtly wrong (off by a stale value), often only for ops downstream of an <code>_</code> in-place call.</li>
+    <li><strong>Saving everything by reflex.</strong> Carrying every activation to the backward "to be safe," reproducing eager's memory profile. <em>Signal:</em> training OOMs at a batch size inference handles fine; profiler shows activation memory ≫ parameter memory.</li>
+    <li><strong>Recomputing the expensive ops.</strong> A partition that regenerates matmul/attention outputs to save a little memory. <em>Signal:</em> backward is far slower than ≈2× the forward; recompute FLOPs dominate the step.</li>
+    <li><strong>Assuming the eager tape and the compiled backward match op-for-op.</strong> Looking for the forward's op boundaries inside the compiled backward. <em>Signal:</em> confusion when a profiler shows fused backward kernels that map to no single autograd node — they are fused vjp clusters.</li>
+    <li><strong>Float non-associativity from recompute.</strong> Expecting bit-identical results between save and recompute. <em>Signal:</em> tiny numerical differences toggling checkpointing — expected; the math is equivalent, the rounding order is not.</li>
+  </ul>
+  </div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><strong>Functionalize before AD.</strong> Pure value semantics first; reintroduce in-place only where liveness proves it safe (06).</li>
+    <li><strong>Think vjp, not Jacobian.</strong> Each op contributes <span class="math">Jᵀ·ḡ</span> as a small graph; never materialize <span class="math">J</span>.</li>
+    <li><strong>Let the partitioner choose.</strong> Don't hand-checkpoint what the min-cut handles; reserve manual checkpointing for cases it can't model.</li>
+    <li><strong>Recompute cheap-and-big, save expensive-and-shared.</strong> Elementwise/dropout → recompute; matmul/attention outputs → save.</li>
+    <li><strong>Reuse the middle-end.</strong> The backward gets fusion/planning/layout for free — confirm in the profiler that backward kernels are fused.</li>
+    <li><strong>Watch the two KPIs together.</strong> Peak memory and recompute FLOPs trade off; tune to the memory budget, not to zero recompute.</li>
+  </ul>
+  </div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the widget and hit <em>save everything</em>: note the peak memory (it exceeds the 16 GB budget → OOM) and that extra FLOPs are zero. Now hit <em>recompute everything</em>: peak memory drops well under budget, but extra backward FLOPs jump to nearly a full extra forward. Finally hit <em>min-cut</em> and read all three KPIs — it should fit the budget while adding only a small fraction of FLOPs, because it recomputes the two cheap-and-big elementwise activations (gelu, dropout) and saves the two expensive matmul outputs. Then by hand: which single box, flipped from recompute to save, would push the min-cut over budget? (Any one of the three recomputed activations — each is ≈4 GB, and saving one lifts peak from ≈13 GB to ≈17 GB, past the 16 GB budget; recomputing them is exactly what the min-cut is doing to stay under budget.) This is the FlashAttention decision from <a href="../../cs336/lessons/07_kernels.html">cs336 · 07</a>, made per-op by the compiler.</div>
+
+<h2>Where this points next</h2>
+
+<p>You now have the whole training graph compiled: AD generated the backward as a graph transform, functionalization made it sound, the partitioner balanced memory against recompute, and the same middle-end fused and planned both halves. But every number in that pipeline assumed <em>one</em> device. The partitioner fought the activation-memory wall on a single GPU and won some headroom — yet a frontier model's parameters alone (tens to hundreds of GB), plus optimizer state, plus the activations the partitioner couldn't recompute away, do not fit on one 80 GB device, and even when they fit, one device can't finish the step in acceptable time. The min-cut bought slack; it did not buy a second order of magnitude. The only move left is to spread the graph — parameters, activations, and the batch — across many devices, which means partitioning and inserting communication becomes <em>another compiler pass</em>. That is lesson 13, <strong><a href="13_distributed.html">Distributed compilation</a></strong>.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+Hand-writing backward kernels for a fused, re-laid-out, rewritten forward is hopeless because the op boundaries you would differentiate no longer exist — so the compiler <strong>generates</strong> the backward instead. <strong>Reverse-mode AD</strong> is a graph-to-graph transform: apply each op's <strong>vjp</strong> (<span class="math">Jᵀ·ḡ</span>, never the full Jacobian) in reverse topological order to build a <em>joint forward+backward graph</em>, not a runtime tape. In <code>torch.compile</code> this is <strong>AOTAutograd</strong>: capture → <strong>functionalize</strong> (remove in-place/aliasing so AD and the 03–06 rewrites are legal — the SSA motif paying back) → autodiff → <strong>min-cut partition</strong> (per activation, <strong>rematerialization</strong>: save its bytes in HBM vs recompute its FLOPs in the backward — cheap-and-big recompute, expensive-and-shared save, exactly FlashAttention's trade automated) → compile each half. The dividend: the <strong>same</strong> fusion, memory-planning, and layout passes run unchanged on the joint graph — the compiler never learned calculus, it learned to rewrite graphs, and gradients are just more graph. The min-cut buys memory headroom on one device but not a second order of magnitude — forcing the move to many devices.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why generate the backward graph instead of hand-writing backward kernels for a compiled model? <em>(§intro/2 — fusion/layout/planning have dissolved the forward's op boundaries, so there is nothing for a human to differentiate; AD runs on the clean graph first, then the same passes optimize the backward.)</em></li>
+  <li>What is a vjp and why does reverse mode use it? <em>(§1 — the vector-Jacobian product <span class="math">Jᵀ·ḡ</span> computed without forming J; reverse mode gives the gradient of one scalar loss w.r.t. all inputs in a single backward sweep, vs forward mode's one pass per input.)</em></li>
+  <li>Contrast eager autograd's tape with AD as a compiler pass. <em>(§1 — the tape is a runtime list of backward closures, rebuilt every step and opaque to optimizers; the pass produces a backward <em>in the IR</em> at compile time, so fusion/planning/layout can rewrite it.)</em></li>
+  <li>What does functionalization do and why is it required before AD? <em>(§3 — rewrites in-place and aliasing ops into pure value-semantics ops; AD's vjp rules and the 03–06 rewrites all assume a value is defined once and still available, which mutation breaks.)</em></li>
+  <li>Explain the save-vs-recompute partition as a min-cut. <em>(§4 — each forward value the backward needs is an edge across the fwd/bwd boundary, payable as its HBM bytes (save) or its recompute FLOPs (recompute); the partitioner picks the cut minimizing total cost under the memory budget — rematerialization.)</em></li>
+  <li>Which activations should you save and which should you recompute? <em>(§4 — recompute cheap-and-big (elementwise: gelu, dropout, bias); save expensive-and-shared (matmul/attention outputs). It's FlashAttention's hand-tuned trade generalized to every op.)</em></li>
+  <li>Why do the forward optimization passes work on the backward unchanged? <em>(§5 — once AD emits a joint graph, the backward is just more typed SSA ops; fusion/liveness/layout don't care whether a value is an activation or a gradient, so the passes written for inference pay off again for training.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="11_dynamic_shapes.html"><span class="dir">← Back</span><span class="ttl">11 · Dynamic shapes</span></a>
+  <a class="next" href="13_distributed.html"><span class="dir">Next →</span><span class="ttl">13 · Distributed compilation</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var chainEl = document.getElementById('rp-chain');
+  if (!chainEl) return;
+
+  // forward chain: each node is an activation the backward may need.
+  // mem  = bytes of the activation if saved (MB, illustrative)
+  // flops = GFLOPs to recompute it in the backward (illustrative)
+  // inputs (x) and params are always available (never recomputed); we model the
+  // intermediate activations only.
+  var NODES = [
+    { nm: 'matmul1', mem: 4096, flops: 70,  save: true  },  // big GEMM output: expensive to recompute
+    { nm: 'gelu',    mem: 4096, flops: 1.5, save: true  },  // cheap-and-big elementwise
+    { nm: 'dropout', mem: 4096, flops: 1.5, save: true  },  // cheap-and-big elementwise
+    { nm: 'matmul2', mem: 4096, flops: 70,  save: true  },  // big GEMM output
+    { nm: 'norm',    mem: 4096, flops: 4,   save: true  }   // reduction: moderate recompute
+  ];
+  var BUDGET_MB = 16 * 1024;      // 16 GB budget
+  var WORKING_MB = 5 * 1024;      // fixed working set (params, grads, current tile) ~5 GB
+  var FULL_FWD_GFLOPS = NODES.reduce(function(a,n){ return a + n.flops; }, 0);
+
+  var memEl  = document.getElementById('rp-mem');
+  var flopEl = document.getElementById('rp-flops');
+  var peakEl = document.getElementById('rp-peak');
+  var fitEl  = document.getElementById('rp-fit');
+  var kMem   = document.getElementById('rp-k-mem');
+  var kPeak  = document.getElementById('rp-k-peak');
+
+  function fmtMB(mb){
+    if (mb >= 1024) return (mb/1024).toFixed(1) + ' GB';
+    return Math.round(mb) + ' MB';
+  }
+
+  function render(){
+    chainEl.innerHTML = '';
+    NODES.forEach(function(n, i){
+      var d = document.createElement('div');
+      d.className = 'rp-node ' + (n.save ? 'save' : 'recmp');
+      d.innerHTML = '<div class="nm">' + n.nm + '</div>' +
+                    '<div class="sz">' + fmtMB(n.mem) + ' · ' + n.flops + ' GF</div>' +
+                    '<div class="tag">' + (n.save ? 'SAVE' : 'RECOMPUTE') + '</div>';
+      d.addEventListener('click', function(){ n.save = !n.save; update(); });
+      chainEl.appendChild(d);
+    });
+  }
+
+  function update(){
+    render();
+    var savedMem = NODES.reduce(function(a,n){ return a + (n.save ? n.mem : 0); }, 0);
+    var extraFlops = NODES.reduce(function(a,n){ return a + (n.save ? 0 : n.flops); }, 0);
+    var peak = savedMem + WORKING_MB;
+
+    memEl.textContent  = fmtMB(savedMem);
+    flopEl.textContent = extraFlops.toFixed(1) + ' GF  (' +
+                         Math.round(100*extraFlops/FULL_FWD_GFLOPS) + '% of a forward)';
+    peakEl.textContent = fmtMB(peak);
+
+    var fits = peak <= BUDGET_MB;
+    fitEl.textContent = fits ? 'yes' : 'OOM';
+    if (fits){ kPeak.classList.remove('over'); fitEl.style.color = 'var(--ok)'; }
+    else     { kPeak.classList.add('over');    fitEl.style.color = 'var(--bad)'; }
+  }
+
+  document.getElementById('rp-save').addEventListener('click', function(){
+    NODES.forEach(function(n){ n.save = true; }); update();
+  });
+  document.getElementById('rp-recmp').addEventListener('click', function(){
+    NODES.forEach(function(n){ n.save = false; }); update();
+  });
+  document.getElementById('rp-mincut').addEventListener('click', function(){
+    // save expensive-and-shared (the matmul outputs); recompute cheap-and-big elementwise
+    // (gelu, dropout) AND the moderate-cost norm, so peak fits the 16 GB budget.
+    NODES.forEach(function(n){ n.save = (n.flops >= 10); }); update();
+  });
+
+  update();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

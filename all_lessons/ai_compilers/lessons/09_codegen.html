@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>09 · Code generation</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local layout only — failure/checklist columns + the codegen picker meters */
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; font-size: 15px; }
+  .lesson-card ul { margin: 0; padding-left: 18px; }
+  .lesson-card li { margin: 7px 0; font-size: 13.5px; line-height: 1.5; }
+  .kpi.over .v { color: var(--bad); }
+  .kpi.good .v { color: var(--ok); }
+  .meter { height: 9px; border-radius: 5px; background: var(--bg-soft); border: 1px solid var(--border); overflow: hidden; margin-top: 6px; }
+  .meter > span { display: block; height: 100%; border-radius: 5px; transition: width .15s ease; }
+  .cg-verdict { margin-top: 12px; font-size: 13.5px; line-height: 1.5; color: var(--text-mute); border-left: 3px solid var(--accent); padding: 8px 12px; background: var(--bg-elev); border-radius: 0 8px 8px 0; }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">ai_compilers / lessons</a><span class="crumb">/</span><span class="crumb">09 · codegen</span><span class="step-pill">lesson 10 / 16</span></div></header>
+
+<main>
+
+<p class="kicker">Part IV — Back end</p>
+<h1>Code generation</h1>
+<p class="subtitle">Lesson 08 chose a <em>schedule</em> for the laid-out graph: tile sizes, loop order, what to stage into SRAM, where to vectorize and unroll. That is a complete recipe for how the loops should run — and not one byte of it executes. A schedule is a plan written in the compiler's own notation; the GPU runs <em>instructions</em>, and there is no instruction in a schedule. This lesson is where the plan becomes machine code: <strong>codegen</strong>, the lowering of a scheduled IR onto a real backend. The fork in the road is which backend — emit low-level <strong>LLVM IR → PTX → SASS</strong> and let LLVM do register allocation and instruction selection, or emit a tile DSL like <strong>Triton</strong> and let <em>its</em> compiler map tiles onto warps and threads. Modern stacks took the second road, and this lesson is the argument for why.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>Lesson 08 separated the algorithm (<em>what</em> to compute) from the schedule (<em>when and where</em> the loops run), and picked a schedule: tile the matmul 128×128×32, stage the A and B tiles into SRAM, vectorize the inner load, unroll by 4. Every one of those decisions is now a fact in the IR. But the IR is still a data structure inside the compiler — a description of a loop nest, not a sequence of opcodes the streaming multiprocessor can fetch and execute. There is no kernel binary, no launch grid, no register assignment, nothing the CUDA driver can hand to the GPU. The schedule says <em>"a tile is 128×128"</em>; it does not say <em>which</em> registers hold the accumulator, <em>which</em> <code>HMMA</code> instructions issue the tensor-core matmul, or how the host even launches the thing. Until something emits real target code, lesson 08's careful plan is inert.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> a schedule is a plan in the compiler's IR — nothing in it is an instruction the GPU runs; the loop nest must become a real kernel binary plus host launch code for a concrete target.<br><strong>New idea:</strong> <strong>codegen / lowering to a backend</strong> — emit either (a) <strong>LLVM IR → NVVM → PTX → SASS</strong> (the classic path: LLVM does register allocation and instruction selection), or (b) a <strong>tile DSL like Triton</strong> as the backend (you emit Triton/MLIR; its compiler does the within-block thread mapping). The codegen target <em>is</em> a rung of the abstraction↔specialization trade — raw PTX buys peak but locks you to one ISA, Triton buys portability for a little peak. Inductor chose Triton. Compile once, <strong>cache</strong> the artifact, run it millions of times.<br><strong>Forces next:</strong> codegen can emit <em>any</em> schedule — but <em>which</em> tile sizes, num_warps, num_stages? The space is huge and shape-dependent, and no human picks it per kernel. That forces a search: autotuning (lesson 10).</div>
+
+<div class="callout"><div class="label">The plan</div>Five moves. (1) What codegen actually produces — a <strong>device kernel</strong> plus <strong>host</strong> launch/grid code, the two-sided artifact. (2) Path A: lower to <strong>LLVM IR</strong>, let NVVM emit <strong>PTX → SASS</strong>; what LLVM gives you (regalloc, instruction selection) and where it falls short for tensor code. (3) Path B: emit <strong>Triton</strong> — why Inductor chose it, you write tiles and Triton's MLIR compiler handles warps and threads. (4) The worked snippet: the fused <code>bias + gelu</code> from lesson 05 as generated Triton, contrasted with the PTX path. (5) <strong>Caching</strong> the compiled artifact and the compile-time cost. Then drive the picker until raw PTX wins peak but loses on lines-of-code and portability, and Triton wins everywhere else.</div>
+
+<h2>1 · What codegen produces: device code + host launch code</h2>
+
+<p>Codegen does not emit "a kernel." It emits two coupled things, and forgetting the second one is the classic beginner's blind spot. The <strong>device code</strong> is the kernel itself — the program each GPU thread runs, expressed eventually as <strong>SASS</strong> (the GPU's actual machine instructions). The <strong>host code</strong> is the CPU-side glue that <em>launches</em> it: it allocates or reuses output buffers, computes the launch grid (how many thread blocks, of what shape), packs the kernel arguments (pointers, strides, scalar params), and issues the launch on a CUDA stream. The schedule from lesson 08 fixes both: the tile size sets the grid (<span class="math">grid = ⌈M/BLOCK_M⌉ × ⌈N/BLOCK_N⌉</span>), and the loop body becomes the device kernel.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">device code</div><div class="v">The per-thread-block program. Lowered to SASS, the GPU's real ISA. Holds the loads, the tensor-core math, the stores. This is what "the kernel" usually means.</div></div>
+  <div class="topic-card"><div class="k">host code</div><div class="v">CPU-side launch: compute grid from tile size, pack args (pointers, strides, scalars), pick stream, call the launch. Cheap to emit, fatal to omit.</div></div>
+  <div class="topic-card"><div class="k">grid / launch config</div><div class="v">Number and shape of thread blocks, derived from the schedule's tiling. <span class="math">grid = ⌈M/BLOCK_M⌉ × ⌈N/BLOCK_N⌉</span>. Set here, tuned in lesson 10.</div></div>
+</div>
+
+<p>Where eager PyTorch issued one library kernel per op with the launch handled by ATen (cross-link <a href="../../gpu_kernels/18_pytorch_to_kernel.html">gpu_kernels · 18 (PyTorch to kernel)</a>), the compiler must now <em>generate</em> both halves itself — because the fused kernels from lesson 05 do not exist in any library; only the compiler knows their shape. That is the whole point of getting here: bespoke kernels demand bespoke codegen.</p>
+
+<h2>2 · Path A — lower to LLVM IR → NVVM → PTX → SASS</h2>
+
+<p>The classic path treats the GPU like any other compiler target: lower the scheduled loop nest to <strong>LLVM IR</strong> — a low-level, typed, SSA instruction set with explicit loads, stores, arithmetic, and branches, the same IR Clang uses for C++ — then hand it to a target backend. For NVIDIA that backend is <strong>NVVM</strong> (NVIDIA's LLVM-based compiler), which emits <strong>PTX</strong> (Parallel Thread Execution: a stable, virtual assembly / ISA that is forward-compatible across GPU generations), which the driver's <code>ptxas</code> finally compiles down to <strong>SASS</strong> (the actual, architecture-specific machine code for one GPU, e.g. sm_90 for Hopper). XLA, TVM's LLVM backend, and Triton's own bottom all end here.</p>
+
+<div class="ir-ladder">
+  <div class="rung"><div class="lvl">LLVM IR</div><div class="desc">Typed SSA: explicit <code>load</code>/<code>store</code>/<code>fadd</code>/<code>br</code>, loops as basic blocks. Target-agnostic but already scalar-level. LLVM runs regalloc + instruction selection here.</div></div>
+  <div class="rung"><div class="lvl">NVVM → PTX</div><div class="desc">Virtual GPU ISA. Stable across generations, forward-compatible. Threads, shared memory, and special registers appear; tensor-core ops as PTX <code>mma</code> intrinsics.</div></div>
+  <div class="rung"><div class="lvl">SASS (ptxas)</div><div class="desc">Real machine code for one architecture (sm_90, sm_80…). Final register schedule, instruction encoding, <code>HMMA</code> tensor-core instructions. What the SM actually fetches.</div></div>
+</div>
+
+<p>What LLVM <em>gives</em> you for free is enormous and is exactly why people reach for it: <strong>register allocation</strong> (deciding which values live in the GPU's limited registers vs spill to local memory), <strong>instruction selection</strong> (matching IR patterns to the best target opcodes), constant propagation, peephole optimization, and a mature backend per ISA. You describe the computation scalar-by-scalar; LLVM turns it into a tight register schedule.</p>
+
+<p>What LLVM does <em>not</em> give you is the hard part of tensor code. LLVM reasons at the level of scalars and machine vectors; it has no native concept of a <strong>tile</strong>, of <strong>shared-memory staging</strong>, of <strong>warp-level tensor-core matmul</strong>, or of the cooperative dance where 256 threads load a 128×128 block, multiply it on the tensor cores, and write it back. To get a fast matmul out of the LLVM path you must hand-write all of that thread choreography — the shared-memory double-buffering, the <code>mma</code> fragment layouts, the bank-conflict-free swizzles — directly, in PTX or in CUDA-with-intrinsics. The IR is low; the abstraction it offers (a scalar machine with vectors) is the <em>wrong shape</em> for a tensor program. That is the gap the next path closes.</p>
+
+<pre class="ascii">scheduled loop nest (lesson 08)
+        │  lower scalars, loads/stores, branches
+        ▼
+   LLVM IR ──► regalloc + instruction selection  (LLVM gives you this)
+        │      but: no tiles, no SRAM staging, no warp-MMA  (you hand-write these)
+        ▼
+   NVVM ──► PTX (virtual ISA, forward-compatible)
+        │      ptxas
+        ▼
+   SASS (sm_90 machine code) ──► the SM executes it</pre>
+
+<h2>3 · Path B — emit a tile DSL (Triton) and let it map threads</h2>
+
+<p>The second path raises the codegen target from a scalar machine to a <strong>tile machine</strong>. Instead of lowering all the way to LLVM yourself, you emit <strong>Triton</strong> — a Python-embedded kernel language whose unit of work is the tile, not the thread. You write the program for <em>one block</em>: which output tile it owns, which input tiles to <code>tl.load</code> into SRAM, the block-level matmuls and reductions on that hot data, the <code>tl.store</code> back. Triton's own compiler (built on MLIR) then does the part LLVM could not: it maps your tiles onto warps and threads, lays out shared memory, picks tensor-core <code>mma</code> instructions, schedules the loads to hide latency, and finally lowers <em>that</em> to LLVM → PTX → SASS. You handed off the thread choreography. The deeper treatment of the tile model and how Triton lowers is in <a href="../../gpu_kernels/22_writing_triton.html">gpu_kernels · 22 (writing Triton)</a>.</p>
+
+<p>This is why <strong>Inductor — the codegen backend of <code>torch.compile</code> — generates Triton rather than raw CUDA/PTX</strong> (cross-link <a href="../../gpu_kernels/23_torch_compile.html">gpu_kernels · 23 (torch.compile)</a>). The compiler's job after fusion (lesson 05) is to emit a <em>kernel per fusion group</em>, and there are thousands of distinct groups across real models. Emitting hand-tuned PTX for each is intractable; emitting Triton is a few dozen lines of templated codegen. The trade is explicit:</p>
+
+<table class="trade-table">
+  <thead><tr><th>backend</th><th>you emit</th><th>who maps threads</th><th>peak perf</th><th>portability</th><th>codegen surface</th></tr></thead>
+  <tbody>
+    <tr><td><strong>LLVM → PTX/SASS</strong></td><td>scalar IR + hand-written thread/SRAM/MMA choreography</td><td>you (then LLVM regalloc)</td><td>highest — full control of every instruction</td><td>locked to NVIDIA ISA; a second path for AMD/etc.</td><td>huge — must generate the choreography per kernel</td></tr>
+    <tr><td><strong>Triton (tile DSL)</strong></td><td>tile-level program (loads, <code>tl.dot</code>, stores)</td><td>Triton's MLIR compiler</td><td>~5–15% off peak for most kernels</td><td>portable — Triton has NVIDIA + AMD backends</td><td>small — a templated tile kernel per fusion group</td></tr>
+  </tbody>
+</table>
+
+<p>The verdict the field reached: for the long tail of fused pointwise/reduction kernels — the bulk of what a compiler emits — Triton's portability and tiny codegen surface dominate, and the few percent of peak you leave on the table is recovered by fusing more aggressively and by autotuning (lesson 10). Raw PTX/SASS is reserved for the handful of kernels where peak is worth a human's month: the flagship GEMM, FlashAttention (cs336/07), the cuDNN/cuBLAS-class library primitives. Everything else, the compiler generates as Triton.</p>
+
+<h2>4 · Worked: the fused bias + gelu, generated two ways</h2>
+
+<p>Take the fused <code>bias + gelu</code> kernel from lesson 05 — the elementwise epilogue that, fused, reads the activation from HBM once, adds the bias, applies GELU, writes once. Here is what Inductor-style codegen <em>emits</em> for it: a Triton kernel. Note the level — tiles, masks, block-wide math; no thread, no register named.</p>
+
+<pre><code>@triton.jit
+def fused_bias_gelu(X, B, Y, n_elements, n_features, BLOCK: tl.constexpr):
+    pid  = tl.program_id(0)                       # this block owns one tile
+    offs = pid * BLOCK + tl.arange(0, BLOCK)      # the tile's element indices
+    mask = offs < n_elements                      # guard the ragged last tile
+    x = tl.load(X + offs, mask=mask)              # one HBM read of the tile
+    b = tl.load(B + offs % n_features, mask=mask) # broadcast bias along features
+    h = x + b                                      # bias add, in registers
+    # tanh-approx GELU, all on hot data — never written to HBM:
+    g = 0.5 * h * (1.0 + tl.math.tanh(0.79788456 * (h + 0.044715 * h * h * h)))
+    tl.store(Y + offs, g, mask=mask)             # one HBM write of the tile
+# host: grid = (triton.cdiv(n_elements, BLOCK),)   <-- launch code, generated too</code></pre>
+
+<p>A handful of readable lines of math plus a host launch line. The compiler picks <code>BLOCK</code> (and <code>num_warps</code>) — that is what lesson 10 tunes. Now contrast the <em>shape</em> of the same kernel down the LLVM/PTX path. You do not write tiles; you write the scalar loop, and the generated PTX is per-thread, verbose, and ISA-specific:</p>
+
+<pre class="ascii">// sketch of the same bias+gelu as generated PTX (per-thread, abridged)
+.visible .entry fused_bias_gelu(.param .u64 X, .param .u64 B, .param .u64 Y, .param .u32 n) {
+    mov.u32    %r1, %ctaid.x;          // block id
+    mov.u32    %r2, %ntid.x;           // block dim
+    mov.u32    %r3, %tid.x;            // thread id
+    mad.lo.s32 %r4, %r1, %r2, %r3;     // global index  = block*dim + thread
+    setp.ge.s32 %p1, %r4, %n;          // bounds guard
+    @%p1 bra   DONE;
+    // ... compute byte offset, ld.global.f32 x, ld.global.f32 b ...
+    add.f32    %f3, %f1, %f2;          // bias add
+    // ... ~20 more PTX instrs: h*h*h, tanh poly, 0.5*h*(1+...) ...
+    st.global.f32 [%rd_y], %f_out;     // store
+DONE: ret;
+}</pre>
+
+<p>Two facts jump out. First, <strong>length</strong>: the Triton version is ~6 lines of intent; the PTX is dozens of per-thread opcodes, and that ratio explodes for anything with a matmul or a reduction, where the PTX must spell out shared-memory staging and <code>mma</code> fragments by hand. Second, <strong>lock-in</strong>: the PTX is NVIDIA-only and you would write a separate file for AMD; the Triton compiles to either. For a <em>single</em> elementwise kernel the gap is annoying. For the thousands of fusion groups a compiler emits, it is the difference between a maintainable backend and an impossible one — which is precisely why Inductor emits the top snippet, not the bottom.</p>
+
+<h2>5 · Cache the artifact: compile once, run a million times</h2>
+
+<p>Codegen and the subsequent LLVM/ptxas (or Triton) compile are <em>not</em> free — emitting and compiling one kernel costs from a few tens of milliseconds (a simple Triton kernel) to seconds (a heavily-autotuned GEMM under <code>max-autotune</code>). If that cost were paid on every forward pass, the compiler would be a catastrophe. It is not, because of the one fact that makes the whole enterprise pay off: <strong>an ML workload runs the same shapes a million times.</strong> So codegen compiles each kernel <em>once</em> and stores the compiled artifact in a <strong>code cache</strong>, keyed by everything that would change the generated code — the source, the input shapes and dtypes, the schedule config, the target architecture. Every later call with a matching key is a cache <em>hit</em>: the kernel is already a binary, and you just launch it.</p>
+
+<table class="trade-table">
+  <thead><tr><th>event</th><th>cost</th><th>amortized over</th></tr></thead>
+  <tbody>
+    <tr><td>first call (cache miss): codegen + compile</td><td>≈30 ms – a few s per kernel (illustrative)</td><td>one-time, at warmup</td></tr>
+    <tr><td>later calls (cache hit): launch the cached binary</td><td>≈3–10 µs launch (the lesson-01 cost)</td><td>every step, millions of times</td></tr>
+    <tr><td>on-disk cache (e.g. Inductor's <code>~/.cache/torch/inductor</code>)</td><td>survives process restarts</td><td>across runs; invalidate on torch/source bump</td></tr>
+  </tbody>
+</table>
+
+<p>This is why <code>torch.compile</code>'s first step is slow and the rest fly (cross-link <a href="../../gpu_kernels/23_torch_compile.html">gpu_kernels · 23</a>): the first call is a compile storm, the steady state is pure cache hits. Two consequences matter in production. <strong>Cold start</strong>: a latency-sensitive service must warm up with representative shapes before serving, or the first user pays the compile. <strong>Cache key</strong>: anything that changes the key — a new shape, a new dtype — is a miss and a recompile, which is exactly the wall that dynamic shapes (lesson 11) crash into. For now, hold the win: codegen pays its cost once and the cache turns it into a rounding error.</p>
+
+<h2>6 · Drive it: pick the codegen target</h2>
+
+<p>The widget below makes the codegen-target trade a knob. For the fused <code>bias + gelu</code> (and, toggle on, a tiled matmul to see the gap widen), pick the backend — <strong>LLVM → PTX/SASS</strong> or <strong>Triton</strong> — and the tile/<code>num_warps</code> config. Watch four readouts: <strong>lines of generated code</strong> (the codegen-surface cost), <strong>portability</strong> (which hardware the artifact runs on), <strong>est. peak-% reachable</strong> (how close to hand-tuned), and <strong>compile time</strong>. The knob that breaks: pick PTX for the matmul and watch lines-of-code and compile time explode while portability collapses to one ISA — the few extra points of peak come at a cost no compiler can pay across thousands of kernels.</p>
+
+<div class="widget" id="cg">
+  <div class="title">Codegen target picker: bias+gelu / matmul</div>
+  <div class="hint">Pick the backend and config. Triton = far fewer lines, portable, ~90% of peak — the choice for the long tail of fused kernels. Raw PTX/SASS = max peak but verbose and locked to one ISA — reserved for a few flagship kernels. Toggle the matmul to watch the PTX line-count and compile-time blow up while Triton stays flat.</div>
+
+  <div class="controls" style="margin-top: 4px;">
+    <label class="inline">backend:
+      <select id="cg-backend">
+        <option value="triton" selected>Triton (tile DSL)</option>
+        <option value="ptx">LLVM → PTX/SASS (raw)</option>
+      </select>
+    </label>
+    <label class="inline">kernel:
+      <select id="cg-kernel">
+        <option value="bg" selected>fused bias + gelu</option>
+        <option value="mm">tiled matmul (128×128×32)</option>
+      </select>
+    </label>
+    <label class="inline">tile (BLOCK): <input type="range" id="cg-tile" min="64" max="1024" step="64" value="256"> <span class="val" id="cg-tilev">256</span></label>
+    <label class="inline">num_warps: <input type="range" id="cg-warps" min="1" max="16" step="1" value="4"> <span class="val" id="cg-warpsv">4</span></label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi" id="cg-k-loc"><div class="k">lines of generated code</div><div class="v" id="cg-loc">—</div></div>
+    <div class="kpi" id="cg-k-port"><div class="k">portability</div><div class="v" id="cg-port">—</div></div>
+    <div class="kpi" id="cg-k-peak"><div class="k">est. peak-% reachable</div><div class="v" id="cg-peak">—</div></div>
+    <div class="kpi" id="cg-k-time"><div class="k">compile time</div><div class="v" id="cg-time">—</div></div>
+  </div>
+
+  <div style="margin-top:10px;">
+    <div style="font-family:var(--mono);font-size:11px;color:var(--text-mute);">peak reachable</div>
+    <div class="meter"><span id="cg-bar-peak"></span></div>
+    <div style="font-family:var(--mono);font-size:11px;color:var(--text-mute);margin-top:10px;">codegen surface (lines, log)</div>
+    <div class="meter"><span id="cg-bar-loc"></span></div>
+  </div>
+
+  <div class="cg-verdict" id="cg-verdict">—</div>
+</div>
+
+<p>Slide it and the verdict is stable: Triton sits near the floor on lines-of-code and compile time and runs on both vendors at ~90% of peak; PTX climbs to the last few points of peak only by paying a 10–40× line-count penalty, a slower compile, and a one-ISA lock-in. For the one GEMM that runs in every layer, a team pays that. For the thousands of fused kernels behind it, the compiler emits Triton and moves on.</p>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Emitting the device kernel but not the host launch.</strong> A kernel with no grid/arg-packing code never runs. <em>Signal:</em> codegen "succeeds" but nothing executes, or a launch error about missing arguments / zero blocks.</li>
+    <li><strong>Reaching for raw PTX for ordinary fused kernels.</strong> Hand-writing PTX for a bias+gelu to "get peak." <em>Signal:</em> a 40× codegen surface and a maintenance burden to save 3% on a kernel that is 1% of runtime — you optimized the wrong thing.</li>
+    <li><strong>Expecting LLVM to handle tensor structure.</strong> Lowering a matmul straight to LLVM IR and assuming you get tensor-core MMA. <em>Signal:</em> the kernel runs on CUDA cores, not tensor cores; perf is ~15× below the tiled Triton/cuBLAS version (cross-link gpu_kernels/09).</li>
+    <li><strong>Treating PTX as final machine code.</strong> Forgetting <code>ptxas</code> recompiles PTX → SASS per architecture. <em>Signal:</em> a kernel JIT-recompiles or fails on a different GPU generation because only PTX, not SASS, was cached.</li>
+    <li><strong>No code cache (or a wrong cache key).</strong> Recompiling the same kernel every call, or a hit when the dtype actually changed. <em>Signal:</em> every step is slow (key too loose → miss) or numerically wrong (key too tight missed a dtype) — compile cost never amortizes.</li>
+  </ul>
+  </div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><strong>Emit both halves.</strong> Device kernel <em>and</em> host launch: grid from tile size, packed args, stream.</li>
+    <li><strong>Default to a tile DSL.</strong> Generate Triton for the fused long tail; it is portable and small to emit.</li>
+    <li><strong>Reserve PTX/SASS for the flagships.</strong> The one GEMM, attention — kernels worth a human's tuning month.</li>
+    <li><strong>Let the backend do regalloc + ISel.</strong> Don't reinvent register allocation; LLVM/Triton already do it.</li>
+    <li><strong>Cache by a complete key.</strong> Source + shapes + dtypes + config + target arch. Compile once, launch forever.</li>
+    <li><strong>Warm up before serving.</strong> Pay the compile storm at startup, not on the first user request.</li>
+  </ul>
+  </div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the widget with <strong>fused bias + gelu</strong> and <strong>Triton</strong>: note the lines-of-code, the ~90% peak, and that portability reads "NVIDIA + AMD." Switch the backend to <strong>PTX</strong>: peak ticks up a few points, but lines-of-code roughly doubles and portability drops to "NVIDIA only." Now flip the kernel to <strong>tiled matmul</strong> and switch between backends again — watch the PTX line-count and compile time blow up far more than they did for bias+gelu (because the matmul backend must hand-write SRAM staging + MMA fragments), while Triton barely moves. Predict before you slide <code>num_warps</code>: does it change lines-of-code? (Barely — warps are a launch/scheduling knob the backend consumes, not source you write; it's exactly the kind of config lesson 10 will <em>search</em>.) The takeaway you should be able to state: codegen target is a portability↔peak dial, and modern compilers park it at "Triton" for everything but a handful of kernels.</div>
+
+<h2>Where this points next</h2>
+
+<p>Codegen closes the gap from plan to machine code: a scheduled loop nest becomes a device kernel plus host launch, emitted as Triton for the long tail and reserved-PTX for the flagships, then cached so its compile cost amortizes to nothing. But notice what we waved past. Codegen can faithfully emit <em>any</em> schedule you hand it — which silently assumes you already <em>chose</em> the right one. Lesson 08 picked a schedule by hand for one matmul; a real model has thousands of kernels, each with a configuration space of tile sizes (powers of two from 16 to 256 on each axis), <code>num_warps</code> (1–16), <code>num_stages</code> (pipeline depth), and unroll factors — a combinatorial space whose best point depends on the exact shape and the exact GPU. No human picks <code>BLOCK=256, num_warps=4</code> per kernel per shape, and the widget's knobs you just slid are precisely the ones that need choosing. The only way out is to <em>search</em> the space — benchmark candidates, or predict them with a cost model — and keep the winner. That is lesson 10, <strong><a href="10_autotuning.html">Autotuning &amp; cost models</a></strong>.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>A schedule is a plan in the compiler's IR; nothing in it is an instruction the GPU runs, so <strong>codegen</strong> must lower it to a real target — a <strong>device kernel</strong> (lowered to <strong>SASS</strong>, the GPU's machine ISA) plus the <strong>host</strong> launch code that computes the grid from the tile size and packs the args. There are two backends, and they are a rung of the abstraction↔specialization trade. <strong>Path A</strong> lowers to <strong>LLVM IR</strong> and lets <strong>NVVM → PTX → SASS</strong> handle <strong>register allocation</strong> and <strong>instruction selection</strong> — but LLVM reasons in scalars and has no notion of a tile, SRAM staging, or warp-level tensor-core MMA, so you must hand-write all that choreography, in NVIDIA-locked, verbose PTX. <strong>Path B</strong> emits a <strong>tile DSL like Triton</strong>: you write the one-block program (loads, <code>tl.dot</code>, stores) and Triton's MLIR compiler maps tiles to warps and threads before lowering to PTX. The fused <code>bias+gelu</code> from lesson 05 is ~6 readable Triton lines vs dozens of per-thread PTX opcodes, and the gap explodes for matmuls. So <strong>Inductor generates Triton</strong>: it trades ~5–15% of peak for portability (NVIDIA + AMD) and a tiny codegen surface across the thousands of fusion groups it must emit, reserving raw PTX/SASS for the few flagship kernels. Because the same shapes run a million times, codegen compiles each kernel once, <strong>caches</strong> the artifact by a key of source + shapes + dtypes + config + arch, and amortizes the compile to a rounding error. The unanswered question — <em>which</em> tile sizes, warps, stages, out of a huge shape-dependent space — forces autotuning.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Codegen produces more than "a kernel." What are the two parts and why does the second matter? <em>(§1 — the device kernel (lowered to SASS) and the host launch code that computes the grid from the tile size, packs args, and issues the launch; without the host half nothing runs, and for fused kernels neither half exists in any library so the compiler must generate both.)</em></li>
+  <li>Walk the classic lowering path and say what each level is. <em>(§2 — scheduled IR → LLVM IR (typed SSA, scalar-level) → NVVM → PTX (virtual, forward-compatible ISA) → SASS (real per-architecture machine code via ptxas). LLVM does regalloc + instruction selection.)</em></li>
+  <li>What does LLVM give you, and why is it the wrong abstraction for tensor code? <em>(§2 — it gives register allocation, instruction selection, peephole opts; but it reasons in scalars/vectors with no native tile, SRAM staging, or warp-MMA concept, so you must hand-write the thread choreography to get tensor-core speed.)</em></li>
+  <li>Why did Inductor choose to generate Triton instead of raw CUDA/PTX? <em>(§3–4 — it must emit a kernel per fusion group, thousands of them; Triton is a tile-level DSL where its MLIR compiler maps threads, so codegen is a few templated lines per group and the artifact is portable (NVIDIA+AMD), trading ~5–15% peak for a maintainable backend.)</em></li>
+  <li>Distinguish PTX from SASS. <em>(§2 — PTX is a stable, forward-compatible virtual ISA emitted by NVVM; SASS is the real, architecture-specific machine code that ptxas produces from PTX and the SM actually executes. Cache SASS per arch, or you JIT-recompile.)</em></li>
+  <li>Codegen + compile cost tens of ms to seconds per kernel. Why isn't that fatal? <em>(§5 — ML runs the same shapes a million times, so each kernel is compiled once and stored in a code cache keyed by source/shapes/dtypes/config/arch; later calls are cache hits that just launch the cached binary, amortizing compile to ~nothing.)</em></li>
+  <li>What is the cache key, and which later lesson does it set up? <em>(§5 — everything that would change generated code: source, input shapes, dtypes, schedule config, target arch; a new shape is a miss → recompile, which is exactly the dynamic-shapes wall in lesson 11.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="08_scheduling.html"><span class="dir">← Back</span><span class="ttl">08 · Scheduling</span></a>
+  <a class="next" href="10_autotuning.html"><span class="dir">Next →</span><span class="ttl">10 · Autotuning</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var backend = document.getElementById('cg-backend');
+  var kernel  = document.getElementById('cg-kernel');
+  var tile    = document.getElementById('cg-tile');
+  var warps   = document.getElementById('cg-warps');
+  if (!backend) return;
+
+  var vTile = document.getElementById('cg-tilev'), vWarps = document.getElementById('cg-warpsv');
+  var loc = document.getElementById('cg-loc'), port = document.getElementById('cg-port');
+  var peak = document.getElementById('cg-peak'), time = document.getElementById('cg-time');
+  var barPeak = document.getElementById('cg-bar-peak'), barLoc = document.getElementById('cg-bar-loc');
+  var verdict = document.getElementById('cg-verdict');
+  var kLoc = document.getElementById('cg-k-loc'), kPort = document.getElementById('cg-k-port');
+
+  function css(v, fb){ var c = getComputedStyle(document.documentElement).getPropertyValue(v).trim(); return c || fb; }
+
+  function compute(){
+    var be = backend.value, kn = kernel.value;
+    var T = +tile.value, W = +warps.value;
+    vTile.textContent = T; vWarps.textContent = W;
+
+    // base lines-of-code per (backend, kernel) — Triton emits intent, PTX emits per-thread opcodes
+    var locBG_triton = 6,   locMM_triton = 22;     // tile-level source
+    var locBG_ptx    = 40,  locMM_ptx    = 520;    // per-thread / hand-written SRAM+MMA
+    var lines, peakPct, portTxt, portClass, compileMs;
+
+    if (be === 'triton'){
+      lines   = (kn === 'bg') ? locBG_triton : locMM_triton;
+      peakPct = (kn === 'bg') ? 95 : 88;           // ~5-15% off peak
+      portTxt = 'NVIDIA + AMD'; portClass = 'good';
+      compileMs = (kn === 'bg') ? 35 : 220;        // includes some Triton lowering
+    } else {
+      lines   = (kn === 'bg') ? locBG_ptx : locMM_ptx;
+      peakPct = (kn === 'bg') ? 98 : 99;           // raw PTX can reach peak
+      portTxt = 'NVIDIA only'; portClass = 'over';
+      compileMs = (kn === 'bg') ? 90 : 1400;       // ptxas + hand path
+    }
+
+    // config nudges: a wildly-off tile costs a little peak (illustrative, small)
+    var ideal = (kn === 'bg') ? 256 : 128;
+    var off = Math.abs(Math.log2(T) - Math.log2(ideal));
+    peakPct = Math.max(60, Math.round(peakPct - off * 4));
+    // num_warps far from sweet spot also shaves a little
+    var wIdeal = 4;
+    peakPct = Math.max(55, peakPct - Math.abs(W - wIdeal) * 1.2);
+    peakPct = Math.round(peakPct);
+
+    loc.textContent  = lines.toLocaleString('en-US');
+    peak.textContent = peakPct + '%';
+    time.textContent = compileMs >= 1000 ? (compileMs/1000).toFixed(1) + ' s' : compileMs + ' ms';
+    port.textContent = portTxt;
+
+    // color the portability + loc KPIs
+    kPort.classList.toggle('good', portClass === 'good');
+    kPort.classList.toggle('over', portClass === 'over');
+    kLoc.classList.toggle('over', lines > 100);
+    kLoc.classList.toggle('good', lines <= 30);
+
+    // meters
+    barPeak.style.width = peakPct + '%';
+    barPeak.style.background = peakPct >= 90 ? css('--ok','#16a34a') : (peakPct >= 75 ? css('--accent','#3b82f6') : css('--bad','#ef4444'));
+    // lines on a log scale, cap ~ log10(1000)=3
+    var locFrac = Math.min(1, Math.log10(Math.max(1, lines)) / 3);
+    barLoc.style.width = (locFrac * 100).toFixed(0) + '%';
+    barLoc.style.background = lines > 100 ? css('--bad','#ef4444') : (lines > 30 ? css('--accent','#3b82f6') : css('--ok','#16a34a'));
+
+    // verdict
+    var v;
+    if (be === 'triton'){
+      v = 'Triton: ' + lines + ' lines, runs on both vendors, ' + peakPct + '% of peak. The right default — small codegen surface across thousands of fusion groups. The few points below peak are recovered by fusing more (lesson 05) and autotuning the tile/warps (lesson 10).';
+    } else {
+      v = 'Raw PTX/SASS: ' + lines.toLocaleString('en-US') + ' lines, NVIDIA-only, ~' + peakPct + '% of peak. You bought the last few points of performance with a ' + (kn==='mm'?'~24×':'~7×') + ' codegen-surface penalty' + (kn==='mm'?' and hand-written SRAM staging + MMA fragments':'') + ' and a slower compile. Worth it for one flagship kernel; ruinous across the long tail.';
+    }
+    verdict.textContent = v;
+  }
+
+  [backend, kernel].forEach(function(s){ s.addEventListener('change', compute); });
+  [tile, warps].forEach(function(s){ s.addEventListener('input', compute); });
+  compute();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

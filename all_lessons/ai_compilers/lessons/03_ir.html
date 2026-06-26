@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>03 · The intermediate representation</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local layout only — failure/checklist columns + the lowering-ladder widget */
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; font-size: 15px; }
+  .lesson-card ul { margin: 0; padding-left: 18px; }
+  .lesson-card li { margin: 7px 0; font-size: 13.5px; line-height: 1.5; }
+  .kpi.over .v { color: var(--bad); }
+  .kpi.good .v { color: var(--ok); }
+  #lower-ir { margin: 10px 0 6px; max-height: 280px; overflow:auto; }
+  .lvl-bar { display:flex; flex-wrap:wrap; gap:6px; margin: 6px 0 2px; }
+  .lvl-bar button { font-family: var(--mono); font-size: 12px; padding: 6px 10px; border:1px solid var(--border); border-radius:6px; background: var(--bg-elev); color: var(--text-mute); cursor:pointer; }
+  .lvl-bar button.on { border-color: var(--accent); color: var(--text); box-shadow: 0 0 0 1px var(--accent) inset; }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">ai_compilers / lessons</a><span class="crumb">/</span><span class="crumb">03 · IR</span><span class="step-pill">lesson 4 / 16</span></div></header>
+
+<main>
+
+<p class="kicker">Part II — Front end</p>
+<h1>The intermediate representation</h1>
+<p class="subtitle">Lesson 02 handed you a captured graph — Dynamo walked the bytecode and emitted an FX graph of the tensor ops. But "a graph" sells it short: what you actually have is a pile of framework objects, each holding references to the next, with shapes baked in by tracing and mutation hiding in views and in-place ops. You cannot safely rewrite that. To fold a constant, merge two ops, or cancel a pair of transposes — and to do it a thousand times in a row without breaking the math — you need a representation with <em>rules</em>: what a value is, what a type carries, and what makes a rewrite legal. This lesson builds that representation, and then makes the one move that defines an ML compiler: there is not one IR but a <strong>ladder</strong> of them.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>Capture gave you a graph, but a graph of <em>what</em>? In eager PyTorch a tensor is a mutable object: <code>x.add_(1)</code> rewrites it in place, a <code>view</code> aliases another tensor's storage, and two names can point at the same bytes. If your IR inherits that, every rewrite becomes a whole-program alias analysis — "is it safe to fold this constant?" depends on whether some far-away op mutates a tensor this one aliases. That does not compose: you cannot apply pass after pass to a fixed point when each pass must re-prove global safety. And even with clean semantics, a single flat list of framework ops (<code>conv</code>, <code>softmax</code>, <code>layer_norm</code>) is the wrong altitude for half the optimizations you want — it is too coarse to express loop tiling and too abstract to talk about vector registers. You need both a sound representation and the right level of it.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> safe, composable, repeated transformation needs a principled IR, not a pile of mutable framework objects.<br><strong>New idea:</strong> a good ML IR is a <strong>typed dataflow DAG</strong> in <strong>SSA / value-semantics</strong> form (each value defined once, no hidden mutation → every rewrite is a local, provable no-op) with a small op set; and crucially there are <strong>multiple levels</strong> of IR — high (framework ops) → mid (linalg / loop nests) → low (vector/scalar) — because no single abstraction can host every optimization. <strong>Lowering</strong> = descending one level, spending portability to buy concrete control. This is the <strong>abstraction ↔ specialization</strong> motif, stated here for the whole track.<br><strong>Forces next:</strong> an IR with typed values and legality rules is an invitation — something has to actually <em>match and rewrite</em> subgraphs to a fixed point. That engine is lesson 04.</div>
+
+<div class="callout"><div class="label">The plan</div>Five moves. (1) Why value semantics / SSA make rewriting <em>local</em> and sound — aliasing and mutation are the enemy. (2) The IR as a typed dataflow DAG, with shape + dtype + device living <em>in the type</em>. (3) The multi-level idea: MLIR dialects and XLA's HLO vs LLVM as progressive-lowering ladders, each rung able to express what the others cannot. (4) A worked example — the same <code>softmax</code> shown at high, mid, and low IR. (5) The abstraction ↔ specialization trade named as the central motif. Then drive the lowering ladder until you watch portability fall and optimizations open up.</div>
+
+<h2>1 · Value semantics and SSA: why rewriting must be local</h2>
+
+<p>The single property that makes an IR rewritable is <strong>value semantics</strong>: an operation takes input values and produces new output values, and nothing is ever mutated in place. A value, once defined, never changes. Pair that with <strong>SSA</strong> — <em>static single assignment</em>, the rule that every value is <em>assigned exactly once</em> and named uniquely — and you get the property compilers have leaned on since the 1980s: the definition of any value is unambiguous, so the <em>uses</em> of a value form an explicit, complete list, and a transform that touches one value cannot silently change another.</p>
+
+<p>Contrast the two worlds with one line. In mutable eager land:</p>
+
+<pre class="ascii">x = randn(1024)
+x.add_(1.0)         # mutates x in place — the old x is gone
+y = x[0:512]        # y aliases x's storage; writing y writes x
+relu_(y)            # mutates y → mutates x → mutates anything aliasing it</pre>
+
+<p>To decide whether <code>relu_(y)</code> is safe to move, fold, or fuse, you must prove what <code>y</code> aliases and whether anything reads the old <code>x</code> afterward — a <em>global</em> question. Now the SSA / value-semantics form of the same computation:</p>
+
+<pre class="ascii">%0 = randn() : tensor&lt;1024xf32&gt;
+%1 = add(%0, 1.0) : tensor&lt;1024xf32&gt;     ; new value, %0 untouched
+%2 = slice(%1, 0, 512) : tensor&lt;512xf32&gt; ; %2 reads %1; no aliasing
+%3 = relu(%2) : tensor&lt;512xf32&gt;          ; new value</pre>
+
+<p>Here every edge is a pure data dependency: <code>%3</code> depends on <code>%2</code> depends on <code>%1</code>. There is no hidden channel. So "is it legal to replace <code>relu(%2)</code> with something cheaper?" is answered by looking only at <code>%2</code>'s definition and <code>%3</code>'s uses — a <strong>local</strong> question. That locality is what lets you stack hundreds of passes and iterate each to a fixed point: every rewrite is a provable no-op on the math, so composing them stays correct. This is the <strong>preserve-semantics</strong> motif made mechanical. The price is that PyTorch programs are full of mutation and views, so the compiler must first run <strong>functionalization</strong> — rewrite <code>add_</code> / view / in-place ops into pure value-producing equivalents — before the IR is in this form. We return to functionalization when it pays off for autodiff (FILE 12).</p>
+
+<h2>2 · A typed dataflow DAG: shape, dtype, device in the type</h2>
+
+<p>With value semantics in hand, the IR is exactly a <strong>directed acyclic graph of typed values</strong>: nodes are operations, edges are values flowing producer → consumer, and there are no cycles (loops, when they exist, are explicit region ops, not back-edges). The thing that makes it an <em>ML</em> IR rather than a generic SSA IR is the <strong>type</strong>. For tensor code the type carries far more than "float": it carries <strong>shape</strong>, <strong>dtype</strong>, and often <strong>device / layout</strong>.</p>
+
+<pre class="ascii">%w  : tensor&lt;4096x4096xbf16, @cuda:0&gt;     ; shape · dtype · device all in the type
+%x  : tensor&lt;8x4096x4096xbf16, @cuda:0&gt;
+%mm = matmul(%x, %w) : tensor&lt;8x4096x4096xbf16&gt;   ; shape inferred & checked</pre>
+
+<p>Putting shape and dtype in the type buys you three things. First, <strong>verification</strong>: a rewrite that produces a shape mismatch is rejected at the IR level, not at runtime. Second, <strong>cost</strong>: every later pass — fusion (FILE 05), memory planning (FILE 06), layout (FILE 07) — needs to know how many bytes a value is, and the type is where that lives; a 268 MB activation and a 4-byte scalar are both "tensors" but the compiler must tell them apart to price a round trip. Third, <strong>specialization</strong>: knowing a dimension is exactly 4,096 (not "some N") unlocks tiling and vectorization that a dynamic shape would block — which is also why dynamic dimensions are the headache of FILE 11, where the type carries a symbol <code>s0</code> instead of a constant. A good ML IR also keeps the <strong>op set small and well-defined</strong>: a few dozen primitive ops with crisp semantics, rather than the thousands of overloads a framework's public API exposes. A small op set means a rewrite pass has a small surface to reason about and a small number of cases to handle correctly.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">SSA / value semantics</div><div class="v">Define once, never mutate. Makes "is this rewrite legal?" a local question, so passes compose to a fixed point.</div></div>
+  <div class="topic-card"><div class="k">typed dataflow DAG</div><div class="v">Nodes = ops, edges = values. Shape · dtype · device live in the type → verifiable, priceable, specializable.</div></div>
+  <div class="topic-card"><div class="k">small op set</div><div class="v">A few dozen primitives with crisp semantics beats thousands of framework overloads — less surface for a pass to break.</div></div>
+</div>
+
+<h2>3 · One IR is not enough: the multi-level ladder</h2>
+
+<p>Here is the move that separates an ML compiler from a generic one. The high-level graph — <code>conv</code>, <code>softmax</code>, <code>layer_norm</code> as single ops — is the perfect altitude for <em>algebraic</em> optimizations: cancel adjacent transposes, fuse a bias into a matmul, recognize an attention pattern. But it is useless for <em>loop</em> optimizations: a single <code>softmax</code> op has no loops to tile, no memory accesses to reorder, no vector width to choose. Drop too low, though — to scalar instructions and registers — and the <code>softmax</code> has dissolved into hundreds of nameless adds and you can no longer recognize it as softmax to fuse it at all. <strong>No single abstraction hosts every optimization.</strong> The answer is a <em>ladder</em> of IRs, and a process called <strong>lowering</strong> that walks down it one rung at a time, each rung re-expressing the program at a lower level where a different class of optimization becomes possible.</p>
+
+<p>Two real ladders dominate practice. <strong>MLIR</strong> — the compiler infrastructure under Triton, IREE, Torch-MLIR, and modern XLA — makes the ladder explicit through <strong>dialects</strong>. A <em>dialect</em> is a self-contained namespace of ops and types at one level of abstraction; lowering is rewriting from a higher dialect to a lower one, and the rewrite that crosses a level is called <strong>legalization</strong> (turning ops legal in dialect A into ops legal in dialect B). A typical descent:</p>
+
+<div class="ir-ladder">
+  <div class="rung"><span class="lvl">high · framework</span><span class="desc"><strong>tosa / mhlo / stablehlo</strong> — whole-tensor ops (<code>conv</code>, <code>softmax</code>, <code>dot</code>). Portable across any backend; the level for algebraic rewrites and fusion.</span></div>
+  <div class="rung"><span class="lvl">mid · structured</span><span class="desc"><strong>linalg</strong> — ops as named loop nests over tensors (a generic reduce, a generic matmul). The level for tiling, fusion-by-loops, and bufferization.</span></div>
+  <div class="rung"><span class="lvl">mid-low · loops</span><span class="desc"><strong>affine / scf / vector</strong> — explicit loops with affine index maps and SIMD vector types. The level for loop reordering, unrolling, vectorization.</span></div>
+  <div class="rung"><span class="lvl">low · target</span><span class="desc"><strong>llvm / nvvm / gpu</strong> — scalar/vector instructions, registers, address spaces. Hands off to LLVM for register allocation and final codegen.</span></div>
+</div>
+
+<p>XLA draws the same ladder with fewer, fatter rungs: it represents the whole program in <strong>HLO</strong> (<em>High-Level Optimizer</em> IR) — a small, functional, value-semantics op set of a hundred-odd tensor primitives where almost all of its optimizations live (fusion, layout, GSPMD sharding) — and then lowers HLO to <strong>LLVM IR</strong> for the CPU/GPU backend to emit PTX. <code>linalg</code> is the linear-algebra dialect named above: a small set of ops, each defined as a loop nest with explicit indexing, that is deliberately the sweet spot for tiling and fusion. The names differ across stacks, but the shape is identical: a high portable rung, one or more structured loop-level rungs, a low target rung, and legalization passes carrying the program down between them.</p>
+
+<h2>4 · The same softmax at three levels</h2>
+
+<p>Make the ladder concrete with one op. At the <strong>high</strong> level, softmax over the last axis is a single op — maximally portable (every backend knows what softmax means), maximally compact, and the level at which a compiler can pattern-match "this is the softmax inside attention" and fuse it:</p>
+
+<pre><code>// HIGH IR (framework / HLO) — one op, fully portable
+%p = softmax(%s, axis=-1) : tensor&lt;8x4096xf32&gt;</code></pre>
+
+<p>Lower one rung to the <strong>mid</strong> level and softmax decomposes into its definition — the numerically-stable five-step reduction — expressed as explicit loop nests over the tensor. Now the loops are visible, so a compiler can tile them, fuse the elementwise <code>sub</code>/<code>exp</code> into the reductions, and decide what stays in on-chip SRAM:</p>
+
+<pre><code>// MID IR (linalg / loop nests) — the math, as loops; tileable & fusible
+%mx  = reduce_max(%s, axis=-1)              // for r: mx[r] = max_c s[r,c]
+%sub = generic sub(%s, broadcast %mx)       // for r,c: t[r,c] = s[r,c] - mx[r]
+%ex  = generic exp(%sub)                     // for r,c: e[r,c] = exp(t[r,c])
+%sm  = reduce_add(%ex, axis=-1)             // for r: sm[r] = sum_c e[r,c]
+%p   = generic div(%ex, broadcast %sm)      // for r,c: p[r,c] = e[r,c] / sm[r]</code></pre>
+
+<p>Lower again to the <strong>low</strong> level and the loops become a concrete schedule on this chip: a vector width, an unroll factor, register-resident accumulators. This rung can saturate the SIMD/SIMT lanes — but it is now written against <em>this</em> target's vector ISA and is no longer portable:</p>
+
+<pre><code>// LOW IR (vector / scalar, target-specific) — concrete, fast, locked to one chip
+loop r in 0..4096:
+  vmx = vmax.f32x8(load_row(%s, r))          // 8-wide vectorized row max
+  vsm = vsplat(0.0)
+  for c in 0..4096 step 8:
+    ve  = vexp.f32x8(vsub(load8(%s,r,c), vbroadcast(vmx)))
+    vsm = vadd.f32x8(vsm, ve)                 // register-resident accumulator
+    store8(%tmp, r, c, ve)
+  inv = vrcp(hsum(vsm))                       // reciprocal of the row sum
+  for c in 0..4096 step 8:
+    store8(%p, r, c, vmul(load8(%tmp,r,c), vbroadcast(inv)))</code></pre>
+
+<p>Read the three dumps top to bottom and the trade is visible in the line count alone: <strong>one</strong> op becomes <strong>five</strong> becomes a fully unrolled vector loop. Descending, you lose portability (the bottom rung names <code>f32x8</code> vector ops that only exist on a particular target) and gain the ability to express concrete optimizations (vectorization, register accumulation) that the top rung literally has no vocabulary for. That is the entire point of the ladder.</p>
+
+<h2>5 · The motif: abstraction ↔ specialization</h2>
+
+<p>Step back and name what just happened, because it governs the rest of the track. A <strong>high</strong> IR is <em>abstract</em>: portable across backends, compact, easy to pattern-match and rewrite algebraically — but it cannot say anything about the memory hierarchy or the instruction set, so it cannot be made fast on its own. A <strong>low</strong> IR is <em>specialized</em>: it talks in tiles, vectors, and registers of one specific chip, so it can be made very fast — but it is locked to that target and too detailed to recognize high-level structure. <strong>Lowering is the act of spending portability to buy concrete optimization.</strong></p>
+
+<div class="callout"><div class="label">The abstraction ↔ specialization trade (the track's spine)</div><strong>High / abstract:</strong> portable, compact, algebraically rewritable, hardware-blind — slow if run as-is. <strong>Low / specialized:</strong> tiled, vectorized, register-aware, hardware-optimal — locked to one target. Every pass in this compiler lives on this axis: <em>descend only as far as the optimization you want requires, and no further</em>, so the higher rungs stay available for the rewrites that need them. Each later lesson — fusion (05), layout (07), scheduling (08), codegen (09) — is one more step down this ladder, each forced by an optimization the rung above could not express.</div>
+
+<p>This is why the ladder is <em>progressive</em> and not a single jump from Python to PTX. If you lowered straight to scalar instructions you would have a fast representation of one program on one chip and no ability to fuse, retile, or retarget. By keeping a high rung for the algebraic wins, a mid rung for the loop wins, and a low rung for the instruction wins, the compiler gets each class of optimization at the level where it is natural — and that is precisely the descent the lowering-ladder widget below lets you walk by hand.</p>
+
+<h2>6 · Drive it: the lowering ladder</h2>
+
+<p>The widget lowers <code>softmax</code> one rung at a time. At each level it shows the IR text and three readouts: the <strong>op count</strong> (how many operations the program has expanded into), whether the ops are <strong>hardware-specific</strong> (your portability), and which <strong>optimizations are now expressible</strong> at this rung. Step down and watch the trade: op count climbs, portability flips from "any backend" to "one chip," and the set of available optimizations grows from "algebraic only" to "loop + vector." There is no free rung — every step buys an optimization with a loss of portability.</p>
+
+<div class="widget" id="lower">
+  <div class="title">The lowering ladder — softmax, high → low</div>
+  <div class="hint">Step the program down the IR levels. The knob that proves the trade: descending raises the op count and opens new optimizations, but flips the IR from portable to hardware-locked. There is no rung that is both portable <em>and</em> register-optimal — that is why a compiler keeps all four.</div>
+
+  <div class="lvl-bar" id="lower-bar"></div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">IR level</div><div class="v" id="lo-name">—</div></div>
+    <div class="kpi"><div class="k">op count</div><div class="v" id="lo-ops">—</div></div>
+    <div class="kpi" id="lo-portk"><div class="k">portability</div><div class="v" id="lo-port">—</div></div>
+    <div class="kpi"><div class="k">new optimizations</div><div class="v" id="lo-opt">—</div></div>
+  </div>
+
+  <pre id="lower-ir"><code id="lo-code">—</code></pre>
+  <div class="chart-legend" style="display:flex;gap:16px;font-family:var(--mono);font-size:11px;color:var(--text-mute);">
+    <span id="lo-trade">descend → +optimizations, −portability</span>
+  </div>
+</div>
+
+<p>The shape of the four readouts is the lesson. Op count and "optimizations now possible" rise together as portability falls — and crucially the optimizations available at a low rung (vectorization, register accumulation) are <em>invisible</em> at the high rung, while the high rung's win (recognize-and-fuse softmax) is <em>gone</em> once you lower. A compiler keeps every rung precisely so it can take each optimization at the level where it exists.</p>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Rewriting an IR with hidden mutation.</strong> Folding or fusing on an IR that still has in-place ops / aliasing views. <em>Signal:</em> a "semantics-preserving" pass changes results, because some far-away op was mutating a tensor this one aliased — the missing functionalization step.</li>
+    <li><strong>Putting too much in one IR level.</strong> Trying to do loop tiling on a high op-graph, or pattern-match softmax on scalar instructions. <em>Signal:</em> the pass has no handle to grab — no loops to tile up high, no recognizable op down low.</li>
+    <li><strong>Lowering too early.</strong> Dropping to vector/scalar before fusion runs. <em>Signal:</em> softmax has dissolved into anonymous adds, so the fuser can no longer recognize it and the high-level win is permanently lost.</li>
+    <li><strong>Shape/dtype not in the type.</strong> An untyped or "tensor of unknown shape" IR. <em>Signal:</em> later passes can't price bytes or verify rewrites; mismatches surface as runtime crashes instead of IR verification errors.</li>
+    <li><strong>A sprawling op set.</strong> Mirroring every framework overload as a distinct IR op. <em>Signal:</em> every rewrite pass has hundreds of cases and quietly misses some, so optimizations fire inconsistently.</li>
+  </ul>
+  </div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><strong>Functionalize first.</strong> Get to value semantics / SSA before any rewrite, so legality is a local question.</li>
+    <li><strong>Type carries shape · dtype · device.</strong> Enough in the type to verify, to price bytes, and to specialize on constant dims.</li>
+    <li><strong>Keep the op set small.</strong> A few dozen crisp primitives, not thousands of overloads.</li>
+    <li><strong>Pick the rung for the optimization.</strong> Algebraic/fusion up high, tiling in the middle, vectorization down low.</li>
+    <li><strong>Descend as little as needed.</strong> Stay high enough that the next pass still has structure to work with.</li>
+    <li><strong>Legalize, don't leap.</strong> Lower one dialect at a time so each level's passes get to run.</li>
+  </ul>
+  </div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the widget and step from the <strong>high</strong> rung to the <strong>mid</strong> rung. Note two things: the op count jumps from 1 to 5 (softmax's max/sub/exp/sum/div), and a new optimization appears — <em>loop tiling / fusion</em> — that simply did not exist at the high rung. Now step to <strong>low</strong> and watch portability flip to "one target (f32x8)." Question to answer for yourself: at which rung would you run a pass that cancels two adjacent transposes, and at which would you choose a SIMD vector width? (Transpose cancellation is an algebraic rewrite — high rung; vector width is an instruction choice — low rung. The fact that those two passes want different rungs <em>is</em> why the ladder exists.) Finally, predict what is lost if you lower straight from high to low, skipping mid: you lose the rung where loop tiling and op-level fusion are expressible, so you never get them.</div>
+
+<h2>Where this points next</h2>
+
+<p>You now have a representation worth optimizing: a typed dataflow DAG in SSA / value-semantics form, sitting on a ladder of levels you can lower through. But a representation with legality rules is inert — it describes which rewrites are <em>allowed</em>, not which ones <em>happen</em>. Something has to walk the graph, recognize "this subgraph matches a pattern I can improve," replace it with an equivalent, and iterate until nothing more fires. The raw captured graph is full of exactly such opportunities — constants waiting to be folded, repeated subexpressions, dead nodes, <code>x·1</code> and back-to-back transposes — and they block the bigger wins until they are cleaned up. That machinery is the <strong>pass / pattern-rewrite engine</strong>, and the catalog of always-valid cleanups it runs, in <strong><a href="04_rewrites.html">04 · Rewrites &amp; canonicalization</a></strong>.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+A captured graph is a pile of mutable framework objects you cannot safely rewrite. A good ML IR fixes that with <strong>value semantics + SSA</strong> (define once, never mutate, so every rewrite's legality is a <em>local</em> question and passes compose to a fixed point — preserve-semantics made mechanical), a <strong>typed dataflow DAG</strong> with shape · dtype · device in the type (so passes can verify, price bytes, and specialize), and a <strong>small op set</strong>. The defining ML move is that there is not one IR but a <strong>ladder</strong> of them — high framework ops → mid <code>linalg</code>/loop nests → low vector/scalar — because no single abstraction hosts every optimization; the same <code>softmax</code> is one op up high, a five-step reduction in the middle, and a vectorized register loop down low. <strong>Lowering</strong> (in MLIR, rewriting between <em>dialects</em> via <strong>legalization</strong>; in XLA, <strong>HLO</strong> → LLVM) walks down that ladder, and each step is the <strong>abstraction ↔ specialization</strong> trade — spending portability to buy concrete optimization. Descend only as far as the next optimization requires, no further. An IR with rules invites the engine that applies them: the pass / pattern-rewrite machinery of lesson 04.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why does SSA / value semantics make graph rewriting tractable? <em>(§1 — define-once + no mutation means a value's uses are an explicit complete list and a transform can't change another value through a hidden alias, so "is this rewrite legal?" is a local question; that locality is what lets you stack passes to a fixed point without re-proving global safety.)</em></li>
+  <li>What does a tensor type carry in an ML IR, and why does each piece matter? <em>(§2 — shape, dtype, device/layout: shape+dtype enable verification and let every later pass price bytes; constant dims unlock tiling/vectorization (specialization); device/layout drive placement and layout passes — a dynamic dim becomes the symbol that breaks specialization in FILE 11.)</em></li>
+  <li>Why have multiple levels of IR instead of one? <em>(§3 — no single abstraction hosts every optimization: a high op-graph has no loops to tile, low scalar code has no recognizable softmax to fuse; you keep a high rung for algebraic/fusion wins, a mid rung for loop wins, a low rung for instruction wins, and lower between them.)</em></li>
+  <li>Define lowering, dialect, and legalization in the MLIR sense. <em>(§3 — a dialect is a namespaced op/type set at one abstraction level; lowering is rewriting from a higher dialect to a lower one; legalization is the pass that turns ops legal in one dialect into ops legal in the next, e.g. tosa/mhlo → linalg → vector → llvm.)</em></li>
+  <li>What are HLO and linalg, and where do they sit? <em>(§3 — HLO is XLA's high-level functional value-semantics tensor IR where most of its optimizations live before lowering to LLVM IR; linalg is MLIR's mid-level linear-algebra dialect expressing ops as loop nests, the sweet spot for tiling and fusion.)</em></li>
+  <li>State the abstraction ↔ specialization trade and one consequence. <em>(§5 — high IR is portable/compact/algebraically-rewritable but hardware-blind; low IR is tiled/vectorized/register-aware but locked to one chip; lowering spends portability for concrete optimization, so you descend only as far as the optimization needs and keep higher rungs for rewrites that require structure.)</em></li>
+  <li>Why must PyTorch be functionalized before these passes run? <em>(§1 — eager PyTorch has in-place ops and aliasing views, so the captured graph isn't in value-semantics form; functionalization rewrites mutation/views into pure value-producing ops so legality stays local — the SSA property the rewrites depend on.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="02_capture.html"><span class="dir">← Back</span><span class="ttl">02 · Capturing the graph</span></a>
+  <a class="next" href="04_rewrites.html"><span class="dir">Next →</span><span class="ttl">04 · Rewrites &amp; canonicalization</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var bar = document.getElementById('lower-bar');
+  if (!bar) return;
+
+  var levels = [
+    {
+      name: 'high · framework op',
+      ops: 1,
+      port: 'any backend',
+      portClass: 'good',
+      opt: 'algebraic rewrite · op-level fusion · pattern-match (recognize softmax)',
+      code:
+'// HIGH IR (framework / HLO) — one op, fully portable\n' +
+'%p = softmax(%s, axis=-1) : tensor<8x4096xf32>'
+    },
+    {
+      name: 'mid · linalg / loops',
+      ops: 5,
+      port: 'any backend',
+      portClass: 'good',
+      opt: '+ loop tiling · fuse elementwise into reductions · stage to SRAM',
+      code:
+'// MID IR (linalg / loop nests) — the math as loops; tileable & fusible\n' +
+'%mx  = reduce_max(%s, axis=-1)         // mx[r] = max_c s[r,c]\n' +
+'%sub = generic sub(%s, bcast %mx)      // t[r,c] = s[r,c] - mx[r]\n' +
+'%ex  = generic exp(%sub)               // e[r,c] = exp(t[r,c])\n' +
+'%sm  = reduce_add(%ex, axis=-1)        // sm[r] = sum_c e[r,c]\n' +
+'%p   = generic div(%ex, bcast %sm)     // p[r,c] = e[r,c] / sm[r]'
+    },
+    {
+      name: 'mid-low · affine / vector',
+      ops: 9,
+      port: 'portable-ish (generic vector)',
+      portClass: '',
+      opt: '+ loop reorder · unroll · vectorize (choose SIMD width)',
+      code:
+'// MID-LOW IR (affine + vector) — explicit loops, SIMD vector types\n' +
+'affine.for r = 0 to 4096 {\n' +
+'  %mx = vector.reduce_max  load_row(%s, r)\n' +
+'  affine.for c = 0 to 4096 step 8 {\n' +
+'    %e  = vector.exp (vector.sub load8(%s,r,c), %mx)\n' +
+'    %sm = vector.add %sm, %e\n' +
+'    store8(%tmp, r, c, %e)\n' +
+'  }\n' +
+'  affine.for c = 0 to 4096 step 8 {\n' +
+'    store8(%p, r, c, vector.div load8(%tmp,r,c), %sm)\n' +
+'  }\n' +
+'}'
+    },
+    {
+      name: 'low · vector/scalar target',
+      ops: 14,
+      port: 'one target (f32x8 ISA)',
+      portClass: 'over',
+      opt: '+ register accumulation · reciprocal trick · instruction selection',
+      code:
+'// LOW IR (target-specific) — concrete, fast, locked to one chip\n' +
+'loop r in 0..4096:\n' +
+'  vmx = vmax.f32x8(load_row(%s, r))     // 8-wide vectorized row max\n' +
+'  vsm = vsplat(0.0)\n' +
+'  for c in 0..4096 step 8:\n' +
+'    ve  = vexp.f32x8(vsub(load8(%s,r,c), vbroadcast(vmx)))\n' +
+'    vsm = vadd.f32x8(vsm, ve)           // register-resident accumulator\n' +
+'    store8(%tmp, r, c, ve)\n' +
+'  inv = vrcp(hsum(vsm))                 // reciprocal of the row sum\n' +
+'  for c in 0..4096 step 8:\n' +
+'    store8(%p, r, c, vmul(load8(%tmp,r,c), vbroadcast(inv)))'
+    }
+  ];
+
+  var nameEl = document.getElementById('lo-name');
+  var opsEl  = document.getElementById('lo-ops');
+  var portEl = document.getElementById('lo-port');
+  var portK  = document.getElementById('lo-portk');
+  var optEl  = document.getElementById('lo-opt');
+  var codeEl = document.getElementById('lo-code');
+  var tradeEl= document.getElementById('lo-trade');
+
+  var cur = 0;
+
+  levels.forEach(function(lv, i){
+    var b = document.createElement('button');
+    b.textContent = (i+1) + ' · ' + lv.name.split(' · ')[0];
+    b.addEventListener('click', function(){ cur = i; render(); });
+    bar.appendChild(b);
+  });
+
+  function render(){
+    var lv = levels[cur];
+    Array.prototype.forEach.call(bar.children, function(b, i){
+      b.classList.toggle('on', i === cur);
+    });
+    nameEl.textContent = lv.name;
+    opsEl.textContent  = lv.ops;
+    portEl.textContent = lv.port;
+    optEl.textContent  = lv.opt;
+    codeEl.textContent = lv.code;
+
+    portK.classList.remove('good','over');
+    if (lv.portClass) portK.classList.add(lv.portClass);
+
+    tradeEl.textContent = 'op count ' + lv.ops + '  ·  ' +
+      (cur === 0 ? 'top rung: most portable, fewest optimizations' :
+       cur === levels.length-1 ? 'bottom rung: most optimizations, least portable' :
+       'descending: +optimizations, −portability');
+  }
+
+  render();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

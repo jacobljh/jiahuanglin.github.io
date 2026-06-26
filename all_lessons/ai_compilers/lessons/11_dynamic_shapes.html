@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>11 · Dynamic shapes &amp; control flow</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local layout only — failure/checklist columns + the request-stream widget */
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; font-size: 15px; }
+  .lesson-card ul { margin: 0; padding-left: 18px; }
+  .lesson-card li { margin: 7px 0; font-size: 13.5px; line-height: 1.5; }
+  .kpi.over .v { color: var(--bad); }
+  .kpi.good .v { color: var(--ok); }
+  /* the request stream visual inside the widget */
+  .reqs { display: flex; flex-wrap: wrap; gap: 5px; margin: 12px 0 4px; }
+  .reqs .r { width: 22px; border-radius: 3px; background: var(--code-bg); border: 1px solid var(--border);
+             position: relative; display: flex; align-items: flex-end; justify-content: center; }
+  .reqs .r .pad { width: 100%; background: rgba(239,68,68,0.30); border-top: 1px dashed var(--bad); }
+  .reqs .r .use { width: 100%; background: var(--accent); }
+  .reqs .r.compile { box-shadow: 0 0 0 2px var(--accent-2) inset; }
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; margin: 6px 0 2px; font-family: var(--mono); font-size: 11px; color: var(--text-mute); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">ai_compilers / lessons</a><span class="crumb">/</span><span class="crumb">11 · dynamic shapes</span><span class="step-pill">lesson 12 / 16</span></div></header>
+
+<main>
+
+<p class="kicker">Part V — The hard parts</p>
+<h1>Dynamic shapes &amp; control flow</h1>
+<p class="subtitle">Every pass in Parts III and IV bought its speedup by knowing the exact shapes. Fusion (lesson 05) grouped ops because it knew the tile counts; the memory planner (06) sized an arena to the byte; layout assignment (07) matched tensor-core fragments to concrete dimensions; the scheduler (08) and autotuner (10) searched tile sizes <em>against one specific</em> M, N, K and cached the winner under those numbers. That whole machine assumed the shapes are constants known at compile time. Production serving violates the assumption on the first request: batch size changes every microbatch, sequence length grows by one token <em>every decode step</em>, inputs arrive ragged, and a router sends a different number of tokens to each expert. If a fresh compile fires on every distinct shape you get a <strong>compile storm</strong> that buries the runtime. This lesson is how a compiler keeps the speedup while the shapes move.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>Autotuning (lesson 10) made the schedule space tractable by paying a one-time search and <em>caching the winning config under a key built from the concrete shapes and dtypes</em>. That cache is the whole economy: search once, replay a million times. But the model is only re-run a million times <em>at the same shape</em>. An autoregressive decoder runs the attention kernel at sequence length 1, then 2, then 3, … up to thousands — every step is a fresh cache key, a cache miss, and a re-trigger of the entire capture → fuse → plan → tune pipeline. A serving endpoint that sees batch sizes 1, 3, 7, 12, 31 in a minute compiles five times before it answers anyone. The static-shape assumption that made every earlier pass cheap is exactly what makes the compiled artifact unusable the moment shapes vary.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> fusion, planning, layout, and autotuning all specialized to concrete static shapes, but real serving has variable batch size, sequence length that grows every decode step, ragged inputs, and data-dependent control flow — full specialization re-pays the entire compile cost on every distinct shape.<br><strong>New idea:</strong> handle dynamism <em>without</em> recompiling each call — <strong>symbolic shapes</strong> (carry dimensions as variables <span class="math">s0</span>, <span class="math">s0+1</span> with constraints, compile once for all sizes), <strong>guards + recompilation</strong> (specialize, guard the assumption, recompile only when a guard is violated), <strong>bucketing/padding</strong> (compile a handful of size buckets, pad each request up to the nearest — trade wasted FLOPs for cache hits), and <strong>control-flow ops</strong> (<code>cond</code>/<code>while</code>/<code>scan</code> captured as real graph nodes instead of unrolled or graph-broken).<br><strong>Forces next:</strong> even fully handled, everything so far compiled the <em>forward / inference</em> graph. Training needs the <em>backward</em> graph — which you never wrote — and the compiler must build and optimize it itself. That is <strong>autodiff as a compiler pass</strong> (lesson 12).</div>
+
+<div class="callout"><div class="label">The plan</div>Five moves. (1) Show why dynamism is everywhere — batching, autoregressive decode, ragged inputs, MoE routing. (2) Price the two extremes: full specialization (safe, but compile storm) vs symbolic shapes (one compile, slightly slower kernels). (3) The guard + recompile mechanism, and the <span class="math">0/1</span> specialization gotcha that bites everyone. (4) Bucketing and padding in real serving stacks — the wasted-compute trade. (5) Data-dependent control flow as graph ops vs the graph break. Then drive the widget until specialize-each becomes a compile storm and symbolic flattens it.</div>
+
+<h2>1 · Why the shapes never hold still</h2>
+
+<p>Define the problem precisely. A <strong>static shape</strong> is a tensor dimension whose value is a compile-time constant — <span class="math">(batch=8, seq=512, d=4096)</span>. A <strong>dynamic shape</strong> (a.k.a. symbolic shape) is a dimension whose value is only known at run time and varies between calls. Earlier passes loved static shapes because every cost they minimized — bytes in a fused tile, slots in the arena, the autotune cache key — is a function of the exact numbers. Four forces make those numbers move in any real deployment:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">variable batch size</div><div class="v">A server batches whatever requests are in flight this 10 ms window — 1, then 5, then 23. Continuous batching (vLLM) changes the batch dimension on essentially every forward pass.</div></div>
+  <div class="topic-card"><div class="k">autoregressive decode</div><div class="v">The killer. Each generated token grows the sequence by one, so the KV-cache length is 1, 2, 3, … N. Attention runs at a <em>different</em> sequence length on every single step.</div></div>
+  <div class="topic-card"><div class="k">ragged inputs</div><div class="v">Prompts are 12 tokens or 4,000 tokens. Padding a batch to its longest member wastes compute on the pad; not padding means every row is a different length.</div></div>
+  <div class="topic-card"><div class="k">MoE routing</div><div class="v">A top-k router sends a data-dependent, run-time-decided number of tokens to each expert. The per-expert GEMM has a shape that is literally not knowable until the routing argmax runs.</div></div>
+</div>
+
+<p>Two of these are <em>shape</em> dynamism (the dimensions vary) and two shade into <em>control-flow</em> dynamism (which ops even run depends on the data — §5). Both break the static-shape contract. The compiler now has exactly three families of answer: specialize per shape and eat recompiles, reason symbolically and compile once, or normalize the shapes (bucket/pad) so only a few distinct ones ever reach the compiler.</p>
+
+<h2>2 · Full specialization vs symbolic shapes</h2>
+
+<p><strong>Full specialization</strong> is the naive correct answer: treat every dimension as a constant, compile a fresh, fully-optimized kernel for each shape you see, and key it in the autotune cache (lesson 10). It is the fastest <em>per call</em> — the kernel knows its trip counts, can unroll loops, and was tuned at exactly this size. It is also correctness-trivial: nothing varies inside a compiled artifact. The catch is the compile bill. PyTorch compile and Inductor compile times run from roughly <span class="math">1–60 s</span> per graph depending on size and <code>max-autotune</code>; XLA HLO compiles are comparable. Pay that on the <em>first</em> appearance of every shape:</p>
+
+<table class="trade-table">
+  <thead><tr><th>workload</th><th>distinct shapes seen</th><th>full-specialization cost</th></tr></thead>
+  <tbody>
+    <tr><td>fixed-shape training step</td><td>1</td><td>compile once, amortize over millions of steps — ideal</td></tr>
+    <tr><td>serving, batch ∈ {1…32}</td><td>≈ 32</td><td>up to 32 compiles before steady state — minutes of cold start</td></tr>
+    <tr><td>decode, seq 1 → 2,048</td><td>≈ 2,048</td><td><strong>compile storm</strong> — recompile on literally every token; serving never warms up</td></tr>
+  </tbody>
+</table>
+
+<p>The decode row is fatal: you would spend seconds compiling for each step that takes microseconds to run. So full specialization is right only when the shape set is tiny and stable — which training is and serving is not.</p>
+
+<p><strong>Symbolic shapes</strong> are the principled fix. Instead of baking a dimension as the constant <span class="math">512</span>, the compiler introduces a <em>shape variable</em> — call it <span class="math">s0</span> — and compiles a single kernel that is correct for <em>all</em> values of <span class="math">s0</span>. Derived dimensions are tracked as symbolic expressions: if the KV cache is length <span class="math">s0</span> and you append one token it becomes <span class="math">s0+1</span>; a reshape that splits <span class="math">s0</span> into heads carries <span class="math">s0/h</span> as a constraint the compiler must prove divides evenly. This is exactly TorchDynamo's <em>symbolic shapes</em> machinery (it uses <code>SymInt</code> and a small symbolic solver, <code>sympy</code>, to discharge the constraints) and XLA's <em>dynamic dimensions</em>. The trade is real but small: a symbolic kernel can't hard-unroll a loop whose bound is a variable, and the autotuner must pick one config that is good across the size range rather than perfect at one size, so you give up maybe <span class="math">5–20%</span> of peak — in exchange for compiling <strong>once</strong> instead of a thousand times.</p>
+
+<pre class="ascii">static  (recompile each call):   matmul[M=512, N=4096, K=4096]   key=(512,4096,4096) → MISS → compile
+                                 matmul[M=513, N=4096, K=4096]   key=(513,4096,4096) → MISS → compile
+                                 matmul[M=514, ...]              ... a new compile every step
+
+symbolic (compile once):         matmul[M=s0,  N=4096, K=4096]   one kernel, valid for all s0 ≥ 1
+                                 guard: s0 ≥ 2  (because s0=1 was specialized away — see §3)</pre>
+
+<p>In PyTorch you reach this with the <code>dynamic</code> flag on <code>torch.compile</code>: <code>dynamic=True</code> opts every dimension to symbolic from the first call; <code>dynamic=False</code> forces full specialization (one compile per shape); the default is adaptive — specialize on the first shape, then if a second distinct value of a dimension appears, promote <em>that</em> dimension to symbolic and recompile once. The deeper mechanics of this live in <a href="../../gpu_kernels/23_torch_compile.html">gpu_kernels · 23 torch.compile</a>.</p>
+
+<h2>3 · Guards and the recompile trigger</h2>
+
+<p>How does a compiled artifact know it is still valid? A <strong>guard</strong> is a cheap boolean predicate, attached to a compiled graph, that asserts every assumption the compiler relied on: dtypes, devices, the rank of each tensor, which dimensions are static and what their values are, and the constraints on the symbolic ones (<span class="math">s0 ≥ 2</span>, <span class="math">s0 % 8 == 0</span>). Before every call the runtime evaluates the guard set in a few microseconds. Guard passes → cache hit → replay the compiled kernel. Guard fails → cache miss → <strong>recompile</strong>, specializing to the new fact (or relaxing a static dim to symbolic), and add the new artifact to the cache. Guards are the bookkeeping that makes "specialize but stay safe" possible: the optimizer is allowed to assume anything it likes, as long as it writes the assumption down as a guard so a violation is caught instead of producing a silently wrong result. This is the same <em>preserve-semantics</em> invariant from lessons 03–04, now enforced dynamically.</p>
+
+<div class="lesson-flow">
+  <div><strong>compile</strong><span>Capture the graph for the current inputs; record every assumption (dtypes, ranks, which dims are static and their values, symbolic constraints) as a guard set.</span></div>
+  <div><strong>guard check</strong><span>On each subsequent call, evaluate the guards (≈ µs). All true → cache hit. This is the fast path that runs for the vast majority of calls.</span></div>
+  <div><strong>violation</strong><span>A guard is false — a new dtype, a static dim took a new value, a constraint broke. Cache miss. Fall through to recompile.</span></div>
+  <div><strong>recompile</strong><span>Re-specialize (or widen a dim to symbolic) and cache the new artifact. Pay the compile cost once; a storm of these is the failure to avoid.</span></div>
+</div>
+
+<p>The trap everyone hits: the <strong><span class="math">0/1</span> specialization gotcha</strong>. Dimensions equal to <span class="math">0</span> or <span class="math">1</span> are special — a size-1 dimension broadcasts, and a great many rewrites are only valid when a dim is exactly 1 (a "squeeze," a broadcast, dropping a unit batch). So compilers <em>always</em> specialize on <span class="math">0</span> and <span class="math">1</span> rather than treat them as symbolic. The consequence: if your very first call has <code>batch=1</code> (extremely common — you smoke-test with a single example, or decode generates one sequence), the guard becomes "<span class="math">batch == 1</span>" baked in. The next call with <code>batch=8</code> violates it and forces a recompile, and now you carry two artifacts and a guard <span class="math">s0 ≥ 2</span> on the symbolic one. The fix is to warm up with a representative shape that is <strong>not</strong> 0 or 1 (and not the longest, either) so the compiler generalizes from a typical case. Watch for it with <code>TORCH_LOGS="recompiles,dynamic"</code> — every recompile prints the guard that fired and the shape that broke it.</p>
+
+<h2>4 · Bucketing and padding in serving</h2>
+
+<p>Symbolic shapes are elegant, but two realities push serving toward a blunter tool. First, some kernels really are faster fully specialized — a fixed trip count unrolls and the autotuner nails one size. Second, CUDA-graph capture (the launch-overhead killer in <code>reduce-overhead</code> mode) needs <em>stable</em> shapes; a fully dynamic graph can't be captured. The workhorse compromise is <strong>bucketing</strong> with <strong>padding</strong>.</p>
+
+<p><strong>Bucketing</strong>: pick a small set of canonical sizes — say sequence buckets <span class="math">{128, 256, 512, 1024, 2048}</span> — and compile (and CUDA-graph-capture) one artifact per bucket. <strong>Padding</strong>: round each incoming request <em>up</em> to the nearest bucket and pad the extra positions (masked so they don't affect the result). A request of length 300 runs on the 512-bucket kernel with 212 padded positions. You now compile a handful of times instead of thousands, every call is a cache hit, and you keep CUDA graphs — at the cost of wasted FLOPs on the padding.</p>
+
+<p>The waste is exactly quantifiable. With buckets and a uniform spread of true lengths, the average padded length is roughly halfway up to the next bucket, so coarse buckets waste more. Concretely, a length-300 request in a 512 bucket does <span class="math">512/300 ≈ 1.7×</span> the necessary attention work. The design knob is bucket granularity: more, tighter buckets → less padding waste but more compiles and more memory pinned by CUDA graphs; fewer, coarser buckets → cheap compile and capture but fat padding. Production stacks tune this empirically and pad attention with masks so the math stays exact. See how real engines wire variable-length batching and KV-cache growth — vLLM's paged KV and continuous batching, SGLang's RadixAttention and prefix-cache reuse — in <a href="../../vllm/lessons/index.html">vllm · lessons</a> and <a href="../../sglang/lessons/index.html">sglang · lessons</a>; both are, at heart, strategies to keep the compiled kernels' shapes under control while the workload churns.</p>
+
+<table class="trade-table">
+  <thead><tr><th>strategy</th><th>compiles</th><th>per-call kernel speed</th><th>wasted FLOPs</th><th>use when</th></tr></thead>
+  <tbody>
+    <tr><td>specialize each shape</td><td>one <em>per distinct shape</em> — storm</td><td>fastest (tuned, unrolled)</td><td>none</td><td>shape set tiny &amp; stable (training)</td></tr>
+    <tr><td>bucket + pad</td><td>one per bucket (≈ 4–8)</td><td>fast (specialized bucket, CUDA-graphable)</td><td>padding up to next bucket (≈ 10–40%)</td><td>serving with bounded length range</td></tr>
+    <tr><td>pad to max</td><td>one (the max shape)</td><td>fast but always max-sized</td><td>huge for short requests</td><td>almost never — only if lengths nearly equal</td></tr>
+    <tr><td>symbolic shapes</td><td><strong>one, for all sizes</strong></td><td>slightly slower (5–20%)</td><td>none</td><td>wide/unpredictable shape range</td></tr>
+  </tbody>
+</table>
+
+<h2>5 · Data-dependent control flow</h2>
+
+<p>The last form of dynamism isn't a shape at all — it's <em>which ops run</em>. A <code>if x.sum() &gt; 0:</code>, a <code>while not converged:</code> loop, a beam-search step, an MoE dispatch: the branch taken or the iteration count depends on a value computed at run time. The capture frontends from lesson 02 have two ways to deal with it, and only one keeps the graph whole.</p>
+
+<p>The lazy way is a <strong>graph break</strong> (lesson 02): Dynamo can't statically resolve the branch, so it ends the current graph, runs the Python <code>if</code> eagerly, and starts a new graph after. Correct, but it severs the graph in two — fusion can't cross the break, and CUDA-graph capture stops there — so you lose the very optimizations Parts III–IV bought. A branch in the middle of a hot loop can erase most of the speedup.</p>
+
+<p>The right way is a <strong>control-flow op</strong>: a real graph node whose <em>operands</em> are the predicate and the sub-graphs for each branch, so the whole thing stays inside one capturable, optimizable graph. PyTorch exposes <code>torch.cond(pred, true_fn, false_fn, operands)</code> for branches and <code>torch.while_loop</code> / associative <code>scan</code> for loops; JAX has <code>lax.cond</code>, <code>lax.while_loop</code>, and <code>lax.scan</code> (and <code>lax.scan</code> is how you express a decode loop as <em>one</em> rolled graph op instead of an unrolled chain of thousands of nodes). The constraint these ops impose is the price: both branches of a <code>cond</code> must produce the <em>same output shapes and dtypes</em> (the compiler picks a layout and arena slot once, for both), and a <code>scan</code> body's carry must be shape-stable across iterations. That constraint is exactly what lets the downstream passes — fusion, memory planning, layout — treat the branch as a single typed value instead of giving up.</p>
+
+<pre><code># Graph break (severs the graph — fusion/CUDA-graph stop here):
+if x.sum() &gt; 0:          # data-dependent Python branch → Dynamo graph-breaks
+    y = f(x)
+else:
+    y = g(x)
+
+# Control-flow op (one graph node — stays fused &amp; capturable):
+y = torch.cond(x.sum() &gt; 0, f, g, (x,))   # both f,g must return same shapes/dtypes
+
+# JAX: a 2,048-step decode as ONE rolled op, not 2,048 unrolled nodes
+final_carry, outs = jax.lax.scan(decode_step, init_carry, xs)</code></pre>
+
+<h2>6 · Drive it: the shape-specialization cache</h2>
+
+<p>The widget streams a batch of inference requests with varying sequence lengths past four strategies. Watch the same request stream produce wildly different bills. <strong>Specialize-each</strong> compiles on every new length — a compile storm whose total time is dominated by compilation, not inference. <strong>Bucket-to-N</strong> compiles only the buckets, hits the cache after, and pays a modest padding tax (the red caps on each bar). <strong>Pad-to-max</strong> compiles once but every request runs at the maximum length — minimal compiles, maximal waste. <strong>Symbolic</strong> compiles exactly once and pads nothing. The KPIs make the §2–4 trade literal: recompiles, cache hit-rate, wasted padding FLOPs, total wall time.</p>
+
+<div class="widget" id="dyn">
+  <div class="title">Shape-specialization cache: four strategies, one request stream</div>
+  <div class="hint">Each bar is one request; height = its true sequence length, the red cap = padding the strategy adds, a glowing border = this request triggered a <em>compile</em>. The knob that breaks: set strategy to <strong>specialize-each</strong> and widen the length range — almost every bar glows (compile storm) and total time explodes. Switch to <strong>symbolic</strong>: exactly one compile, no red caps.</div>
+
+  <div class="controls" style="margin-top:4px;">
+    <label class="inline">strategy:
+      <select id="dy-strat">
+        <option value="spec">specialize each shape</option>
+        <option value="bucket" selected>bucket to N</option>
+        <option value="padmax">pad to max</option>
+        <option value="sym">symbolic shapes</option>
+      </select>
+    </label>
+    <label class="inline">requests: <input type="range" id="dy-n" min="8" max="48" step="1" value="28"> <span class="val" id="dy-nv">28</span></label>
+    <label class="inline">max length: <input type="range" id="dy-max" min="256" max="2048" step="128" value="1024"> <span class="val" id="dy-maxv">1,024</span></label>
+    <label class="inline">buckets: <input type="range" id="dy-b" min="2" max="8" step="1" value="4"> <span class="val" id="dy-bv">4</span></label>
+    <button id="dy-reroll" type="button">re-roll stream</button>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi" id="dy-k-rc"><div class="k">recompiles</div><div class="v" id="dy-rc">—</div></div>
+    <div class="kpi good"><div class="k">cache hit-rate</div><div class="v" id="dy-hit">—</div></div>
+    <div class="kpi" id="dy-k-waste"><div class="k">wasted padding FLOPs</div><div class="v" id="dy-waste">—</div></div>
+    <div class="kpi"><div class="k">total time (compile + run)</div><div class="v" id="dy-time">—</div></div>
+  </div>
+
+  <div class="reqs" id="dy-bars"></div>
+  <div class="legend">
+    <span><i style="background:var(--accent)"></i> useful work (true length)</span>
+    <span><i style="background:rgba(239,68,68,0.30); border:1px dashed var(--bad)"></i> wasted padding</span>
+    <span><i style="background:var(--code-bg); box-shadow:0 0 0 2px var(--accent-2) inset"></i> triggered a compile</span>
+  </div>
+</div>
+
+<p>Re-roll the stream a few times. Specialize-each's bill tracks the number of <em>distinct</em> lengths, not requests — a stream of 28 requests with 25 distinct lengths is 25 compiles. Bucketing collapses that to the bucket count no matter how many distinct lengths appear, and the padding caps shrink as you add buckets. Symbolic stays at one compile forever. That is the recompile-versus-waste trade, made into a knob.</p>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Compile storm in decode.</strong> Leaving full specialization on for an autoregressive loop recompiles on every token. <em>Signal:</em> first-token latency is fine but throughput is glued to the floor; <code>TORCH_LOGS="recompiles"</code> prints a recompile per step.</li>
+    <li><strong>The <span class="math">0/1</span> warmup.</strong> Warming up with <code>batch=1</code> bakes in a <span class="math">batch==1</span> guard; the first real batch recompiles. <em>Signal:</em> an unexpected recompile right after deploy, guard message naming the batch dim.</li>
+    <li><strong>Buckets too coarse.</strong> Two giant buckets minimize compiles but pad a 300-token request to 2,048. <em>Signal:</em> GPU utilization high but tokens/sec low — you're computing mostly mask.</li>
+    <li><strong>Data-dependent branch left as Python.</strong> An <code>if x.sum()&gt;0</code> in the hot path graph-breaks, severing fusion and CUDA-graph capture. <em>Signal:</em> measured speedup ≈ 1.0×; <code>TORCH_LOGS="graph_breaks"</code> flags the branch.</li>
+    <li><strong><code>cond</code> branches with mismatched shapes.</strong> The two arms return different shapes/dtypes, so the op won't compile. <em>Signal:</em> a constraint error at trace time demanding equal output specs from both branches.</li>
+  </ul>
+  </div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><strong>Inventory the moving dims</strong> — batch, sequence/KV length, ragged padding, expert counts. Each is a recompile axis until handled.</li>
+    <li><strong>Mark dynamic dims explicitly</strong> (<code>dynamic=True</code> or <code>mark_dynamic</code>) so the compiler reasons symbolically instead of specializing.</li>
+    <li><strong>Warm up with a representative shape</strong> — not 0, not 1, not the maximum — so guards generalize.</li>
+    <li><strong>Bucket the serving length axis</strong> and pad with masks; tune granularity against the padding-waste vs compile-count trade.</li>
+    <li><strong>Express control flow as ops</strong> (<code>torch.cond</code>/<code>scan</code>, <code>lax.cond</code>/<code>scan</code>), not Python branches, to keep the graph whole.</li>
+    <li><strong>Watch the logs</strong> — <code>recompiles</code>, <code>dynamic</code>, <code>graph_breaks</code> — every recompile and break costs you the optimizations of Parts III–IV.</li>
+  </ul>
+  </div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the widget, set strategy to <strong>specialize each shape</strong>, requests to 28 and max length to 2,048: note the recompile count (close to the number of distinct lengths) and the total time — almost all of it is compilation. Now switch to <strong>bucket to N</strong> with 4 buckets: recompiles drop to 4, hit-rate jumps, and a thin red padding cap appears on most bars. Slide buckets up to 8 and watch the caps shrink (less waste) while recompiles rise to 8 (more compile). Finally pick <strong>symbolic shapes</strong>: one recompile, zero padding, total time near pure run cost. Predict before you check: at 8 buckets over a length range of 256–2,048, what is the worst-case padding ratio for a request that lands just above a bucket boundary? (Roughly the bucket spacing over the request length — coarser buckets, fatter worst case.)</div>
+
+<h2>Where this points next</h2>
+
+<p>You can now keep the Part III–IV speedups while batch size, sequence length, and control flow all move at run time: symbolic shapes to compile once, guards to specialize safely, bucketing to bound the compile count, and control-flow ops to keep branches and loops inside the graph. But notice what every one of those handled — the <em>forward</em> graph. Everything from capture (02) through autotuning (10) and this lesson has compiled inference: the path from inputs to outputs. Training needs the <strong>backward</strong> graph too — the gradients — and you never wrote it. Hand-writing a backward for a fused, planned, laid-out, dynamically-shaped forward is hopeless; the compiler must <em>build</em> the backward graph from the forward and then run the same fusion, planning, and layout passes on it. That makes differentiation itself a compiler pass — lesson 12, <strong><a href="12_autodiff.html">Autodiff as a compiler pass</a></strong>.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+Every pass in Parts III and IV bought its speedup by specializing to concrete static shapes and caching the result under those numbers — but production serving moves the shapes on every call: variable batch, KV length that grows each decode step, ragged prompts, MoE routing. Full specialization stays correct but triggers a <strong>compile storm</strong> — a recompile per distinct shape, fatal in decode where the cost dwarfs the microsecond kernels it protects. Four tools keep the speedup. <strong>Symbolic shapes</strong> carry dimensions as variables (<span class="math">s0</span>, <span class="math">s0+1</span>) with constraints and compile <em>once</em> for the whole size range, trading ≈5–20% peak for one compile. <strong>Guards</strong> are cheap predicates recording every assumption the optimizer made; they pass → cache hit, fail → recompile — the dynamic enforcement of the preserve-semantics invariant — and the <span class="math">0/1</span> gotcha means warming up at batch 1 bakes in a guard that the first real batch violates. <strong>Bucketing + padding</strong> compiles a handful of canonical sizes and rounds each request up, keeping cache hits and CUDA graphs at the cost of wasted FLOPs on the pad (the granularity knob: tighter buckets = less waste, more compiles). And <strong>control-flow ops</strong> — <code>torch.cond</code>/<code>scan</code>, <code>lax.cond</code>/<code>scan</code> — capture branches and loops as real graph nodes (with equal output specs across arms) instead of graph-breaking into eager, so fusion and capture survive. This is the defining hard problem of ML compilers — and it is the last one about the forward graph: training forces the compiler to build the backward graph itself.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why does autoregressive decode break a statically-specialized compiler so badly? <em>(§1–2 — the KV-cache/sequence length grows by one every step, so every step is a new shape, a new autotune cache key, a cache miss, and a recompile; you spend seconds compiling per step that runs in microseconds — a compile storm.)</em></li>
+  <li>What is a symbolic shape and what does it cost? <em>(§2 — a dimension carried as a variable s0 with constraints (s0+1, s0%8==0) so one kernel is valid for all sizes; you compile once instead of per shape, paying ≈5–20% peak because variable loop bounds can't hard-unroll and one autotune config must serve the whole range.)</em></li>
+  <li>What is a guard, and how does recompilation get triggered? <em>(§3 — a cheap boolean predicate recording the optimizer's assumptions (dtypes, ranks, static dim values, symbolic constraints); checked in µs before each call. Pass → replay cached kernel; fail → recompile and re-specialize. It's the dynamic form of preserve-semantics.)</em></li>
+  <li>Explain the 0/1 specialization gotcha. <em>(§3 — dims of size 0 or 1 enable broadcast/squeeze rewrites only valid at exactly that size, so compilers always specialize on them; warming up at batch=1 bakes a batch==1 guard that the first real batch violates, forcing a recompile. Warm up with a representative non-0/1 shape.)</em></li>
+  <li>When do you bucket-and-pad instead of using symbolic shapes, and what's the trade? <em>(§4 — when you need per-shape kernel speed or CUDA-graph capture, which needs stable shapes; compile a few buckets and round requests up. Trade: cache hits + capture vs wasted FLOPs on padding; tighter buckets cut waste but add compiles and pinned memory.)</em></li>
+  <li>How should a compiler handle <code>if x.sum() &gt; 0:</code> in a hot loop? <em>(§5 — capturing it as a Python branch graph-breaks, severing fusion and CUDA-graph capture; rewrite as a control-flow op torch.cond (both arms returning the same shapes/dtypes) so it stays one optimizable graph node.)</em></li>
+  <li>Why is a decode loop expressed as <code>lax.scan</code> rather than an unrolled Python loop? <em>(§5 — scan is one rolled graph op with a shape-stable carry, so the graph is a few nodes the compiler can fuse and capture; unrolling 2,048 steps produces 2,048× the nodes and a hopeless compile, and a data-dependent length can't be unrolled at all.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="10_autotuning.html"><span class="dir">← Back</span><span class="ttl">10 · Autotuning</span></a>
+  <a class="next" href="12_autodiff.html"><span class="dir">Next →</span><span class="ttl">12 · Autodiff</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var bars = document.getElementById('dy-bars');
+  if (!bars) return;
+
+  var selStrat = document.getElementById('dy-strat');
+  var slN = document.getElementById('dy-n'), slMax = document.getElementById('dy-max'), slB = document.getElementById('dy-b');
+  var vN = document.getElementById('dy-nv'), vMax = document.getElementById('dy-maxv'), vB = document.getElementById('dy-bv');
+  var kRc = document.getElementById('dy-rc'), kHit = document.getElementById('dy-hit');
+  var kWaste = document.getElementById('dy-waste'), kTime = document.getElementById('dy-time');
+  var kRcBox = document.getElementById('dy-k-rc'), kWasteBox = document.getElementById('dy-k-waste');
+  var btn = document.getElementById('dy-reroll');
+
+  var COMPILE_MS = 1200;   // illustrative: one compile ≈ 1.2 s
+  var seed = 12345;
+  function rng(){ seed = (seed*1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+
+  var lengths = [];
+  function roll(){
+    var n = +slN.value, mx = +slMax.value;
+    lengths = [];
+    for (var i=0;i<n;i++){
+      // skew toward shorter requests, but allow long ones
+      var u = rng(); u = u*u;            // bias low
+      var L = 16 + Math.round(u * (mx - 16));
+      lengths.push(L);
+    }
+  }
+
+  function comma(x){ return Math.round(x).toLocaleString('en-US'); }
+
+  // attention work ~ length^2 (the dominant data-dependent cost); run time ~ that, in toy ms
+  function work(L){ return L*L; }
+  var RUN_SCALE = 1 / 4000;   // toy: scale length^2 into ~ms-ish run units
+
+  function buckets(mx, nb){
+    // geometric-ish buckets from 128..mx, nb of them, ascending
+    var arr = [];
+    var lo = 128;
+    if (mx <= lo){ return [mx]; }
+    for (var i=0;i<nb;i++){
+      var f = (i+1)/nb;
+      var v = Math.round(lo * Math.pow(mx/lo, f) / 64) * 64;
+      if (v < lo) v = lo;
+      if (v > mx) v = mx;
+      arr.push(v);
+    }
+    // dedup + ensure ascending + ensure top reaches mx
+    arr = arr.filter(function(v,i){ return arr.indexOf(v)===i; });
+    arr.sort(function(a,b){return a-b;});
+    if (arr[arr.length-1] < mx) arr.push(mx);
+    return arr;
+  }
+
+  function ceilToBucket(L, bks){
+    for (var i=0;i<bks.length;i++){ if (L <= bks[i]) return bks[i]; }
+    return bks[bks.length-1];
+  }
+
+  function recompute(){
+    vN.textContent = comma(+slN.value);
+    vMax.textContent = comma(+slMax.value);
+    vB.textContent = +slB.value;
+    var strat = selStrat.value, mx = +slMax.value;
+    var bks = buckets(mx, +slB.value);
+
+    var seen = {};      // cache keys already compiled
+    var compiles = 0, hits = 0, calls = lengths.length;
+    var usefulFlops = 0, paddedFlops = 0;
+    var rendered = [];
+
+    for (var i=0;i<lengths.length;i++){
+      var L = lengths[i];
+      var effLen, key, isCompile=false;
+      if (strat === 'spec'){ effLen = L; key = 'L'+L; }
+      else if (strat === 'bucket'){ effLen = ceilToBucket(L, bks); key = 'B'+effLen; }
+      else if (strat === 'padmax'){ effLen = mx; key = 'MAX'; }
+      else { effLen = L; key = 'SYM'; }   // symbolic: one artifact, no padding
+
+      if (!seen[key]){ seen[key]=true; compiles++; isCompile=true; }
+      else { hits++; }
+
+      usefulFlops += work(L);
+      paddedFlops += work(effLen) - work(L);
+      rendered.push({ L:L, eff:effLen, compile:isCompile });
+    }
+
+    var runMs = 0;
+    for (var j=0;j<rendered.length;j++){ runMs += work(rendered[j].eff) * RUN_SCALE; }
+    var compileMs = compiles * COMPILE_MS;
+    var totalMs = compileMs + runMs;
+
+    var hitRate = calls>0 ? (hits/calls*100) : 0;
+    var wastePct = usefulFlops>0 ? (paddedFlops/usefulFlops*100) : 0;
+
+    kRc.textContent = comma(compiles);
+    kHit.textContent = hitRate.toFixed(0) + '%';
+    kWaste.textContent = wastePct.toFixed(0) + '%';
+    kTime.textContent = (totalMs/1000).toFixed(1) + ' s  (' + (compileMs/1000).toFixed(1) + ' compile + ' + (runMs/1000).toFixed(2) + ' run)';
+
+    // color the danger KPIs
+    if (compiles > Math.max(8, calls*0.5)) kRcBox.classList.add('over'); else kRcBox.classList.remove('over');
+    if (wastePct > 60) kWasteBox.classList.add('over'); else kWasteBox.classList.remove('over');
+
+    // render bars
+    bars.innerHTML = '';
+    var H = 120; // px max height
+    for (var b=0;b<rendered.length;b++){
+      var r = rendered[b];
+      var div = document.createElement('div');
+      div.className = 'r' + (r.compile ? ' compile' : '');
+      var totH = Math.max(6, Math.round(r.eff / mx * H));
+      div.style.height = totH + 'px';
+      var useH = Math.round(r.L / mx * H);
+      var padH = totH - useH;
+      if (padH > 0){
+        var pad = document.createElement('div'); pad.className='pad'; pad.style.height = padH + 'px';
+        div.appendChild(pad);
+      }
+      var use = document.createElement('div'); use.className='use'; use.style.height = useH + 'px';
+      div.appendChild(use);
+      div.title = 'true len ' + r.L + ' → runs at ' + r.eff + (r.compile ? '  (compiled)' : '  (cache hit)');
+      bars.appendChild(div);
+    }
+  }
+
+  [selStrat, slN, slMax, slB].forEach(function(el){
+    el.addEventListener('input', function(){
+      if (el === slN || el === slMax) roll();
+      recompute();
+    });
+  });
+  btn.addEventListener('click', function(){ seed = (Date.now() & 0x7fffffff) || 1; roll(); recompute(); });
+
+  roll();
+  recompute();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

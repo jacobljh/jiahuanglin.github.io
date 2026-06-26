@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>02 · Capturing the graph</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local layout only — failure/checklist columns + the capture-sim board */
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; font-size: 15px; }
+  .lesson-card ul { margin: 0; padding-left: 18px; }
+  .lesson-card li { margin: 7px 0; font-size: 13.5px; line-height: 1.5; }
+  .kpi.bad .v { color: var(--bad); }
+  .kpi.good .v { color: var(--ok); }
+  .cap-prog { font-family: var(--mono); font-size: 12.5px; line-height: 1.55; background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; margin: 4px 0 12px; white-space: pre; overflow-x: auto; }
+  .cap-prog .hl { color: var(--accent-2); font-weight: 600; }
+  .cap-graph { font-family: var(--mono); font-size: 12px; line-height: 1.5; background: var(--code-bg); border: 1px dashed var(--border); border-radius: 8px; padding: 12px 14px; min-height: 96px; white-space: pre; overflow-x: auto; color: var(--text-mute); }
+  .seg { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+  .seg button { font-family: var(--mono); font-size: 12px; }
+  .seg button.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; color: var(--text); }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">ai_compilers / lessons</a><span class="crumb">/</span><span class="crumb">02 · capture</span><span class="step-pill">lesson 3 / 16</span></div></header>
+
+<main>
+
+<p class="kicker">Part II — Front end</p>
+<h1>Capturing the graph</h1>
+<p class="subtitle">Lesson 01 priced eager execution and found two ceilings — launch-bound (thousands of tiny kernels, each ~3–10 µs to dispatch) and bandwidth-bound (each op re-reads its activation from HBM). Both are <em>whole-program</em> problems: to fuse two ops you must see both at once, to plan memory you must see every buffer's lifetime. But eager PyTorch hands the runtime one op at a time and forgets it the instant it returns. There is no program to optimize — only a stream of already-executed calls. Before any pass in this track can run, you have to do the unglamorous thing first: turn the Python into a <strong>graph</strong>. This lesson is about the three ways to capture one, and the real trade hiding in each.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>The eager ceilings from lesson 01 are global. Fusion needs to know that the <code>gelu</code> consumes the <code>add</code> that consumes the <code>matmul</code>; memory planning needs every buffer's first-def and last-use across the whole forward. Eager gives you none of that: <code>y = x @ w</code> dispatches a kernel, returns a tensor, and the dispatcher moves on — the relationship between this op and the next lives only in the Python interpreter's call stack, which is gone by the time the next line runs. You cannot optimize a program you never get to hold. The compiler's first job is therefore not optimization at all; it is <strong>capture</strong> — reconstructing the dataflow graph that eager execution threw away.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> the whole-program optimizations lesson 01 demands need the whole program as a graph, but the program is imperative Python that runs and forgets.<br><strong>New idea:</strong> <strong>graph capture</strong>, with three strategies and a genuine trade — <strong>tracing</strong> (run with example inputs, record the ops; simple and backend-agnostic, but bakes in shapes and silently drops data-dependent control flow), <strong>scripting / AST</strong> (parse the source; keeps control flow at the cost of supporting only a language subset), and <strong>bytecode analysis</strong> (TorchDynamo — interpret CPython bytecode, emit an FX graph of the straight-line tensor ops, and <strong>graph-break</strong> back to eager at anything it can't trace), guarded by <strong>guards</strong> that invalidate the captured graph when its assumptions change.<br><strong>Forces next:</strong> capture hands you a graph, but it is a tangle of framework objects with no rules about what an op, a value, or a legal rewrite is — you need a principled IR (lesson 03).</div>
+
+<div class="callout"><div class="label">The plan</div>Five moves. (1) Pin down why eager gives you no graph and what "capture" even means. (2) Tracing: run-and-record (<code>fx.symbolic_trace</code>, <code>torch.jit.trace</code>, JAX <code>make_jaxpr</code>) — and the trap, where <code>if x.sum() &gt; 0</code> vanishes. (3) Scripting / AST: parse the source to keep control flow, paying for it with a language subset. (4) Dynamo: bytecode interpretation, partial graphs, guards, graph breaks — the modern default. (5) Lay the three side by side in a trade table. Then drive the capture simulator until tracing silently drops a branch and Dynamo guards-and-breaks instead.</div>
+
+<h2>1 · Why eager hands you no graph</h2>
+
+<p>In eager mode every tensor op is dispatched and executed the moment Python reaches it. <code>z = x @ w</code> walks Python → the PyTorch <strong>dispatcher</strong> → an ATen kernel → a CUDA launch → an output tensor, and then control returns to the interpreter. The next line repeats the whole walk. There is no object anywhere that says "z is the matmul of x and w, and it feeds the next add." That edge existed for a microsecond as a stack frame and is now gone. This is exactly what makes eager pleasant to debug — you can <code>print</code> any intermediate, set a breakpoint, branch on a tensor's value — and exactly what makes it impossible to optimize across ops.</p>
+
+<p>A <strong>graph</strong> is the thing eager refuses to build: a directed acyclic graph whose nodes are ops and whose edges are tensor values, capturing <em>which op produces which value and who consumes it</em>. With that in hand a compiler can finally ask the lesson-01 questions — which round trips can I merge, which buffers can share storage, which layout cancels a transpose. <strong>Capture</strong> is the act of recovering that graph from the imperative program. There are exactly three places to intercept the program to do it, and they line up with how much of the program's structure each one can see.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">trace — watch it run</div><div class="v">Execute the function on a concrete example input and record each tensor op as it fires. Sees the <em>one path</em> that example took. The recorder never sees the Python <code>if</code> — only the branch that happened to run.</div></div>
+  <div class="topic-card"><div class="k">script / AST — read the source</div><div class="v">Parse the Python source into an AST and compile a typed subset of it directly. Sees the <code>if</code>/<code>for</code> as syntax, so control flow survives — but only for the subset of Python it knows how to translate.</div></div>
+  <div class="topic-card"><div class="k">bytecode — interpret the frame</div><div class="v">Hook CPython's frame evaluation, symbolically interpret the bytecode, accumulate tensor ops into a graph, and bail to eager (a <em>graph break</em>) at any instruction it can't model. Captures most code with no source rewrite.</div></div>
+</div>
+
+<h2>2 · Tracing: run once, record the ops</h2>
+
+<p><strong>Tracing</strong> runs the function on example inputs and records every tensor op the execution actually performs, in order, wiring outputs to inputs to build the graph. It is the simplest strategy and the most portable — the result is just a list of ops, which any backend can consume. <code>torch.fx.symbolic_trace</code> does it with <em>Proxy</em> objects (fake tensors that record operations instead of computing them); <code>torch.jit.trace</code> does it by running real tensors and watching the dispatcher; JAX's <code>make_jaxpr</code> traces a function into a <strong>jaxpr</strong> — JAX's typed, functional trace IR. A <strong>trace</strong>, then, is the recorded op sequence of one execution. Here is the jaxpr for a tiny linear-plus-gelu, abridged:</p>
+
+<pre><code>&gt;&gt;&gt; import jax, jax.numpy as jnp
+&gt;&gt;&gt; def f(x, w, b): return jax.nn.gelu(x @ w + b)
+&gt;&gt;&gt; print(jax.make_jaxpr(f)(jnp.ones((8, 4)), jnp.ones((4, 4)), jnp.ones(4)))
+{ lambda ; a:f32[8,4] b:f32[4,4] c:f32[4]. let
+    d:f32[8,4] = dot_general[dimension_numbers=(([1],[0]),([],[]))] a b
+    e:f32[8,4] = add d c
+    f:f32[8,4] = ... gelu(e) ...           # exp / tanh / mul chain, abridged
+  in (f,) }</code></pre>
+
+<p>Notice the shapes are <em>frozen into the type of every value</em>: <code>f32[8,4]</code>, not <code>f32[batch,4]</code>. That is the first half of tracing's trap — the trace is specialized to the example's shapes. Feed it a batch of 16 and the trace is, in general, invalid; you re-trace. The second, more dangerous half is <strong>control flow</strong>. The tracer only ever sees the ops that <em>executed</em>, so a data-dependent branch collapses to whichever side the example happened to take:</p>
+
+<pre><code>def f(x):
+    if x.sum() &gt; 0:          # a Python bool on a traced tensor — the tracer can't see both sides
+        return x * 2
+    return x - 1
+
+# trace with x.sum() &gt; 0  →  graph is just  {mul x, 2}.  The  (x - 1)  branch is GONE.
+# run the trace on an x with negative sum  →  you still get  x * 2.  Silently wrong.</code></pre>
+
+<p>The <code>if</code> is not in the graph because it was never a tensor op — it was a Python control decision that the tracer resolved once and baked in. <code>fx.symbolic_trace</code> at least <em>errors</em> if you call <code>bool()</code> on a Proxy (you can't branch on a fake tensor); <code>jit.trace</code> warns but proceeds. Either way, tracing's verdict is blunt: <strong>it captures dataflow perfectly and control flow not at all.</strong> For a feed-forward block with fixed shapes that is fine. For anything with a real branch — early exit, padding-dependent masking, mixture-of-experts routing — it is a correctness bug waiting to ship.</p>
+
+<h2>3 · Scripting / AST: parse the source, keep the branches</h2>
+
+<p>If the problem with tracing is that control flow lives in the source and never reaches the runtime, the obvious fix is to capture from the source. <strong>Scripting</strong> parses the Python AST and compiles it — <code>if</code>, <code>for</code>, <code>while</code> and all — into a graph IR that contains real control-flow nodes. <code>torch.jit.script</code> is the canonical example: it walks the function's AST and emits TorchScript, an IR with genuine branch and loop ops, so both sides of every <code>if</code> are preserved regardless of which one any particular input takes.</p>
+
+<pre><code>@torch.jit.script
+def f(x):
+    if bool((x.sum() &gt; 0).item()):   # captured as a real prim::If node — BOTH branches live in the graph
+        return x * 2
+    return x - 1
+# graph(%x): %1 : bool = aten::gt(aten::sum(%x), 0)
+#            %y : Tensor = prim::If(%1)
+#              block0(): -&gt; (aten::mul(%x, 2))     # then
+#              block1(): -&gt; (aten::sub(%x, 1))     # else</code></pre>
+
+<p>The cost is paid in coverage. The AST compiler can only translate the <strong>subset</strong> of Python it has rules for: static types (it infers or you annotate; defaults to <code>Tensor</code>), a fixed set of builtins, no arbitrary <code>*args</code> games, no calling into NumPy or third-party libraries, no dynamic class tricks. Hit something outside the subset and scripting fails to compile — loudly, which is at least honest, but it means real models need rewriting to fit the subset. This is why <code>torch.jit.script</code> never became the default capture path: the subset was a constant tax on model authors, and the field wanted something that captured ordinary, unmodified PyTorch.</p>
+
+<h2>4 · Dynamo: interpret the bytecode, guard, and break</h2>
+
+<p><strong>TorchDynamo</strong> (the capture front end of <code>torch.compile</code>) is the third strategy, and it splits the difference. Instead of running the function (tracing) or parsing its source (scripting), it hooks CPython's <em>frame evaluation</em> — the layer below the source — and <strong>symbolically interprets the bytecode</strong>. As it steps through the instructions, it accumulates the tensor ops into an <strong>FX graph</strong> (PyTorch's flat IR: a list of <code>(op, args, kwargs)</code> nodes with tensor metadata; see <a href="../../gpu_kernels/23_torch_compile.html">gpu_kernels · 23 torch.compile</a>). When it reaches an instruction it can model as a tensor op, it adds a node. When it reaches one it cannot — a data-dependent Python branch, a <code>print</code>, a call into NumPy, a list mutation — it does a <strong>graph break</strong>: it compiles the straight-line graph accumulated so far, hands control back to the real CPython interpreter to run the un-traceable bit eagerly, then starts a fresh graph after. The result is a chain of compiled graph islands separated by eager gaps.</p>
+
+<p>Because Dynamo captures a <em>straight-line</em> graph (it followed one path through the bytecode), it must protect that graph's assumptions. It does this with <strong>guards</strong>: a set of cheap runtime checks — on input dtypes, shapes (or symbolic shape relations), tensor ids, Python constants, the values it branched on — recorded alongside the compiled graph. Before reusing a cached graph, the runtime checks its guards; if every guard passes, it replays the compiled kernels, if any guard fails, the graph is invalid for these inputs and Dynamo <strong>recompiles</strong>. So Dynamo handles the cases tracing botched in two different ways: a data-dependent branch becomes a graph break (run that branch eagerly, capture each side's straight-line continuation separately), and a changed shape or dtype trips a guard and triggers a recompile rather than silently running a stale graph. A compact guard set looks like this:</p>
+
+<pre><code># torch._dynamo guards recorded for one compiled graph (illustrative, abridged):
+TENSOR_MATCH:  L['x']  dtype=torch.float32  device=cuda:0  rank=2  requires_grad=False
+SHAPE_ENV:     L['x'].size()[0] == 8        # batch specialized to 8  (recompiles if it changes)
+               L['x'].size()[1] == 4
+CONSTANT_MATCH L['scale'] == 2.0            # a Python float captured by value
+#  miss any guard  →  cache miss  →  retrace + recompile this frame</code></pre>
+
+<p>And the FX graph Dynamo emits for the straight-line part of our running example — captured, then fed to the rest of the compiler — reads like the jaxpr did, but as PyTorch nodes:</p>
+
+<pre><code>opcode         name     target                      args              # FX graph dump (torch.fx)
+-------------  -------  --------------------------  ----------------
+placeholder    x        x                           ()
+placeholder    w        w                           ()
+placeholder    b        b                           ()
+call_function  mm       aten.mm                     (x, w)
+call_function  add      aten.add                    (mm, b)
+call_function  gelu     aten.gelu                   (add,)
+output         output   output                      (gelu,)</code></pre>
+
+<p>This is the verdict the field reached: capture ordinary, unmodified PyTorch (no scripting subset to satisfy), keep correctness in the face of control flow and shape change (graph break + guard, never a silent wrong answer), and accept that the captured region may be fragmented. The remaining art — and most of lesson 11's job — is keeping graph breaks rare (each one stops fusion and CUDA-graph capture at the boundary) and guards loose enough to avoid a recompile storm.</p>
+
+<table class="trade-table">
+  <thead><tr><th>strategy</th><th>how it captures</th><th>control flow?</th><th>shape handling</th><th>coverage</th><th>failure mode</th></tr></thead>
+  <tbody>
+    <tr><td><strong>tracing</strong><br><span class="math">fx.symbolic_trace, jit.trace, make_jaxpr</span></td><td>run on example inputs, record ops</td><td><strong>lost</strong> — only the taken path</td><td>baked in; re-trace on change</td><td>high (any backend consumes the op list)</td><td>silently drops branches; stale shapes</td></tr>
+    <tr><td><strong>scripting / AST</strong><br><span class="math">jit.script</span></td><td>parse source AST, compile a subset</td><td><strong>preserved</strong> as branch/loop ops</td><td>can stay symbolic</td><td>low — only the supported Python subset</td><td>fails to compile unsupported Python</td></tr>
+    <tr><td><strong>bytecode</strong><br><span class="math">TorchDynamo</span></td><td>interpret CPython bytecode → FX</td><td><strong>graph-break</strong> to eager, recapture each side</td><td>guarded; recompile (or symbolic, L11) on change</td><td>very high — unmodified PyTorch</td><td>too many breaks / recompiles erode the win</td></tr>
+  </tbody>
+</table>
+
+<h2>5 · Drive it: the capture simulator</h2>
+
+<p>The widget runs a tiny program — one shape and one data-dependent branch — through each capture strategy. Pick a strategy, then perturb the world: flip the branch the input takes, or change the input's shape. Watch the four KPIs. Tracing always captures a graph but loses the branch (and goes stale when the shape changes, with no signal); scripting keeps the branch but only because the program stays in-subset; Dynamo keeps correctness by breaking the graph at the branch and by firing a guard → recompile when the shape changes. The configuration that "breaks" is tracing with the branch flipped: it reports a captured graph and preserved-looking output while having silently dropped the path the new input needs.</p>
+
+<div class="widget" id="capsim">
+  <div class="title">Capture simulator — one branch, one shape, three strategies</div>
+  <div class="hint">The program is <code>y = (x*2) if x.sum()&gt;0 else (x-1)</code> on a tensor of batch <span class="math">B</span>. Toggle the two perturbations and switch strategy. <strong>Proves:</strong> tracing captures but drops the branch (and silently runs stale on a new shape); Dynamo guards the shape and graph-breaks the branch instead of getting it wrong.</div>
+
+  <div class="controls" style="margin-top:6px">
+    <span class="seg" id="cs-mode" role="group" aria-label="capture strategy">
+      <button data-m="trace" class="on">tracing</button>
+      <button data-m="script">scripting</button>
+      <button data-m="dynamo">dynamo</button>
+    </span>
+  </div>
+  <div class="controls" style="margin-top:8px">
+    <label class="inline"><input type="checkbox" id="cs-branch"> branch flips (new input takes the <em>other</em> path)</label>
+    <label class="inline"><input type="checkbox" id="cs-shape"> input shape changed (B: 8 → 16)</label>
+  </div>
+
+  <div class="cap-prog">def f(x):                     <span class="hl"># traced/captured with example: x of shape [8], x.sum() &gt; 0</span>
+    if x.sum() &gt; 0:           <span class="hl"># data-dependent branch</span>
+        return x * 2          <span class="hl"># "then" path</span>
+    return x - 1              <span class="hl"># "else" path</span></div>
+
+  <div class="cap-graph" id="cs-graph">captured graph appears here</div>
+
+  <div class="kpi-grid">
+    <div class="kpi" id="cs-k-cap"><div class="k">graph captured?</div><div class="v" id="cs-cap">—</div></div>
+    <div class="kpi" id="cs-k-cf"><div class="k">control flow preserved?</div><div class="v" id="cs-cf">—</div></div>
+    <div class="kpi" id="cs-k-guard"><div class="k">guard fired → recompile?</div><div class="v" id="cs-guard">—</div></div>
+    <div class="kpi" id="cs-k-break"><div class="k"># graph breaks</div><div class="v" id="cs-break">—</div></div>
+  </div>
+  <p class="hint" id="cs-note" style="margin-top:10px"></p>
+</div>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Tracing a model with a real branch.</strong> The trace bakes in whichever path the example took; a different input gets the wrong graph. <em>Signal:</em> outputs that are correct on your trace input and quietly wrong on others — and no error, because the <code>if</code> was never in the graph.</li>
+    <li><strong>Treating a frozen shape as dynamic.</strong> A trace specialized to batch 8 reused at batch 16. <em>Signal:</em> shape-mismatch errors at run time, or a re-trace on every batch that erases the compile win.</li>
+    <li><strong>Branching on <code>.item()</code> inside a Dynamo region.</strong> Forces a graph break (data-dependent) you didn't intend. <em>Signal:</em> <code>TORCH_LOGS="graph_breaks"</code> shows a break exactly where you read a scalar; fusion stops there.</li>
+    <li><strong>Guard too tight.</strong> Specializing on a value that varies every call (e.g. a per-step constant). <em>Signal:</em> a recompile <em>every</em> step — <code>TORCH_LOGS="recompiles"</code> floods; compile time dwarfs run time.</li>
+    <li><strong>Pushing unsupported Python into <code>jit.script</code>.</strong> A NumPy call or dynamic attribute in the scripted region. <em>Signal:</em> a compile-time TorchScript error naming the unsupported construct.</li>
+  </ul>
+  </div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><strong>No data-dependent control flow?</strong> Tracing is fine and gives the cleanest graph.</li>
+    <li><strong>Has branches/loops on tensor values?</strong> Use bytecode capture (Dynamo) or structured control-flow ops (<code>torch.cond</code>), not a bare trace.</li>
+    <li><strong>Count graph breaks.</strong> <code>torch._dynamo.explain(fn, x)</code> reports them; each break is a fusion and CUDA-graph boundary.</li>
+    <li><strong>Watch recompiles.</strong> Loosen guards / mark dims dynamic so a changing shape doesn't retrace every call (lesson 11).</li>
+    <li><strong>Verify capture, not just speed.</strong> Compare compiled vs eager outputs with the branch taking <em>both</em> paths.</li>
+  </ul>
+  </div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the simulator and select <strong>tracing</strong>. Leave both toggles off — note it captures a graph, control flow shows "lost," 0 breaks. Now flip <strong>branch flips</strong>: the captured graph is unchanged (still <code>mul</code>) even though the new input needs the <code>sub</code> path — that is the silent bug, KPIs look healthy. Flip <strong>input shape changed</strong> on top: tracing still reports a graph but it is now stale for batch 16, again with no guard to catch it. Switch to <strong>dynamo</strong> and repeat: flipping the branch raises the break count to 1 (it captures each side separately), and changing the shape fires a guard → recompile. Finally switch to <strong>scripting</strong>: control flow is preserved with 0 breaks, but convince yourself why a NumPy call in this function would make this strategy fail to compile entirely. Which single strategy never returns a <em>wrong</em> answer for this program?</div>
+
+<h2>Where this points next</h2>
+
+<p>Whichever strategy you pick, the output is a graph — a jaxpr, a TorchScript graph, an FX graph. But "a graph" here is still just a pile of framework objects: ATen op nodes, Proxy edges, Python constants, in-place mutations that alias each other, types that may or may not carry a shape. There are no <em>rules</em> — no statement of what counts as a value, what a legal rewrite is, why moving an op past another preserves the math. Try to run constant folding or fusion on this raw capture and you will trip over aliasing and mutation immediately. To rewrite a graph safely and repeatedly you need a representation with a contract: single-assignment values, types that carry shape and dtype and device, a small well-defined op set, and levels you can lower between. That is the <strong>intermediate representation</strong>, lesson 03 — <strong><a href="03_ir.html">The intermediate representation</a></strong>.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+Optimization needs the whole program as a graph, but eager Python executes and forgets one op at a time, so the compiler's first job is <strong>capture</strong>. Three strategies trade structure for coverage. <strong>Tracing</strong> (<code>fx.symbolic_trace</code>, <code>jit.trace</code>, JAX <code>make_jaxpr</code> → a <strong>jaxpr</strong>) runs the function on example inputs and records the ops: dead simple and maximally portable, but it captures only the path that ran, so it <em>bakes in shapes</em> and <em>silently drops data-dependent control flow</em> — <code>if x.sum()&gt;0</code> disappears. <strong>Scripting / AST</strong> (<code>jit.script</code>) parses the source so branches and loops survive as real graph ops, at the price of supporting only a Python subset. <strong>Bytecode analysis</strong> (TorchDynamo) symbolically interprets CPython bytecode into an <strong>FX graph</strong>, protects each straight-line capture with a <strong>guard</strong> set (dtypes, shapes, constants) that triggers a <strong>recompile</strong> when violated, and does a <strong>graph break</strong> back to eager at anything it can't trace — capturing unmodified PyTorch while never returning a silently wrong answer. That is the modern verdict: Dynamo for capture, breaks and guards as the safety valves. But the captured graph is a tangle of framework objects with no rules for safe rewriting — which forces a principled IR next.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why can't you optimize an eager program without capturing it first? <em>(§1 — eager dispatches and executes each op immediately and discards the dataflow relationship; cross-op transforms like fusion and memory planning need the whole producer/consumer DAG, which only exists once you capture a graph.)</em></li>
+  <li>What does tracing silently get wrong, and why? <em>(§2 — it records only the ops that executed, so a data-dependent <code>if</code> collapses to the path the example took and the other branch never enters the graph; shapes are also frozen into value types. No tensor op = nothing to capture.)</em></li>
+  <li>How does scripting preserve control flow, and what does it cost? <em>(§3 — it parses the AST and emits real branch/loop ops (<code>prim::If</code>), so both sides survive; the cost is that it only compiles a typed Python subset, so unsupported constructs fail to compile.)</em></li>
+  <li>What exactly is a guard, and what happens when one fails? <em>(§4 — a cheap runtime check on a captured graph's assumptions (dtype, shape/symbolic-shape relation, tensor id, captured constant); on failure the cached graph is invalid for these inputs, so Dynamo retraces and recompiles the frame.)</em></li>
+  <li>What is a graph break and what does it cost you? <em>(§4 — Dynamo hits an instruction it can't model, compiles the graph so far, runs the un-traceable part in eager CPython, then starts a new graph; it bounds the captured region, so fusion and CUDA-graph capture stop at the boundary.)</em></li>
+  <li>You torch.compile a model and see a recompile every step. Diagnose. <em>(§4 / Failure modes — a guard is over-specialized on a value or shape that changes each call; loosen it / mark the dim dynamic so the graph is reused instead of retraced — full treatment in lesson 11.)</em></li>
+  <li>Which capture strategy would you pick for a feed-forward block vs a model with early-exit, and why? <em>(§5 — tracing for the branch-free block (cleanest, most portable graph); Dynamo (or <code>torch.cond</code>) for early-exit, because a bare trace would drop the exit path and ship a correctness bug.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="01_eager_baseline.html"><span class="dir">← Back</span><span class="ttl">01 · The eager baseline</span></a>
+  <a class="next" href="03_ir.html"><span class="dir">Next →</span><span class="ttl">03 · The intermediate representation</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var seg = document.getElementById('cs-mode');
+  if (!seg) return;
+  var btns = Array.prototype.slice.call(seg.querySelectorAll('button'));
+  var cbBranch = document.getElementById('cs-branch');
+  var cbShape  = document.getElementById('cs-shape');
+  var gEl = document.getElementById('cs-graph');
+  var cap = document.getElementById('cs-cap'), cf = document.getElementById('cs-cf');
+  var gd = document.getElementById('cs-guard'), brk = document.getElementById('cs-break');
+  var kCap = document.getElementById('cs-k-cap'), kCf = document.getElementById('cs-k-cf');
+  var kGd = document.getElementById('cs-k-guard'), kBrk = document.getElementById('cs-k-break');
+  var note = document.getElementById('cs-note');
+  var mode = 'trace';
+
+  function set(el, kpi, text, kind){   // kind: 'good' | 'bad' | ''
+    el.textContent = text;
+    kpi.classList.remove('good','bad');
+    if (kind) kpi.classList.add(kind);
+  }
+
+  function render(){
+    var flip = cbBranch.checked;     // new input takes the OTHER (else) path
+    var newShape = cbShape.checked;  // B 8 -> 16
+    var B = newShape ? 16 : 8;
+
+    if (mode === 'trace'){
+      // tracing: records only the path the EXAMPLE took (the 'then' / mul path, B=8).
+      // graph never changes with perturbations -> that's the bug.
+      gEl.textContent =
+        'placeholder  x\n' +
+        'call_function mul   (x, 2)        # only the "then" path was recorded\n' +
+        'output        (mul,)              # shape frozen: x : f32[8]';
+      set(cap, kCap, 'yes', 'good');
+      set(cf,  kCf,  'LOST — only "then" recorded', 'bad');
+      set(gd,  kGd,  'no guard', newShape ? 'bad' : '');
+      set(brk, kBrk, '0', '');
+      if (flip && newShape)
+        note.textContent = 'Silently wrong twice over: the graph still runs x*2 though the new input needs x-1, and it is stale for batch 16 — no guard, no error.';
+      else if (flip)
+        note.textContent = 'Silently wrong: the captured graph is x*2, but this input needed x-1. The branch was never an op, so it vanished — and nothing flags it.';
+      else if (newShape)
+        note.textContent = 'Stale: the trace is specialized to f32[8] and is being reused at f32[16] with no guard to catch it.';
+      else
+        note.textContent = 'Captures clean dataflow, but the branch is already gone — correct only as long as every input takes the recorded path at the recorded shape.';
+    }
+    else if (mode === 'script'){
+      // scripting: AST has the real If node -> both branches present, control flow preserved.
+      gEl.textContent =
+        'graph(%x):\n' +
+        '  %c : bool   = aten::gt(aten::sum(%x), 0)\n' +
+        '  %y : Tensor = prim::If(%c)\n' +
+        '      block0(): -> (aten::mul(%x, 2))   # then\n' +
+        '      block1(): -> (aten::sub(%x, 1))   # else';
+      set(cap, kCap, 'yes', 'good');
+      set(cf,  kCf,  'PRESERVED (prim::If)', 'good');
+      set(gd,  kGd,  'n/a (no spec.)', '');
+      set(brk, kBrk, '0', '');
+      note.textContent = (flip
+        ? 'Correct on the flipped input — both branches are in the graph, so the If picks x-1 at run time. '
+        : 'Both branches captured as a real If node. ')
+        + 'Works only because this function stays inside the TorchScript subset; a NumPy call here would fail to compile.';
+    }
+    else { // dynamo
+      var breaks = flip ? 1 : 0;     // data-dependent branch -> graph break
+      gEl.textContent =
+        'FX graph #0 (up to the branch):\n' +
+        '  placeholder x\n' +
+        '  call_function sum  (x,)\n' +
+        '  call_function gt   (sum, 0)   -> graph break: data-dependent if\n' +
+        (flip
+          ? 'FX graph #1 (else, captured separately):\n  call_function sub (x, 1)'
+          : 'FX graph #1 (then):\n  call_function mul (x, 2)') +
+        '\nguards: TENSOR_MATCH x dtype=f32 rank=1; SHAPE_ENV size[0]==' + B;
+      set(cap, kCap, 'yes (islands)', 'good');
+      set(cf,  kCf,  'via graph break + eager', 'good');
+      set(gd,  kGd,  newShape ? 'YES — recompile' : 'no (guards hold)', newShape ? 'bad' : 'good');
+      set(brk, kBrk, String(breaks), breaks ? '' : 'good');
+      var parts = [];
+      parts.push(flip
+        ? 'The data-dependent if forces 1 graph break; Dynamo runs the compare in eager and captures each side as its own straight-line graph — never wrong.'
+        : 'Straight-line capture into one FX island; the compare guard records which branch was taken.');
+      if (newShape) parts.push('Batch 8 → 16 fails the SHAPE_ENV guard, so the frame recompiles instead of running stale.');
+      note.textContent = parts.join(' ');
+    }
+  }
+
+  btns.forEach(function(b){
+    b.addEventListener('click', function(){
+      btns.forEach(function(x){ x.classList.remove('on'); });
+      b.classList.add('on');
+      mode = b.getAttribute('data-m');
+      render();
+    });
+  });
+  cbBranch.addEventListener('change', render);
+  cbShape.addEventListener('change', render);
+  render();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>
