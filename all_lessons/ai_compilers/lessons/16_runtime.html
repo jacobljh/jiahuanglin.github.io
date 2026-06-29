@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>16 · The runtime &amp; executor</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local layout only — failure/checklist columns + the launch-overhead visual */
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; font-size: 15px; }
+  .lesson-card ul { margin: 0; padding-left: 18px; }
+  .lesson-card li { margin: 7px 0; font-size: 13.5px; line-height: 1.5; }
+  .kpi.over .v { color: var(--bad); }
+  .kpi.good .v { color: var(--ok); }
+  /* the launch-timeline visual inside the widget */
+  .lt-track { position: relative; height: 34px; border: 1px solid var(--border); border-radius: 6px; background: var(--code-bg); overflow: hidden; margin: 12px 0 4px; }
+  .lt-seg { position: absolute; top: 0; height: 100%; box-sizing: border-box; }
+  .lt-seg.tax { background: rgba(220,38,38,0.34); border-right: 1px solid rgba(220,38,38,0.6); }
+  .lt-seg.work { background: rgba(22,163,74,0.30); border-right: 1px solid rgba(22,163,74,0.55); }
+  .lt-seg.driver { background: rgba(99,102,241,0.40); border-right: 1px solid rgba(99,102,241,0.75); }
+  .lt-cap { font-family: var(--mono); font-size: 11px; color: var(--text-mute); margin: 2px 0 0; }
+  .lt-legend { display: flex; flex-wrap: wrap; gap: 16px; margin: 8px 0 2px; font-family: var(--mono); font-size: 11px; color: var(--text-mute); }
+  .lt-legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .lt-legend i { width: 14px; height: 10px; border-radius: 2px; display: inline-block; }
+  .flag-ok { color: var(--ok); } .flag-bad { color: var(--bad); }
+  @media (max-width: 720px) { .lesson-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">ai_compilers / lessons</a><span class="crumb">/</span><span class="crumb">16 · runtime &amp; executor</span><span class="step-pill">lesson 17 / 20</span></div></header>
+
+<main>
+
+<p class="kicker">Part VI — Shipping the compiled model</p>
+<h1>The runtime &amp; executor</h1>
+<p class="subtitle">Everything since lesson 02 has produced a thing, not an act. Capture, lowering, fusion, the memory plan from lesson 06, codegen, autotuning, and now quantization (lesson 15) all hand you the same deliverable: an inert <em>artifact</em> — a cache of compiled kernels plus a recipe that says which buffer goes where. An artifact does not run. Something has to walk in, allocate the buffers the plan describes, push the kernels onto the GPU in order, and do it without paying the per-op tax that lesson 01 priced and that has been sitting on the critical path this whole time. That something is the runtime. This lesson is the run-time half of a track that has, until now, been entirely about compile time.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>Quantization (lesson 15) was the last pass that touches kernels: by lesson 16 the compiler has finished. What it leaves behind is a static bundle — Triton or PTX cubins keyed by shape and dtype (lesson 09, 10), a memory plan that says "buffer 7 reuses buffer 3's slot, the arena is 412 MB" (lesson 06), and a list of guards (lesson 11) that say which inputs the bundle is valid for. None of that allocates a single byte or launches a single kernel. Worse, lesson 01's launch-bound ceiling is <em>still standing</em>: even a perfectly fused, quantized, scheduled artifact, if you dispatch its kernels one Python call at a time, pays ≈5–25 µs of CPU tax per launch and the GPU starves between them. The compiler made the kernels fast; nothing yet makes <em>launching them</em> fast, or even possible.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> the compiler produces an inert artifact — kernels plus a memory plan plus guards — and nothing in it allocates buffers, dispatches kernels in order, or amortizes the per-op launch tax that lesson 01 left on the critical path.<br><strong>New idea:</strong> the <strong>runtime / executor</strong> as the run-time counterpart to the compiler — <strong>streams &amp; async dispatch</strong> (a launch queue the GPU drains while the CPU runs ahead, overlapping kernels with H2D/D2H copies via events), a <strong>caching allocator / memory pool</strong> that <em>realizes</em> the lesson-06 plan by serving buffers from one preallocated arena instead of calling <code>cudaMalloc</code> on the hot path, and <strong>CUDA graph capture &amp; replay</strong> — record the entire launch sequence once, replay it with a single driver call, which is the real fix for lesson 01's launch ceiling. Plus the <strong>AOT path</strong> (<code>torch.export</code> → AOTInductor <code>.so</code>, a serialized engine) for Python-free serving.<br><strong>Forces next:</strong> graph replay needs stable shapes and stable addresses, so it fights the dynamic shapes of lesson 11; and fusion, quantization, and replay all silently change results or recompile. You now need to <em>trust</em> and <em>debug</em> the compiled artifact — lesson 17.</div>
+
+<div class="callout"><div class="label">The plan</div>Five moves. (1) Draw the line between the compiler artifact and the runtime: who owns what. (2) Streams &amp; async dispatch — the launch queue, overlap with copies, events, and why the launch tax is <em>still</em> on the critical path for small models. (3) The caching allocator that realizes the lesson-06 plan without hot-path <code>cudaMalloc</code>; fragmentation and OOM; pool segments. (4) CUDA graphs — capture/replay, the one-call launch, <code>mode="reduce-overhead"</code>, cudagraph trees, and the stable-shape/stable-address catch that collides with lesson 11. (5) The AOT/serving path — <code>torch.export</code> → AOTInductor <code>.so</code>, serialized engines, the guard-check-then-dispatch loop, and the code/graph cache for warm starts. Then drive the widget until graph-replay collapses N launches into ≈1 driver call — and dynamic shapes break it.</div>
+
+<h2>1 · Two halves of the machine: the artifact vs the runtime</h2>
+
+<p>It is worth saying plainly because the whole track has blurred it: a compiler and a runtime are different programs, run at different times, that own different things. The <strong>compiler</strong> runs once, ahead of (or just before) serving, and its output is a <strong>compiled artifact</strong> — an inert data structure. The <strong>runtime</strong> (also called the <strong>executor</strong>) runs on every request and is the live process that turns that data structure into GPU work.</p>
+
+<table class="trade-table">
+  <thead><tr><th>concern</th><th>compiler (compile time) — owns the <em>artifact</em></th><th>runtime / executor (run time) — owns the <em>act</em></th></tr></thead>
+  <tbody>
+    <tr><td>kernels</td><td>generates &amp; caches them (lesson 09), tunes configs (lesson 10), quantizes (lesson 15)</td><td>looks them up by shape/dtype and <em>launches</em> them in order</td></tr>
+    <tr><td>memory</td><td>computes the plan: liveness, reuse, arena size (lesson 06)</td><td><em>realizes</em> the plan — allocates the arena, hands out slices, recycles them</td></tr>
+    <tr><td>shapes</td><td>specializes &amp; emits <strong>guards</strong> (lesson 11)</td><td>checks guards on each input; dispatches or recompiles on a miss</td></tr>
+    <tr><td>overhead</td><td>nothing it can do at compile time about per-launch CPU tax</td><td>amortizes it — async streams, then CUDA graph replay</td></tr>
+    <tr><td>when it runs</td><td>once, offline or on first call (JIT)</td><td>every forward pass, on the critical path of latency</td></tr>
+  </tbody>
+</table>
+
+<p>The reason this split is the natural close of the track: every pass you derived attacked a <em>compile-time</em> quantity — fewer kernels, fewer bytes, smaller peak. But the model's actual latency is paid at <em>run time</em>, and three run-time costs survive every compile-time win — buffer allocation, kernel dispatch, and the launch tax. The runtime is the only place those die. Lesson 06's plan is the clearest example: it is a brilliant assignment of buffers to slots that, on its own, allocates nothing. The caching allocator (§3) is the runtime component that makes the plan real.</p>
+
+<h2>2 · Streams &amp; async dispatch: running the CPU ahead of the GPU</h2>
+
+<p>The first thing the runtime does to hide the launch tax is refuse to wait. A <strong>stream</strong> is a FIFO queue of GPU work; operations enqueued on the same stream execute in order, but the enqueue call returns to the CPU <em>immediately</em>, before the kernel runs. So <code>cudaLaunchKernel</code> is asynchronous: the CPU pushes a launch onto the stream and races ahead to dispatch the next op while the GPU is still chewing on the last one. If the CPU can stay ahead of the GPU, the per-op dispatch+launch tax is hidden <em>behind</em> kernel execution and only the kernels' own time is on the critical path.</p>
+
+<div class="lesson-flow">
+  <div><strong>CPU dispatches</strong><span>Python → dispatcher → <code>cudaLaunchKernel</code> enqueues kernel <em>k</em> onto the stream, returns in ≈5–25 µs (lesson 01).</span></div>
+  <div><strong>CPU runs ahead</strong><span>While the GPU executes <em>k</em>, the CPU is already enqueuing <em>k+1</em>, <em>k+2</em>, … building a backlog the GPU drains.</span></div>
+  <div><strong>copies overlap</strong><span>A separate stream does H2D / D2H <code>cudaMemcpyAsync</code>; with pinned host memory it overlaps the compute stream instead of serializing it.</span></div>
+  <div><strong>events synchronize</strong><span>A <code>cudaEvent</code> recorded on one stream and waited on by another expresses "kernel B needs A's output" without a full device sync.</span></div>
+</div>
+
+<p>This is genuine overlap, and it is why a well-fed training step can be compute-bound despite a slow Python loop. But it has a hard limit, and the limit is exactly lesson 01's launch-bound ceiling. If the GPU drains the queue faster than the CPU can refill it — many tiny kernels, each finishing in ≈1–2 µs while dispatch costs ≈6 µs — then the GPU runs <em>dry</em>: it idles waiting for the next launch, the CPU never catches up, and the launch tax is back on the critical path. A transformer layer at small batch can launch 80–200 kernels per token; at ≈6 µs each that is ≈0.5–1.2 ms of pure CPU dispatch per token that no amount of async hides, because there is nothing to hide it behind. Async dispatch overlaps the tax with work; when there is not enough work, the tax wins.</p>
+
+<p>Two more runtime hazards belong here. A <strong>device synchronization</strong> — anything that forces the CPU to wait for the GPU — drains the pipeline: a stray <code>.item()</code>, <code>print(loss)</code>, or <code>cpu()</code> in the loop serializes the whole async queue and re-exposes every launch. And the launch queue itself is finite; if the CPU runs <em>too</em> far ahead the enqueue call blocks. The runtime's job is to keep the CPU exactly far enough ahead to hide the tax and no further.</p>
+
+<h2>3 · The caching allocator: realizing the lesson-06 plan</h2>
+
+<p>Lesson 06 produced a memory plan: a static assignment of every intermediate buffer to an offset in one arena, sized to the maximum concurrent live bytes. The <strong>caching allocator</strong> (also <strong>memory pool</strong>) is the runtime component that turns that plan into pointers. The motivation is the same fact lesson 06 opened on: a raw <code>cudaMalloc</code> costs on the order of a few microseconds, can <em>synchronize the whole device</em>, and fragments the heap. Calling it on the hot path — thousands of times per step — would dwarf the kernels you fused so carefully.</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">reserve in big segments</div><div class="v">On startup the allocator grabs a few large slabs from the driver (PyTorch's caching allocator pulls 2 MB / 20 MB segments). Per-tensor allocations are then served from these segments with pointer arithmetic — no driver call, no sync.</div></div>
+  <div class="topic-card"><div class="k">free means return-to-pool</div><div class="v">A <code>free</code> does not call <code>cudaFree</code>; it returns the block to the pool so the next allocation of that size reuses it. This is exactly lesson 06's "two non-overlapping buffers share a slot," made dynamic at run time.</div></div>
+  <div class="topic-card"><div class="k">stream-aware</div><div class="v">Because frees are async, a block freed on a stream cannot be reused until that stream's work finishes. The allocator records a stream event and only recycles the block once it is safe — otherwise you'd hand live data to a new tensor.</div></div>
+  <div class="topic-card"><div class="k">fragmentation &amp; OOM</div><div class="v">Segments split into mismatched sizes leave gaps too small to use: you OOM with gigabytes "free" but unusable. <code>expandable_segments</code> and <code>empty_cache()</code> fight it; the lesson-06 plan, when honored, sidesteps it entirely.</div></div>
+</div>
+
+<p>The connection to the plan is the payoff. A pure runtime allocator (eager PyTorch) discovers buffer lifetimes <em>as it goes</em> and does a good but greedy job. A <em>compiled</em> artifact ships the plan, so the runtime can preallocate exactly the arena the compiler computed and hand out slices with zero discovery and zero fragmentation. Compile-time planning (lesson 06) and run-time allocation (here) are the two halves of one mechanism: one decides where bytes go, the other puts them there. And — foreshadowing §4 — CUDA graph replay <em>requires</em> the buffer addresses to be stable across replays, which is only possible if the allocator hands out the same pointers every time. So the graph-safe path needs a dedicated, captured memory pool.</p>
+
+<h2>4 · CUDA graphs: collapse N launches into one</h2>
+
+<p>Async streams hide the launch tax behind work; they do not remove it, and when there is not enough work (§2) the tax is exposed. To actually remove it you stop issuing N launches. A <strong>CUDA graph</strong> is a recorded DAG of GPU operations — kernels, copies, events — captured once and then <strong>replayed</strong> as a unit. Capture runs the model once in a special mode that, instead of executing launches, <em>records</em> them; replay submits the entire recorded sequence to the driver with a single call. The per-launch CPU cost — Python, dispatch, <code>cudaLaunchKernel</code> — collapses from N × ≈6 µs to ≈1 driver call's worth of overhead for the whole graph.</p>
+
+<div class="lesson-flow">
+  <div><strong>warmup</strong><span>Run the block a few times on a side stream so cuBLAS/cuDNN pick algorithms and the allocator settles. Capturing un-warmed code records the wrong kernels.</span></div>
+  <div><strong>capture</strong><span><code>cudaStreamBeginCapture</code> → run the block → <code>cudaStreamEndCapture</code> yields a graph object. No kernels actually ran; their launches were recorded.</span></div>
+  <div><strong>instantiate</strong><span><code>cudaGraphInstantiate</code> compiles the graph into an executable form once.</span></div>
+  <div><strong>replay</strong><span><code>cudaGraphLaunch</code> submits all N kernels in one call. Run it every step; the CPU is essentially idle.</span></div>
+</div>
+
+<p>In PyTorch this is what <code>torch.compile(model, mode="reduce-overhead")</code> turns on — Inductor captures the compiled region into a CUDA graph automatically. Because real models have regions that can be captured and regions that cannot (dynamic control flow, CPU-side logic), the runtime keeps <strong>cudagraph trees</strong>: a forest of captured subgraphs sharing one memory pool, so the decode loop's stable inner kernels replay from a graph while the changing outer logic stays eager. Worked number: a small-batch decoder spending ≈1 ms/token in launch overhead and ≈0.4 ms in actual kernel time can drop to ≈0.4–0.5 ms/token once the launch tax collapses — a 2× step speedup with zero change to any kernel, purely from killing dispatch.</p>
+
+<div class="callout"><div class="label">The catch — and it is the whole reason lesson 17 exists</div>A CUDA graph is a <em>recording</em>. It replays the <strong>same kernels</strong> reading from the <strong>same memory addresses</strong> in the <strong>same order</strong>. That imposes two hard requirements that collide with everything dynamic:
+<br><strong>Stable shapes.</strong> The captured kernels are specialized to the shapes seen during capture. A new sequence length or batch size needs a <em>different</em> graph — so dynamic shapes (lesson 11) either force re-capture per shape (a capture storm, the runtime cousin of lesson 11's compile storm) or force you to pad/bucket every request up to a captured size, paying lesson 11's wasted-FLOPs tax to keep the cache hit.
+<br><strong>Stable addresses.</strong> Replay writes to the exact pointers recorded at capture. The caching allocator must therefore serve the captured region from a dedicated, private pool that hands out identical addresses every replay — and inputs must be copied <em>into</em> those fixed buffers rather than passed as fresh tensors. Forget this and the graph reads stale or wrong memory: a silent correctness bug, not a crash.</div>
+
+<p>So CUDA graphs are the cleanest fix for lesson 01's launch ceiling and one of the most error-prone runtime features: the speedup is real and large, but it is bought with rigidity that fights lesson 11 directly and demands a cooperating allocator from §3.</p>
+
+<h2>5 · The AOT / serving path: Python-free dispatch</h2>
+
+<p>Everything above still assumes a live Python process driving the runtime. JIT compilation (Dynamo capturing on first call, lesson 02) is convenient for development but carries a Python interpreter, a warmup compile on cold start, and graph-break risk into production. The <strong>ahead-of-time (AOT)</strong> path removes Python from the serving loop entirely: compile the artifact offline, serialize it, and ship a self-contained executable the server loads and calls.</p>
+
+<div class="lesson-flow">
+  <div><strong>export</strong><span><code>torch.export</code> traces the model to a sound, ahead-of-time graph (a stricter capture than Dynamo — no graph breaks allowed, dynamic dims declared up front, lesson 11).</span></div>
+  <div><strong>compile to artifact</strong><span><strong>AOTInductor</strong> lowers that graph to a shared library — a <code>.so</code> bundling the generated kernels, the memory plan, and a tiny C++ launcher. TensorRT does the analogous thing: build a serialized <em>engine</em>.</span></div>
+  <div><strong>load &amp; serve</strong><span>The server <code>dlopen</code>s the <code>.so</code> (or deserializes the engine) — no Python, no warmup compile. Each request runs the same guard-check → dispatch loop.</span></div>
+</div>
+
+<p>At serve time the loop is mechanical and matches the artifact-vs-runtime table from §1: <strong>check the guards</strong> (do these input shapes/dtypes match what was compiled? lesson 11) → on a hit, <strong>dispatch the cached kernels</strong> (optionally as a replayed CUDA graph, §4) → on a miss, fall back (recompile in JIT, or reject/pad in a static AOT engine that cannot recompile). The economics are the lesson-10 amortization argument, now applied to the whole artifact rather than one kernel: a <strong>compile cache</strong> (Inductor's FX-graph cache, on disk and shareable across processes) means a cold start reloads a previously compiled artifact instead of re-running capture → fuse → plan → tune. Pay the compile once; replay the warm artifact a million times.</p>
+
+<p>For production LLM serving the runtime is the whole game, and dedicated serving engines push these ideas much further — paged KV-cache allocators, continuous batching that keeps the launch queue full, and CUDA-graph-captured decode steps. That depth lives in <a href="../../vllm/lessons/index.html">vLLM · lessons</a> and <a href="../../sglang/lessons/index.html">SGLang · lessons</a>; this lesson is the compiler-runtime boundary those engines sit on top of.</p>
+
+<h2>6 · Drive it: the launch-overhead killer</h2>
+
+<p>The widget runs the §2–§4 model on a chain of small kernels. Set the kernel count and the per-launch CPU tax (lesson 01's profiler numbers), then switch the dispatch mode: <strong>eager</strong> pays the full tax on every launch; <strong>streams</strong> overlaps the tax with kernel work but still exposes whatever the GPU cannot absorb; <strong>CUDA-graph replay</strong> collapses all N launches into ≈1 driver call. Watch total launch overhead and wall-time fall as you move down the modes — and watch the <strong>graph-capture valid?</strong> flag: flip on <strong>dynamic shapes</strong> and it turns FALSE, because a recording cannot replay against a shape it never captured. That flag turning red is lesson 11 reaching forward to break lesson 16's best trick.</p>
+
+<div class="widget" id="lk">
+  <div class="title">Launch-overhead killer — eager vs streams vs CUDA-graph replay</div>
+  <div class="hint">A chain of <em>N</em> small kernels, each ≈1–2 µs of real work but paying a fixed CPU launch tax (lesson 01). <strong>Eager</strong> = tax on every launch. <strong>Streams</strong> = tax overlapped with work, but the GPU runs dry when the queue empties. <strong>CUDA-graph replay</strong> = all N launches → ≈1 driver call. The knob that breaks it: turn on <strong>dynamic shapes</strong> and graph capture goes invalid (a recording can't replay an unseen shape — lesson 11).</div>
+
+  <div class="controls" style="margin-top:4px;">
+    <label class="inline">kernels in chain N: <input type="range" id="lk-n" min="4" max="200" step="4" value="120"> <span class="val" id="lk-nv">120</span></label>
+    <label class="inline">per-launch CPU tax µs: <input type="range" id="lk-tax" min="2" max="20" step="1" value="6"> <span class="val" id="lk-taxv">6</span></label>
+    <label class="inline">per-kernel GPU work µs: <input type="range" id="lk-work" min="1" max="40" step="1" value="2"> <span class="val" id="lk-workv">2</span></label>
+    <label class="inline">dispatch mode:
+      <select id="lk-mode">
+        <option value="eager">eager (one Python call per op)</option>
+        <option value="streams">streams (async, CPU runs ahead)</option>
+        <option value="graph" selected>CUDA-graph replay</option>
+      </select>
+    </label>
+    <label class="inline"><input type="checkbox" id="lk-dyn"> dynamic shapes (shape changes every call)</label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi" id="lk-ovh-kpi"><div class="k">total launch overhead</div><div class="v" id="lk-ovh">—</div></div>
+    <div class="kpi"><div class="k">wall-time / step</div><div class="v" id="lk-wall">—</div></div>
+    <div class="kpi"><div class="k">driver calls</div><div class="v" id="lk-calls">—</div></div>
+    <div class="kpi" id="lk-valid-kpi"><div class="k">graph-capture valid?</div><div class="v" id="lk-valid">—</div></div>
+  </div>
+
+  <div class="lt-track" id="lk-track"></div>
+  <p class="lt-cap" id="lk-cap"></p>
+  <div class="lt-legend">
+    <span><i style="background:rgba(220,38,38,0.34)"></i> CPU launch tax</span>
+    <span><i style="background:rgba(22,163,74,0.30)"></i> GPU kernel work</span>
+    <span><i style="background:rgba(99,102,241,0.40)"></i> one driver call (graph)</span>
+  </div>
+  <p class="hint" id="lk-note" style="margin-top:10px;"></p>
+</div>
+
+<p>The lesson the widget makes physical: streams help only while there is enough kernel work to hide the tax behind — push N up or work down and async stops saving you, exactly lesson 01's launch-bound regime. Graph replay does not depend on having work to hide behind; it removes the launches outright. But it is the one mode the dynamic-shapes switch can disable, which is precisely the tension lesson 17 and lesson 11 have to manage.</p>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Expecting the compiler to fix launch overhead.</strong> Fusion cuts launches; it does not remove the dispatch tax on the launches that remain. <em>Signal:</em> a fused model is still slow at batch 1 and the GPU trace shows gaps between kernels — that is the runtime's job (graphs), not the compiler's.</li>
+    <li><strong>A sync in the hot loop.</strong> <code>.item()</code>, <code>print(loss)</code>, <code>.cpu()</code>, or a Python <code>if</code> on a tensor value drains the async queue. <em>Signal:</em> wall-time jumps with no kernel getting slower; the timeline shows the GPU idling at each sync.</li>
+    <li><strong>Capturing a CUDA graph against dynamic shapes.</strong> Each new shape needs a re-capture — a capture storm — or silently replays the wrong-sized kernel. <em>Signal:</em> memory balloons as graphs pile up, or outputs are wrong only for off-size inputs.</li>
+    <li><strong>Passing fresh input tensors to a replayed graph.</strong> Replay reads the captured addresses; new tensors live elsewhere, so the graph reads stale memory. <em>Signal:</em> a silent correctness bug that vanishes the moment you copy inputs into the static buffers.</li>
+    <li><strong>Hot-path <code>cudaMalloc</code> defeating a good plan.</strong> Calling a raw allocator (or <code>empty_cache()</code>) inside the loop reintroduces the per-alloc sync and fragmentation. <em>Signal:</em> microsecond-scale gaps before kernels and a sawtooth memory profile.</li>
+    <li><strong>Shipping JIT to production.</strong> First request pays a warmup compile; a graph break mid-serve drops to slow eager. <em>Signal:</em> p99 latency spikes on cold start or on rare inputs — the fix is the AOT export path.</li>
+  </ul>
+  </div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><strong>Separate artifact from runtime.</strong> Kernels + plan + guards are inert; the executor allocates, dispatches, and amortizes.</li>
+    <li><strong>Keep the CPU ahead of the GPU.</strong> Async streams, pinned memory for copies, no stray syncs in the loop.</li>
+    <li><strong>Serve buffers from a pool.</strong> Realize the lesson-06 plan from one preallocated arena; never <code>cudaMalloc</code> on the hot path.</li>
+    <li><strong>Use CUDA graphs when shapes are stable.</strong> <code>reduce-overhead</code> for launch-bound regions; pad/bucket to a captured shape, and feed inputs through fixed buffers.</li>
+    <li><strong>Reach for AOT to ship.</strong> <code>torch.export</code> → AOTInductor <code>.so</code> (or a serialized engine) for Python-free, warmup-free serving; rely on the compile cache for warm starts.</li>
+  </ul>
+  </div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the widget at its defaults (N = 120 kernels, 6 µs tax, 2 µs work, CUDA-graph mode). Read the wall-time, then switch to <strong>eager</strong>: the overhead should jump to ≈120 × 6 µs ≈ 720 µs of pure tax, dwarfing the ≈240 µs of kernel work — this is lesson 01's launch-bound ceiling, alive in a compiled model. Switch to <strong>streams</strong>: overhead drops because the tax overlaps with work, but it does not vanish — the GPU still runs dry whenever 6 µs of tax outruns 2 µs of work. Now push <strong>per-kernel GPU work</strong> up to 40 µs and watch streams nearly catch graph mode: with enough work to hide behind, async is almost as good. Drop work back to 2 µs and only graph replay stays fast. Finally, in graph mode, tick <strong>dynamic shapes</strong> and watch <em>graph-capture valid?</em> flip to FALSE and the overhead snap back to the eager number — the runtime falls off its best trick exactly where lesson 11 said it would.</div>
+
+<h2>Where this points next</h2>
+
+<p>You can now ship: the compiler's inert artifact has a runtime that allocates its buffers from a pool, dispatches its kernels asynchronously, and — when shapes hold still — replays them as a single CUDA-graph call that finally buries lesson 01's launch ceiling, all packaged as an AOT <code>.so</code> the server loads without Python. But look at what shipping required. CUDA graphs replay a fixed recording, so they break under the dynamic shapes of lesson 11. The caching allocator hands out reused storage, so a stale address is a silent wrong answer. And the kernels themselves arrived here already willing to move bits: fusion reassociated floats (lesson 04), quantization is <em>deliberately</em> approximate (lesson 15), and a recompile can swap in a different-accumulating kernel without telling you. The whole track kept promising "preserve semantics," yet half of Part VI legitimately changes the output. So the last question before synthesis is the one production actually asks: how do you tell acceptable float drift from a real bug, and find which pass — or which silent recompile — caused it? That is lesson 17, <strong><a href="17_debugging.html">Debugging compiled models</a></strong>.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+The compiler's job ends with an <strong>inert artifact</strong>: cached kernels (lessons 09–10, 15), a memory plan (lesson 06), and guards (lesson 11). It allocates nothing and launches nothing. The <strong>runtime / executor</strong> is the run-time other half that makes it run. <strong>Streams</strong> dispatch kernels asynchronously so the CPU races ahead and the per-op launch tax overlaps with kernel work — but only while there is enough work to hide behind; small models run the GPU dry and lesson 01's launch ceiling returns. The <strong>caching allocator</strong> realizes the lesson-06 plan by serving every buffer from one preallocated arena, never calling <code>cudaMalloc</code> on the hot path, recycling freed blocks the way the plan said two non-overlapping buffers share a slot. <strong>CUDA graphs</strong> are the real fix for the launch ceiling: capture the whole launch sequence once, replay it with ≈1 driver call (<code>mode="reduce-overhead"</code>, cudagraph trees), collapsing N × ≈6 µs of tax to nearly nothing — at the price of <em>stable shapes</em> (it fights lesson 11) and <em>stable addresses</em> (it needs a graph-safe pool). The <strong>AOT path</strong> (<code>torch.export</code> → AOTInductor <code>.so</code>, serialized TensorRT engines) drops Python from serving entirely: a guard-check-then-dispatch loop over a compile-cached artifact, the lesson-10 amortization argument applied to the whole model. Compile time decides; run time does. And because replay, fusion, and quantization all bend the output or hide a recompile, the next step is learning to trust and debug it.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>What does a deep-learning compiler actually produce, and what runs it? <em>(§1 — an inert artifact: shape/dtype-keyed kernels, a memory plan, and input guards. A separate runtime/executor allocates the buffers, checks guards, and dispatches the kernels every forward pass — compile time vs run time.)</em></li>
+  <li>If <code>cudaLaunchKernel</code> is async, why is a model still launch-bound at batch 1? <em>(§2 — async hides the per-op tax only by overlapping it with kernel work. When kernels finish faster than the CPU can dispatch (tiny tensors), the GPU drains the queue and idles; the ≈5–25 µs tax is back on the critical path.)</em></li>
+  <li>Why does the caching allocator exist, and how does it relate to the memory-planning pass? <em>(§3 — a raw <code>cudaMalloc</code> is slow, syncs the device, and fragments; the allocator serves buffers from preallocated segments with no driver call. It realizes the compile-time plan from lesson 06 at run time — planning decides the layout, the allocator places the bytes.)</em></li>
+  <li>How does a CUDA graph remove launch overhead, and what does <code>mode="reduce-overhead"</code> do? <em>(§4 — it records the whole launch DAG once and replays it with a single <code>cudaGraphLaunch</code>, collapsing N CPU launches to ≈1; <code>reduce-overhead</code> makes Inductor capture the compiled region into a graph automatically.)</em></li>
+  <li>Why do CUDA graphs conflict with dynamic shapes, and what are the two fixes? <em>(§4 — a graph replays kernels specialized to the captured shape from captured addresses. A new shape needs a re-capture (capture storm) or padding/bucketing up to a captured size (wasted FLOPs, lesson 11); addresses must come from a fixed graph-safe pool with inputs copied in.)</em></li>
+  <li>What is the difference between the JIT and AOT serving paths? <em>(§5 — JIT (Dynamo) compiles on first call, keeps Python in the loop, risks warmup spikes and graph breaks; AOT (<code>torch.export</code> → AOTInductor <code>.so</code> / TensorRT engine) compiles offline into a self-contained library the server runs with no Python and no warmup compile, backed by a compile cache.)</em></li>
+  <li>You captured a CUDA graph and outputs are wrong only for some inputs. What likely happened? <em>(§4 — you passed fresh input tensors instead of copying into the static captured buffers, so replay reads stale addresses; or the shape changed and the graph replayed a wrong-sized kernel. Fix: stable addresses + stable shapes, or re-capture per bucket.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="15_quantization.html"><span class="dir">← Back</span><span class="ttl">15 · Quantization &amp; precision lowering</span></a>
+  <a class="next" href="17_debugging.html"><span class="dir">Next →</span><span class="ttl">17 · Debugging compiled models</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var nEl = document.getElementById('lk-n');
+  if (!nEl) return;
+  var taxEl = document.getElementById('lk-tax');
+  var workEl = document.getElementById('lk-work');
+  var modeEl = document.getElementById('lk-mode');
+  var dynEl = document.getElementById('lk-dyn');
+
+  var nv = document.getElementById('lk-nv'), taxv = document.getElementById('lk-taxv'), workv = document.getElementById('lk-workv');
+  var kOvh = document.getElementById('lk-ovh'), kWall = document.getElementById('lk-wall');
+  var kCalls = document.getElementById('lk-calls'), kValid = document.getElementById('lk-valid');
+  var ovhKpi = document.getElementById('lk-ovh-kpi'), validKpi = document.getElementById('lk-valid-kpi');
+  var track = document.getElementById('lk-track'), cap = document.getElementById('lk-cap'), note = document.getElementById('lk-note');
+
+  var GRAPH_DRIVER_US = 8;   // one-call replay cost for the whole graph
+
+  function us(x){ return x >= 1000 ? (x/1000).toFixed(2)+' ms' : x.toFixed(0)+' µs'; }
+  function comma(n){ return Math.round(n).toLocaleString('en-US'); }
+
+  function compute(){
+    var N = +nEl.value, tax = +taxEl.value, work = +workEl.value;
+    var mode = modeEl.value, dyn = dynEl.checked;
+
+    nv.textContent = N; taxv.textContent = tax; workv.textContent = work;
+
+    var gpuWork = N * work;           // total kernel time, same in every mode
+    var overhead, calls, wall;
+    var graphValid = true;
+
+    if (mode === 'eager') {
+      // full tax serialized in front of each kernel
+      overhead = N * tax;
+      calls = N;
+      wall = N * (tax + work);
+    } else if (mode === 'streams') {
+      // CPU runs ahead: per-step cost is max(tax, work); exposed overhead is what tax adds beyond work
+      var perStep = Math.max(tax, work);
+      wall = N * perStep + tax;        // +tax: priming the first launch
+      overhead = wall - gpuWork;
+      if (overhead < 0) overhead = 0;
+      calls = N;
+    } else { // graph
+      // a graph can't be captured against a shape it never saw
+      if (dyn) {
+        graphValid = false;
+        // falls back to eager dispatch (must re-capture every call = no replay benefit)
+        overhead = N * tax;
+        calls = N;
+        wall = N * (tax + work);
+      } else {
+        overhead = GRAPH_DRIVER_US;    // ~1 driver call for all N launches
+        calls = 1;
+        wall = gpuWork + GRAPH_DRIVER_US;
+      }
+    }
+
+    kOvh.textContent = us(overhead);
+    kWall.textContent = us(wall);
+    kCalls.textContent = comma(calls);
+
+    if (mode === 'graph' && !graphValid) {
+      kValid.textContent = 'FALSE — dynamic'; kValid.className = 'v flag-bad';
+      validKpi.classList.add('over'); validKpi.classList.remove('good');
+    } else if (mode === 'graph') {
+      kValid.textContent = 'TRUE'; kValid.className = 'v flag-ok';
+      validKpi.classList.add('good'); validKpi.classList.remove('over');
+    } else {
+      kValid.textContent = 'n/a (' + mode + ')'; kValid.className = 'v';
+      validKpi.classList.remove('good'); validKpi.classList.remove('over');
+    }
+
+    // overhead KPI color: green if overhead is a small share of wall-time
+    if (overhead <= 0.25 * wall){ ovhKpi.classList.add('good'); ovhKpi.classList.remove('over'); }
+    else { ovhKpi.classList.add('over'); ovhKpi.classList.remove('good'); }
+
+    // timeline visual: render the FIRST few launches of the chain (cap at 8 for legibility)
+    track.innerHTML = '';
+    var show = Math.min(N, 8);
+    if (mode === 'graph' && graphValid) {
+      // one driver call, then all kernels back-to-back
+      var unit = 100 / (GRAPH_DRIVER_US + show * work);
+      var x = 0;
+      var d = document.createElement('div');
+      d.className = 'lt-seg driver'; d.style.left = '0%'; d.style.width = (GRAPH_DRIVER_US * unit) + '%';
+      track.appendChild(d); x = GRAPH_DRIVER_US * unit;
+      for (var i = 0; i < show; i++){
+        var w = document.createElement('div');
+        w.className = 'lt-seg work'; w.style.left = x + '%'; w.style.width = (work * unit) + '%';
+        track.appendChild(w); x += work * unit;
+      }
+      cap.textContent = 'One driver call submits all ' + N + ' kernels; the CPU is idle while the GPU runs them back-to-back.';
+    } else if (mode === 'streams') {
+      // tax overlaps work: draw tax band then work, but stagger so they pipeline
+      var step = Math.max(tax, work);
+      var unitS = 100 / (show * step + tax);
+      var xs = 0;
+      for (var j = 0; j < show; j++){
+        var t = document.createElement('div');
+        t.className = 'lt-seg tax'; t.style.left = xs + '%'; t.style.width = (tax * unitS) + '%';
+        track.appendChild(t);
+        var wk = document.createElement('div');
+        wk.className = 'lt-seg work'; wk.style.left = (xs + tax * unitS * 0.0) + '%';
+        // show work starting after a small offset to convey overlap
+        wk.style.left = (xs + Math.min(tax, work) * unitS) + '%';
+        wk.style.width = (work * unitS) + '%';
+        track.appendChild(wk);
+        xs += step * unitS;
+      }
+      cap.textContent = 'Tax (red) overlaps kernel work (green) as the CPU runs ahead; the GPU idles only when tax outruns work.';
+    } else {
+      // eager: tax then work, fully serialized, repeated
+      var unitE = 100 / (show * (tax + work));
+      var xe = 0;
+      for (var k = 0; k < show; k++){
+        var te = document.createElement('div');
+        te.className = 'lt-seg tax'; te.style.left = xe + '%'; te.style.width = (tax * unitE) + '%';
+        track.appendChild(te); xe += tax * unitE;
+        var we = document.createElement('div');
+        we.className = 'lt-seg work'; we.style.left = xe + '%'; we.style.width = (work * unitE) + '%';
+        track.appendChild(we); xe += work * unitE;
+      }
+      cap.textContent = (mode === 'graph')
+        ? 'Dynamic shapes: capture is invalid, so the runtime falls back to eager re-dispatch — tax on every launch.'
+        : 'Each launch pays the full CPU tax (red) serialized in front of its kernel work (green).';
+    }
+
+    if (mode === 'eager') {
+      note.textContent = 'Eager: ' + N + ' launches × ' + tax + ' µs = ' + us(N*tax) + ' of pure tax, vs ' + us(gpuWork) + ' of real work. This is lesson 01’s launch-bound ceiling inside a compiled model.';
+    } else if (mode === 'streams') {
+      note.textContent = (tax > work)
+        ? 'Streams: tax (' + tax + ' µs) outruns work (' + work + ' µs), so the GPU runs dry between launches and the tax is still exposed. Raise per-kernel work to hide it.'
+        : 'Streams: work (' + work + ' µs) covers the tax (' + tax + ' µs), so async hides nearly all overhead — almost as good as a graph.';
+    } else if (!graphValid) {
+      note.textContent = 'Dynamic shapes break capture: a recording can’t replay a shape it never saw, so replay is disabled and you fall back to eager (lesson 11). This is the runtime cousin of the compile storm.';
+    } else {
+      note.textContent = 'CUDA-graph replay: all ' + N + ' launches collapse into 1 driver call (' + GRAPH_DRIVER_US + ' µs), so wall-time ≈ the kernel work itself. The launch ceiling is gone — as long as shapes stay stable.';
+    }
+  }
+
+  [nEl, taxEl, workEl].forEach(function(s){ s.addEventListener('input', compute); });
+  modeEl.addEventListener('change', compute);
+  dynEl.addEventListener('change', compute);
+  compute();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

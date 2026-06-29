@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>15 · Quantization &amp; precision lowering</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local layout only — failure/checklist columns + the precision-dial widget */
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; font-size: 15px; }
+  .lesson-card ul { margin: 0; padding-left: 18px; }
+  .lesson-card li { margin: 7px 0; font-size: 13.5px; line-height: 1.5; }
+  .kpi.over .v { color: var(--bad); }
+  .kpi.good .v { color: var(--ok); }
+
+  /* precision-dial widget */
+  #pd .dial-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; margin-top: 6px; }
+  #pd .acc-track { position: relative; height: 26px; border: 1px solid var(--border); border-radius: 6px; background: var(--code-bg); overflow: hidden; margin-top: 4px; }
+  #pd .acc-fill { position: absolute; top: 0; left: 0; height: 100%; width: 100%; transition: width .15s, background .15s; }
+  #pd .acc-lab { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 11px; color: var(--text-mute); margin-bottom: 3px; }
+  #pd .verdict { margin-top: 12px; padding: 9px 12px; border-radius: 8px; font-size: 13px; border: 1px solid var(--border); background: var(--bg-elev); }
+  #pd .verdict.good { border-color: var(--ok); }
+  #pd .verdict.bad { border-color: var(--bad); }
+  #pd .controls label.inline { display: block; margin: 8px 0; }
+  @media (max-width: 760px) { .lesson-grid { grid-template-columns: 1fr; } #pd .dial-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">ai_compilers / lessons</a><span class="crumb">/</span><span class="crumb">15 · quantization</span><span class="step-pill">lesson 16 / 20</span></div></header>
+
+<main>
+
+<p class="kicker">Part VI — Shipping the compiled model</p>
+<h1>Quantization &amp; precision lowering</h1>
+<p class="subtitle">Lesson 14 closed the last coverage gap: every op in the graph now lowers to a generated or vendor kernel, so fusion runs end to end with no graph-break seams. But step back and look at the currency we have spent the whole track chasing — bytes moved across HBM. Every pass so far moved <em>fp16/bf16</em> bytes: fusion cut how many times we move them, layout decided their order, planning decided where they live. Not one pass changed how <em>wide</em> a number is. That is the single biggest remaining lever, and it has been sitting untouched: spend precision. Halve every weight and activation from 16 bits to 8 and you halve HBM traffic and double tensor-core throughput in one move. This lesson makes that a compiler pass — and it is the one pass in the entire stack that does <em>not</em> preserve the math exactly.</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>After lesson 14 the compiler can generate a kernel for every op, and lessons 05–10 made those kernels as tight as fp16 allows: fused, planned, laid out, scheduled, autotuned. But re-read the roofline from <a href="01_eager_baseline.html">lesson 01</a>. A memory-bound op's wall-clock is <span class="math">bytes ÷ bandwidth</span>, and a GEMM that is bandwidth-limited (the decode-time matmul, which reloads the whole weight matrix to produce one token) is paying for 16-bit weights it does not numerically need. Tensor cores on an H100 do bf16 at ≈990 TFLOP/s but <strong>int8 at ≈1,980 TOPS and fp8 at ≈1,980 TFLOP/s</strong> — 2× — and the weights themselves are half the bytes. The middle end never reached for any of this because every pass it ran had to be a <em>provable no-op on the numbers</em>, and lower precision is not a no-op. That self-imposed rule left a clean 2–4× on the table.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> even a fully fused, scheduled, autotuned fp16 graph leaves 2–4× unclaimed — int8/fp8 halve HBM traffic and double tensor-core throughput, and weight-only int8/int4 directly attacks the bandwidth-bound decode GEMM (lesson 01's roofline).<br><strong>New idea:</strong> <strong>quantization as a graph pass</strong> — insert <strong>quantize/dequantize (QDQ)</strong> nodes, pick per-tensor or per-channel <strong>scale/zero-point</strong> by <strong>calibration</strong> (PTQ) or by learning them (QAT), then <strong>fuse the dequant into the GEMM epilogue</strong> (lesson 05) so the matmul runs in int8/fp8 and only widens at the end; decide <em>which</em> ops stay fp16 (precision assignment, the dual of layout assignment in lesson 07). The twist on the track's first motif: this is the one pass that is <strong>deliberately not bit-exact</strong> — it preserves the math <em>approximately</em>, on an <strong>accuracy budget</strong>.<br><strong>Forces next:</strong> you have now generated and quantized a cache of kernels — artifacts. But an artifact is inert. What actually <em>launches</em> them at run time, allocates their buffers, and amortizes launch overhead? That is the runtime (lesson 16).</div>
+
+<div class="callout"><div class="label">The plan</div>Five moves. (1) The bytes argument: int8 vs fp16 traffic and tensor-core throughput, and why weight-only int8/int4 is the right tool for bandwidth-bound decode. (2) The QDQ representation: quantize → int op → dequantize as graph nodes; per-tensor vs per-channel scale/zero-point; symmetric vs affine. (3) How you choose the scales: PTQ calibration (min-max / percentile / MSE on a small set) vs QAT (fake-quant in the forward, straight-through estimator). (4) The compiler's job: propagate quant, fuse dequant into the matmul epilogue, and assign which ops stay fp16. (5) fp8 (e4m3/e5m2), int4 weight-only (AWQ/GPTQ-style), 2:4 structured sparsity — and the honest caveat about outliers and the accuracy budget. Then drive the precision dial until int4 with bad calibration falls off the accuracy cliff.</div>
+
+<h2>1 · The bytes argument: why precision is the biggest remaining lever</h2>
+
+<p><strong>Quantization</strong> is representing a tensor of real numbers with a lower-precision integer (or narrow-float) type plus a small amount of metadata — a <strong>scale</strong> and optionally a <strong>zero-point</strong> — so that the original value is recovered approximately as <span class="math">x ≈ scale · (q − zero_point)</span>, where <span class="math">q</span> is the stored integer. Going from bf16 (2 bytes) to int8 (1 byte) does two things at once, and both attack the roofline.</p>
+
+<p><strong>Half the bytes.</strong> A 7-billion-parameter model in bf16 is ≈14 GB; in int8 it is ≈7 GB; in int4 it is ≈3.5 GB. During autoregressive <em>decode</em> the model reads its entire weight matrix from HBM to produce a <em>single</em> token — the matmul is tiny (batch 1, one query vector) but the weight load is the whole model, so decode is <strong>weight-bandwidth-bound</strong>. Halving the weight bytes nearly halves decode latency directly. This is the lesson-01 roofline turned into money: time ≈ weight_bytes ÷ bandwidth, so cutting the bytes cuts the time.</p>
+
+<p><strong>Double the FLOPs.</strong> Tensor cores have dedicated low-precision modes. Approximate H100 peaks: bf16 ≈990 TFLOP/s, fp8 (e4m3) ≈1,980 TFLOP/s, int8 ≈1,980 TOPS, and on Blackwell the gap widens again with fp4. For the <em>prefill</em> / training GEMMs that are compute-bound, int8/fp8 is a straight 2× on the math throughput. So quantization helps both regimes: it cuts traffic for the bandwidth-bound decode and lifts throughput for the compute-bound prefill.</p>
+
+<table class="trade-table">
+  <thead><tr><th>format</th><th>bytes/elem</th><th>7B model size</th><th>tensor-core peak (H100, ≈)</th><th>best for</th></tr></thead>
+  <tbody>
+    <tr><td>fp16 / bf16</td><td>2</td><td>≈14 GB</td><td>≈990 TFLOP/s</td><td>baseline; no accuracy risk</td></tr>
+    <tr><td>fp8 (e4m3 / e5m2)</td><td>1</td><td>≈7 GB</td><td>≈1,980 TFLOP/s</td><td>training &amp; inference; keeps a float exponent</td></tr>
+    <tr><td>int8</td><td>1</td><td>≈7 GB</td><td>≈1,980 TOPS</td><td>inference; needs calibration</td></tr>
+    <tr><td>int4 (weight-only)</td><td>0.5</td><td>≈3.5 GB</td><td>dequant→fp16 matmul</td><td>memory-bound decode; accuracy-sensitive</td></tr>
+  </tbody>
+</table>
+
+<p>The crucial distinction the table hides: <strong>weight-only</strong> vs <strong>weight+activation</strong>. Weight-only quant (store weights int4/int8, dequantize them to fp16 just before the matmul, compute in fp16) wins purely on <em>weight bandwidth</em> — perfect for decode, where the weight load dominates and the actual matmul is tiny. Weight+activation quant (both operands int8, compute in int8 on the int8 tensor cores) is what unlocks the <em>throughput</em> 2×, but it is harder because activations have outliers (more on that in §5). For a decode-bound LLM, int4 <em>weight-only</em> is often the single highest-leverage knob; for a compute-bound prefill or training step, int8 <em>weight+activation</em> is the prize.</p>
+
+<h2>2 · The QDQ representation: quantize and dequantize as graph nodes</h2>
+
+<p>The compiler does not need a parallel "int8 graph." It represents quantization with two new node types inserted into the ordinary graph: a <strong>quantize</strong> node (fp → int, dividing by the scale and rounding) and a <strong>dequantize</strong> node (int → fp, multiplying by the scale). The pattern is <strong>QDQ</strong>: wrap a region you want to run in low precision with <code>quantize</code> on its inputs and <code>dequantize</code> on its outputs. The op in the middle sees integers; the rest of the graph still sees floats.</p>
+
+<pre class="ascii">FX-style graph with QDQ nodes around a linear layer (per-channel weight, per-tensor act):
+
+  %x        : f16[B, K]
+  %w        : f16[N, K]                 # weight, known at compile time
+  # --- quantize the weight once, at compile time, per output channel ---
+  %w_scale  : f16[N]      = compute_per_channel_scale(%w)   # one scale per row
+  %w_q      : i8[N, K]    = quantize(%w, %w_scale, zp=0, axis=0)   # symmetric
+  # --- quantize the activation at run time, per tensor ---
+  %x_scale  : f16[1]      = calibrated_scale                 # from PTQ, baked in
+  %x_q      : i8[B, K]    = quantize(%x, %x_scale, zp=0)
+  # --- the matmul runs in int8 → i32 accumulator ---
+  %acc      : i32[B, N]   = int8_matmul(%x_q, %w_q)          # int8 tensor cores
+  # --- dequantize: scale back to f16 (fused into the epilogue, see §4) ---
+  %y        : f16[B, N]   = dequantize(%acc, %x_scale * %w_scale)   # per-channel
+  %out      : f16[B, N]   = gelu(%y + %bias)                 # epilogue, stays f16</pre>
+
+<p>Three choices define a QDQ scheme, and the compiler must pin each one:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">scale &amp; zero-point</div><div class="v"><strong>Scale</strong> maps the float range to the integer range (e.g. fp range ±6 → int8 ±127 ⇒ scale ≈ 0.047). <strong>Zero-point</strong> is the integer that represents float 0; needed when the range is not centered on 0.</div></div>
+  <div class="topic-card"><div class="k">symmetric vs affine</div><div class="v"><strong>Symmetric</strong>: zero-point = 0, range is ±max, one multiply to dequant — ideal for weights (roughly zero-centered). <strong>Affine</strong> (asymmetric): a nonzero zero-point fits a one-sided range like a post-ReLU activation, at the cost of an extra add.</div></div>
+  <div class="topic-card"><div class="k">per-tensor vs per-channel</div><div class="v"><strong>Per-tensor</strong>: one scale for the whole tensor — cheapest, but one fat channel forces a coarse scale on all. <strong>Per-channel</strong>: a scale vector along the output axis, so each row/channel gets its own range — much better accuracy for weights, the standard for int8 linear layers.</div></div>
+  <div class="topic-card"><div class="k">static vs dynamic</div><div class="v"><strong>Static</strong>: activation scale fixed ahead of time by calibration (one less op at run time). <strong>Dynamic</strong>: compute the activation's scale per call from its actual min/max — more accurate for spiky activations, a small runtime cost.</div></div>
+</div>
+
+<p>Why does per-channel matter so much? A weight matrix can have one output channel with 10× the dynamic range of its neighbors. A single per-tensor scale must cover that fat channel, so every other channel wastes most of its 256 int8 codes on a range it never uses — quantization error explodes. Give each output channel its own scale (a length-<span class="math">N</span> vector, negligible metadata) and every channel uses its full code range. Per-channel weight quant is essentially free in storage and is the reason int8 linear layers hold accuracy.</p>
+
+<h2>3 · Choosing the scales: PTQ calibration vs QAT</h2>
+
+<p>The scales are the whole game. Set them too tight and you <strong>clip</strong> the tails; too loose and you waste resolution on empty range. Two families pick them.</p>
+
+<p><strong>Post-training quantization (PTQ)</strong> takes a trained fp model and chooses scales <em>without any retraining</em>, by running a small <strong>calibration</strong> set (a few hundred representative inputs) through the network and observing each tensor's actual value distribution. From that histogram you pick the scale by one of three rules:</p>
+
+<div class="lesson-flow">
+  <div><strong>min–max</strong><span>Scale to cover the absolute min/max seen. Simplest; but one outlier activation stretches the range and starves the bulk of values of resolution.</span></div>
+  <div><strong>percentile</strong><span>Clip to, say, the 99.99th percentile and let the rare tail saturate. Trades a little clipping error for far better resolution on the common values — usually a win.</span></div>
+  <div><strong>MSE / KL</strong><span>Search the clipping threshold that minimizes reconstruction error (mean-squared, or KL-divergence between the fp and quantized histograms, as in TensorRT's entropy calibrator). Most accurate, most search.</span></div>
+</div>
+
+<p>PTQ is fast (minutes, no gradients, a small dataset) and is the default for int8 inference. Its ceiling is that it cannot <em>recover</em> from the error it introduces — it only chooses the least-bad scales for a fixed model.</p>
+
+<p><strong>Quantization-aware training (QAT)</strong> goes further: it simulates quantization <em>during</em> training (or a fine-tune) so the weights learn to be robust to it. The mechanism is <strong>fake-quant</strong> — in the forward pass, insert <code>dequantize(quantize(x))</code> so the network actually sees the rounded/clipped values and its loss reflects the quantization error. The problem is that <code>quantize</code> is a step function: its derivative is zero almost everywhere, so gradients cannot flow back through it. The fix is the <strong>straight-through estimator (STE)</strong>: on the backward pass, pretend the rounding was the identity (gradient = 1) within the representable range, so gradients pass through the fake-quant unchanged. The model trains against the quantized forward while still receiving usable gradients. QAT typically recovers most of the accuracy PTQ loses, at the cost of a training run — so you reach for it only when PTQ's drop exceeds your budget (commonly for int4, or int8 on a sensitive model).</p>
+
+<table class="trade-table">
+  <thead><tr><th></th><th>PTQ</th><th>QAT</th></tr></thead>
+  <tbody>
+    <tr><td>cost</td><td>minutes; a few hundred calibration samples; no gradients</td><td>a training/fine-tune run with fake-quant + STE</td></tr>
+    <tr><td>accuracy</td><td>good for int8; degrades for int4 / sensitive models</td><td>recovers most of the loss; needed for aggressive bit-widths</td></tr>
+    <tr><td>when</td><td>default first attempt</td><td>when PTQ blows the accuracy budget</td></tr>
+  </tbody>
+</table>
+
+<h2>4 · The compiler's job: propagate, fuse the dequant, assign precision</h2>
+
+<p>Given a QDQ-annotated graph, the compiler does three things, and each rhymes with a pass you have already seen.</p>
+
+<p><strong>Propagate the quant.</strong> A bare QDQ pattern is wasteful: <code>quantize</code> right before an op and <code>dequantize</code> right after it means you constantly cross back to fp16 between layers. The pass slides the quant boundaries outward so a <em>run</em> of ops stays in int8 — the output of one int8 matmul feeds the next int8 op without a round trip through fp16. This is exactly the propagation idea from layout (lesson 07): pick a region's precision and conform the agnostic ops inside it, instead of choosing op-by-op.</p>
+
+<p><strong>Fuse the dequant into the epilogue.</strong> The headline optimization, and the direct callback to <a href="05_fusion.html">lesson 05</a>. A naive lowering computes the int8 matmul into an int32 accumulator, <em>writes</em> the int32 result to HBM, then a separate <code>dequantize</code> kernel reads it back, multiplies by the scale, and writes fp16. That is two extra round trips — it would undo the whole point. Instead the compiler fuses the dequantize (the per-channel scale multiply, plus the bias-add and activation) into the matmul's <strong>epilogue</strong>: while the int32 output tile is still hot in registers, multiply by <span class="math">x_scale · w_scale</span>, add bias, apply GELU, and write fp16 once. The quantization machinery costs <em>zero</em> extra HBM traffic — it rides the trip the matmul was making anyway. Without epilogue fusion, quantization is often a net loss; with it, it is the win the table promises.</p>
+
+<p><strong>Assign which ops stay fp16.</strong> Not everything should be quantized. Softmax, layernorm, the residual stream, and the final logits are numerically delicate — quantizing them buys little (they are not the big GEMMs) and risks a lot. So the compiler solves a <strong>precision-assignment</strong> problem: choose a precision for each tensor that minimizes bytes/latency subject to staying inside the accuracy budget, keeping sensitive ops in fp16 and the heavy linear layers in int8/fp8. This is the structural twin of <a href="07_layout.html">layout assignment (lesson 07)</a> — a global per-tensor labeling where a locally greedy choice (quantize <em>everything</em>) is globally wrong (it breaks accuracy), so you anchor on what must stay fp16 and conform the rest. The objective is identical in shape; only the label being assigned (precision, not layout) differs.</p>
+
+<p>And here is the motif, stated plainly. Every other pass in this track was bound by <strong>preserve semantics</strong> — a provable no-op on the numbers (lessons 03–04, 05, 07). Quantization breaks that rule <em>on purpose</em>. It does not preserve the math exactly; it preserves it <em>approximately</em>, trading a bounded, measured accuracy drop for bytes and FLOPs. The invariant changes from "bit-exact" to "within the accuracy budget" — which is why lesson 17 will need a whole debugging discipline to tell acceptable quantization drift from a real bug. Of all the passes, this is the one that requires you to decide, in advance, how much correctness you are willing to spend.</p>
+
+<h2>5 · fp8, int4 weight-only, 2:4 sparsity — and what breaks</h2>
+
+<p>Three production directions push past int8, each with its own bargain.</p>
+
+<p><strong>fp8.</strong> Two 8-bit float formats trade exponent for mantissa: <strong>e4m3</strong> (4 exponent, 3 mantissa bits — more precision, smaller range, used for weights and activations) and <strong>e5m2</strong> (5 exponent, 2 mantissa — more range, less precision, used for gradients). Because fp8 keeps an <em>exponent</em>, it tolerates the wide dynamic range of activations far better than int8 does, which is why fp8 is viable for <em>training</em> (with per-tensor or finer scaling factors) where int8 activations would clip. Hopper and Blackwell have native fp8 tensor cores; the cost is the bookkeeping of the scaling factors.</p>
+
+<p><strong>int4 weight-only.</strong> For decode-bound LLMs the prize is shrinking the weights as far as possible while computing in fp16. <strong>GPTQ</strong> quantizes weights one column at a time, using second-order (Hessian) information to compensate the remaining weights for each rounding error. <strong>AWQ</strong> (activation-aware) observes that a small fraction of weight channels are salient (the ones multiplied by large activations) and scales them to protect their precision before quantizing. Both push to 4 bits with surprisingly small loss — but at int4 you are near the cliff, and the method and calibration matter enormously (cross-link <a href="../../distillation/lessons/index.html">distillation — the compression sibling track</a>, which treats weight compression and low-rank/quant methods in depth).</p>
+
+<p><strong>2:4 structured sparsity.</strong> A different axis: instead of narrower numbers, fewer of them. <strong>2:4 sparsity</strong> means that in every contiguous group of 4 weights, exactly 2 are forced to zero. NVIDIA's sparse tensor cores (Ampere onward) skip the zeros and run such a matmul at ≈2×, storing only the nonzeros plus a 2-bit index per group. It composes with quantization (int8 + 2:4 stacks both wins) but requires retraining/pruning to the 2:4 pattern, and the structured constraint costs more accuracy than unstructured pruning would.</p>
+
+<p><strong>The honest caveat.</strong> Quantization spends an accuracy budget, and the bill comes due at <em>outliers</em>. A handful of activation channels in large transformers have magnitudes 10–100× the rest; a per-tensor scale that covers them clips everything else into a few codes, and accuracy collapses. This is why activation quant is harder than weight quant, why methods like SmoothQuant migrate scale from activations to weights, and why fp8's exponent helps. What breaks, concretely: per-tensor int8 on outlier-heavy activations; int4 without GPTQ/AWQ-grade calibration; quantizing the delicate softmax/norm/logit ops; and any scheme where the dequant is <em>not</em> fused into the epilogue (then it is slower <em>and</em> less accurate). The pass is real leverage, but it is the one place in the compiler where "I made it faster" must always be paired with "and I measured what it cost."</p>
+
+<h2>6 · Drive it: the precision dial</h2>
+
+<p>The widget is a matmul-heavy block (a transformer linear layer). Pick a <strong>precision</strong> — fp16, fp8, int8, or int4 weight-only — and set the <strong>calibration quality</strong>. Watch the four numbers the pass actually trades: HBM bytes, model size, estimated speedup, and a simulated accuracy drop. The point to feel: int8 is a near-free ≈2× (small drop even at mediocre calibration); int4 is a bigger win but its accuracy depends sharply on calibration — drop calibration to "poor" at int4 and the accuracy falls off a cliff. That cliff is the accuracy budget made visible.</p>
+
+<div class="widget" id="pd">
+  <div class="title">Precision dial — bytes vs the accuracy budget</div>
+  <div class="hint">Lower precision halves bytes and lifts throughput, but spends accuracy. The knob that breaks: set precision to <strong>int4</strong> and slide calibration toward <strong>poor</strong> — the accuracy drop blows past the budget while int8 at the same calibration stays fine. Good calibration tames int4; nothing tames a too-low bit-width with bad scales.</div>
+
+  <div class="dial-grid">
+    <div class="controls">
+      <label class="inline">precision:
+        <select id="pd-prec">
+          <option value="fp16">fp16 / bf16 (baseline)</option>
+          <option value="fp8">fp8 (e4m3)</option>
+          <option value="int8" selected>int8 (weight + activation)</option>
+          <option value="int4">int4 (weight-only)</option>
+        </select>
+      </label>
+      <label class="inline">calibration quality: <input type="range" id="pd-cal" min="0" max="100" step="5" value="85"> <span class="val" id="pd-calv">85</span> / 100</label>
+      <label class="inline">weight count: <input type="range" id="pd-w" min="1" max="70" step="1" value="7"> <span class="val" id="pd-wv">7</span> B params</label>
+    </div>
+    <div>
+      <div class="kpi-grid" style="grid-template-columns:repeat(2,1fr);">
+        <div class="kpi"><div class="k">model size</div><div class="v" id="pd-size">—</div></div>
+        <div class="kpi"><div class="k">HBM bytes / decode step</div><div class="v" id="pd-bytes">—</div></div>
+        <div class="kpi" id="pd-k-spd"><div class="k">est. speedup vs fp16</div><div class="v" id="pd-spd">—</div></div>
+        <div class="kpi" id="pd-k-acc"><div class="k">accuracy drop</div><div class="v" id="pd-acc">—</div></div>
+      </div>
+      <div class="acc-lab" style="margin-top:10px;"><span>accuracy retained</span><span id="pd-retv">—</span></div>
+      <div class="acc-track"><div class="acc-fill" id="pd-retfill"></div></div>
+    </div>
+  </div>
+  <div class="verdict" id="pd-verdict">—</div>
+</div>
+
+<p>The shape of the result is the lesson: fp16 is the safe, expensive baseline; int8 buys ≈2× for a fraction of a point of accuracy that good calibration nearly erases; int4 buys ≈4× on size but lives on the edge — calibrate it well (GPTQ/AWQ-grade) and it holds; calibrate it poorly and it falls off the cliff. The compiler's job is to ride that curve to the lowest precision that stays inside the accuracy budget, never past it.</p>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Per-tensor scale on outlier-heavy activations.</strong> One fat channel forces a coarse scale on all. <em>Signal:</em> int8 accuracy collapses on transformers; switching to per-channel weights / SmoothQuant or fp8 recovers it.</li>
+    <li><strong>Dequant not fused into the epilogue.</strong> A separate dequant kernel reads int32 from HBM and writes fp16. <em>Signal:</em> quantization made it <em>slower</em> — the extra round trips ate the win (lesson 05).</li>
+    <li><strong>int4 with PTQ min–max calibration.</strong> Too few bits and naive scales. <em>Signal:</em> the accuracy cliff — large quality drop where GPTQ/AWQ would have held; the widget's broken knob.</li>
+    <li><strong>Quantizing the delicate ops.</strong> int8 on softmax / layernorm / final logits. <em>Signal:</em> big accuracy loss for tiny byte savings — those ops were never the heavy GEMMs.</li>
+    <li><strong>No accuracy gate in the pipeline.</strong> Shipping a quantized model without measuring drift. <em>Signal:</em> a silent quality regression in production that the bytes/latency dashboard never showed (forces lesson 17).</li>
+  </ul>
+  </div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><strong>Profile the regime first.</strong> Decode-bound → weight-only int4/int8 (bandwidth). Compute-bound prefill/training → int8/fp8 weight+activation (throughput).</li>
+    <li><strong>Per-channel for weights.</strong> One scale per output channel — nearly free metadata, big accuracy win.</li>
+    <li><strong>Calibrate, don't min–max.</strong> Use percentile or MSE/entropy on a representative set; reach for QAT only when PTQ blows the budget.</li>
+    <li><strong>Always fuse the dequant.</strong> Fold the per-channel scale + bias + activation into the GEMM epilogue; never a standalone dequant kernel.</li>
+    <li><strong>Keep sensitive ops fp16.</strong> Anchor softmax/norm/logits at fp16; quantize the heavy linear layers — it's precision assignment, not all-or-nothing.</li>
+    <li><strong>Set an accuracy budget and gate on it.</strong> Define the tolerated drop up front and measure every quantized build against an fp reference.</li>
+  </ul>
+  </div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the widget at 7 B params, <strong>int8</strong>, calibration 85. Note model size (≈7 GB, half of fp16's ≈14 GB), the ≈2× speedup, and the small accuracy drop. (1) Slide calibration down to 0: int8's drop grows but stays modest — int8 is forgiving. (2) Switch to <strong>int4</strong> at calibration 85: size drops to ≈3.5 GB, speedup climbs, accuracy drop is still acceptable — good calibration holds int4. (3) Now slide calibration toward 0 at int4: watch the accuracy drop fall off the cliff and the verdict turn red — same bit-width, ruined by bad scales. (4) Confirm by hand: at int4, weight bytes are ¼ of fp16, so a weight-bandwidth-bound decode step should be ≈4× faster — does the HBM-bytes KPI match? That gap between int8's gentle slope and int4's cliff is the accuracy budget you must respect.</div>
+
+<h2>Where this points next</h2>
+
+<p>You have now built the last of the make-it-fast passes: a graph that is captured, canonicalized, fused, planned, laid out, scheduled, autotuned, coverage-complete, and now quantized — a cache of compiled kernels, each in the precision the accuracy budget allows, with their dequant folded into the epilogue. But that cache is <em>inert</em>. Nothing in lessons 02–15 said what happens at run time: who allocates the buffers the memory planner sized, who dispatches the kernels in order, who keeps lesson 01's launch-overhead ceiling from reappearing now that you have a pile of tiny quantized kernels to fire. The compiler produced an artifact; an <em>executor</em> has to run it, with low overhead, honoring the plan. That is the other half of the compile-time/run-time split: <strong><a href="16_runtime.html">16 · The runtime &amp; executor</a></strong>.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>Every pass so far moved fp16 bytes; the biggest untouched lever is to make the numbers <em>narrower</em>. <strong>Quantization</strong> stores weights/activations as int8/int4 or fp8 plus a <strong>scale</strong> (and zero-point), recovering <span class="math">x ≈ scale · (q − zp)</span> — halving HBM traffic (≈14 GB → ≈7 GB at int8 for a 7 B model), doubling tensor-core throughput (≈990 → ≈1,980 TFLOP/s for fp8/int8), and directly attacking the weight-bandwidth-bound decode GEMM with <strong>weight-only</strong> int4. The compiler represents it as <strong>QDQ</strong> nodes, picks <strong>per-channel</strong> (not per-tensor) scales by <strong>PTQ calibration</strong> (min–max/percentile/MSE) or <strong>QAT</strong> (fake-quant + straight-through estimator), then propagates the quant, <strong>fuses the dequant into the GEMM epilogue</strong> (lesson 05) so the int8 matmul costs zero extra round trips, and solves a <strong>precision-assignment</strong> problem (the dual of layout, lesson 07) that keeps softmax/norm/logits in fp16. fp8 (e4m3/e5m2) keeps an exponent for training; int4 weight-only (GPTQ/AWQ) and <strong>2:4 sparsity</strong> push further. The defining twist: this is the one pass that is <em>deliberately not bit-exact</em> — it preserves the math <em>approximately</em>, on an <strong>accuracy budget</strong>, and outliers are where that budget breaks. With kernels generated and quantized, the artifact is built — but inert, which forces the runtime that launches it.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why does quantization help both decode and prefill, by different mechanisms? <em>(§1 — decode is weight-bandwidth-bound, so halving weight bytes (int8/int4 weight-only) nearly halves latency; prefill/training is compute-bound, so int8/fp8 tensor cores at ≈2× throughput lift the FLOPs. Bytes for one, FLOPs for the other.)</em></li>
+  <li>What is a QDQ node and what does the dequant fuse into? <em>(§2,4 — quantize (fp→int) and dequantize (int→fp) nodes wrap a low-precision region; the dequant (per-channel scale multiply + bias + activation) fuses into the GEMM epilogue while the int32 tile is hot, so it costs zero extra HBM traffic — lesson 05. Without that fusion, quant can be a net loss.)</em></li>
+  <li>Per-tensor vs per-channel scale — why does per-channel matter for weights? <em>(§2 — one fat-range output channel forces a per-tensor scale that wastes most int8 codes on the other channels; a per-channel scale vector (negligible metadata) lets every channel use its full range, which is why int8 linear layers hold accuracy.)</em></li>
+  <li>PTQ vs QAT, and what is the straight-through estimator? <em>(§3 — PTQ picks scales from calibration on a small set with no retraining (fast, good for int8); QAT inserts fake-quant in the forward and trains against it. quantize has zero gradient, so the STE pretends rounding is the identity (gradient 1) on the backward so gradients flow. QAT recovers accuracy PTQ can't, for int4/sensitive models.)</em></li>
+  <li>How is quantization a counterexample to "preserve semantics"? <em>(§4 — every other pass is a provable no-op on the numbers; quantization is deliberately approximate, trading a bounded, measured accuracy drop for bytes/FLOPs. The invariant changes from bit-exact to "within the accuracy budget," which is why it needs a debugging discipline (lesson 17).)</em></li>
+  <li>Why is int8 activation quant harder than weight quant, and how does fp8 help? <em>(§5 — activations have outlier channels 10–100× the rest; a per-tensor int8 scale clips everything else. fp8 keeps an exponent so it spans wide dynamic range without clipping, which is why fp8 (not int8) is viable for training activations; SmoothQuant migrates scale to weights as another fix.)</em></li>
+  <li>Why is int4 weight-only the right tool for LLM decode, and what's the risk? <em>(§1,5 — decode reloads the whole weight matrix per token (bandwidth-bound) with a tiny matmul, so int4 weights ≈4× less weight bytes ≈ ≈4× faster decode, computing in fp16. Risk: 4 bits is near the accuracy cliff, so it needs GPTQ/AWQ-grade calibration — naive min–max falls off.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="14_op_coverage.html"><span class="dir">← Back</span><span class="ttl">14 · Operator coverage</span></a>
+  <a class="next" href="16_runtime.html"><span class="dir">Next →</span><span class="ttl">16 · The runtime &amp; executor</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var root = document.getElementById('pd');
+  if (!root) return;
+
+  var sel = document.getElementById('pd-prec');
+  var cal = document.getElementById('pd-cal'), calv = document.getElementById('pd-calv');
+  var wEl = document.getElementById('pd-w'), wv = document.getElementById('pd-wv');
+  var oSize = document.getElementById('pd-size'), oBytes = document.getElementById('pd-bytes');
+  var oSpd = document.getElementById('pd-spd'), oAcc = document.getElementById('pd-acc');
+  var retv = document.getElementById('pd-retv'), retfill = document.getElementById('pd-retfill');
+  var kSpd = document.getElementById('pd-k-spd'), kAcc = document.getElementById('pd-k-acc');
+  var verdict = document.getElementById('pd-verdict');
+
+  // bytes/elem and rough tensor-core/decode speedup vs fp16
+  var FMT = {
+    fp16: { bytes: 2.0,  spd: 1.0 },
+    fp8:  { bytes: 1.0,  spd: 1.9 },
+    int8: { bytes: 1.0,  spd: 1.9 },
+    int4: { bytes: 0.5,  spd: 3.6 }   // weight-only: ~4x weight bandwidth on decode
+  };
+  // base accuracy drop (%) at PERFECT calibration, and how much POOR calibration adds.
+  // int4 has a small floor but a large calibration sensitivity -> the cliff.
+  var ACC = {
+    fp16: { floor: 0.0, calSens: 0.0 },
+    fp8:  { floor: 0.2, calSens: 0.6 },
+    int8: { floor: 0.4, calSens: 1.6 },
+    int4: { floor: 1.2, calSens: 14.0 }  // poor calibration -> big drop = the cliff
+  };
+
+  var BW = 3.3e12; // H100 HBM bandwidth, bytes/s, for an illustrative decode-step time
+
+  function fmtGB(b){ return b >= 1e9 ? (b/1e9).toFixed(1)+' GB' : (b/1e6).toFixed(0)+' MB'; }
+
+  function render(){
+    var prec = sel.value;
+    var q = +cal.value; calv.textContent = q;
+    var nB = +wEl.value; wv.textContent = nB;
+    var params = nB * 1e9;
+
+    var f = FMT[prec], a = ACC[prec];
+
+    // model size = params * bytes/elem
+    var sizeBytes = params * f.bytes;
+    oSize.textContent = fmtGB(sizeBytes);
+
+    // decode step ~ read all weights once: bytes = model size; time = bytes/BW
+    oBytes.textContent = fmtGB(sizeBytes) + '  (' + (sizeBytes/BW*1000).toFixed(0) + ' ms)';
+
+    // speedup vs fp16 decode (bandwidth-bound) ~ fp16_bytes / this_bytes, capped by f.spd
+    var spd = f.spd;
+    oSpd.textContent = spd.toFixed(2) + '×';
+
+    // accuracy drop: floor + calSens * (1 - quality)
+    var poorness = 1 - q/100;            // 0 = perfect calib, 1 = worst
+    var drop = a.floor + a.calSens * poorness * poorness;  // squared -> the cliff is steep at the end
+    if (prec === 'fp16') drop = 0;
+    var retained = Math.max(0, 100 - drop);
+
+    oAcc.textContent = drop.toFixed(1) + ' %';
+    retv.textContent = retained.toFixed(1) + ' %';
+    retfill.style.width = retained + '%';
+
+    // budget: treat > 2% drop as out-of-budget
+    var BUDGET = 2.0;
+    var overBudget = drop > BUDGET;
+
+    if (drop <= 0.5) { retfill.style.background = 'var(--ok)'; }
+    else if (!overBudget) { retfill.style.background = 'var(--accent)'; }
+    else { retfill.style.background = 'var(--bad)'; }
+
+    kAcc.classList.toggle('over', overBudget);
+    kAcc.classList.toggle('good', drop <= 0.5);
+    kSpd.classList.toggle('good', spd >= 1.8 && !overBudget);
+
+    verdict.classList.remove('good','bad');
+    if (prec === 'fp16'){
+      verdict.innerHTML = '<strong>fp16 baseline.</strong> No accuracy risk, full bytes and FLOPs. ' + fmtGB(sizeBytes) + ', 1.00× — the cost the rest of the dial beats.';
+    } else if (overBudget){
+      verdict.classList.add('bad');
+      verdict.innerHTML = '<strong>Over the accuracy budget.</strong> ' + prec + ' at calibration ' + q + ' drops ' + drop.toFixed(1) + '% (> 2% budget). ' +
+        (prec === 'int4' ? 'This is the int4 cliff — improve calibration (GPTQ/AWQ-grade) or step up to int8.' : 'Improve calibration or keep this region fp16.');
+    } else {
+      verdict.classList.add('good');
+      verdict.innerHTML = '<strong>Inside budget.</strong> ' + prec + ' gives ' + spd.toFixed(2) + '× at ' + fmtGB(sizeBytes) +
+        ' for only a ' + drop.toFixed(1) + '% accuracy drop. Fuse the dequant into the epilogue and ship it.';
+    }
+  }
+
+  sel.addEventListener('change', render);
+  cal.addEventListener('input', render);
+  wEl.addEventListener('input', render);
+  render();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

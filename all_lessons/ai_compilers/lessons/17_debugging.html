@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>17 · Debugging compiled models</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-local layout only — failure/checklist columns, the flowchart, the detective widget */
+  .lesson-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  .lesson-card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 14px; }
+  .lesson-card h3 { margin-top: 0; font-size: 15px; }
+  .lesson-card ul { margin: 0; padding-left: 18px; }
+  .lesson-card li { margin: 7px 0; font-size: 13.5px; line-height: 1.5; }
+  .kpi.over .v { color: var(--bad); }
+  .kpi.good .v { color: var(--ok); }
+  .dd-wrap { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; align-items: start; }
+  .dd-faults { display: grid; gap: 6px; margin: 4px 0 8px; }
+  .dd-faults label { font-family: var(--mono); font-size: 12.5px; display: flex; align-items: center; gap: 8px; }
+  .dd-tol { margin: 8px 0 4px; }
+  .dd-tol label { display: block; font-size: 13px; margin: 6px 0; }
+  .verdict { font-family: var(--mono); font-size: 14px; padding: 8px 10px; border-radius: 6px; margin-top: 8px; border: 1px solid var(--border); }
+  .verdict.pass { color: var(--ok); border-color: var(--ok); }
+  .verdict.fail { color: var(--bad); border-color: var(--bad); }
+  .culprit { font-family: var(--mono); font-size: 12px; color: var(--text-mute); margin-top: 6px; min-height: 16px; }
+  .culprit b { color: var(--bad); }
+  .flow { display: grid; gap: 0; margin: 16px 0; font-size: 13.5px; }
+  .flow .row { display: grid; grid-template-columns: 150px minmax(0,1fr); gap: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); padding: 11px 14px; margin-bottom: 8px; }
+  .flow .q { font-family: var(--mono); font-size: 12px; color: var(--accent); font-weight: 600; }
+  .flow .a { color: var(--text-mute); line-height: 1.5; }
+  @media (max-width: 820px) { .lesson-grid, .dd-wrap, .flow .row { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">ai_compilers / lessons</a><span class="crumb">/</span><span class="crumb">17 · debugging</span><span class="step-pill">lesson 18 / 20</span></div></header>
+
+<main>
+
+<p class="kicker">Part VI — Shipping the compiled model</p>
+<h1>Debugging compiled models</h1>
+<p class="subtitle">Lesson 16 produced something that actually runs in production: a cache of compiled, quantized kernels, a memory plan, and a runtime that replays the whole launch sequence as one driver call. The model is fast and it fits. There is just one problem you've been quietly accumulating since lesson 04 — it no longer computes exactly what the eager model computed. Fusion reorders arithmetic. Reassociation (which lesson 04 planted as the one rewrite that <em>isn't</em> bit-exact) reorders reductions. Quantization (lesson 15) is <em>deliberately</em> approximate. A different fused kernel accumulates in a different order. And graph-replay can silently fall back to recompiling without telling you. The whole track kept promising "preserve semantics" — and then spent four lessons legitimately moving bits. This lesson is how you tell an acceptable float drift from a real bug, find which pass caused it, and decide when the answer is "ship it" versus "that's broken."</p>
+
+<div class="callout source-note"><div class="label">The previous step left this broken</div>You can now build a model that is fast (00–13), lowers every op (14), spends precision for bytes (15), and launches with near-zero overhead (16). But every one of those wins moved you off the eager reference. Run the compiled model and the logits differ in the 4th decimal place — is that the harmless rounding of a reordered <code>sum</code>, or did the int8 calibration (15) clip an outlier channel and corrupt a layer? Worse, the model that was 5× faster yesterday is 1.2× today and the GPU is mostly idle — a guard from lesson 02/11 is firing on every batch and you're recompiling in a hot loop, but nothing printed an error. A compiled model fails <em>differently</em> from eager: not with a stack trace, but with a number that's slightly wrong or a speed that quietly evaporated. You have no stack frame to set a breakpoint in — the Python is gone, replaced by a Triton kernel and a captured graph. Production needs a way to <em>trust</em> the compiler, which means a way to interrogate it.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> fusion (05), float reassociation (04), quantization (15, deliberately approximate), different kernels &amp; accumulation order, and graph-replay/recompile (16) all can change the output or silently re-pay compile cost — so "it ran" no longer means "it's correct" or "it's fast."<br><strong>New idea:</strong> the debugging toolchain — <strong>accuracy as a first-class check</strong> (an <span class="math">rtol</span>/<span class="math">atol</span> tolerance against an <strong>fp32 reference</strong>, distinguishing float drift from a bug); <strong>bisection via the minifier</strong> (auto-shrink to the smallest graph that still reproduces, and tag the offending pass); <strong>reading the compiler logs</strong> (<code>TORCH_LOGS=graph_breaks,recompiles,guards</code> / tlparse) to diagnose graph-break and recompile storms; and the <strong>determinism</strong> story (TF32/fast-math, accumulation dtype, atomic/reduction-order nondeterminism, and the deterministic switch's perf cost).<br><strong>Forces next:</strong> with build · ship · <em>trust</em> all in hand, you've seen every piece — time to assemble them as the real stacks (18) and trace one block end to end (19).</div>
+
+<div class="callout"><div class="label">The plan</div>Five moves. (1) Why compiled ≠ bit-identical, and the rtol/atol + fp32-reference test that separates acceptable drift from a bug. (2) Bisection and the <strong>minifier</strong> — let the tool shrink the repro to the offending subgraph and pass. (3) Read the compiler: <code>TORCH_LOGS</code> / tlparse to diagnose graph-break storms (callback 02) and recompile storms (callback 11). (4) Determinism: where nondeterminism comes from and what the deterministic switch costs. (5) A debugging flowchart — slow? wrong? recompiling? — that routes any symptom to the right tool. Then drive the divergence detective until you can read a tolerance verdict cold.</div>
+
+<h2>1 · Why compiled ≠ bit-identical, and the test that tells drift from a bug</h2>
+
+<p>Start by accepting the thing nobody tells you: <strong>a correct compiler does not produce the same bits as eager.</strong> It produces a result that is <em>mathematically equivalent on the reals</em> but rounded differently. Four mechanisms, all of which you've already met:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">reassociation (04)</div><div class="v">Fusion and reduction-tree rewrites change the <em>order</em> of float adds. Floats are non-associative — <span class="math">(1e20 + −1e20) + 1 = 1</span> but <span class="math">1e20 + (−1e20 + 1) = 0</span>. Legal under fast-math; changes the last bits.</div></div>
+  <div class="topic-card"><div class="k">different kernel (05, 09)</div><div class="v">The fused Triton kernel sums a row in a different tile order than eager's library kernel. Same math, different accumulation path, different rounding — a few ulps.</div></div>
+  <div class="topic-card"><div class="k">accumulation dtype</div><div class="v">A bf16 matmul that accumulates in fp32 vs one that accumulates in bf16 differ by far more than a few ulps — the low-precision accumulator loses bits every add.</div></div>
+  <div class="topic-card"><div class="k">quantization (15)</div><div class="v">The one pass that is <em>deliberately</em> approximate. int8/int4 quant preserves the math only on an accuracy budget; this drift is expected and can be large.</div></div>
+</div>
+
+<p>So "the numbers differ" is not a bug report — it's the normal state of affairs. The real question is <em>how much</em> they differ, and the only honest way to ask it is against a <strong>reference</strong>. The reference is the eager model run in <strong>fp32</strong> (or fp64 if you're paranoid): the highest-precision computation of the <em>same math</em>, which is your best proxy for the true real-number answer. You then compare the compiled output to it with a two-part tolerance, exactly the test <code>torch.allclose</code> / <code>numpy.allclose</code> implements:</p>
+
+<div class="math block">|compiled − reference| ≤ atol + rtol · |reference|</div>
+
+<p><strong>atol</strong> (absolute tolerance) is the floor — it forgives small differences near zero, where relative error explodes (<span class="math">|0.0001 − 0.0|</span> is "infinitely" wrong relatively but absolutely tiny). <strong>rtol</strong> (relative tolerance) scales with the magnitude of the value — it forgives a larger absolute gap on a large number, because large floats have larger ulps. A reasonable starting pair for bf16/fp16 work is <span class="math">rtol ≈ 1e-2</span>, <span class="math">atol ≈ 1e-3</span>; for fp32, something like <span class="math">rtol ≈ 1e-5</span>. The verdict — <em>within tolerance?</em> — is your "drift vs bug" classifier:</p>
+
+<table class="trade-table">
+  <thead><tr><th>observation</th><th>diagnosis</th><th>action</th></tr></thead>
+  <tbody>
+    <tr><td>max rel error ≈ 1e-3, scattered uniformly</td><td>benign float drift (reassociation / different kernel)</td><td>ship it; this is expected at bf16</td></tr>
+    <tr><td>max rel error ≈ 1e-2 on int8, concentrated in a few channels</td><td>quantization on its accuracy budget (15) — within design</td><td>check end-task metric, not raw logits; ship if metric holds</td></tr>
+    <tr><td>error grows layer over layer, or a handful of <code>NaN</code>/<code>Inf</code></td><td><strong>real bug</strong> — overflow, a wrong rewrite, a bad cast</td><td>do not ship; bisect to the pass (§2)</td></tr>
+    <tr><td>error ~0 on most inputs, huge on a few</td><td><strong>real bug</strong> — a guard mismatch or an outlier the calibration missed</td><td>do not ship; minify the failing input (§2)</td></tr>
+  </tbody>
+</table>
+
+<p>The trap is tolerance choice itself. Set the tolerance too loose and a genuine bug slips through as "close enough"; set it too tight and benign reassociation drift trips it on every run and you waste a week chasing a non-bug. The discipline is to anchor the tolerance to a <em>downstream metric</em> wherever you can — perplexity, top-1 accuracy, a generation-quality eval — because the last bits of a logit almost never matter, but a clipped channel that drops accuracy 3 points does. Raw-tensor <code>allclose</code> is the fast screen; the task metric is the verdict that ships.</p>
+
+<h2>2 · Bisection and the minifier: let the tool find the pass</h2>
+
+<p>Suppose the verdict is "real bug": the compiled model's error blows past any sane tolerance. The graph has thousands of ops and a dozen passes ran over it. Where is the fault? The brute-force answer is <strong>bisection</strong> — disable half the passes (or half the graph), re-test, and recurse into whichever half still reproduces. That's <span class="math">log₂</span> of the problem size in steps, and it's exactly what a <strong>minifier</strong> automates.</p>
+
+<p>A <strong>minifier</strong> is a tool that takes a large failing program plus a check ("does the compiled output diverge from the reference?") and <em>automatically shrinks</em> it — deleting ops, narrowing the graph, simplifying inputs — to the smallest subgraph that still triggers the failure, while also identifying the pass after which the divergence first appears. In <code>torch.compile</code> you arm it with an environment variable:</p>
+
+<pre class="ascii"># reproduce-after a given compiler stage, on an accuracy divergence
+TORCHDYNAMO_REPRO_AFTER="aot"        # bisect after AOTAutograd (the joint fwd/bwd graph)
+TORCHDYNAMO_REPRO_LEVEL=4            # 4 = accuracy minifier (vs crash minifier)
+python train.py
+# → writes repro.py: a ~20-line graph that still diverges,
+#   plus which lowering reproduced it. Hand that to a bug report.</pre>
+
+<p>Two flavors matter. The <strong>crash minifier</strong> shrinks a graph that makes the backend <em>error</em> (a codegen assertion, an unsupported op) down to the offending node. The <strong>accuracy minifier</strong> (the one you want here, <code>REPRO_LEVEL=4</code>) shrinks a graph whose <em>output diverges</em> from the reference beyond tolerance, isolating the few ops whose lowering introduced the divergence. The output is a tiny, self-contained <code>repro.py</code> — the difference between "the 70B model is wrong somewhere" and "this 8-op subgraph, after fusion, produces a <code>NaN</code> on this one input shape." That artifact is what turns a vague divergence into a fixable, reportable bug. <code>REPRO_AFTER</code> picks the stage to bisect from — <code>"dynamo"</code> (the captured FX graph), <code>"aot"</code> (after autodiff + functionalization, lesson 12), or the Inductor lowering — so you can localize the fault to <em>capture</em>, <em>the joint graph</em>, or <em>codegen</em>.</p>
+
+<p>The same bisection logic works by hand when you don't have a minifier: compare against the reference at each lowering stage. If the FX graph (capture) already diverges, the bug is in your model or capture; if it's exact after capture but wrong after Inductor, the bug is in fusion/codegen; if it only appears under <code>reduce-overhead</code> (CUDA graphs, lesson 16), it's a stale-buffer or stable-address problem, not a math bug. Each stage you can mark "matches reference" cuts the search space in half.</p>
+
+<h2>3 · Read the compiler: graph-break storms and recompile storms</h2>
+
+<p>The other failure mode isn't wrong — it's <em>slow</em>, and silently so. Two diseases, both diagnosable only by making the compiler talk. You make it talk with <strong>structured logs</strong>: <code>torch.compile</code> exposes <code>TORCH_LOGS</code>, a comma-separated list of channels, and <strong>tlparse</strong>, a tool that turns the raw log dump into a navigable HTML report of every compiled region, guard, and break.</p>
+
+<pre class="ascii">TORCH_LOGS="graph_breaks,recompiles,guards" python serve.py
+# graph_breaks → every place Dynamo fell back to eager and why
+# recompiles    → every guard that fired and forced a recompile
+# guards        → the exact assumptions each compiled graph is specialized on</pre>
+
+<p>A <strong>graph-break storm</strong> (callback to lesson 02) is when Dynamo can't trace some construct — a data-dependent <code>.item()</code>, a print, an unsupported op (lesson 14), a Python side effect — and <strong>graph-breaks</strong> back to eager at that point, splitting your one big fusable graph into many small islands. Fusion can't cross a break (lesson 05's seam problem), so the win evaporates: instead of one fused kernel you get the eager launch storm lesson 01 priced. The log tells you exactly where and why:</p>
+
+<pre class="ascii">[graph_breaks] torch._dynamo: BREAK in forward() at model.py:88
+    reason: Tensor.item() called — data-dependent value escapes the graph
+    → graph split here; 2 subgraphs, fusion cannot cross the seam
+[graph_breaks] torch._dynamo: BREAK at model.py:142
+    reason: unsupported builtin print() with tensor arg</pre>
+
+<p>The fix is to remove the break (avoid <code>.item()</code> in the hot path, wrap unsupported ops as custom ops per lesson 14, or set <code>fullgraph=True</code> to make a break a hard error you must resolve rather than a silent fallback). A <strong>recompile storm</strong> (callback to lesson 11) is different: the graph compiled fine, but a <strong>guard</strong> — the assumption set the compiled graph is specialized on (shapes, dtypes, the value of a Python flag, an object id) — keeps failing, so the runtime recompiles on nearly every call. The classic cause is shape specialization: you didn't mark a dimension dynamic, so every new sequence length recompiles. The log makes it obvious:</p>
+
+<pre class="ascii">[recompiles] torch._dynamo: recompiling forward() (cache size 7)
+    guard failed: L['x'].size()[1] == 512   (now 537)
+    → tip: mark batch/seq dynamic with torch._dynamo.mark_dynamic(x, 1)
+[recompiles] ... (cache size 8)  guard failed: L['x'].size()[1] == 537 (now 489)</pre>
+
+<p>A climbing "cache size" with a shape guard in every entry is the signature: you are compiling, not running. The fix is the lesson-11 toolkit — symbolic/<code>dynamic=True</code> shapes so one graph covers a range, or bucketing so only a few sizes ever compile, plus the <code>recompile_limit</code> guardrail that converts an out-of-control storm into a loud error. tlparse stitches all of this into one report: how many distinct graphs you compiled, what each is guarded on, and which guard is thrashing — the whole-program view that a single exception never gives you. (For kernel-level profiling once the graph is stable, the deeper treatment is <a href="../../gpu_kernels/20_profiling_toolkit.html">gpu_kernels · 20 the profiling toolkit</a> and <a href="../../gpu_kernels/21_reading_profile_roofline.html">21 reading a profile against the roofline</a>.)</p>
+
+<h2>4 · Determinism: where the nondeterminism lives, and what the switch costs</h2>
+
+<p>Sometimes the bug is that the model gives a <em>different</em> answer each run with no code change — which makes everything above impossible, because you can't bisect a moving target. <strong>Determinism</strong> means: same inputs, same code, bit-identical outputs, every run. Compiled (and even eager GPU) code is nondeterministic by default for performance reasons, from three sources:</p>
+
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">atomic / reduction order</div><div class="v">Many GPU kernels (scatter-add, some backward reductions) use <strong>atomics</strong> — parallel threads add into one location in hardware-scheduled, run-varying order. Floats are non-associative (04), so the order changes the last bits run to run.</div></div>
+  <div class="topic-card"><div class="k">TF32 / fast-math</div><div class="v"><strong>TF32</strong> runs fp32 matmuls through tensor cores at reduced (19-bit) mantissa precision; <strong>fast-math</strong> lets the compiler reassociate/contract. Both trade precision for speed and can vary the result.</div></div>
+  <div class="topic-card"><div class="k">accumulation dtype</div><div class="v">Whether a reduction accumulates in fp32 or in the (smaller) storage dtype. Reduced-precision accumulation both loses precision and makes the order matter more — set it explicitly, don't inherit a backend default.</div></div>
+</div>
+
+<p>The frameworks expose one switch that forces deterministic algorithms everywhere they exist and <em>errors</em> where they don't, so a hidden nondeterministic kernel can't sneak through:</p>
+
+<pre class="ascii">torch.use_deterministic_algorithms(True)   # deterministic kernels, or raise
+torch.backends.cudnn.deterministic = True
+torch.backends.cuda.matmul.allow_tf32 = False   # full fp32, no TF32 shortcut
+import os; os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # deterministic cuBLAS</pre>
+
+<p>This is a real trade, not a free correctness dial. Forcing deterministic algorithms can cost <strong>10–30%</strong> wall-clock (sometimes worse): the deterministic scatter-add replaces fast atomics with a serialized or sorted reduction, and disabling TF32 drops matmul throughput by ~2–3× on tensor cores. So you turn determinism <em>on</em> while you debug — to get a stable target to bisect against and to make a divergence reproducible — and turn it <em>off</em> for production, where a few ulps of run-to-run noise are harmless and the speed is not. The same reproducibility-vs-speed tension as fast-math in lesson 04, now stated as an operational switch. The mistake is leaving it on in production (paying 20% for nothing) or expecting bit-identical results <em>without</em> it (chasing "nondeterminism bugs" that are just atomics).</p>
+
+<h2>5 · The debugging flowchart</h2>
+
+<p>Put it together as a triage. Every symptom of a compiled model routes to one of three questions, and each question has its tool. Don't reach for the minifier when the problem is a recompile storm, or for <code>TORCH_LOGS</code> when the output is wrong — match the tool to the symptom.</p>
+
+<div class="flow">
+  <div class="row"><div class="q">slow?</div><div class="a">Is it slower than expected or slower than yesterday? → Turn on <code>TORCH_LOGS=recompiles,graph_breaks</code> + tlparse. Climbing cache size + a shape guard = <strong>recompile storm</strong> → mark dynamic / bucket (11). Many small kernels + breaks = <strong>graph-break storm</strong> → remove breaks / custom-op (02, 14). If the graph is stable and still slow, it's a kernel problem → profile (gpu_kernels 20/21), not a compiler problem.</div></div>
+  <div class="row"><div class="q">wrong?</div><div class="a">Is the output off? → Compare to the <strong>fp32 eager reference</strong> with rtol/atol. Within tolerance and uniform = benign drift, <strong>ship</strong>. Concentrated on quantized channels = check the task metric (15). Growing per layer or <code>NaN</code>/<code>Inf</code> = <strong>real bug</strong> → run the <strong>accuracy minifier</strong> (<code>TORCHDYNAMO_REPRO_AFTER</code>, <code>REPRO_LEVEL=4</code>) to get a tiny repro and the offending pass (§2).</div></div>
+  <div class="row"><div class="q">flaky?</div><div class="a">Different answer each run, or can't reproduce a failure? → Turn on <code>use_deterministic_algorithms(True)</code> and disable TF32 to get a stable target, then bisect. If it only diverges <em>without</em> determinism, it's atomics/reduction-order noise (harmless) — not a bug. If it diverges even <em>with</em> determinism on, it's a real bug; minify it (§2,§4).</div></div>
+</div>
+
+<h2>6 · Drive it: the divergence detective</h2>
+
+<p>The widget runs a compiled block against its fp32 reference and reports the two numbers that decide everything: <strong>max absolute error</strong> and <strong>max relative error</strong>. Toggle fault sources — aggressive fusion-reassociation, int8 quantization, TF32 — and watch each add a characteristic amount of <em>drift</em> that sits comfortably under a sane tolerance. Then flip on <strong>a real bug</strong> (a wrong accumulation dtype that loses bits every add) and watch the error blow past any reasonable line. Move the <strong>rtol/atol</strong> slider to set your tolerance and read the <em>within tolerance?</em> verdict. The lesson is in the knob that breaks: tighten the tolerance far enough and the <em>benign</em> drift trips the verdict too — false-positive triage — which is exactly why you anchor tolerance to a task metric, not to "as tight as possible."</p>
+
+<div class="widget" id="dd">
+  <div class="title">Divergence detective — drift vs bug, and tolerance triage</div>
+  <div class="hint">Each fault adds error against the fp32 reference. Float drift (fusion-reassoc, TF32) stays tiny; quant sits on its budget; the <strong>real bug</strong> blows past. The knob that breaks: drag the tolerance tighter and watch benign drift falsely trip the verdict — the false positive that wastes a debugging week.</div>
+
+  <div class="dd-wrap">
+    <div>
+      <div class="dd-faults">
+        <label><input type="checkbox" id="dd-fuse"> aggressive fusion-reassociation (fast-math)</label>
+        <label><input type="checkbox" id="dd-tf32"> TF32 matmul (19-bit mantissa)</label>
+        <label><input type="checkbox" id="dd-quant"> int8 quantization (on accuracy budget)</label>
+        <label><input type="checkbox" id="dd-bug"> <b>a real bug</b> (bf16 accumulation — loses bits)</label>
+      </div>
+      <div class="dd-tol">
+        <label>rtol: <input type="range" id="dd-rtol" min="-6" max="-1" step="0.25" value="-2"> <span class="val" id="dd-rtolv">1e-2</span></label>
+        <label>atol: <input type="range" id="dd-atol" min="-7" max="-2" step="0.25" value="-3"> <span class="val" id="dd-atolv">1e-3</span></label>
+      </div>
+    </div>
+    <div>
+      <div class="kpi-grid">
+        <div class="kpi"><div class="k">max abs error</div><div class="v" id="dd-abs">—</div></div>
+        <div class="kpi"><div class="k">max rel error</div><div class="v" id="dd-rel">—</div></div>
+        <div class="kpi"><div class="k">tolerance bound</div><div class="v" id="dd-bound">—</div></div>
+        <div class="kpi" id="dd-vk"><div class="k">drift class</div><div class="v" id="dd-class">—</div></div>
+      </div>
+      <div class="verdict" id="dd-verdict">set faults and tolerance</div>
+      <div class="culprit" id="dd-culprit"></div>
+    </div>
+  </div>
+</div>
+
+<p>The shape of the readout is the whole skill. With sane tolerances (<span class="math">rtol = 1e-2</span>), every drift source — fusion, TF32, even int8 quant — reports "within tolerance," while the real bug always fails: that's the classifier working. Then drag rtol down toward <span class="math">1e-5</span> and watch fusion drift flip to "FAIL" even though nothing is broken. The compiler didn't get worse; your tolerance got unrealistic. A correct debugging process is a correct <em>tolerance</em> plus a correct <em>reference</em> — get either wrong and the verdict lies.</p>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Demanding bit-identical results from the compiler.</strong> Treating any difference from eager as a bug. <em>Signal:</em> you "found a numerical regression" that is uniform ~1e-3 drift in bf16 — that's reassociation/different-kernel rounding, not breakage.</li>
+    <li><strong>Comparing against the wrong reference.</strong> Diffing the compiled bf16 model against the eager bf16 model — both are imprecise, so you can't tell which is right. <em>Signal:</em> the "error" disappears when you re-run because eager itself drifted; you needed an fp32 reference.</li>
+    <li><strong>Tolerance too loose / too tight.</strong> Loose hides a real bug as "close enough"; tight trips on every benign run. <em>Signal:</em> a quant bug that drops eval accuracy 3 points passes <code>allclose</code> — anchor to the task metric, not raw tensors.</li>
+    <li><strong>Chasing a recompile storm as a "slowness bug" in the kernels.</strong> Profiling the kernel when the real cost is recompilation. <em>Signal:</em> the GPU is idle and <code>TORCH_LOGS=recompiles</code> shows a climbing cache size with a shape guard — it's compiling, not running.</li>
+    <li><strong>Leaving determinism on in production.</strong> Paying 10–30% for run-to-run reproducibility nobody needs at serve time. <em>Signal:</em> serving is mysteriously slow and matmuls aren't using TF32 — the deterministic switch is still set from a debug session.</li>
+    <li><strong>Calling atomics noise a bug.</strong> Treating run-to-run last-bit variation as a defect. <em>Signal:</em> the "nondeterminism" vanishes under <code>use_deterministic_algorithms(True)</code> — it was scatter-add reduction order, harmless.</li>
+  </ul>
+  </div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><strong>Always diff against an fp32 reference.</strong> Eager-bf16-vs-compiled-bf16 can't tell you which is correct; fp32 is your proxy for the true answer.</li>
+    <li><strong>Pick rtol/atol from the task, not from zero.</strong> Anchor to perplexity/accuracy; raw <code>allclose</code> is a screen, the metric is the verdict.</li>
+    <li><strong>Let the minifier bisect.</strong> <code>TORCHDYNAMO_REPRO_AFTER</code> + accuracy minifier (<code>REPRO_LEVEL=4</code>) shrinks to the offending subgraph and pass — ship that repro, not the 70B.</li>
+    <li><strong>Read the logs before guessing.</strong> <code>TORCH_LOGS=graph_breaks,recompiles,guards</code> + tlparse names the break/guard exactly; storms are diagnosed, not intuited.</li>
+    <li><strong>Determinism on to debug, off to ship.</strong> Stable target for bisection; pay the perf back in production where ulps don't matter.</li>
+    <li><strong>Set accumulation dtype explicitly.</strong> Reduced-precision accumulation is a real-bug source, not benign drift — don't inherit a backend default.</li>
+  </ul>
+  </div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Open the detective and turn on <strong>fusion-reassociation</strong> and <strong>TF32</strong> together with rtol at <span class="math">1e-2</span>: read the max rel error and confirm the verdict is "within tolerance — benign drift." Now add <strong>int8 quantization</strong> and note the error jumps but still passes — that's the accuracy budget, the thing you'd verify with a task metric rather than <code>allclose</code>. Reset, turn on <strong>only the real bug</strong>, and confirm it fails at <em>every</em> tolerance you can set above the floor — a bug doesn't hide behind a reasonable tolerance. Finally, with just fusion drift on, drag rtol from <span class="math">1e-2</span> down to <span class="math">1e-5</span> and find the point where benign drift flips to "FAIL." That crossing is tolerance triage: predict, before you ship, whether your chosen rtol would have falsely failed a clean compiled model — and if so, loosen it to the task metric.</div>
+
+<h2>Where this points next</h2>
+
+<p>You can now do the thing the whole production half was missing: not just build a fast, fitting model, but <em>trust</em> it. You can tell an acceptable float drift (reassociation, TF32, a different kernel — uniform, tiny, ship it) from a real bug (growing error, <code>NaN</code>, a clipped channel — minify it); you can let the accuracy minifier hand you a 20-line repro tagged with the guilty pass; you can read <code>TORCH_LOGS</code>/tlparse to catch a graph-break or recompile storm before it eats your throughput; and you can force determinism to get a stable target, knowing what it costs. That closes the loop the track has been building since lesson 04 — every "preserve semantics" promise now has a way to <em>verify</em> the preservation and a defined boundary (fast-math, quant) where it's relaxed on purpose. With build (00–13), ship (14–16), and trust (17) all in hand, you've seen every part of the machine in isolation. The remaining question is how the real systems wire them together — and whether torch.compile, XLA, TVM, MLIR, and TensorRT are really the same chain under different names. That's lesson 18, <strong><a href="18_stacks.html">The real stacks</a></strong>.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+A correct compiler is <strong>not</strong> bit-identical to eager: fusion and reassociation (04) reorder float adds, different kernels accumulate in different orders, the accumulation dtype changes precision, and quantization (15) is deliberately approximate — so "the numbers differ" is the normal state, not a bug report. The classifier is an <strong>fp32 reference</strong> plus a two-part tolerance <span class="math">|compiled − ref| ≤ atol + rtol·|ref|</span>: uniform ~1e-3 drift is benign and ships; error that grows per layer or produces <code>NaN</code> is a real bug. To localize it, <strong>bisect</strong> — the <strong>minifier</strong> (<code>TORCHDYNAMO_REPRO_AFTER</code>, accuracy minifier <code>REPRO_LEVEL=4</code>) auto-shrinks a huge failing model to the smallest subgraph and the offending pass. The other failure is silent slowness: <code>TORCH_LOGS=graph_breaks,recompiles,guards</code> + tlparse diagnose a <strong>graph-break storm</strong> (Dynamo fell back to eager, fusion can't cross the seam — callback 02) or a <strong>recompile storm</strong> (a shape <strong>guard</strong> thrashes the cache — callback 11). And <strong>determinism</strong> — nondeterministic from atomics/reduction order, TF32, and accumulation dtype (all 04's non-associativity) — is a 10–30% perf switch you keep <em>on</em> to debug (stable target) and <em>off</em> to ship. The triage: slow → read the logs; wrong → diff the fp32 reference then minify; flaky → force determinism then bisect. Trust is the last thing the production stack needed.</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why doesn't a correct compiler produce bit-identical results, and how do you tell drift from a bug? <em>(§1 — fusion/reassociation (04) reorder non-associative float adds, different kernels accumulate differently, quant (15) is deliberately approximate; compare to an fp32 reference with <span class="math">|out−ref| ≤ atol + rtol·|ref|</span> — uniform tiny error is benign drift, error that grows per layer or yields NaN is a real bug.)</em></li>
+  <li>What's the difference between rtol and atol, and why do you need both? <em>(§1 — atol is an absolute floor that forgives differences near zero where relative error explodes; rtol scales the allowed gap with the value's magnitude because large floats have larger ulps; the combined bound handles both small and large values.)</em></li>
+  <li>What does the accuracy minifier do, and how is it different from the crash minifier? <em>(§2 — the crash minifier shrinks a graph that makes the backend error down to the offending node; the accuracy minifier (<code>REPRO_LEVEL=4</code>) shrinks a graph whose output diverges from the reference to the few ops that introduced the divergence, plus the pass; <code>REPRO_AFTER</code> picks the stage — dynamo/aot/inductor — to bisect from.)</em></li>
+  <li>You turn on torch.compile and the model gets slower. How do you diagnose it? <em>(§3 — <code>TORCH_LOGS=recompiles,graph_breaks</code> + tlparse: a climbing cache size with a shape guard in each entry is a recompile storm (mark dynamic/bucket, 11); many small kernels with breaks is a graph-break storm (remove breaks / custom-op, 02/14); if the graph is stable and still slow it's a kernel problem, profile it.)</em></li>
+  <li>Where does nondeterminism in compiled GPU code come from, and what does forcing determinism cost? <em>(§4 — atomic/reduction order (run-varying float add order), TF32 reduced-precision matmuls, and reduced-precision accumulation; <code>use_deterministic_algorithms(True)</code> + disabling TF32 forces deterministic kernels or errors, costing ~10–30% wall-clock — keep it on to debug, off to ship.)</em></li>
+  <li>A quantized model passes <code>torch.allclose</code> but eval accuracy drops 3 points. What went wrong? <em>(§1 — you anchored tolerance to raw tensors instead of the task metric; quant drift on its accuracy budget can pass a loose allclose while a clipped/outlier channel still hurts the downstream metric — the metric is the verdict, allclose is only a screen.)</em></li>
+  <li>Why diff against an fp32 reference rather than the eager bf16 model? <em>(§1, Failure modes — eager bf16 is itself imprecise and drifts, so a bf16-vs-bf16 diff can't say which is right; the fp32 (or fp64) run of the same math is the best proxy for the true real-number answer and gives a stable target.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="16_runtime.html"><span class="dir">← Back</span><span class="ttl">16 · The runtime &amp; executor</span></a>
+  <a class="next" href="18_stacks.html"><span class="dir">Next →</span><span class="ttl">18 · The real stacks</span></a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var root = document.getElementById('dd');
+  if (!root) return;
+  var fFuse = document.getElementById('dd-fuse'),
+      fTf32 = document.getElementById('dd-tf32'),
+      fQuant= document.getElementById('dd-quant'),
+      fBug  = document.getElementById('dd-bug'),
+      sRtol = document.getElementById('dd-rtol'),
+      sAtol = document.getElementById('dd-atol');
+  var vRtol = document.getElementById('dd-rtolv'),
+      vAtol = document.getElementById('dd-atolv'),
+      kAbs  = document.getElementById('dd-abs'),
+      kRel  = document.getElementById('dd-rel'),
+      kBound= document.getElementById('dd-bound'),
+      kClass= document.getElementById('dd-class'),
+      vk    = document.getElementById('dd-vk'),
+      verd  = document.getElementById('dd-verdict'),
+      culp  = document.getElementById('dd-culprit');
+
+  // Reference value magnitude the errors are measured against (a typical logit).
+  // Each fault contributes a characteristic RELATIVE error; we combine in quadrature
+  // for the independent float-rounding sources and additively for the real bug.
+  var REF = 4.0;                 // |reference| magnitude
+  // illustrative relative-error contributions, order-of-magnitude realistic
+  var ERR = {
+    fuse:  3e-4,   // reassociation drift in bf16-ish reduction order
+    tf32:  9e-4,   // TF32 19-bit mantissa on the matmul
+    quant: 8e-3,   // int8 on its accuracy budget — bigger but bounded
+    bug:   2.0e-1  // bf16 accumulation loses bits every add — catastrophic, grows
+  };
+
+  function fmt(x){
+    if (x === 0) return '0';
+    var e = Math.floor(Math.log10(x));
+    var m = x / Math.pow(10, e);
+    return m.toFixed(1) + 'e' + e;
+  }
+
+  function compute(){
+    var rtol = Math.pow(10, +sRtol.value);
+    var atol = Math.pow(10, +sAtol.value);
+    vRtol.textContent = fmt(rtol);
+    vAtol.textContent = fmt(atol);
+
+    // combine independent rounding sources in quadrature (RMS), bug adds on top
+    var driftSq = 0, anyDrift = false, anyBug = false;
+    if (fFuse.checked){ driftSq += ERR.fuse*ERR.fuse; anyDrift = true; }
+    if (fTf32.checked){ driftSq += ERR.tf32*ERR.tf32; anyDrift = true; }
+    if (fQuant.checked){ driftSq += ERR.quant*ERR.quant; anyDrift = true; }
+    var relDrift = Math.sqrt(driftSq);
+    var relBug = 0;
+    if (fBug.checked){ relBug = ERR.bug; anyBug = true; }
+
+    var relErr = relDrift + relBug;        // total relative error
+    var absErr = relErr * REF;             // absolute error against |ref|
+
+    kAbs.textContent = relErr === 0 ? '0' : fmt(absErr);
+    kRel.textContent = relErr === 0 ? '0' : fmt(relErr);
+
+    // tolerance bound: atol + rtol*|ref|, expressed as both abs and the implied rel
+    var bound = atol + rtol * REF;
+    kBound.textContent = fmt(bound);
+
+    var within = absErr <= bound;
+
+    // classify the dominant source
+    var cls, culprit = '';
+    if (relErr === 0){ cls = 'none'; }
+    else if (anyBug && relBug >= relDrift){ cls = 'BUG'; }
+    else if (fQuant.checked && ERR.quant >= relDrift*0.9){ cls = 'quant budget'; }
+    else { cls = 'float drift'; }
+    kClass.textContent = cls;
+
+    // verdict
+    verd.className = 'verdict ' + (within ? 'pass' : 'fail');
+    vk.className = 'kpi ' + (cls === 'BUG' ? 'over' : (within ? 'good' : 'over'));
+
+    if (relErr === 0){
+      verd.className = 'verdict';
+      verd.textContent = 'no faults — compiled matches reference exactly';
+      culp.textContent = '';
+      return;
+    }
+
+    if (within){
+      verd.textContent = 'WITHIN TOLERANCE — ' + (cls === 'BUG'
+        ? 'but a real bug is hiding under a too-loose tolerance!'
+        : (cls === 'quant budget' ? 'quant on its budget — verify the task metric' : 'benign float drift, ship it'));
+    } else {
+      verd.textContent = 'OUT OF TOLERANCE — ' + (cls === 'BUG'
+        ? 'real bug: minify it (REPRO_AFTER + accuracy minifier)'
+        : 'benign drift falsely tripped — tolerance too tight (triage)');
+    }
+
+    // culprit line
+    if (anyBug){
+      culp.innerHTML = 'dominant source: <b>real bug</b> (bf16 accumulation) — error ' +
+        (relBug/Math.max(relDrift,1e-12) > 5 ? 'dwarfs' : 'exceeds') + ' the float drift';
+    } else if (fQuant.checked){
+      culp.innerHTML = 'dominant source: int8 quantization (accuracy budget) — bounded, check task metric';
+    } else if (anyDrift){
+      culp.innerHTML = 'dominant source: float drift (' +
+        (fFuse.checked?'fusion-reassoc ':'') + (fTf32.checked?'TF32':'') + ') — last-bit rounding';
+    } else culp.textContent = '';
+  }
+
+  [fFuse,fTf32,fQuant,fBug].forEach(function(c){ c.addEventListener('change', compute); });
+  [sRtol,sAtol].forEach(function(s){ s.addEventListener('input', compute); });
+  compute();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>
