@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>09 · 3D Gaussian Splatting</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../index.html">all lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">computer_vision_3d</a>
+    <span class="crumb">/</span>
+    <span class="crumb">09 · Gaussian Splatting</span>
+    <span class="step-pill">lesson 9 / 12</span>
+  </div>
+</header>
+
+<main>
+
+<h1>3D Gaussian Splatting</h1>
+<p class="subtitle">Lesson 08's NeRF is beautiful and slow: an <em>implicit</em> radiance field queried by a neural network hundreds of times per ray, so a single frame takes seconds. This lesson keeps the one idea that made NeRF trainable — <strong>differentiable front-to-back compositing</strong> — but swaps the representation out from under it. Instead of an implicit field you march, we place <em>explicit</em> primitives you <strong>rasterize</strong>. That single swap buys real-time rendering (100+ FPS) and easy editing, and in doing so it resolves the explicit-vs-implicit tension from lesson 01 decisively in favor of speed.</p>
+
+<div class="callout">
+  <div class="label">The plan</div>
+  Six moves. (1) Restate NeRF's <strong>cost</strong> precisely and set the target: explicit primitives + rasterization + differentiability = real-time. (2) Define the <strong>primitive</strong> — a 3D Gaussian with mean, covariance, opacity, and view-dependent color — and the one non-obvious detail: how to parameterize the covariance so it stays a <em>valid</em> shape under gradient descent (a direct payoff of lesson 02's quaternions). (3) <strong>Splat</strong> each 3D Gaussian to a 2D one via the EWA covariance transform, and be honest that the projection Jacobian is only a local <em>approximation</em>. (4) <strong>Tile-based rasterization</strong>: sort by depth, blend front-to-back — the <em>same</em> compositing equation as NeRF, but over a handful of splats instead of hundreds of MLP queries. That is the entire real-time story. (5) <strong>Optimize</strong> with a photometric loss and grow/prune the millions of Gaussians with adaptive density control, initialized from the SfM point cloud (CV lesson 05). (6) A head-to-head <strong>NeRF vs 3DGS</strong> table and when to pick which.
+</div>
+
+<h2>1 · Why NeRF is slow, and what we want instead</h2>
+
+<p>Recall the NeRF forward pass from lesson 08. To color one pixel you cast a ray, pick tens to low-hundreds of sample points along it, and at <em>every</em> sample evaluate an MLP <span class="math">F<sub>θ</sub>(x, dir) → (color, density)</span> to get the emitted color and volume density; then you integrate those samples front-to-back. Multiply out the arithmetic: (pixels per frame) × (samples per ray) × (one full MLP forward per sample). For a 800×800 image at ~192 samples/ray that is on the order of <span class="math">10<sup>8</sup></span> network evaluations <em>per frame</em>. Even with the hash-grid acceleration of Instant-NGP, the representation is <strong>implicit</strong> — there is no geometry to draw, only a field to interrogate sample-by-sample — so rendering is fundamentally <em>ray marching through a network</em>. That is why vanilla NeRF renders in seconds per frame and trains in hours.</p>
+
+<p>Now write down what we actually want for a product that has to render and be edited interactively:</p>
+
+<div class="math block">
+  explicit primitives &nbsp;+&nbsp; rasterization &nbsp;+&nbsp; differentiability &nbsp;=&nbsp; 100+ FPS .
+</div>
+
+<p>Each term is doing work. <strong>Explicit primitives</strong> means the scene <em>is</em> a list of things with coordinates — no per-sample network to evaluate. <strong>Rasterization</strong> means we project those primitives to the screen and let the GPU's native strength (drawing lots of small overlapping shapes) do the rendering, instead of marching rays. <strong>Differentiability</strong> means we <em>keep</em> the property from lesson 01 §4 that made the whole inverse-rendering loop work: gradients flow from the image error back into the primitives, so we can still <em>fit</em> the scene to photos by gradient descent.</p>
+
+<div class="callout">
+  <div class="label">The reframe — lesson 01's dichotomy, resolved</div>
+  Lesson 01 laid out the explicit/implicit axis and refused to declare a winner, because the right choice comes from the <em>constraint</em>. Here the constraint is explicit: real-time rendering and editing. Given that, you want an <strong>explicit</strong> representation (fast to draw, easy to move around) that is <em>also</em> soft and differentiable (so it still optimizes like a field). 3D Gaussian Splatting (3DGS) is exactly that hybrid — the one lesson 01 flagged as the deliberate middle of the zoo. This whole lesson is that abstract trade-off cashed out into a concrete method.
+</div>
+
+<h2>2 · The primitive — a 3D Gaussian</h2>
+
+<p>A 3DGS scene is a set of a few million <strong>3D Gaussians</strong>, each a small anisotropic blob. One Gaussian carries four things:</p>
+
+<ul>
+  <li><strong>Mean</strong> <span class="math">μ ∈ ℝ³</span> — where the blob sits in world space (its position).</li>
+  <li><strong>Covariance</strong> <span class="math">Σ ∈ ℝ³ˣ³</span> — the blob's size, its anisotropic stretch, and its orientation, all in one matrix. This is the interesting parameter, and §2 is mostly about how to store it safely.</li>
+  <li><strong>Opacity</strong> <span class="math">α ∈ [0,1]</span> — how much the blob occludes what is behind it (its peak alpha).</li>
+  <li><strong>View-dependent color</strong> via <strong>spherical-harmonic (SH) coefficients</strong> — instead of one RGB, each Gaussian stores a small set of SH coefficients per channel, and the color emitted <em>toward the camera</em> is the SH series evaluated in the viewing direction. Degree-0 SH is a flat color; adding higher-degree bands lets the blob look different from different angles, which is how 3DGS reproduces specular highlights and glossy reflections — the same view-dependence NeRF got from feeding <span class="math">dir</span> into its MLP.</li>
+</ul>
+
+<p>The blob's spatial influence at a point <span class="math">x</span> is an unnormalized Gaussian centered at <span class="math">μ</span> with covariance <span class="math">Σ</span>:</p>
+
+<div class="math block">
+  G(x) = \exp\!\big(-\tfrac{1}{2}\,(x-μ)ᵀ\,Σ<sup>-1</sup>\,(x-μ)\big) .
+</div>
+
+<p>The quadratic form <span class="math">(x-μ)ᵀ Σ<sup>-1</sup> (x-μ)</span> is the squared <strong>Mahalanobis distance</strong> — the "distance in units of the blob's own spread." It equals 1 on the <span class="math">1σ</span> ellipsoid, so <span class="math">Σ</span> literally is the shape: its eigenvectors are the ellipsoid's axes and the square roots of its eigenvalues are the axis half-lengths.</p>
+
+<h3>The covariance must stay valid — enter quaternions (lesson 02)</h3>
+
+<p>Here is the subtlety that trips people up. A covariance matrix must be <strong>symmetric positive semidefinite (PSD)</strong> — otherwise <span class="math">Σ<sup>-1</sup></span> and the quadratic form are meaningless (a negative eigenvalue would make <span class="math">G(x)</span> blow up along some direction instead of decaying). A symmetric <span class="math">3×3</span> has 6 independent entries, and it is tempting to just make those 6 numbers learnable and let the optimizer move them. <strong>Do not.</strong></p>
+
+<div class="callout bad">
+  <div class="label">The trap — optimizing the 6 raw entries</div>
+  If you treat <span class="math">Σ</span>'s six entries as free parameters, gradient descent will happily push them to a configuration with a negative eigenvalue. The matrix is then <strong>indefinite</strong>, not a valid covariance: <span class="math">Σ<sup>-1</sup></span> stops being PSD, the "Gaussian" is no longer a decaying bump, and the render (and its gradients) go garbage. This is the exact analog of lesson 02's warning that you cannot let an optimizer roam the 9 entries of a rotation matrix — the valid set is a curved subset you fall off of. Constraining a matrix to stay PSD during optimization is awkward; the fix is to <em>parameterize it so it is PSD by construction.</em>
+</div>
+
+<p>The construction factors the covariance into a <strong>scale</strong> and a <strong>rotation</strong>. Let <span class="math">S = \mathrm{diag}(s<sub>x</sub>, s<sub>y</sub>, s<sub>z</sub>)</span> be a diagonal scale (the blob's extent along its own three axes) and let <span class="math">R</span> be a rotation matrix built from a <strong>unit quaternion</strong> <span class="math">q</span>. Define</p>
+
+<div class="math block">
+  Σ = R\,S\,Sᵀ\,Rᵀ = R\,(SSᵀ)\,Rᵀ,\qquad SSᵀ = \mathrm{diag}(s<sub>x</sub><sup>2</sup>, s<sub>y</sub><sup>2</sup>, s<sub>z</sub><sup>2</sup>) .
+</div>
+
+<p>Why this is guaranteed valid: for <em>any</em> vector <span class="math">v</span>, <span class="math">vᵀΣv = vᵀ R S Sᵀ Rᵀ v = ‖Sᵀ Rᵀ v‖² ≥ 0</span>, so <span class="math">Σ</span> is PSD automatically — no constraint to enforce, no re-projection step. The factorization also <em>cleanly separates the two things you want to control independently</em>: <span class="math">S</span> is the shape/size (how stretched the blob is along its own axes) and <span class="math">R</span> is the orientation (which way those axes point). You optimize the three log-scales <span class="math">\log s</span> (log-space keeps them positive) and the four quaternion components (renormalized to unit length each step), and reconstruct <span class="math">Σ</span> from them for rendering.</p>
+
+<div class="callout ok">
+  <div class="label">A concrete payoff of lesson 02</div>
+  This is <em>exactly</em> the quaternion machinery from lesson 02 earning its keep. Lesson 02 argued quaternions are the right way to <em>store and optimize</em> an orientation — minimal redundancy (4 numbers, 1 unit-norm constraint), no gimbal lock, cheap to renormalize onto the manifold. A Gaussian's orientation is stored as precisely such a quaternion, and the PSD-by-construction trick <span class="math">Σ = RSSᵀRᵀ</span> is the SO(3) "stay on the manifold" idea applied to covariances. If an interviewer asks "why does 3DGS store a quaternion per Gaussian rather than a raw covariance?", the answer is this section: valid-by-construction PSD, and clean scale/orientation separation.
+</div>
+
+<h2>3 · Rendering by splatting — the EWA covariance transform</h2>
+
+<p>To draw the scene we must get each 3D Gaussian onto the 2D image. "Splatting" means projecting a 3D Gaussian to a <strong>2D Gaussian</strong> in image space and stamping (splatting) that 2D footprint onto the pixels. Two pieces project: the mean and the covariance.</p>
+
+<p><strong>The mean</strong> projects like any 3D point — through the world→camera rigid transform and then the pinhole projection of CV lesson 04: <span class="math">μ</span> goes to camera coordinates, then to a pixel via the intrinsics <span class="math">K</span>. Nothing new.</p>
+
+<p><strong>The covariance</strong> is the interesting part. A 2D Gaussian in image space also has a <span class="math">2×2</span> covariance <span class="math">Σ'</span>, and it is obtained by pushing the 3D covariance through the same transformation the mean underwent — but a covariance transforms by <em>sandwiching</em> with the transformation's linear part. The EWA (Elliptical Weighted Average) splatting result is:</p>
+
+<div class="math block">
+  Σ' = J\,W\,Σ\,Wᵀ\,Jᵀ ,
+</div>
+
+<p>where <span class="math">W</span> is the world→camera <strong>rotation</strong> (the viewing transform's linear part — it reorients the covariance into camera coordinates) and <span class="math">J</span> is the <strong>Jacobian of the projective map</strong> evaluated at <span class="math">μ</span>. The sandwich form is the standard rule for how a covariance transforms under a linear map <span class="math">y = My</span>: <span class="math">\mathrm{Cov}(y) = M\,\mathrm{Cov}(x)\,Mᵀ</span>. The composition <span class="math">J W</span> is that linear map: first rotate into the camera frame (<span class="math">W</span>), then apply the local linearization of the perspective projection (<span class="math">J</span>).</p>
+
+<div class="callout warn">
+  <div class="label">Why <span class="math">J</span> makes this an approximation</div>
+  Perspective projection is <strong>nonlinear</strong> — it divides <span class="math">x</span> and <span class="math">y</span> by depth <span class="math">z</span> (lesson 01's <span class="math">x = f X/Z</span>), so a straight 3D shape does not map to a similarly-shaped 2D one in general. The covariance-sandwich rule, though, only holds exactly for <em>linear</em> maps. <span class="math">J</span> is the local <strong>affine approximation</strong> of the projection at the point <span class="math">μ</span>: it is the best linear map matching the true projection right at the blob's center, and it drifts from the truth as you move away from <span class="math">μ</span>. So the projected footprint <span class="math">Σ'</span> is only <em>approximately</em> a Gaussian. The error grows for Gaussians that are <strong>large</strong> (they extend far from <span class="math">μ</span>, where the linearization is stale) or <strong>far off the optical axis</strong> (where perspective distortion is strongest). This is the same "linearize a nonlinear map with its Jacobian" move as the exp-map linearization in lesson 02 §4 — clean near the point, approximate away from it.</p>
+</div>
+
+<p>The upshot: after splatting, each visible Gaussian is a 2D elliptical bump on the image with center = projected <span class="math">μ</span> and shape = <span class="math">Σ'</span>. Evaluating that 2D Gaussian at a pixel gives a scalar in <span class="math">[0,1]</span> — the blob's spatial weight at that pixel — which we combine with the blob's opacity next.</p>
+
+<h2>4 · Differentiable tile-based rasterization</h2>
+
+<p>Now blend the splats into a picture, differentiably and fast. The 3DGS rasterizer does it in three stages:</p>
+
+<ol>
+  <li><strong>Tile.</strong> Partition the image into small tiles (e.g. 16×16 pixels). For each Gaussian, find which tiles its 2D footprint <span class="math">Σ'</span> overlaps, and add it to those tiles' lists. This turns "which of the millions of Gaussians touch this pixel?" into a cheap local lookup and lets each tile be rasterized independently (great for the GPU).</li>
+  <li><strong>Sort by depth.</strong> Within the visible set, sort the Gaussians front-to-back by their camera-space depth. This is one <em>global</em> per-view sort (a fast GPU radix sort keyed by depth + tile), not a per-pixel sort — every pixel in a tile then walks the same depth-ordered list. Correct compositing requires a consistent front-to-back order, and this sort supplies it.</li>
+  <li><strong>Blend front-to-back, per pixel.</strong> Walk the sorted list and accumulate color with alpha compositing, stopping early once the pixel is opaque (transmittance <span class="math">≈ 0</span>).</li>
+</ol>
+
+<p>The blend is the alpha-over compositing equation:</p>
+
+<div class="math block">
+  C = \sum_{i} c<sub>i</sub>\,α'<sub>i</sub>\,\prod_{j&lt;i}\big(1 - α'<sub>j</sub>\big) ,\qquad α'<sub>i</sub> = α<sub>i</sub>\cdot G'<sub>i</sub>(\text{pixel}) ,
+</div>
+
+<p>where <span class="math">c<sub>i</sub></span> is the Gaussian's SH color for this view, <span class="math">α<sub>i</sub></span> is its learned opacity, and <span class="math">G'<sub>i</sub>(\text{pixel})</span> is its projected 2D Gaussian evaluated at that pixel. The product <span class="math">\prod_{j&lt;i}(1-α'<sub>j</sub>)</span> is the accumulated <strong>transmittance</strong> <span class="math">T<sub>i</sub></span> — the fraction of light that survived all the nearer, partially-opaque blobs — so each blob contributes its color scaled by how visible it still is.</p>
+
+<div class="callout">
+  <div class="label">This is the same equation as NeRF — that is the whole trick</div>
+  Compare this to lesson 08 §3. NeRF's volume-rendering integral, discretized, is <span class="math">C = \sum_i T<sub>i</sub>\,α<sub>i</sub>\,c<sub>i</sub></span> with <span class="math">T<sub>i</sub> = \prod_{j&lt;i}(1-α<sub>j</sub>)</span> — <em>identical</em> front-to-back alpha compositing. 3DGS did <strong>not</strong> change how you combine samples along a viewing direction; it changed <em>what the samples are</em> and <em>how you gather them</em>. NeRF's samples are hundreds of MLP evaluations at points marched along a ray. 3DGS's "samples" are a handful of sorted splats that happen to touch the pixel — no network, just a Gaussian evaluated and multiplied. Swap "evaluate the MLP at the next ray sample" for "read the next depth-sorted splat" and you have turned an expensive sequential field-query into a hardware-friendly sorted rasterization. <strong>That single swap is the entire real-time story.</strong>
+</div>
+
+<p><strong>Why it is differentiable.</strong> Every operation here — the Gaussian <span class="math">G'<sub>i</sub></span>, the product <span class="math">α<sub>i</sub>\cdot G'<sub>i</sub></span>, the running transmittance, the weighted sum — is smooth in the Gaussians' parameters. There is no hard coverage test (the discontinuity that lesson 01 §4 warned breaks mesh rasterization); a Gaussian's <em>soft</em> falloff gives every pixel a nonzero gradient with respect to the blob's mean, covariance, opacity, and color. So the rasterizer is a differentiable renderer <span class="math">R</span> in exactly the sense the inverse-rendering loop needs, and it runs on the GPU at interactive rates.</p>
+
+<h2>5 · Optimization and adaptive density control</h2>
+
+<p>Fitting a scene is the loop from lesson 01, instantiated. Given a set of posed training images, render each view with the rasterizer above and compare to the ground-truth photo with a <strong>photometric loss</strong> — the same family NeRF used: an <span class="math">L1</span> term plus a <strong>D-SSIM</strong> (structural-similarity) term that penalizes local structural error, not just per-pixel color:</p>
+
+<div class="math block">
+  \mathcal{L} = (1-λ)\,\mathcal{L}<sub>1</sub> + λ\,\mathcal{L}<sub>\text{D-SSIM}</sub> .
+</div>
+
+<p>Because the whole forward pass is differentiable, gradients flow to <em>every</em> parameter of <em>every</em> Gaussian: the mean <span class="math">μ</span>, the log-scales, the orientation quaternion, the opacity <span class="math">α</span>, and the SH color coefficients. A plain optimizer (Adam) descends all of them jointly.</p>
+
+<p>But how many Gaussians, and where? You do not know the right count up front, so 3DGS <strong>changes the set itself</strong> during training — this is <strong>adaptive density control</strong>, and it is what lets a few million blobs organize into a sharp scene:</p>
+
+<ul>
+  <li><strong>Initialize from the SfM point cloud.</strong> The camera poses come from Structure-from-Motion (CV lesson 05), and SfM also produces a <em>sparse</em> 3D point cloud as a by-product. 3DGS seeds one small Gaussian at each such point — a far better start than random, because those points already sit on real surfaces. (This is the same SfM initialization NeRF-style pipelines rely on, reused here.)</li>
+  <li><strong>Clone</strong> in <em>under</em>-reconstructed regions. Where a region is missing detail, the tell-tale is a <em>small</em> Gaussian carrying a <em>large</em> positional gradient (the optimizer wants to move it to cover more than it can). 3DGS <em>clones</em> such Gaussians — duplicating the blob and nudging the copy along the gradient — to add coverage where the scene is under-populated.</li>
+  <li><strong>Split</strong> in <em>over</em>-reconstructed regions. Where a single Gaussian has grown <em>too large</em> and is smearing detail (large scale, large positional gradient), 3DGS <em>splits</em> it into two smaller Gaussians (scaled down and offset), trading one coarse blob for finer ones that can capture high-frequency structure.</li>
+  <li><strong>Prune</strong> the useless. Gaussians whose opacity has decayed toward zero (<span class="math">α → 0</span>) contribute nothing, so they are periodically removed, keeping the count — and memory and render cost — in check. (Opacity is also reset low every so often to force genuinely-needed blobs to re-earn their opacity, which lets floaters be pruned.)</li>
+</ul>
+
+<p>The result is an <em>automatic</em> allocation of capacity: dense clusters of tiny Gaussians on detailed, textured surfaces; a few big ones on flat walls; nothing wasted in empty space. This grow/prune behavior is the explicit-representation counterpart of NeRF letting an MLP implicitly distribute its capacity — here the capacity is a literal, editable list of primitives you can add to and delete from.</p>
+
+<h2>6 · NeRF vs 3DGS — the comparison</h2>
+
+<p>Both fit a scene to posed images by differentiable front-to-back compositing under a photometric loss. Everything else differs, and the differences all trace back to the one choice — implicit field vs explicit primitives:</p>
+
+<table>
+  <thead><tr><th>Axis</th><th>NeRF (lesson 08)</th><th>3D Gaussian Splatting (this lesson)</th></tr></thead>
+  <tbody>
+    <tr><td>Representation</td><td>implicit field (MLP <span class="math">F<sub>θ</sub></span>)</td><td>explicit primitives (millions of Gaussians)</td></tr>
+    <tr><td>Rendering</td><td>ray-march + MLP query per sample</td><td>rasterize + alpha-blend sorted splats</td></tr>
+    <tr><td>Speed</td><td>seconds per frame</td><td><strong>100+ FPS</strong> (real-time)</td></tr>
+    <tr><td>Training</td><td>hours → minutes (with hash grids)</td><td>minutes</td></tr>
+    <tr><td>Memory</td><td>small — one compact MLP</td><td>large — hundreds of MB of Gaussians</td></tr>
+    <tr><td>Editability</td><td>hard — geometry is baked into weights</td><td>easy — move / delete / recolor blobs directly</td></tr>
+    <tr><td>Typical artifacts</td><td>floaters (spurious semi-transparent haze)</td><td>popping (order flips) + spiky / needle Gaussians</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <div class="label">Interview shortcut — which to pick</div>
+  Argue from the constraint, never the fashion (lesson 01's rule). Pick <strong>3DGS</strong> when you need <em>real-time rendering or interactive editing</em> and can afford the memory — VR/AR walkthroughs, live scene editing, anything that must hit frame rate. Pick a <strong>NeRF-style implicit</strong> field when you need <em>compactness</em> (a scene in a few MB of weights), a <em>continuous</em> field you can query at arbitrary points (e.g. for downstream geometry or a signed-distance readout), or when memory/bandwidth is the binding limit. Same loss, same compositing math, opposite ends of the storage-vs-speed trade.
+</div>
+
+<p>The widget below is 3DGS in 2D: a handful of 2D Gaussians, each with a covariance you build from a rotation angle and two scales — the planar version of §2's <span class="math">Σ = RSSᵀRᵀ</span> — rasterized by the exact front-to-back blend of §4. Stretch and rotate one blob to cover a diagonal streak with a single anisotropic Gaussian; reorder the depths and watch which blob wins the pixel ("popping"); dial opacity to feel the difference between hard occlusion and see-through blending.</p>
+
+<div class="widget" id="gs-widget">
+  <div class="title">2D Gaussian splatting — rasterize &amp; composite anisotropic blobs</div>
+  <div class="hint">A small scene of 2D Gaussians. Each has a mean, a covariance <span class="math">Σ = R(θ)\,\mathrm{diag}(s<sub>x</sub><sup>2</sup>, s<sub>y</sub><sup>2</sup>)\,R(θ)ᵀ</span>, a color, an opacity, and a depth. The canvas is <strong>rasterized</strong> pixel-by-pixel: at each pixel we walk the blobs <em>front-to-back by depth</em>, computing each one's Gaussian weight <span class="math">g = \exp(-\tfrac12\,\text{Mahalanobis}²)</span> and compositing <span class="math">α' = \text{opacity}\cdot g</span> with running transmittance — the same equation as §4. Thin outlines are each blob's <span class="math">1σ</span> ellipse. <strong>Try:</strong> pick a blob, then stretch <span class="math">s<sub>x</sub></span> and rotate <span class="math">θ</span> to blanket a diagonal region with <em>one</em> anisotropic Gaussian (fewer blobs, more coverage); change its <strong>depth</strong> to reorder the stack and watch it pop in front of / behind its neighbors; drop <strong>opacity</strong> to blend through instead of occlude.</div>
+
+  <canvas class="dist-canvas" id="gs-canvas" width="760" height="340" style="height:340px;"></canvas>
+
+  <div class="controls" style="margin-top: 12px;">
+    <span style="font-size:13px;color:var(--text-mute);">active Gaussian:</span>
+    <button id="gs-g0" class="primary">1</button>
+    <button id="gs-g1">2</button>
+    <button id="gs-g2">3</button>
+    <button id="gs-g3">4</button>
+    <button id="gs-g4">5</button>
+    <button id="gs-g5">6</button>
+  </div>
+  <div class="controls">
+    <label class="inline">s<sub>x</sub>: <input type="range" id="gs-sx" min="6" max="90" step="1" value="30"> <span class="val" id="gs-sx-val">30</span></label>
+    <label class="inline">s<sub>y</sub>: <input type="range" id="gs-sy" min="6" max="90" step="1" value="18"> <span class="val" id="gs-sy-val">18</span></label>
+    <label class="inline">θ: <input type="range" id="gs-th" min="0" max="180" step="1" value="20"> <span class="val" id="gs-th-val">20°</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline">opacity: <input type="range" id="gs-op" min="5" max="100" step="1" value="85"> <span class="val" id="gs-op-val">0.85</span></label>
+    <label class="inline">depth: <input type="range" id="gs-dp" min="0" max="100" step="1" value="50"> <span class="val" id="gs-dp-val">0.50</span></label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">Gaussians</div><div class="v" id="gs-k-n">6</div></div>
+    <div class="kpi"><div class="k">Active axis lengths (1σ)</div><div class="v" id="gs-k-axes" style="font-size:13px;">—</div></div>
+    <div class="kpi"><div class="k">Active depth rank</div><div class="v" id="gs-k-rank">—</div></div>
+    <div class="kpi"><div class="k">Mean accumulated opacity</div><div class="v" id="gs-k-cov">—</div></div>
+  </div>
+
+  <details>
+    <summary>Show the core JS</summary>
+<pre><code>// Per-Gaussian covariance from rotation θ and scales (s_x, s_y):  Σ = R diag(s_x², s_y²) Rᵀ
+// We precompute Σ⁻¹ (a 2×2 inverse) once per Gaussian, not per pixel.
+function invCov(sx, sy, th){
+  var c = Math.cos(th), s = Math.sin(th);
+  // Σ = [[a,b],[b,d]]
+  var a = c*c*sx*sx + s*s*sy*sy;
+  var d = s*s*sx*sx + c*c*sy*sy;
+  var b = c*s*(sx*sx - sy*sy);
+  var det = a*d - b*b;
+  return { ia: d/det, ib: -b/det, id: a/det };   // Σ⁻¹
+}
+
+// RASTERIZE: iterate pixels (coarse step for speed); blend blobs FRONT-TO-BACK by depth.
+for (var py = 0; py &lt; H; py += STEP)
+for (var px = 0; px &lt; W; px += STEP){
+  var T = 1, r = bgR, g = bgG, b = bgB;            // transmittance + accumulated colour
+  for (var k = 0; k &lt; order.length; k++){          // order = indices sorted by depth (near→far)
+    var G = gauss[order[k]], dx = px - G.mx, dy = py - G.my;
+    var m2 = G.ia*dx*dx + 2*G.ib*dx*dy + G.id*dy*dy;   // Mahalanobis²
+    var val = Math.exp(-0.5*m2);                        // 2D Gaussian weight ∈ (0,1]
+    var aP = G.opacity * val;                           // α′ = opacity · g
+    r += T*aP*G.r; g += T*aP*G.g; b += T*aP*G.b;        // C += T·α′·colour
+    T *= (1 - aP);                                       // update transmittance
+    if (T &lt; 0.003) break;                                // pixel opaque → early out
+  }
+  fillRect(px, py, STEP, STEP, r, g, b);
+}
+// Reordering depths changes `order` → a different blob blends on top ("popping").</code></pre>
+  </details>
+</div>
+
+<h2>Where this points next</h2>
+
+<p>Both branches of neural rendering — implicit NeRF and explicit 3DGS — now share a spine: fit <em>one</em> scene to <em>its own</em> posed photos by differentiable compositing. But notice what they never do: <strong>generalize</strong>. Optimize a NeRF or a splat cloud for a room, and you learn that room and nothing else; a new scene means training again from scratch. That is fine for capture, useless for a model that should look at a novel object and <em>infer</em> its 3D shape. <strong>Lesson 10</strong> makes the turn to <em>learning across scenes</em>: neural networks that operate directly on 3D data — point clouds (PointNet and permutation invariance), voxels and sparse convolution (the <span class="math">O(N³)</span> escape from lesson 01 §3), and meshes — so a network trained on many objects can predict on ones it has never seen. The representations from lesson 01 return, this time as the <em>inputs and outputs</em> of learned models rather than things you optimize one at a time.</p>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  3D Gaussian Splatting keeps NeRF's one essential idea — <strong>differentiable front-to-back alpha compositing</strong>, <span class="math">C = \sum_i c<sub>i</sub>α'<sub>i</sub>\prod_{j&lt;i}(1-α'<sub>j</sub>)</span> — but replaces the <em>implicit</em> field-you-march with <em>explicit</em> primitives you <em>rasterize</em>. Each primitive is a 3D Gaussian: mean <span class="math">μ</span>, opacity <span class="math">α</span>, view-dependent SH color, and a covariance stored as <span class="math">Σ = RSSᵀRᵀ</span> — PSD by construction, with <span class="math">R</span> a <strong>quaternion</strong> (lesson 02), so scale and orientation are optimized independently and never leave the valid set. Rendering splats each 3D Gaussian to a 2D one via the EWA transform <span class="math">Σ' = JWΣWᵀJᵀ</span>, where <span class="math">J</span> is the projection Jacobian — a local affine <em>approximation</em> that distorts large or off-axis blobs. A <strong>tile-based, depth-sorted rasterizer</strong> then blends a handful of splats per pixel instead of hundreds of MLP queries per ray — the single swap that buys <strong>real-time</strong> speed. Training is a photometric <span class="math">L1</span> + D-SSIM loss with <strong>adaptive density control</strong> — seed from the SfM point cloud (CV lesson 05), clone in under-reconstructed regions, split over-large blobs, prune transparent ones. Pick 3DGS for real-time rendering/editing when you can spend the memory; pick implicit NeRF for compactness or a continuous field.
+</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Why is 3DGS real-time when NeRF is not, given they share the same compositing equation? <em>(§1, §4 — NeRF ray-marches an implicit field with hundreds of MLP queries per ray; 3DGS rasterizes explicit primitives and blends a handful of depth-sorted splats per pixel — no per-sample network, hardware-friendly sorted rasterization.)</em></li>
+  <li>Why store a Gaussian's covariance as <span class="math">Σ = RSSᵀRᵀ</span> with a quaternion, instead of its 6 raw entries? <em>(§2 — free entries drift to a negative eigenvalue → indefinite, invalid <span class="math">Σ</span>; the factorization is PSD by construction and separates scale from orientation, reusing lesson 02's quaternion.)</em></li>
+  <li>Derive how a 3D covariance projects to 2D, and say why it is only approximate. <em>(§3 — <span class="math">Σ' = JWΣWᵀJᵀ</span> by the covariance-sandwich rule; <span class="math">J</span> is the local affine linearization of the nonlinear perspective map at <span class="math">μ</span>, so large / far-off-axis Gaussians are distorted.)</em></li>
+  <li>Write the front-to-back blending equation and relate it to NeRF. <em>(§4 — <span class="math">C = \sum_i c<sub>i</sub>α'<sub>i</sub>\prod_{j&lt;i}(1-α'<sub>j</sub>)</span> with <span class="math">α'<sub>i</sub> = α<sub>i</sub>G'<sub>i</sub></span>; identical alpha compositing to NeRF §3, summed over sorted splats not ray samples.)</em></li>
+  <li>What does adaptive density control do, and how is the optimization initialized? <em>(§5 — clone under-reconstructed (small blob, large positional grad), split over-large blobs, prune <span class="math">α→0</span>; initialized from the SfM sparse point cloud of CV lesson 05.)</em></li>
+  <li>When would you choose 3DGS over NeRF, and what artifacts does each show? <em>(§6 — 3DGS for real-time rendering/editing if memory allows (hundreds of MB, popping + spiky blobs); NeRF for compactness / a continuous field (small weights, floaters).)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="08_volumetric_rendering_nerf.html">
+    <span class="dir">&larr; Previous</span>
+    <span class="ttl">08 · Volumetric rendering &amp; NeRF</span>
+  </a>
+  <a class="next" href="10_deep_learning_3d.html">
+    <span class="dir">Next &rarr;</span>
+    <span class="ttl">10 · Deep learning on 3D</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var canvas = document.getElementById('gs-canvas');
+  if(!canvas) return;
+  var ctx = canvas.getContext('2d');
+
+  var sxR = document.getElementById('gs-sx'), sxV = document.getElementById('gs-sx-val');
+  var syR = document.getElementById('gs-sy'), syV = document.getElementById('gs-sy-val');
+  var thR = document.getElementById('gs-th'), thV = document.getElementById('gs-th-val');
+  var opR = document.getElementById('gs-op'), opV = document.getElementById('gs-op-val');
+  var dpR = document.getElementById('gs-dp'), dpV = document.getElementById('gs-dp-val');
+
+  var kN = document.getElementById('gs-k-n'), kAxes = document.getElementById('gs-k-axes');
+  var kRank = document.getElementById('gs-k-rank'), kCov = document.getElementById('gs-k-cov');
+
+  var btns = [
+    document.getElementById('gs-g0'), document.getElementById('gs-g1'),
+    document.getElementById('gs-g2'), document.getElementById('gs-g3'),
+    document.getElementById('gs-g4'), document.getElementById('gs-g5')
+  ];
+
+  // scene: 6 Gaussians in a nominal 760x340 space; means stored as fractions so they
+  // survive canvas resizes. sx,sy in px (nominal), th in radians, depth in [0,1] (near→far).
+  var G = [
+    { fx:0.26, fy:0.40, sx:34, sy:20, th:0.35, op:0.85, dep:0.20, r:37,  g:99,  b:235 }, // blue
+    { fx:0.44, fy:0.60, sx:30, sy:18, th:0.90, op:0.85, dep:0.40, r:217, g:119, b:6   }, // amber
+    { fx:0.60, fy:0.36, sx:26, sy:24, th:0.10, op:0.80, dep:0.55, r:22,  g:163, b:74  }, // green
+    { fx:0.70, fy:0.62, sx:40, sy:16, th:2.20, op:0.80, dep:0.65, r:220, g:38,  b:38  }, // red
+    { fx:0.50, fy:0.30, sx:22, sy:22, th:0.00, op:0.75, dep:0.80, r:147, g:51,  b:234 }, // purple
+    { fx:0.36, fy:0.66, sx:28, sy:20, th:1.30, op:0.75, dep:0.35, r:8,   g:145, b:178 }  // teal
+  ];
+  var active = 0;
+
+  function invCov(sx, sy, th){
+    var c = Math.cos(th), s = Math.sin(th);
+    var a = c*c*sx*sx + s*s*sy*sy;
+    var d = s*s*sx*sx + c*c*sy*sy;
+    var b = c*s*(sx*sx - sy*sy);
+    var det = a*d - b*b;
+    if (det < 1e-6) det = 1e-6;
+    return { ia: d/det, ib: -b/det, id: a/det };
+  }
+
+  function syncControls(){
+    var gg = G[active];
+    sxR.value = gg.sx; syR.value = gg.sy;
+    thR.value = Math.round(gg.th*180/Math.PI);
+    opR.value = Math.round(gg.op*100);
+    dpR.value = Math.round(gg.dep*100);
+    sxV.textContent = gg.sx; syV.textContent = gg.sy;
+    thV.textContent = Math.round(gg.th*180/Math.PI)+'°';
+    opV.textContent = gg.op.toFixed(2);
+    dpV.textContent = gg.dep.toFixed(2);
+  }
+
+  function setActive(i){
+    active = i;
+    for (var k=0;k<btns.length;k++) btns[k].className = (k===i) ? 'primary' : '';
+    syncControls();
+    render();
+  }
+  for (var k=0;k<btns.length;k++) (function(kk){ btns[kk].addEventListener('click', function(){ setActive(kk); }); })(k);
+
+  function readControls(){
+    var gg = G[active];
+    gg.sx = parseFloat(sxR.value); gg.sy = parseFloat(syR.value);
+    gg.th = parseFloat(thR.value)*Math.PI/180;
+    gg.op = parseFloat(opR.value)/100;
+    gg.dep = parseFloat(dpR.value)/100;
+    sxV.textContent = sxR.value; syV.textContent = syR.value;
+    thV.textContent = thR.value+'°';
+    opV.textContent = gg.op.toFixed(2);
+    dpV.textContent = gg.dep.toFixed(2);
+  }
+
+  function render(){
+    var dpr = window.devicePixelRatio || 1;
+    var W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== Math.round(W*dpr)){ canvas.width = Math.round(W*dpr); canvas.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    // background colour (soft canvas grey ~ --code-bg)
+    var bgR = 241, bgG = 243, bgB = 247;
+
+    // scale nominal px sizes to the current canvas (nominal design width 760)
+    var sc = W/760;
+
+    // precompute per-Gaussian pixel-space params + Σ⁻¹ (once, not per pixel)
+    var prep = [];
+    for (var i=0;i<G.length;i++){
+      var gg = G[i];
+      var sx = gg.sx*sc, sy = gg.sy*sc;
+      var ic = invCov(sx, sy, gg.th);
+      prep.push({
+        mx: gg.fx*W, my: gg.fy*H,
+        ia: ic.ia, ib: ic.ib, id: ic.id,
+        op: gg.op, r: gg.r, g: gg.g, b: gg.b, dep: gg.dep, idx: i
+      });
+    }
+    // depth order: near (small depth) → far, blended front-to-back
+    var order = prep.slice().sort(function(p,q){ return p.dep - q.dep; });
+
+    // RASTERIZE with a coarse pixel step for speed
+    var STEP = 3;
+    var sumT = 0, nPix = 0;
+    for (var py=0; py<H; py+=STEP){
+      for (var px=0; px<W; px+=STEP){
+        var T = 1, cr = bgR, cg = bgG, cb = bgB;
+        for (var o=0;o<order.length;o++){
+          var P = order[o];
+          var dx = px - P.mx, dy = py - P.my;
+          var m2 = P.ia*dx*dx + 2*P.ib*dx*dy + P.id*dy*dy;
+          if (m2 > 18) continue;                 // beyond ~4σ: negligible, skip
+          var val = Math.exp(-0.5*m2);
+          var aP = P.op*val;
+          cr += T*aP*P.r; cg += T*aP*P.g; cb += T*aP*P.b;
+          T *= (1-aP);
+          if (T < 0.003) break;                  // opaque → early out
+        }
+        ctx.fillStyle = 'rgb('+Math.round(cr)+','+Math.round(cg)+','+Math.round(cb)+')';
+        ctx.fillRect(px, py, STEP, STEP);
+        sumT += (1-T); nPix++;
+      }
+    }
+
+    // OVERLAY: 1σ covariance ellipse for each Gaussian (thin outline; active one bolder)
+    for (var e=0;e<prep.length;e++){
+      var P2 = prep[e];
+      // recover Σ from Σ⁻¹ (2x2): Σ = inv([[ia,ib],[ib,id]])
+      var det2 = P2.ia*P2.id - P2.ib*P2.ib; if (det2 < 1e-9) det2 = 1e-9;
+      var Sa = P2.id/det2, Sb = -P2.ib/det2, Sd = P2.ia/det2;
+      // eigen-decomposition of [[Sa,Sb],[Sb,Sd]]
+      var tr = Sa+Sd, dd = Sa*Sd - Sb*Sb;
+      var disc = Math.sqrt(Math.max(0, tr*tr/4 - dd));
+      var l1 = tr/2 + disc, l2 = tr/2 - disc;      // eigenvalues (variances)
+      var ang = 0.5*Math.atan2(2*Sb, Sa-Sd);       // ellipse orientation
+      var A = Math.sqrt(Math.max(l1,0)), Bx = Math.sqrt(Math.max(l2,0)); // 1σ half-axes
+      ctx.save();
+      ctx.translate(P2.mx, P2.my); ctx.rotate(ang);
+      ctx.beginPath(); ctx.ellipse(0, 0, A, Bx, 0, 0, 2*Math.PI);
+      var activ = (P2.idx === active);
+      ctx.lineWidth = activ ? 2.2 : 1;
+      ctx.strokeStyle = activ ? '#111827' : 'rgba(31,36,48,0.45)';
+      ctx.stroke();
+      // centre dot
+      ctx.fillStyle = activ ? '#111827' : 'rgba(31,36,48,0.5)';
+      ctx.beginPath(); ctx.arc(0, 0, activ ? 3 : 2, 0, 2*Math.PI); ctx.fill();
+      ctx.restore();
+
+      if (activ){
+        // stash axis lengths for KPI
+        kAxes.textContent = A.toFixed(0) + ' × ' + Bx.toFixed(0) + ' px';
+      }
+    }
+
+    // depth rank of the active Gaussian (1 = nearest / on top)
+    var rank = 1;
+    for (var o2=0;o2<order.length;o2++){ if (order[o2].idx === active){ rank = o2+1; break; } }
+
+    kN.textContent = G.length;
+    kRank.textContent = rank + ' of ' + G.length + (rank===1 ? ' (front)' : '');
+    kCov.textContent = (nPix>0 ? (sumT/nPix).toFixed(2) : '—');
+  }
+
+  [sxR,syR,thR,opR,dpR].forEach(function(el){
+    el.addEventListener('input', function(){ readControls(); render(); });
+  });
+  window.addEventListener('resize', render);
+
+  setActive(0);
+})();
+</script>
+
+</body>
+</html>

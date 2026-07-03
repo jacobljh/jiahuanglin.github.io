@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>06 · The rasterization pipeline</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="inner">
+    <a class="crumb-link" href="../index.html">all lessons</a>
+    <span class="crumb">/</span>
+    <a class="crumb-link" href="index.html">computer_vision_3d</a>
+    <span class="crumb">/</span>
+    <span class="crumb">06 · rasterization</span>
+    <span class="step-pill">lesson 6 / 12</span>
+  </div>
+</header>
+
+<main>
+
+<h1>The rasterization pipeline</h1>
+<p class="subtitle">Lesson 05 gave us surfaces — explicit triangle meshes and implicit fields, with marching cubes bridging them. But a representation is <em>inert</em> until you can turn it into an image, and every lesson so far has quietly assumed a renderer to close the loop. This lesson builds the classical one the entire real-time field runs on: <strong>rasterization</strong>. It is lesson 01's forward operator <span class="math">R</span> made concrete for a mesh — the map from 3D triangles to 2D pixels that a GPU executes billions of times a second. We build it end to end: the transform chain that projects triangles through the camera, the coverage test that decides which pixels each triangle owns, and the z-buffer that resolves who is in front.</p>
+
+<div class="callout">
+  <div class="label">The plan</div>
+  Five moves. (1) Contrast the two ways to answer "what geometry is at each pixel" — <strong>ray tracing</strong> (image-centric) vs <strong>rasterization</strong> (geometry-centric) — and see why the geometry-centric loop is what maps onto GPU hardware and dominates real time. (2) Build the <strong>geometry pipeline</strong>: the model → world → view → clip → NDC → screen transform chain, and <em>derive</em> the perspective-projection matrix as the trick that stuffs view-space <span class="math">Z</span> into the clip-space <span class="math">w</span> so the hardware's perspective divide produces <span class="math">1/Z</span> foreshortening. (3) <strong>Clip and cull</strong> before filling — the near plane you cannot divide past, and back-face culling that halves the work. (4) The <strong>coverage test</strong>: edge functions, which are signed areas, which are barycentric coordinates — one computation that both tests inside/outside <em>and</em> hands lesson 07 its interpolation weights. (5) The <strong>z-buffer</strong>: per-pixel, order-independent hidden-surface removal. We finish on the catch that reshapes the rest of the track — coverage is a hard, discontinuous decision, so this whole pipeline has no useful gradient.
+</div>
+
+<h2>1 · Rasterization vs ray tracing — two directions through the same question</h2>
+
+<p>Rendering answers one question: <strong>for each pixel, what piece of scene geometry is visible there, and what color should it be?</strong> There are exactly two ways to loop over that question, and they differ only in which index is on the outside.</p>
+
+<p><strong>Ray tracing is image-centric.</strong> Loop over pixels. For each pixel, construct the ray from the camera through that pixel and ask the scene "what do you hit first?" — an intersection query against every primitive (accelerated by a spatial data structure like a BVH). The loop is <span class="math">\text{for each pixel: for each object, intersect}</span>. It is the natural formulation for global effects — a hit point can spawn secondary rays for shadows, reflections, and refractions — which is exactly why it is the physically-based, offline-render workhorse.</p>
+
+<p><strong>Rasterization is geometry-centric.</strong> Loop over triangles. For each triangle, project its three vertices to the screen and ask "which pixels does this cover?" — then write those pixels. The loop is <span class="math">\text{for each triangle: for each covered pixel, shade}</span>. Nothing about triangle A's processing depends on triangle B, so the loop is a <strong>stream</strong>: triangles flow through a fixed sequence of stages, embarrassingly parallel, needing no global scene data structure held in memory.</p>
+
+<table>
+  <thead><tr><th>Axis</th><th>Ray tracing</th><th>Rasterization</th></tr></thead>
+  <tbody>
+    <tr><td>Outer loop</td><td>pixels (image-centric)</td><td>triangles (geometry-centric)</td></tr>
+    <tr><td>Core operation</td><td>ray–primitive intersection</td><td>project triangle, test pixel coverage</td></tr>
+    <tr><td>Needs a global structure?</td><td>yes — BVH / kd-tree over the whole scene</td><td>no — one triangle at a time, streamed</td></tr>
+    <tr><td>Global effects (shadows, reflections)</td><td>natural — spawn secondary rays</td><td>hard — needs extra passes / tricks</td></tr>
+    <tr><td>Hardware fit</td><td>irregular, memory-bound traversal</td><td><strong>perfect for GPUs</strong> — a fixed parallel stream</td></tr>
+    <tr><td>Dominant use</td><td>offline / photorealism</td><td><strong>real time</strong> (games, AR, viewers)</td></tr>
+  </tbody>
+</table>
+
+<p>Rasterization dominates real time for a structural reason, not an accidental one. Its inner loop touches <em>one triangle's worth</em> of data at a time and emits pixels independently, so it maps directly onto the GPU's model of thousands of threads running the same program over different data. There is no scene-wide acceleration structure to build or chase pointers through; the pipeline is fixed and feed-forward. That is why every mesh you have ever seen move at 60 fps — every game, every CAD viewer, every AR overlay, and (lesson 09) every Gaussian-splat renderer — went through a rasterizer.</p>
+
+<p>In lesson 01's terms, this lesson computes the <strong>forward operator</strong> <span class="math">R</span> for the mesh representation of lesson 05: <span class="math">\hat I = R(\text{mesh}, \text{camera})</span>. Hold onto one word: <em>forward</em>. Everything here runs the loop's step ② in the easy direction, image out of geometry. The reason lessons 08–09 exist is that the inverse — geometry out of image, by backpropagating through <span class="math">R</span> — is broken for this <span class="math">R</span>, because (as §4 makes precise, and lesson 07 §5 develops) the coverage test is not differentiable. Build the forward pipeline first; feel exactly where it becomes non-invertible.</p>
+
+<h2>2 · The geometry pipeline — the transform chain</h2>
+
+<p>A triangle starts life as three vertices in the coordinate frame the artist modeled it in, and must end as three points in pixel coordinates. It gets there by a fixed chain of coordinate changes, each a matrix multiply, most of them the rigid-body and camera transforms of lessons 02 and 04:</p>
+
+<div class="ascii">
+  model space
+     │  M   model matrix  — place the object in the world (a rigid/affine transform)
+     ▼
+  world space
+     │  V   view matrix   — express the world in the CAMERA's frame; V = (camera pose)⁻¹ ∈ SE(3)  (lesson 02)
+     ▼
+  view / camera space
+     │  P   projection matrix — the pinhole, as a 4×4 that loads Z into w
+     ▼
+  clip space   (a 4-vector: x_c, y_c, z_c, w_c)
+     │  ÷ w   the PERSPECTIVE DIVIDE — hardware divides x,y,z by w
+     ▼
+  NDC   normalized device coords, the cube [−1,1]³
+     │  viewport transform — scale/shift NDC x,y into pixel coordinates
+     ▼
+  screen / pixel space
+</div>
+
+<p>The first two matrices are review. <span class="math">M</span> places the object in the world (lesson 02's rigid transforms, optionally with scale). <span class="math">V</span> re-expresses the world in the camera's own frame: if the camera's pose in the world is <span class="math">T<sub>wc</sub> ∈ SE(3)</span>, then <span class="math">V = T<sub>wc</sub><sup>−1</sup></span>, because moving the world into camera coordinates is the inverse of placing the camera in the world. Composed, <span class="math">V·M</span> takes a model-space vertex straight into <strong>view space</strong>, where the camera sits at the origin looking down its own axis — exactly the setup CV lesson 04's pinhole assumed.</p>
+
+<h3>Deriving the perspective projection</h3>
+
+<p>Now the one genuinely new matrix. From <a href="../computer_vision/04_cameras_projection_geometry.html">CV lesson 04</a>, the pinhole camera projects a view-space point <span class="math">(X, Y, Z)</span> onto the image plane by dividing by depth:</p>
+
+<div class="math block">
+  x<sub>screen</sub> = f\,\dfrac{X}{Z},\qquad y<sub>screen</sub> = f\,\dfrac{Y}{Z} .
+</div>
+
+<p>That divide is the entire source of perspective — distant things (large <span class="math">Z</span>) shrink. The problem: a matrix multiply is <em>linear</em>, and dividing by a coordinate is not a linear operation. You cannot write "divide by <span class="math">Z</span>" as a <span class="math">4×4</span> matrix acting on <span class="math">(X, Y, Z, 1)</span>. So the pipeline splits the job in two, and this is the key idea of the whole section: <strong>the matrix does not do the division — it sets up the division.</strong> The projection matrix's real job is to copy (a function of) view-space <span class="math">Z</span> into the fourth, homogeneous coordinate <span class="math">w</span>. Then a <em>separate</em>, fixed hardware step — the <strong>perspective divide</strong> — divides everything by that <span class="math">w</span>, and the <span class="math">1/Z</span> foreshortening falls out for free.</p>
+
+<p>Concretely, a projection matrix maps the view-space homogeneous point to a clip-space 4-vector whose <span class="math">w</span> component is <span class="math">Z</span> (up to sign/scale):</p>
+
+<div class="math block">
+  \begin{pmatrix} x<sub>c</sub> \\ y<sub>c</sub> \\ z<sub>c</sub> \\ w<sub>c</sub> \end{pmatrix}
+  = P \begin{pmatrix} X \\ Y \\ Z \\ 1 \end{pmatrix},
+  \qquad w<sub>c</sub> = Z .
+</div>
+
+<p>The perspective divide then produces NDC coordinates <span class="math">(x<sub>c</sub>/w<sub>c</sub>,\ y<sub>c</sub>/w<sub>c</sub>,\ z<sub>c</sub>/w<sub>c</sub>) = (x<sub>c</sub>/Z,\ y<sub>c</sub>/Z,\ z<sub>c</sub>/Z)</span>. If the matrix set <span class="math">x<sub>c</sub> = f·X</span>, the divide yields <span class="math">f·X/Z</span> — exactly the pinhole. The matrix stayed linear; the nonlinearity lives entirely in the one shared divide. That factorization — linear matrices, then a single divide by <span class="math">w</span> — is precisely why homogeneous coordinates are the language of graphics.</p>
+
+<h3>Frustum → cube: the near and far planes</h3>
+
+<p>The projection matrix also handles depth. The camera sees a truncated pyramid — the <strong>view frustum</strong>, bounded by a <strong>near plane</strong> at distance <span class="math">n</span> and a <strong>far plane</strong> at <span class="math">f</span> (everything nearer than <span class="math">n</span> or farther than <span class="math">f</span> is discarded). Projection warps this frustum into the axis-aligned NDC cube <span class="math">[−1,1]³</span>: the <span class="math">x,y</span> extents map to <span class="math">[−1,1]</span>, and the depth range <span class="math">[n, f]</span> maps monotonically to <span class="math">z<sub>ndc</sub> ∈ [−1, 1]</span> so that hidden-surface tests can compare a single number per pixel. The standard depth mapping is</p>
+
+<div class="math block">
+  z<sub>ndc</sub>(Z) = \dfrac{f+n}{f-n} \;-\; \dfrac{2fn}{(f-n)\,Z} ,
+</div>
+
+<p>which one checks sends <span class="math">Z=n → z<sub>ndc</sub>=-1</span> and <span class="math">Z=f → z<sub>ndc</sub>=+1</span>. Notice its shape: it is affine in <span class="math">1/Z</span>, not in <span class="math">Z</span>. That is the whole subtlety of the next callout.</p>
+
+<h3>A worked number</h3>
+
+<p>Pick a near plane <span class="math">n = 1</span> and a far plane <span class="math">f = 100</span> (a 100:1 range, typical), and push a view-space point at depth <span class="math">Z = 5</span> through the chain. Suppose its view-space lateral coordinates and focal-like term give clip <span class="math">x<sub>c</sub> = 3.0</span>, and <span class="math">w<sub>c</sub> = Z = 5</span>. The perspective divide gives</p>
+
+<div class="math block">
+  x<sub>ndc</sub> = \dfrac{x<sub>c</sub>}{w<sub>c</sub>} = \dfrac{3.0}{5} = 0.60 .
+</div>
+
+<p>For depth, plug into the mapping:</p>
+
+<div class="math block">
+  z<sub>ndc</sub>(5) = \dfrac{101}{99} - \dfrac{2\cdot100\cdot1}{99\cdot5} = 1.0202 - 0.4040 = 0.6162 .
+</div>
+
+<p>Read what just happened. Linearly, <span class="math">Z=5</span> sits only <span class="math">(5-1)/(100-1) ≈ 4\%</span> of the way from the near plane to the far plane. Yet its NDC depth <span class="math">0.616</span> is already <span class="math">(0.616-(-1))/2 ≈ 81\%</span> of the way across the <span class="math">[-1,1]</span> depth range. The first <span class="math">4\%</span> of physical depth consumed <span class="math">81\%</span> of the depth-buffer's range. Depth precision is lavished near the camera and starved far away.</p>
+
+<div class="callout warn">
+  <div class="label">The trap: nonlinear depth and z-fighting</div>
+  Because <span class="math">z<sub>ndc</sub></span> is affine in <span class="math">1/Z</span>, not <span class="math">Z</span>, depth is mapped into the buffer <strong>nonlinearly</strong> — precision bunches near the camera (the worked number: 4% of depth ate 81% of the range). Far-away coplanar or near-coplanar surfaces get NDC depths that differ by less than a float's resolution, so the z-buffer cannot decide which is in front and they flicker pixel-to-pixel as the camera moves — <strong>z-fighting</strong>. This is the same <span class="math">1/Z</span> structure lesson 03 met as <strong>inverse depth (disparity)</strong>, where stereo resolves near objects far better than far ones, and lesson 07 will meet again as the reason interpolation must be done in <span class="math">1/Z</span>. Practical fixes push the ratio <span class="math">f/n</span> down (a near plane too close is the usual culprit) or use a reversed-<span class="math">Z</span> / logarithmic buffer to redistribute the precision.
+</div>
+
+<h2>3 · Triangle setup, clipping, and culling</h2>
+
+<p>Between "projected vertices" and "filled pixels" the pipeline does two cheap rejections that save enormous downstream work.</p>
+
+<p><strong>Clipping.</strong> Triangles are trimmed to the view frustum before the perspective divide, and the near plane is not optional — it is a correctness requirement. The divide is <span class="math">(x<sub>c</sub>, y<sub>c</sub>, z<sub>c</sub>)/w<sub>c</sub></span> with <span class="math">w<sub>c</sub> = Z</span>. For a point <em>behind</em> the camera, <span class="math">Z ≤ 0</span>, so <span class="math">w<sub>c</sub> ≤ 0</span> and the divide is meaningless — dividing by zero, or by a negative that flips the point through the origin to a phantom position on screen. So a triangle straddling the camera plane must be <strong>clipped against the near plane</strong> first: the portion with <span class="math">Z &lt; n</span> is cut off, and the polygon is re-triangulated from the safe part (a triangle clipped by one plane can become a quad → two triangles). Only then is it safe to divide. Clipping against the other five frustum planes is an optimization (it avoids rasterizing off-screen pixels); near-plane clipping is a must.</p>
+
+<p><strong>Back-face culling.</strong> A closed (watertight) mesh shows you only its outward-facing triangles; the ones facing away are always occluded by the front of the object, so drawing them is wasted work. You detect them after projection from the <strong>winding order</strong>: compute the signed area of the projected triangle in screen space (the same signed area §4 is built on). A consistently-wound mesh (lesson 05's manifoldness) has front faces of one sign and back faces of the other; the pipeline discards, say, all clockwise-projected triangles. For a convex closed shape exactly half the triangles face away, so back-face culling <strong>roughly halves the fill work</strong> essentially for free — a single sign test per triangle, done before touching any pixel.</p>
+
+<div class="callout">
+  <div class="label">The reframe</div>
+  Clipping and culling are the pipeline being <em>lazy on purpose</em>: spend a few operations per triangle to avoid the far larger per-<em>pixel</em> cost of shading geometry that is behind the camera or facing away. This is the streaming philosophy from §1 — cull early, so the expensive parallel stage only ever sees triangles that can actually contribute pixels.
+</div>
+
+<h2>4 · The coverage test — edge functions and barycentric coordinates</h2>
+
+<p>Now the heart of rasterization. A triangle's three vertices are in screen (pixel) coordinates <span class="math">V<sub>0</sub>, V<sub>1</sub>, V<sub>2</sub></span>. For a candidate pixel with sample point <span class="math">P</span> (its center), the question is binary: <strong>is <span class="math">P</span> inside the triangle?</strong> The classical answer is the <strong>edge function</strong>. For the directed edge from <span class="math">V<sub>0</sub></span> to <span class="math">V<sub>1</sub></span>, define</p>
+
+<div class="math block">
+  E<sub>01</sub>(P) = (P - V<sub>0</sub>) × (V<sub>1</sub> - V<sub>0</sub>)
+  = (P<sub>x</sub>-V<sub>0x</sub>)(V<sub>1y</sub>-V<sub>0y</sub>) - (P<sub>y</sub>-V<sub>0y</sub>)(V<sub>1x</sub>-V<sub>0x</sub>) ,
+</div>
+
+<p>the 2D cross product (a scalar). Geometrically it is <em>twice the signed area</em> of the triangle <span class="math">(V<sub>0</sub>, V<sub>1</sub>, P)</span>: its sign tells you which side of the directed line <span class="math">V<sub>0</sub>→V<sub>1</sub></span> the point <span class="math">P</span> lies on. Compute all three edge functions <span class="math">E<sub>01</sub>, E<sub>12</sub>, E<sub>20</sub></span>. Then</p>
+
+<div class="math block">
+  P \text{ is inside} \iff E<sub>01</sub>(P),\ E<sub>12</sub>(P),\ E<sub>20</sub>(P) \text{ all share the same sign.}
+</div>
+
+<p>The picture: each edge, oriented consistently around the triangle, splits the plane into a "left" and "right" half; the triangle's interior is the one intersection where you are on the interior side of all three edges at once. All-same-sign is exactly that intersection.</p>
+
+<h3>The same numbers are the barycentric coordinates</h3>
+
+<p>Here is the fact that makes this the elegant center of the pipeline. Divide each edge function by the full triangle's signed area <span class="math">A = \tfrac12 E<sub>012</sub></span> (itself an edge function on all three vertices). The three normalized quantities</p>
+
+<div class="math block">
+  \alpha = \dfrac{\text{area}(P,V<sub>1</sub>,V<sub>2</sub>)}{\text{area}(V<sub>0</sub>,V<sub>1</sub>,V<sub>2</sub>)},\quad
+  \beta = \dfrac{\text{area}(V<sub>0</sub>,P,V<sub>2</sub>)}{\text{area}(V<sub>0</sub>,V<sub>1</sub>,V<sub>2</sub>)},\quad
+  \gamma = \dfrac{\text{area}(V<sub>0</sub>,V<sub>1</sub>,P)}{\text{area}(V<sub>0</sub>,V<sub>1</sub>,V<sub>2</sub>)}
+</div>
+
+<p>are the <strong>barycentric coordinates</strong> of <span class="math">P</span>, and they satisfy</p>
+
+<div class="math block">
+  \alpha + \beta + \gamma = 1,\qquad P = \alpha V<sub>0</sub> + \beta V<sub>1</sub> + \gamma V<sub>2</sub> .
+</div>
+
+<p>(The three sub-triangle areas tile the whole triangle, so their fractions sum to one.) "All three edge functions same sign" is identically "all three barycentrics <span class="math">≥ 0</span>" — the coverage test <em>is</em> the sign of the barycentrics. So a single computation does double duty: the <strong>signs</strong> of <span class="math">(\alpha, \beta, \gamma)</span> answer coverage, and their <strong>values</strong> are the interpolation weights. Any per-vertex attribute — depth, color, normal, texture coordinate — is carried to <span class="math">P</span> by the very same weights, <span class="math">a(P) = \alpha\,a<sub>0</sub> + \beta\,a<sub>1</sub> + \gamma\,a<sub>2</sub></span>. That is the interpolation machinery lesson 07 builds shading on, and it is why §5 can interpolate depth for the z-buffer without any extra math. It is also why triangles are the primitive (lesson 05 §2): only a triangle has this unique, linear barycentric interpolation.</p>
+
+<p>Two properties make this ideal for hardware. It is <strong>local</strong> — each pixel's test needs only the triangle's three vertices, nothing global. And it is <strong>parallel</strong> — every pixel in the triangle's screen-space bounding box can be tested independently, at the same time, by the same tiny program. A GPU rasterizer evaluates edge functions incrementally over a whole tile of pixels at once. This is the streaming loop of §1 realized down at the pixel level.</p>
+
+<div class="callout bad">
+  <div class="label">The catch that breaks the inverse</div>
+  Coverage is a <strong>hard, discrete decision</strong>: a pixel is either fully in or fully out, with nothing in between. As a function of a vertex's position it is a <strong>step function</strong> — nudge a vertex by an infinitesimal amount and a boundary pixel abruptly flips from covered to uncovered. Its derivative is <strong>zero</strong> wherever the pixel doesn't flip and <strong>undefined</strong> at the instant it does. So <span class="math">∂(\text{pixel})/∂(\text{vertex}) </span> carries no usable signal, and you cannot backpropagate an image loss into mesh vertices through this pipeline. This is the concrete mechanism behind lesson 01 §4's abstract warning, and lesson 07 §5 develops it in full — it is the single reason the soft, volumetric representations of lessons 08–09 exist. The forward operator <span class="math">R</span> is fast and exact; it is just not invertible by gradient descent.
+</div>
+
+<h2>5 · The z-buffer — hidden-surface removal</h2>
+
+<p>Coverage tells you <em>which</em> triangles touch a pixel, but many can touch the same one — a near wall and the far wall behind it both cover it. Which color survives? The winner is the nearest fragment, and the <strong>z-buffer</strong> (depth buffer) finds it with almost no bookkeeping.</p>
+
+<p>Alongside the color framebuffer, keep a second buffer of the same size holding, per pixel, the <strong>nearest depth seen so far</strong>, initialized to <span class="math">+∞</span> (the far plane). As each triangle is rasterized, for every covered pixel produce a <strong>fragment</strong> and:</p>
+
+<ol>
+  <li><strong>Interpolate its depth</strong> with the barycentric weights from §4: <span class="math">z<sub>frag</sub> = \alpha z<sub>0</sub> + \beta z<sub>1</sub> + \gamma z<sub>2</sub></span> (in NDC/buffer depth). No extra geometry — the same weights that decided coverage.</li>
+  <li><strong>Depth test.</strong> If <span class="math">z<sub>frag</sub></span> is nearer than the stored depth, the fragment wins: write its color to the framebuffer and overwrite the stored depth with <span class="math">z<sub>frag</sub></span>. Otherwise it is occluded — discard it.</li>
+</ol>
+
+<p>That is the whole algorithm. Its virtues are exactly what a streaming pipeline needs:</p>
+
+<ul>
+  <li><strong>O(1) per fragment</strong> — one interpolation, one compare, one conditional write. No sorting.</li>
+  <li><strong>Order-independent</strong> — the final image is the same no matter what order the triangles arrive in, because each pixel independently keeps the running minimum. This is what lets rasterization stay a stream: you never need all the geometry at once.</li>
+</ul>
+
+<p>Contrast the <strong>painter's algorithm</strong> — sort triangles back-to-front and paint over. It needs a global sort (breaking the stream), and worse, it is simply <em>wrong</em> for <strong>interpenetrating</strong> triangles (which is in front depends on the pixel, not the triangle) and for <strong>cyclic overlaps</strong> (A over B over C over A, where no single ordering exists). The z-buffer resolves all of these per pixel, because it compares depths at the sample point rather than committing to one order for a whole triangle.</p>
+
+<div class="callout warn">
+  <div class="label">Depth precision, again</div>
+  The z-buffer inherits §2's nonlinear depth: because stored depth is affine in <span class="math">1/Z</span>, distant fragments are packed into a sliver of the buffer's range, so two far coplanar surfaces can round to the same value and <strong>z-fight</strong>. The buffer's correctness is exact; its <em>precision</em> is the failure mode. And note what quantity this buffer actually holds — the depth of the visible surface per pixel. That is the same "expected depth" that <strong>lesson 08</strong>'s volume rendering will produce as an <em>integral</em> over a soft density field, rather than a hard per-pixel minimum: the z-buffer is the hard-surface limit of the volumetric depth to come.
+</div>
+
+<p>The widget puts §4 and §5 together at pixel scale: two triangles fighting over an overlap region, resolved by edge-function coverage per pixel and a per-pixel z-buffer. Slide one triangle's depth below the other's and watch it seize the contested pixels.</p>
+
+<div class="widget" id="rz-widget">
+  <div class="title">Rasterize two triangles with a z-buffer</div>
+  <div class="hint">The canvas is a coarse <strong>pixel grid</strong> (each cell is a "pixel"). Two triangles — <span style="color:#2563eb;font-weight:600;">A (blue)</span> and <span style="color:#d97706;font-weight:600;">B (amber)</span> — overlap. Each cell is filled by <strong>true rasterization</strong>: for every pixel center we compute the three <strong>edge functions</strong> (signed sub-areas), test inside (<em>all same sign</em>), turn the sub-areas into <strong>barycentric weights</strong>, interpolate that fragment's depth <span class="math">z = b<sub>0</sub>z<sub>0</sub> + b<sub>1</sub>z<sub>1</sub> + b<sub>2</sub>z<sub>2</sub></span>, and keep it only if it is <strong>nearer</strong> than the z-buffer's stored depth. Triangle outlines and vertices are overlaid. Push <strong>B's depth</strong> below <strong>A's</strong> and B wins the overlap — the z-buffer resolving occlusion, per pixel, with no sorting. Watch the <em>depth-test flips</em> KPI: it counts pixels in the overlap where the depth test changed the winner.</div>
+
+  <canvas class="dist-canvas" id="rz-canvas" width="760" height="380" style="height:380px;"></canvas>
+
+  <div class="controls" style="margin-top: 12px;">
+    <label class="inline">triangle A depth z<sub>A</sub>: <input type="range" id="rz-za" min="0.05" max="0.95" step="0.01" value="0.35"> <span class="val" id="rz-za-val">0.35</span></label>
+    <label class="inline">triangle B depth z<sub>B</sub>: <input type="range" id="rz-zb" min="0.05" max="0.95" step="0.01" value="0.65"> <span class="val" id="rz-zb-val">0.65</span></label>
+  </div>
+  <div class="controls">
+    <label class="inline">grid resolution: <input type="range" id="rz-res" min="16" max="64" step="1" value="40"> <span class="val" id="rz-res-val">40</span></label>
+    <label class="inline">shared vertex x: <input type="range" id="rz-vx" min="-120" max="120" step="1" value="0"> <span class="val" id="rz-vx-val">0</span></label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">A covered pixels</div><div class="v" id="rz-k-a">—</div></div>
+    <div class="kpi"><div class="k">B covered pixels</div><div class="v" id="rz-k-b">—</div></div>
+    <div class="kpi"><div class="k">Depth-test flips (overlap)</div><div class="v" id="rz-k-flip">—</div></div>
+    <div class="kpi"><div class="k">Total shaded pixels</div><div class="v" id="rz-k-total">—</div></div>
+  </div>
+
+  <details>
+    <summary>Show the core JS</summary>
+<pre><code>// signed area of triangle (a,b,c) = 2× area; sign encodes winding / which side.
+function area(a, b, c){
+  return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+}
+
+// Rasterize one triangle into the pixel grid + z-buffer.
+// tri.v = [v0,v1,v2] in canvas coords; tri.z = constant depth (per-vertex works the same).
+function rasterize(tri, color, zbuf, colbuf, W, H, cols, rows){
+  var v0 = tri.v[0], v1 = tri.v[1], v2 = tri.v[2];
+  var Atot = area(v0, v1, v2);            // full-triangle signed area (2×)
+  if (Atot === 0) return 0;               // degenerate
+  var cw = W / cols, ch = H / rows;       // pixel size
+  var covered = 0;
+  for (var iy = 0; iy &lt; rows; iy++){
+    for (var ix = 0; ix &lt; cols; ix++){
+      var P = { x: (ix + 0.5) * cw, y: (iy + 0.5) * ch };   // pixel centre
+      // three edge functions == three sub-triangle signed areas
+      var w0 = area(v1, v2, P);           // opposite v0  -> weight of v0
+      var w1 = area(v2, v0, P);           // opposite v1  -> weight of v1
+      var w2 = area(v0, v1, P);           // opposite v2  -> weight of v2
+      // inside iff all edge functions share the sign of the total area
+      var inside = (Atot &gt; 0) ? (w0 &gt;= 0 &amp;&amp; w1 &gt;= 0 &amp;&amp; w2 &gt;= 0)
+                              : (w0 &lt;= 0 &amp;&amp; w1 &lt;= 0 &amp;&amp; w2 &lt;= 0);
+      if (!inside) continue;
+      covered++;
+      // barycentric weights = sub-area / total area  (sum to 1)
+      var b0 = w0 / Atot, b1 = w1 / Atot, b2 = w2 / Atot;
+      // interpolate fragment depth (here z is constant, but this is the general form)
+      var zf = b0 * tri.z + b1 * tri.z + b2 * tri.z;
+      var idx = iy * cols + ix;
+      if (zf &lt; zbuf[idx]){                 // DEPTH TEST: keep the nearer fragment
+        zbuf[idx] = zf;
+        colbuf[idx] = color;
+      }
+    }
+  }
+  return covered;
+}</code></pre>
+  </details>
+</div>
+
+<h2>Where this points next</h2>
+
+<p>We can now turn a mesh into an image: transform triangles through model → world → view → clip → NDC → screen, cut them at the near plane and cull the back faces, decide coverage with edge functions that double as barycentric weights, and resolve occlusion with an order-independent z-buffer. That is the complete forward operator <span class="math">R</span> for a mesh — geometry in, pixels out, in real time. But the pixels we produced are flat: we interpolated depth, yet said nothing about their <em>color</em>, and even the interpolation hides a subtlety. <strong>Lesson 07</strong> finishes the picture. It interpolates per-vertex attributes correctly — and shows why naive screen-space interpolation is <em>wrong</em> under perspective, so you must interpolate in <span class="math">1/Z</span> (the same inverse-depth structure from §2 and lesson 03) — then maps <strong>textures</strong> (and confronts their aliasing, fixed by mipmapping) and applies <strong>shading</strong>. It closes on the formal argument this lesson previewed in §4's red callout: the coverage step is a discontinuous function of geometry with no useful gradient, so the whole rasterizer is <strong>non-differentiable</strong>. That single fact is the hinge of the track: it is precisely why <strong>lesson 08</strong> abandons hard surfaces for a soft, semi-transparent <strong>radiance field</strong> rendered by an integral you <em>can</em> backpropagate — turning the un-invertible forward map of this lesson into the differentiable one that inverse rendering needs.</p>
+
+<div class="callout ok">
+  <div class="label">Takeaway</div>
+  <strong>Rasterization</strong> is the geometry-centric renderer — loop over triangles, find covered pixels — and it dominates real time because that loop is a stateless, embarrassingly parallel <strong>stream</strong> that maps onto GPU hardware, needing no global scene structure. It computes lesson 01's forward operator <span class="math">R</span> for a mesh, in the <em>forward</em> direction only. The <strong>geometry pipeline</strong> is a matrix chain model → world → view (<span class="math">V = T<sub>wc</sub><sup>-1</sup> ∈ SE(3)</span>) → clip → NDC → screen; the <strong>projection matrix</strong> stays linear by loading view-space <span class="math">Z</span> into the clip <span class="math">w</span>, so a single hardware <strong>perspective divide</strong> produces the pinhole's <span class="math">x = fX/Z</span>. Depth maps into NDC affine in <span class="math">1/Z</span> — <strong>nonlinearly</strong> (worked: 4% of depth ate 81% of the range), the root of <strong>z-fighting</strong> and the same inverse-depth from lesson 03. Before filling, <strong>clip</strong> the near plane (you cannot divide by <span class="math">w ≤ 0</span>) and <strong>cull</strong> back faces by signed-area sign (halving the work). The <strong>coverage test</strong> uses <strong>edge functions</strong> — 2D cross products / signed sub-areas — that are the <strong>barycentric coordinates</strong> <span class="math">(\alpha,\beta,\gamma)</span>: their signs decide inside/outside and their values are the interpolation weights lesson 07 needs. The <strong>z-buffer</strong> resolves occlusion per fragment by interpolating depth and keeping the nearest — <span class="math">O(1)</span> and order-independent, unlike the painter's algorithm. And the whole thing is <strong>non-differentiable</strong>: coverage is a step function of vertex position with zero/undefined derivative (lesson 07 §5, lesson 01 §4) — the reason the soft, volumetric methods of lessons 08–09 exist.
+</div>
+
+<h2>Interview prompts</h2>
+
+<ul class="prompt-list">
+  <li>Contrast rasterization and ray tracing, and explain why rasterization dominates real-time rendering. <em>(§1 — rasterization loops over triangles (geometry-centric), ray tracing over pixels (image-centric); rasterization is a stateless parallel stream needing no global structure, so it maps onto GPU hardware, while ray tracing's per-ray traversal is natural for global effects but memory-bound.)</em></li>
+  <li>Walk through the transform chain from model space to pixel coordinates, and derive how the perspective projection produces <span class="math">1/Z</span> foreshortening. <em>(§2 — model→world (M)→view (V = camera-pose⁻¹ ∈ SE(3))→clip (P)→NDC (÷w)→screen; P stays linear by copying view-space Z into the clip w, and the single perspective divide by w yields x = fX/Z.)</em></li>
+  <li>Why is depth stored nonlinearly in the buffer, and what problem does that cause? <em>(§2/§5 — <span class="math">z<sub>ndc</sub></span> is affine in <span class="math">1/Z</span>, so precision bunches near the camera and starves far away; distant coplanar surfaces round to equal depths and z-fight. Same inverse-depth structure as stereo disparity, lesson 03. Fix: shrink f/n, reversed/log-Z.)</em></li>
+  <li>Why must triangles be clipped against the near plane, and how does back-face culling work? <em>(§3 — points with <span class="math">Z ≤ 0</span> give <span class="math">w ≤ 0</span>, so the perspective divide is invalid/flips them; near-clip is a correctness must. Back-face culling drops triangles by the sign of their projected signed area (winding), roughly halving fill work on closed meshes.)</em></li>
+  <li>Explain edge functions and their connection to barycentric coordinates. <em>(§4 — an edge function is the 2D cross product / twice the signed area of (edge, P); P is inside iff all three share a sign. Normalized by the total area they ARE the barycentrics <span class="math">(\alpha,\beta,\gamma)</span>, summing to 1 — one computation gives both the coverage test and the interpolation weights.)</em></li>
+  <li>How does a z-buffer resolve visibility, and why is it better than the painter's algorithm? <em>(§5 — per fragment, interpolate depth barycentrically and keep it iff nearer than the stored value; <span class="math">O(1)</span>, order-independent, no sort. The painter's algorithm needs a global sort and fails on interpenetrating and cyclically-overlapping triangles, which the per-pixel depth test handles.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="05_surfaces_meshes_implicit.html">
+    <span class="dir">&larr; Previous</span>
+    <span class="ttl">05 · Surfaces — meshes &amp; implicit fields</span>
+  </a>
+  <a class="next" href="07_shading_textures.html">
+    <span class="dir">Next &rarr;</span>
+    <span class="ttl">07 · Shading, interpolation &amp; textures</span>
+  </a>
+</footer>
+
+</main>
+
+<script>
+(function(){
+  var canvas = document.getElementById('rz-canvas');
+  if(!canvas) return;
+  var ctx = canvas.getContext('2d');
+
+  var zaR = document.getElementById('rz-za'), zaV = document.getElementById('rz-za-val');
+  var zbR = document.getElementById('rz-zb'), zbV = document.getElementById('rz-zb-val');
+  var resR = document.getElementById('rz-res'), resV = document.getElementById('rz-res-val');
+  var vxR = document.getElementById('rz-vx'), vxV = document.getElementById('rz-vx-val');
+  var kA = document.getElementById('rz-k-a'), kB = document.getElementById('rz-k-b');
+  var kFlip = document.getElementById('rz-k-flip'), kTotal = document.getElementById('rz-k-total');
+
+  // signed area of triangle (a,b,c) = twice the area; sign encodes winding.
+  function area(a, b, c){
+    return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+  }
+
+  function render(){
+    var zA = parseFloat(zaR.value);
+    var zB = parseFloat(zbR.value);
+    var cols = parseInt(resR.value, 10);
+    var vx = parseFloat(vxR.value);
+    zaV.textContent = zA.toFixed(2);
+    zbV.textContent = zB.toFixed(2);
+    resV.textContent = cols;
+    vxV.textContent = vx;
+
+    var dpr = window.devicePixelRatio || 1;
+    var W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== Math.round(W*dpr)){ canvas.width = Math.round(W*dpr); canvas.height = Math.round(H*dpr); }
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    // keep pixels roughly square: derive row count from the aspect ratio
+    var cw = W / cols;
+    var rows = Math.max(1, Math.round(H / cw));
+    var ch = H / rows;
+
+    var cx = W/2, cy = H/2;
+    // Two triangles that overlap in the middle. They share a movable apex near the
+    // centre (vx shifts it), so the slider reshapes the contested region.
+    var apex = { x: cx + vx, y: cy - 30 };
+    var triA = {
+      v: [ { x: cx - 250, y: cy - 120 }, { x: cx + 60, y: cy + 150 }, apex ],
+      z: zA
+    };
+    var triB = {
+      v: [ { x: cx + 250, y: cy - 120 }, { x: cx - 60, y: cy + 150 }, apex ],
+      z: zB
+    };
+
+    // ── z-buffer + colour/owner buffers over the pixel grid ──
+    var n = cols * rows;
+    var zbuf = new Float64Array(n);
+    var owner = new Int8Array(n);   // 0 = empty, 1 = A, 2 = B
+    var i;
+    for (i = 0; i < n; i++){ zbuf[i] = Infinity; owner[i] = 0; }
+
+    // Rasterize one triangle: edge-function coverage + barycentric depth + z-test.
+    // `id` labels the owner; returns {covered, flips} where flips counts pixels this
+    // triangle WON from a previously-shaded pixel (an occlusion decision in overlap).
+    function rasterize(tri, id){
+      var v0 = tri.v[0], v1 = tri.v[1], v2 = tri.v[2];
+      var Atot = area(v0, v1, v2);
+      if (Atot === 0) return { covered: 0, flips: 0 };
+      var covered = 0, flips = 0;
+      for (var iy = 0; iy < rows; iy++){
+        for (var ix = 0; ix < cols; ix++){
+          var Px = (ix + 0.5) * cw, Py = (iy + 0.5) * ch;
+          var P = { x: Px, y: Py };
+          var w0 = area(v1, v2, P);
+          var w1 = area(v2, v0, P);
+          var w2 = area(v0, v1, P);
+          var inside = (Atot > 0) ? (w0 >= 0 && w1 >= 0 && w2 >= 0)
+                                  : (w0 <= 0 && w1 <= 0 && w2 <= 0);
+          if (!inside) continue;
+          covered++;
+          var b0 = w0 / Atot, b1 = w1 / Atot, b2 = w2 / Atot;
+          var zf = b0 * tri.z + b1 * tri.z + b2 * tri.z;  // constant here; general form
+          var idx = iy * cols + ix;
+          if (zf < zbuf[idx]){
+            if (owner[idx] !== 0 && owner[idx] !== id) flips++;  // stole a shaded pixel
+            zbuf[idx] = zf;
+            owner[idx] = id;
+          }
+        }
+      }
+      return { covered: covered, flips: flips };
+    }
+
+    // Count raw coverage per triangle independently (before the z-test decides winners),
+    // and the size of the overlap, so the KPIs report honest per-triangle coverage.
+    var coverA = 0, coverB = 0, overlap = 0;
+    (function(){
+      var a0 = triA.v[0], a1 = triA.v[1], a2 = triA.v[2], Aa = area(a0,a1,a2);
+      var b0v = triB.v[0], b1v = triB.v[1], b2v = triB.v[2], Ab = area(b0v,b1v,b2v);
+      for (var iy = 0; iy < rows; iy++) for (var ix = 0; ix < cols; ix++){
+        var P = { x: (ix + 0.5) * cw, y: (iy + 0.5) * ch };
+        var inA, inB;
+        var wa0 = area(a1,a2,P), wa1 = area(a2,a0,P), wa2 = area(a0,a1,P);
+        inA = (Aa > 0) ? (wa0>=0 && wa1>=0 && wa2>=0) : (wa0<=0 && wa1<=0 && wa2<=0);
+        var wb0 = area(b1v,b2v,P), wb1 = area(b2v,b0v,P), wb2 = area(b0v,b1v,P);
+        inB = (Ab > 0) ? (wb0>=0 && wb1>=0 && wb2>=0) : (wb0<=0 && wb1<=0 && wb2<=0);
+        if (inA) coverA++;
+        if (inB) coverB++;
+        if (inA && inB) overlap++;
+      }
+    })();
+
+    // Rasterize in a fixed order (A then B); the z-buffer, not the order, picks winners.
+    rasterize(triA, 1);
+    var rb = rasterize(triB, 2);
+
+    // ── paint the shaded pixel grid (blocky) ──
+    for (var iy = 0; iy < rows; iy++){
+      for (var ix = 0; ix < cols; ix++){
+        var o = owner[iy * cols + ix];
+        if (o === 0) continue;
+        ctx.fillStyle = (o === 1) ? 'rgba(37,99,235,0.85)' : 'rgba(217,119,6,0.85)';
+        ctx.fillRect(ix * cw + 0.5, iy * ch + 0.5, cw - 1, ch - 1);
+      }
+    }
+
+    // ── faint pixel-grid lines ──
+    ctx.strokeStyle = 'rgba(31,36,48,0.10)'; ctx.lineWidth = 1;
+    for (var gx = 0; gx <= cols; gx++){
+      ctx.beginPath(); ctx.moveTo(gx * cw, 0); ctx.lineTo(gx * cw, H); ctx.stroke();
+    }
+    for (var gy = 0; gy <= rows; gy++){
+      ctx.beginPath(); ctx.moveTo(0, gy * ch); ctx.lineTo(W, gy * ch); ctx.stroke();
+    }
+
+    // ── overlay the true triangle outlines + vertices ──
+    function outline(tri, stroke){
+      ctx.strokeStyle = stroke; ctx.lineWidth = 2; ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(tri.v[0].x, tri.v[0].y);
+      ctx.lineTo(tri.v[1].x, tri.v[1].y);
+      ctx.lineTo(tri.v[2].x, tri.v[2].y);
+      ctx.closePath(); ctx.stroke();
+      ctx.fillStyle = stroke;
+      for (var k = 0; k < 3; k++){
+        ctx.beginPath(); ctx.arc(tri.v[k].x, tri.v[k].y, 3.5, 0, 2*Math.PI); ctx.fill();
+      }
+    }
+    outline(triA, '#1e40af');
+    outline(triB, '#b45309');
+
+    // ── caption ──
+    ctx.fillStyle = '#5b6573'; ctx.font = '11px monospace';
+    var lead = (zB < zA) ? 'B is nearer (z_B < z_A) — B wins the overlap'
+                         : (zA < zB ? 'A is nearer (z_A < z_B) — A wins the overlap'
+                                    : 'equal depth — ties resolved by draw order');
+    ctx.fillText(lead, 12, H - 12);
+
+    // ── KPIs ──
+    kA.textContent = coverA + ' px';
+    kB.textContent = coverB + ' px';
+    kFlip.textContent = rb.flips + ' / ' + overlap + ' overlap';
+    kTotal.textContent = (coverA + coverB - overlap) + ' px';
+    kFlip.style.color = (rb.flips > 0) ? '#d97706' : 'var(--text)';
+  }
+
+  zaR.addEventListener('input', render);
+  zbR.addEventListener('input', render);
+  resR.addEventListener('input', render);
+  vxR.addEventListener('input', render);
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+
+</body>
+</html>
