@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>14 · LoRA — parameter-efficient fine-tuning</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-specific layout only — do not redefine shared classes */
+  #lora-canvas { width: 100%; height: 360px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; display: block; }
+  .cost-cols { display: grid; grid-template-columns: 1fr; gap: 16px; }
+  .decomp { display: grid; grid-template-columns: 170px minmax(0,1fr); gap: 12px; align-items: baseline; margin: 6px 0; }
+  .decomp .lab { font-family: var(--mono); font-size: 12px; color: var(--accent); }
+  .decomp .txt { font-size: 14px; color: var(--text-mute); line-height: 1.45; }
+  @media (max-width: 720px) { .decomp { grid-template-columns: 1fr; gap: 3px; } }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="index.html">llm_from_scratch / lessons</a><span class="crumb">/</span><span class="crumb">14 · LoRA</span><span class="step-pill">lesson 15 / 16</span></div></header>
+
+<main>
+
+<p class="kicker">Part V — Fine-tuning</p>
+<h1>LoRA — parameter-efficient fine-tuning</h1>
+<p class="subtitle">Lesson 13 turned the base completer into an instruction-following assistant by fine-tuning it — but that meant nudging all ~124 million weights and then saving an entire second copy of the model just for that one behavior. Most of that update is redundant. This lesson replaces the whole-model update with a tiny <em>low-rank patch</em> that trains a fraction of a percent of the parameters, starts exactly at the base model, and can be swapped per task.</p>
+
+<div class="callout source-note"><div class="label">What the last step left broken</div>Instruction fine-tuning (13) is <strong>full fine-tuning</strong>: every matrix <span class="math">W</span> in every block gets a gradient and gets updated, and the result is a fresh 124M-parameter checkpoint you must store and serve. Want a second skill — a summarizer, a coder, a support bot? That is another full backward pass over 124M parameters and another whole 500 MB checkpoint on disk. The cost scales linearly with the number of tasks, even though each task only bends the model a little. We are paying to re-store the entire model to remember a small adjustment.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> full fine-tuning (13) updates and stores all ~124M parameters per task — one complete model copy each — and most of that update is redundant.<br><strong>New idea:</strong> freeze the pretrained weights <span class="math">W</span> and learn only a <em>low-rank</em> change <span class="math">ΔW = A·B</span>, where <span class="math">A</span> is <span class="math">(d × r)</span>, <span class="math">B</span> is <span class="math">(r × d)</span>, and the rank <span class="math">r ≪ d</span>. Train just <span class="math">2·d·r</span> numbers instead of <span class="math">d²</span>; initialize <span class="math">B = 0</span> so <span class="math">ΔW = 0</span> and training begins <em>exactly</em> at the base model; scale the patch by <span class="math">α/r</span>.<br><strong>Forces next:</strong> we have now built every piece of a working, trainable, steerable GPT — but entirely at a 124M toy scale. Lesson 15 asks what actually changes when you push this same machine to frontier scale, and hands off to the tracks that go there.</div>
+
+<div class="callout"><div class="label">The plan</div>Five moves. (1) Count the true cost of full fine-tuning: <span class="math">d²</span> updated and stored per matrix, one copy per task. (2) State the insight that makes it avoidable — the adaptation you need is <em>low-rank</em>. (3) Build the mechanics: freeze <span class="math">W</span>, add <span class="math">ΔW = A·B</span>, the frozen-plus-patch forward pass, <span class="math">B = 0</span> at init, the <span class="math">α/r</span> scale. (4) Do the arithmetic of the payoff and see how adapters swap. (5) Decide where to attach LoRA and treat rank as the one capacity knob. Then drive the rank explorer and watch the parameter count collapse.</div>
+
+<h2>1 · The true cost of full fine-tuning</h2>
+
+<p>A single weight matrix in a transformer block — say a query projection <span class="math">W_q</span> — is <span class="math">(d × d)</span>. For GPT-2 small that is <span class="math">768 × 768 ≈ 590{,}000</span> numbers in <em>one</em> matrix, and a block has several such matrices (the four attention projections plus the two feed-forward matrices), stacked <span class="math">L = 12</span> times. Full fine-tuning computes a gradient for every one of those ≈124M numbers and writes back a new value for each.</p>
+
+<p>Two costs follow, and the second is the one that bites. The <strong>compute</strong> cost is a full backward pass — real, but you pay it once. The <strong>storage and deployment</strong> cost is forever: the output of fine-tuning is a complete, standalone 124M-parameter checkpoint. Ten fine-tuned tasks means ten full checkpoints, ten times the disk, and — if you want to serve them — either ten models loaded in memory or an expensive swap of the entire weight set every time a request needs a different skill.</p>
+
+<div class="callout warn"><div class="label">The waste, stated precisely</div>Fine-tuning does not rebuild the model from scratch; it <em>nudges</em> a model that already works. The nudge — the difference <span class="math">ΔW = W_finetuned − W_base</span> between the fine-tuned and base weights — is what actually encodes the new task. Yet full fine-tuning throws that structure away and stores the whole sum <span class="math">W_base + ΔW</span> as a fresh dense matrix. We are re-saving the shared foundation, over and over, to record a comparatively small change.</div>
+
+<h2>2 · The insight: the change you need is low-rank</h2>
+
+<p>Here is the observation that unlocks everything. When you adapt a large pretrained model to a specific downstream task, the update <span class="math">ΔW</span> that fine-tuning discovers does <em>not</em> need the full expressive range of a <span class="math">(d × d)</span> matrix. Empirically it has a very low <strong>intrinsic rank</strong>: it can be approximated well by a matrix that is the product of two thin ones. The pretrained <span class="math">W</span> already carries the heavy, general knowledge; task adaptation only has to steer within a small subspace.</p>
+
+<p>Recall what rank means. Any <span class="math">(d × d)</span> matrix of rank <span class="math">r</span> can be written as a product of a tall matrix and a wide one:</p>
+
+<div class="math block">ΔW &nbsp;≈&nbsp; A · B, &nbsp;&nbsp; where &nbsp; A is (d × r) &nbsp; and &nbsp; B is (r × d), &nbsp;&nbsp; r ≪ d</div>
+
+<p>The tall <span class="math">A</span> and wide <span class="math">B</span> meet at a narrow waist of width <span class="math">r</span> — the <em>rank</em> — that pinches all the information passing through. A full-rank update would need <span class="math">r = d</span> and buy nothing. But if adaptation truly lives in a low-dimensional subspace, a small <span class="math">r</span> (LoRA's paper uses values like 1, 2, 4, 8) recovers most of the benefit while the two factors together hold only <span class="math">2·d·r</span> numbers — vastly fewer than the <span class="math">d²</span> in the dense update. This is the entire idea of <strong>Lo</strong>w-<strong>R</strong>ank <strong>A</strong>daptation.</p>
+
+<div class="callout"><div class="label">Why a product of two matrices is "low-rank"</div>Multiply a <span class="math">(d × r)</span> by an <span class="math">(r × d)</span> and the result is <span class="math">(d × d)</span>, but its rank can be at most <span class="math">r</span> — every column of the product is a combination of just <span class="math">r</span> underlying directions (the columns of <span class="math">A</span>). The bottleneck <span class="math">r</span> is a hard ceiling on how much structure <span class="math">ΔW</span> can encode. LoRA bets that a small ceiling is enough for adaptation, and the bet usually pays.</div>
+
+<h2>3 · The mechanics: freeze, patch, and start from zero</h2>
+
+<p>LoRA changes three things about the layer and nothing else. First, <strong>freeze <span class="math">W</span></strong>: the pretrained matrix keeps its values and receives no gradient. Second, <strong>add the low-rank patch</strong> beside it. The layer that used to compute <span class="math">Wx</span> now computes the frozen result plus a small correction routed through the bottleneck:</p>
+
+<div class="math block">y &nbsp;=&nbsp; W x &nbsp;+&nbsp; (α / r) · A (B x)</div>
+
+<p>Read the correction right-to-left, and notice we never build the big <span class="math">(d × d)</span> matrix <span class="math">A·B</span> explicitly. The input <span class="math">x</span> (dimension <span class="math">d</span>) first hits <span class="math">B</span> and is squeezed down to the tiny rank-<span class="math">r</span> vector <span class="math">Bx</span>; then <span class="math">A</span> lifts it back up to dimension <span class="math">d</span>; finally the <span class="math">α/r</span> factor scales it and it is added to the frozen <span class="math">Wx</span>. Only <span class="math">A</span> and <span class="math">B</span> — together <span class="math">2·d·r</span> parameters — carry gradients and get trained.</p>
+
+<h3>Initialize B = 0 so training begins at the base model</h3>
+
+<p>The third change is the quiet, clever one. Initialize <span class="math">A</span> with small random values but set <span class="math">B = 0</span>. Then at step zero:</p>
+
+<div class="math block">ΔW = A · B = A · 0 = 0 &nbsp;&nbsp;⟹&nbsp;&nbsp; y = W x + 0 = W x</div>
+
+<p>The very first forward pass is <em>identical</em> to the untouched base model — the patch adds nothing. This matters: fine-tuning should start from the model you already trust and move away from it deliberately, not lurch to a random new function on step one. As training proceeds, gradients flow into <span class="math">B</span> (and <span class="math">A</span>), the product <span class="math">A·B</span> grows away from zero, and the model smoothly departs from the base only as far as the task demands. Setting <span class="math">A = 0</span> instead of <span class="math">B</span> would also give <span class="math">ΔW = 0</span> at init, but then <span class="math">B</span> would receive no gradient on the first step; zeroing <span class="math">B</span> and keeping <span class="math">A</span> nonzero keeps both factors learning immediately.</p>
+
+<h3>The α / r scale</h3>
+
+<p>The factor <span class="math">α/r</span> decouples "how hard the patch pushes" from "how wide the bottleneck is." <span class="math">α</span> is a fixed constant (often set once, e.g. to the initial <span class="math">r</span>); dividing by <span class="math">r</span> means that when you later raise the rank, the patch's overall magnitude does not blow up in proportion — you can retune <span class="math">r</span> without re-tuning the learning rate. In practice <span class="math">α/r</span> behaves like a second, LoRA-specific learning-rate multiplier on the update.</p>
+
+<pre><code>class LoRALinear:                 # wraps a frozen linear layer W: (d, d)
+    def __init__(self, W, r, alpha):
+        self.W = freeze(W)        # pretrained; no gradient
+        self.A = zeros(d, r)      # will hold small random init...
+        self.B = zeros(r, d)      # ...but B stays 0 at start  => ΔW = 0
+        init_small_random(self.A)
+        self.scale = alpha / r
+
+    def forward(self, x):
+        return x @ self.W.T + self.scale * ((x @ self.B.T) @ self.A.T)
+        #      └ frozen base ┘         └ low-rank patch through the r-waist ┘</code></pre>
+
+<p>Everything downstream is unchanged: the loss is still cross-entropy over the response tokens (13), the optimizer is still AdamW (10). The <em>only</em> difference is which parameters carry gradients — and there are now dramatically fewer of them.</p>
+
+<h2>4 · The payoff: the arithmetic and the swap</h2>
+
+<p>Put GPT-2's numbers in. A dense <span class="math">(d × d)</span> matrix with <span class="math">d = 768</span> holds <span class="math">768² ≈ 590{,}000</span> parameters. Adapt it with rank <span class="math">r = 8</span> and the LoRA factors hold <span class="math">2 · 768 · 8 ≈ 12{,}300</span> — about <strong>2%</strong> of the dense matrix, a roughly <strong>48×</strong> reduction, per matrix. Applied across the model, LoRA typically trains well under 1% of the total parameters while matching full fine-tuning's task quality closely.</p>
+
+<div class="decomp"><div class="lab">full update</div><div class="txt"><span class="math">d²</span> params per matrix = <span class="math">768² ≈ 590{,}000</span> — trained <em>and</em> stored, per task.</div></div>
+<div class="decomp"><div class="lab">LoRA update</div><div class="txt"><span class="math">2·d·r</span> params per matrix = <span class="math">2·768·8 ≈ 12{,}300</span> — the only thing trained or stored.</div></div>
+<div class="decomp"><div class="lab">ratio</div><div class="txt"><span class="math">2·d·r / d² = 2r/d = 16/768 ≈ 2%</span> of the parameters; compression <span class="math">d/(2r) = 768/16 = 48×</span>.</div></div>
+
+<p>The storage win compounds into a <strong>deployment</strong> win. Because <span class="math">W</span> is frozen and shared, every task's adapter is just its own small <span class="math">A, B</span> pair — a few megabytes instead of a few hundred. You load the one base model once, then hot-swap adapters per request: attach the summarizer's <span class="math">(A, B)</span> for one call, the support bot's for the next, all over the same frozen backbone. Ten skills cost one model plus ten tiny patches, not ten models. (If you ever want a single fused checkpoint, you can add <span class="math">(α/r)·A·B</span> back into <span class="math">W</span> once and ship a plain model — but the whole point is usually to keep the base pristine and the patches separate.)</p>
+
+<div class="callout"><div class="label">Stacking with quantization: QLoRA</div>The base <span class="math">W</span> is only ever read in the forward pass, never updated — so it can be stored in low precision. <strong>QLoRA</strong> quantizes the frozen backbone to 4-bit and trains the LoRA factors in higher precision on top, shrinking the memory needed to fine-tune a large model onto a single consumer GPU. The systems detail lives in the scale track; see the cross-reference below.</div>
+
+<h2>5 · Where to attach it, and rank as the capacity knob</h2>
+
+<p>You do not have to LoRA-ize every matrix. The original work found that adapting the <strong>attention projections</strong> — the <span class="math">W_q, W_k, W_v</span> (and sometimes the output projection <span class="math">W_o</span>) inside multi-head attention (06) — gives most of the benefit, since attention is where the model decides <em>what to relate to what</em> for the new task. The large feed-forward matrices can be left frozen, or included when you want more adapter capacity. This selectivity is part of why the trainable-parameter count stays so small.</p>
+
+<p>The one knob that matters is the rank <span class="math">r</span>. It is a direct dial on the adapter's capacity: too small and the low-rank patch cannot express the adaptation the task needs (it underfits, and quality lags full fine-tuning); larger and it captures more, at the cost of more trainable parameters and a weaker regularizing effect. Because init keeps you at the base model and <span class="math">α/r</span> keeps the scale sane, sweeping <span class="math">r</span> is cheap — which is exactly what the widget lets you do.</p>
+
+<h2>6 · Watch the parameter count collapse</h2>
+
+<p>The widget draws the frozen weight matrix <span class="math">W</span> (greyed — it never changes) beside the two LoRA factors <span class="math">A</span> and <span class="math">B</span> that meet at the rank-<span class="math">r</span> waist. Move the <span class="math">r</span> slider to widen or pinch that waist, and the <span class="math">d</span> slider to resize the whole layer. The KPIs compute the trainable parameter count <span class="math">2·d·r</span> against the full <span class="math">d²</span>, the percentage, and the compression factor — live. It shows <span class="math">B = 0</span> at initialization, so <span class="math">ΔW = A·B = 0</span>: the patch starts invisible and the model starts exactly at the base.</p>
+
+<div class="widget" id="lora-widget">
+  <div class="title">LoRA rank explorer</div>
+  <div class="hint">Proves the core trade: freezing <span class="math">W</span> and learning <span class="math">ΔW = A·B</span> at rank <span class="math">r ≪ d</span> buys adaptation for <span class="math">2·d·r</span> parameters instead of <span class="math">d²</span> — a tiny fraction. With <span class="math">B = 0</span> at init, <span class="math">ΔW = 0</span>, so training starts <em>at</em> the base model.</div>
+
+  <div class="controls">
+    <label class="inline">d (layer width): <input type="range" id="lora-d" min="64" max="1024" step="64" value="768"> <span class="val" id="lora-d-v">768</span></label>
+    <label class="inline">rank r: <input type="range" id="lora-r" min="1" max="64" step="1" value="8"> <span class="val" id="lora-r-v">8</span></label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">trainable params (2·d·r)</div><div class="v" id="lora-kpi-tr">—</div></div>
+    <div class="kpi"><div class="k">full update (d²)</div><div class="v" id="lora-kpi-full">—</div></div>
+    <div class="kpi"><div class="k">% of full</div><div class="v" id="lora-kpi-pct">—</div></div>
+    <div class="kpi"><div class="k">compression</div><div class="v" id="lora-kpi-comp">—</div></div>
+    <div class="kpi"><div class="k">ΔW at init</div><div class="v" id="lora-kpi-init">0</div></div>
+  </div>
+
+  <canvas id="lora-canvas"></canvas>
+</div>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>Rank too small.</strong> The bottleneck <span class="math">r</span> can't express the needed adaptation; the model underfits and lags full fine-tuning. <em>Fix:</em> raise <span class="math">r</span> or LoRA-ize more matrices.</li>
+    <li><strong>Forgetting the <span class="math">α/r</span> scale.</strong> The patch pushes too hard or too softly, and changing <span class="math">r</span> silently changes the effective learning rate.</li>
+    <li><strong>Not freezing <span class="math">W</span>.</strong> If the base gets gradients too, you are back to full fine-tuning plus a redundant patch — you lose the entire storage/swap benefit.</li>
+    <li><strong>Zeroing <span class="math">A</span> instead of <span class="math">B</span> (or both nonzero).</strong> Both-zero kills all gradient; a random start on both makes <span class="math">ΔW ≠ 0</span> at init, so you no longer begin at the base model.</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li><span class="math">W</span> frozen (no gradient); only <span class="math">A</span> <span class="math">(d×r)</span> and <span class="math">B</span> <span class="math">(r×d)</span> train.</li>
+    <li>Forward = <span class="math">Wx + (α/r)·A(Bx)</span>, routed through the rank-<span class="math">r</span> waist.</li>
+    <li><span class="math">B = 0</span> at init ⇒ <span class="math">ΔW = 0</span> ⇒ start exactly at the base model.</li>
+    <li>Rank <span class="math">r ≪ d</span>; trainable params <span class="math">2·d·r ≪ d²</span>.</li>
+    <li>Attach to attention projections first; store one small adapter per task.</li>
+  </ul></div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Set <span class="math">d = 768</span> and <span class="math">r = 8</span>: the KPIs should read about 12k trainable parameters — roughly 2% of the ~590k in the full matrix, ~48× compression. Now drag <span class="math">r</span> up to 64 and watch the trainable count and percentage climb linearly while compression falls; then drag <span class="math">d</span> up to 1024 with <span class="math">r</span> fixed and watch the percentage <em>drop</em> (because <span class="math">2r/d</span> shrinks as <span class="math">d</span> grows — LoRA pays off <em>more</em> on wider layers). Note that no slider ever changes "ΔW at init," which stays 0. Which of the three properties from lesson 00 — accurate, trainable, steerable — does LoRA make cheaper to reach?</div>
+
+<h2>Where this points next</h2>
+
+<p>Step back. Over fourteen lessons you have built the whole machine from a single character: text became BPE ids, ids became embeddings with positions, a sliding window supplied free targets, attention was derived in three forced steps, the transformer block made depth trainable, a stack plus a head produced text, cross-entropy gave it a notion of wrong, AdamW drove it down, sampling and pretrained weights gave it fluency, and fine-tuning — classification, then instruction, now the cheap low-rank variant — bent it to a task. Every piece was a forced move, and every piece ran at a 124M toy scale. So the last question is the obvious one: <strong>what actually changes when you take this exact machine to a frontier model?</strong> The architecture, it turns out, barely does. Lesson 15, <a href="15_the_whole_machine.html">The whole machine — and what scale changes</a>, replays the entire chain end to end and names precisely where scale lives — data, compute, systems, and the modern component swaps — before handing you off to the tracks that build there.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>Full fine-tuning (13) updates and stores all ~124M parameters per task; most of that is redundant because the adaptation <span class="math">ΔW</span> is <em>low-rank</em>. LoRA freezes <span class="math">W</span> and learns <span class="math">ΔW = A·B</span> with <span class="math">A</span> <span class="math">(d×r)</span>, <span class="math">B</span> <span class="math">(r×d)</span>, <span class="math">r ≪ d</span>, so the forward pass is <span class="math">Wx + (α/r)·A(Bx)</span> and only <span class="math">2·d·r</span> parameters train — for <span class="math">d=768, r=8</span> that is ~12k vs ~590k per matrix, ~48× fewer. Initializing <span class="math">B = 0</span> makes <span class="math">ΔW = 0</span> at start, so fine-tuning begins <em>at</em> the base model; the <span class="math">α/r</span> factor decouples patch strength from rank. Attach it to the attention projections, keep one tiny swappable adapter per task, and stack it with quantization (QLoRA) to fine-tune large models cheaply. Rank <span class="math">r</span> is the single capacity knob.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>Why is full fine-tuning expensive even though the compute is a one-time cost? <em>(§1 — the output is a complete standalone checkpoint per task, so storage and deployment cost scale linearly with the number of tasks.)</em></li>
+  <li>What is the key empirical assumption LoRA relies on? <em>(§2 — the adaptation matrix <span class="math">ΔW</span> has low intrinsic rank, so it is well-approximated by a product of two thin matrices.)</em></li>
+  <li>Write the LoRA forward pass and say which parts train. <em>(§3 — <span class="math">y = Wx + (α/r)·A(Bx)</span>; <span class="math">W</span> is frozen, only <span class="math">A</span> and <span class="math">B</span> (2·d·r params) train.)</em></li>
+  <li>Why initialize <span class="math">B = 0</span>, and why not <span class="math">A = 0</span> instead? <em>(§3 — <span class="math">B=0</span> makes <span class="math">ΔW=0</span> so training starts at the base model, while <span class="math">A</span> being nonzero lets both factors get gradients on step one; <span class="math">A=0</span> would starve <span class="math">B</span> of gradient initially.)</em></li>
+  <li>What does the <span class="math">α/r</span> scale do? <em>(§3 — it decouples the patch's magnitude from the rank, so you can retune <span class="math">r</span> without re-tuning the learning rate; it acts as a LoRA-specific step multiplier.)</em></li>
+  <li>For <span class="math">d=768, r=8</span>, how many parameters does LoRA train per matrix versus full fine-tuning, and what is the ratio? <em>(§4 — <span class="math">2·768·8 ≈ 12{,}300</span> vs <span class="math">768² ≈ 590{,}000</span>; ratio <span class="math">2r/d ≈ 2%</span>, about 48× fewer.)</em></li>
+  <li>Where do you attach LoRA and what is the single capacity knob? <em>(§5 — typically the attention projections <span class="math">W_q, W_k, W_v</span> (± <span class="math">W_o</span>); the rank <span class="math">r</span> is the capacity dial — too small underfits, larger costs more parameters.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="13_instruction_finetuning.html"><span class="dir">← Back</span><span class="ttl">13 · Instruction fine-tuning</span></a>
+  <a class="next" href="15_the_whole_machine.html"><span class="dir">Next →</span><span class="ttl">15 · The whole machine</span></a>
+</footer>
+
+<p style="font-size:13px; color:var(--text-mute); margin-top:18px;">Companion reads: <a href="../../cs336/lessons/16_sft.html">cs336 · 16 Supervised fine-tuning</a> covers LoRA and QLoRA at systems scale; <a href="../../gpt_mini/lessons/03_sft.html">gpt_mini · 03 SFT</a> shows fine-tuning as runnable post-training code.</p>
+
+</main>
+
+<script>
+(function(){
+  var cv = document.getElementById('lora-canvas');
+  if (!cv) return;
+  var ctx = cv.getContext('2d');
+
+  // palette (fallbacks match style.css) — no Math.random / no Date used anywhere here.
+  function cssv(name, fb){ try { var v = getComputedStyle(document.documentElement).getPropertyValue(name); return (v && v.trim()) || fb; } catch(e){ return fb; } }
+  var C = {
+    accent: cssv('--accent','#2563eb'), accent2: cssv('--accent-2','#d97706'),
+    ok: cssv('--ok','#16a34a'), bad: cssv('--bad','#dc2626'), purple: cssv('--purple','#7c3aed'),
+    mute: cssv('--text-mute','#5b6573'), dim: cssv('--text-dim','#94a3b8'), text: cssv('--text','#1f2430'),
+    border: cssv('--border','#dde2ea')
+  };
+
+  function fmt(n){
+    n = Math.round(n);
+    if (n >= 1e6) return (n/1e6).toFixed(2) + 'M';
+    if (n >= 1e3) return (n/1e3).toFixed(1) + 'k';
+    return '' + n;
+  }
+
+  function roundRect(x, y, w, h, rad){
+    if (w < 2*rad) rad = w/2; if (h < 2*rad) rad = h/2;
+    ctx.beginPath();
+    ctx.moveTo(x + rad, y);
+    ctx.arcTo(x + w, y, x + w, y + h, rad);
+    ctx.arcTo(x + w, y + h, x, y + h, rad);
+    ctx.arcTo(x, y + h, x, y, rad);
+    ctx.arcTo(x, y, x + w, y, rad);
+    ctx.closePath();
+  }
+
+  // draw a schematic matrix as an outlined block with a light interior grid.
+  // fill = interior color, edge = border color, cols/rows = how many grid lines to hint.
+  function matBlock(x, y, w, h, fill, edge, cols, rows, label, sub){
+    ctx.fillStyle = fill;
+    roundRect(x, y, w, h, 5); ctx.fill();
+    ctx.strokeStyle = edge; ctx.lineWidth = 1.5; roundRect(x, y, w, h, 5); ctx.stroke();
+    // interior grid hint (kept sparse so it reads at any size)
+    ctx.strokeStyle = edge; ctx.globalAlpha = 0.28; ctx.lineWidth = 1;
+    var cc = Math.min(cols, 10), rr = Math.min(rows, 10), i;
+    for (i=1;i<cc;i++){ var gx = x + w*i/cc; ctx.beginPath(); ctx.moveTo(gx, y+2); ctx.lineTo(gx, y+h-2); ctx.stroke(); }
+    for (i=1;i<rr;i++){ var gy = y + h*i/rr; ctx.beginPath(); ctx.moveTo(x+2, gy); ctx.lineTo(x+w-2, gy); ctx.stroke(); }
+    ctx.globalAlpha = 1;
+    // label
+    ctx.fillStyle = edge; ctx.font = '600 14px ' + cssv('--mono','monospace'); ctx.textAlign = 'center';
+    ctx.fillText(label, x + w/2, y + h/2 + 2);
+    if (sub){ ctx.fillStyle = C.mute; ctx.font = '10px ' + cssv('--mono','monospace'); ctx.fillText(sub, x + w/2, y + h + 14); }
+    ctx.textAlign = 'left';
+  }
+
+  function draw(){
+    var d = +document.getElementById('lora-d').value;
+    var r = +document.getElementById('lora-r').value;
+    if (r > d) r = d;
+
+    // KPIs
+    var trainable = 2 * d * r;
+    var full = d * d;
+    var pct = 100 * trainable / full;      // = 200*r/d
+    var comp = full / trainable;           // = d/(2r)
+    document.getElementById('lora-kpi-tr').textContent = fmt(trainable);
+    document.getElementById('lora-kpi-full').textContent = fmt(full);
+    document.getElementById('lora-kpi-pct').textContent = (pct < 1 ? pct.toFixed(2) : pct.toFixed(1)) + '%';
+    document.getElementById('lora-kpi-comp').textContent = comp.toFixed(comp < 10 ? 1 : 0) + '×';
+    document.getElementById('lora-kpi-init').textContent = '0 (B=0)';
+
+    var dpr = window.devicePixelRatio || 1;
+    var rect = cv.getBoundingClientRect();
+    cv.width = Math.max(1, rect.width) * dpr; cv.height = Math.max(1, rect.height) * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    var W = rect.width, H = rect.height;
+    ctx.clearRect(0, 0, W, H);
+    ctx.textBaseline = 'alphabetic';
+
+    // header
+    ctx.fillStyle = C.mute; ctx.font = '11px ' + cssv('--mono','monospace'); ctx.textAlign = 'left';
+    ctx.fillText('frozen W  (d×d, greyed — never updated)   +   trainable ΔW = A·B  through a rank-r waist', 12, 18);
+
+    // geometry: a big square for W on the left; A (tall, width∝r) and B (wide, height∝r) on the right.
+    var top = 42, bottom = H - 30;
+    var side = Math.min(bottom - top, (W - 40) * 0.42);   // W is a square
+    side = Math.max(120, side);
+    var wx = 16, wy = top + ((bottom - top) - side) / 2;
+
+    // frozen W
+    matBlock(wx, wy, side, side, '#eef1f6', C.mute, 10, 10, 'W', 'd × d  = ' + fmt(full));
+    // a small "frozen" tag
+    ctx.fillStyle = C.mute; ctx.font = '10px ' + cssv('--mono','monospace'); ctx.textAlign = 'left';
+    ctx.fillText('❄ frozen', wx + 6, wy + 14);
+
+    // plus sign
+    var plusX = wx + side + 26;
+    ctx.fillStyle = C.text; ctx.font = '600 22px ' + cssv('--mono','monospace'); ctx.textAlign = 'center';
+    ctx.fillText('+', plusX, wy + side/2 + 8);
+
+    // right side: A · B laid out to echo (d×r)(r×d).
+    // waist width r maps to a strip thickness; clamp so r=1 is visible and r=d is a full square.
+    var rightX = plusX + 22;
+    var rightW = W - rightX - 16;
+    if (rightW < 150) rightW = 150;
+    // A is (d × r): tall, height = side, width ∝ r ; B is (r × d): wide, width = side region, height ∝ r
+    var strip = Math.max(10, Math.min(side * 0.42, (side * r / d) )); // r as a fraction of d, but keep visible
+    // ensure the r=1 case is legible
+    if (strip < 14) strip = 14;
+
+    var aW = strip, aH = side;
+    var ax = rightX, ay = wy;
+    // B sits to the right of A, its height is the waist, its width fills the remaining block up to ~side
+    var bW = Math.min(side, rightW - aW - 46);
+    if (bW < 70) bW = 70;
+    var bH = strip;
+    var bx = ax + aW + 30;
+    var by = wy + (side - bH) / 2;
+
+    // A (trainable, accent) — the up-projection
+    matBlock(ax, ay, aW, aH, '#e7effe', C.accent, Math.max(1, Math.round(r/2)), 10, 'A', 'd × r');
+    // multiply dot
+    ctx.fillStyle = C.text; ctx.font = '600 18px ' + cssv('--mono','monospace'); ctx.textAlign = 'center';
+    ctx.fillText('·', ax + aW + 15, wy + side/2 + 6);
+    // B (init 0, drawn hollow/dashed to signal ΔW=0 at start) — the down-projection
+    ctx.fillStyle = '#fbfbfd';
+    roundRect(bx, by, bW, bH, 5); ctx.fill();
+    ctx.save();
+    ctx.setLineDash([5,4]); ctx.strokeStyle = C.accent2; ctx.lineWidth = 1.5;
+    roundRect(bx, by, bW, bH, 5); ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = C.accent2; ctx.font = '600 14px ' + cssv('--mono','monospace'); ctx.textAlign = 'center';
+    ctx.fillText('B = 0', bx + bW/2, by + bH/2 + 4);
+    ctx.fillStyle = C.mute; ctx.font = '10px ' + cssv('--mono','monospace');
+    ctx.fillText('r × d', bx + bW/2, by + bH + 14);
+
+    // the waist annotation: bracket the width r on A
+    ctx.strokeStyle = C.purple; ctx.lineWidth = 1.5;
+    var brY = ay - 8;
+    ctx.beginPath(); ctx.moveTo(ax, brY); ctx.lineTo(ax + aW, brY); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(ax, brY-4); ctx.lineTo(ax, brY+4); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(ax+aW, brY-4); ctx.lineTo(ax+aW, brY+4); ctx.stroke();
+    ctx.fillStyle = C.purple; ctx.font = '600 11px ' + cssv('--mono','monospace'); ctx.textAlign = 'center';
+    ctx.fillText('r = ' + r, ax + aW/2, brY - 6);
+
+    // bottom caption: the parameter comparison, drawn as two proportional bars
+    var capY = bottom + 6;
+    ctx.textAlign = 'left'; ctx.fillStyle = C.mute; ctx.font = '11px ' + cssv('--mono','monospace');
+    // (kept short; full numbers are in the KPIs)
+    ctx.fillText('trainable ' + fmt(trainable) + '  vs  full ' + fmt(full) + '   (' + (pct<1?pct.toFixed(2):pct.toFixed(1)) + '%,  ' + comp.toFixed(comp<10?1:0) + '× smaller)', 12, capY + 4);
+  }
+
+  document.getElementById('lora-d').addEventListener('input', function(){
+    document.getElementById('lora-d-v').textContent = this.value;
+    draw();
+  });
+  document.getElementById('lora-r').addEventListener('input', function(){
+    document.getElementById('lora-r-v').textContent = this.value;
+    draw();
+  });
+  window.addEventListener('resize', draw);
+  draw();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>

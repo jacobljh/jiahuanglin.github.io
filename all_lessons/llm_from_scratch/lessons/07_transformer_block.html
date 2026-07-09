@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>07 · The transformer block — norm, GELU, residuals</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* lesson-specific layout only — do not redefine shared classes */
+  .blk-cols { display: grid; grid-template-columns: 1fr; gap: 16px; }
+  #stab-canvas { width: 100%; height: 300px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; display: block; }
+  #split-canvas { width: 100%; height: 96px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; display: block; margin-top: 14px; }
+  .toggle-on { background: var(--ok); color: #fff; border-color: var(--ok); }
+  .toggle-on:hover { background: #15a34a; }
+  .block-svg { max-width: 520px; margin: 14px auto; }
+  .block-svg .box { fill: var(--bg-elev); stroke: var(--border); stroke-width: 1; }
+  .block-svg .box.attn { fill: #ecebff; stroke: var(--purple, #7c3aed); }
+  .block-svg .box.ff { fill: #fff4e6; stroke: var(--accent-2); }
+  .block-svg .box.norm { fill: #eef4ff; stroke: var(--accent); }
+  .block-svg .box.add { fill: #e9f7ee; stroke: var(--ok); }
+  .block-svg text { font-family: var(--mono); font-size: 11px; fill: var(--text); }
+  .block-svg .flow { stroke: var(--text-dim); stroke-width: 1.4; fill: none; }
+  .block-svg .flow.skip { stroke: var(--ok); stroke-width: 1.6; stroke-dasharray: 4 3; }
+  .block-svg .lbl { fill: var(--text-mute); font-size: 10px; }
+</style>
+</head>
+<body>
+
+<header class="topnav"><div class="inner"><a class="crumb-link" href="index.html">llm_from_scratch / lessons</a><span class="crumb">/</span><span class="crumb">07 · transformer block</span><span class="step-pill">lesson 8 / 16</span></div></header>
+
+<main>
+
+<p class="kicker">Part III — The GPT</p>
+<h1>The transformer block — norm, GELU, residuals</h1>
+<p class="subtitle">Lesson 06 finished attention: a causal, multi-head layer that lets each token gather information from every earlier token, in several views at once. But look closely at what it does — and does not — do. It <em>mixes</em> vectors across positions with weighted sums; it never pushes a single token's vector through a nonlinear transform of its own, and if you naively stack a dozen of these layers the whole thing refuses to train. This lesson wraps attention in the three pieces that fix both problems and turn it into a unit you can stack: a feed-forward MLP, LayerNorm, and residual shortcuts.</p>
+
+<div class="callout source-note"><div class="label">What the last step left broken</div>Attention is entirely <em>linear per token</em>: every output vector is a weighted average of value vectors, and averaging can never introduce the nonlinear, per-position computation a language model needs (to decide, feature by feature, "given this blended context, what should this position now represent?"). Worse, depth itself is hostile. Stack many layers and two things go wrong at once: the scale of the activations drifts — growing or shrinking layer by layer until the numbers are unusable — and the gradient that has to travel back to the earliest layers shrinks toward zero, so those layers never learn. A raw deep stack of attention layers is not just weak; it is untrainable.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> attention (06) only mixes information across positions with weighted averages — it does no per-position nonlinear work, and a naive deep stack of it neither holds its activation scale nor passes gradient back to its early layers.<br><strong>New idea:</strong> wrap attention into a reusable <em>block</em>. A feed-forward MLP (<span class="math">d → 4d →</span> GELU <span class="math">→ d</span>) does the nonlinear, per-position processing; <strong>LayerNorm</strong> standardizes each token vector so activations cannot drift; and <strong>residual shortcuts</strong> (<span class="math">x = x + sublayer(LN(x))</span>) leave a clean identity path so gradients reach the bottom. The block maps <span class="math">(B,T,d) → (B,T,d)</span> unchanged.<br><strong>Forces next:</strong> one block is shallow, and it still outputs <em>vectors</em>, not text. Lesson 08 stacks <span class="math">L</span> of these blocks, caps them with a final norm and a head that returns to the vocabulary, and runs the generation loop for real.</div>
+
+<div class="callout"><div class="label">The plan</div>Four moves. (1) Add the per-position MLP attention lacks — and derive why it widens to <span class="math">4d</span>, why GELU rather than ReLU, and why it holds two-thirds of the block's parameters. (2) See depth break in two ways and fix each: LayerNorm for drifting activations, residual shortcuts for vanishing gradients. (3) Settle where the norm goes — <em>inside</em> the branch (pre-norm), and why that trains without warmup. (4) Assemble the full block as two pre-norm residual sublayers, then drive a depth stack to watch it live or die.</div>
+
+<h2>1 · The piece attention is missing: a per-position MLP</h2>
+
+<p>Re-read the attention output from lesson 06 with a skeptical eye. For each position it returns <span class="math">z<sub>i</sub> = Σ<sub>j</sub> α<sub>ij</sub> v<sub>j</sub></span> — a <em>weighted average</em> of value vectors. Averaging is a linear operation. Stack two attention layers and, between the softmaxes, you are still only ever taking linear combinations of linear projections; there is no place where a token's own vector is bent through a nonlinearity. Attention answers "<em>whom</em> should I listen to?" brilliantly, but it never answers "<em>now that I have listened, what should I compute?</em>" That second question is per-position work, and it needs its own module.</p>
+
+<p>The module is a small two-layer neural network — a feed-forward MLP — applied to <strong>each token vector independently and identically</strong>. It expands the vector to a wider hidden space, applies a nonlinearity, and contracts it back:</p>
+
+<div class="math block">FFN(x) = W<sub>2</sub> · GELU(W<sub>1</sub> x + b<sub>1</sub>) + b<sub>2</sub> &nbsp;&nbsp;&nbsp; where &nbsp; W<sub>1</sub> : (d → 4d), &nbsp; W<sub>2</sub> : (4d → d)</div>
+
+<pre><code>class FeedForward:            # applied to every position, same weights
+    W1 = Linear(d,   4*d)     # expand:  768 -> 3072
+    act = GELU()              # the nonlinearity
+    W2 = Linear(4*d, d)       # contract: 3072 -> 768
+    forward(x) = W2(act(W1(x)))</code></pre>
+
+<h3>Why widen to 4d?</h3>
+<p>The expansion is where the nonlinear computation happens. A nonlinearity applied directly at width <span class="math">d</span> can only carve <span class="math">d</span> features; projecting up to <span class="math">4d</span> first gives GELU a much larger space to bend, letting the layer represent far richer per-position functions before compressing the result back down to the residual width. The factor <span class="math">4×</span> is the convention GPT-2 and most transformers use — big enough to add real capacity, small enough to stay affordable. The contraction back to <span class="math">d</span> is mandatory, not optional: the block must return a <span class="math">(B,T,d)</span> tensor of the same shape it received, or it could not be stacked (§4).</p>
+
+<h3>Why GELU, not ReLU?</h3>
+<p>The classic choice is ReLU — <span class="math">max(0, x)</span> — which hard-clips every negative input to exactly zero. That has a nasty side effect: any neuron pushed slightly negative gets a gradient of exactly zero and stops learning (a "dead" unit), and the function has a sharp corner at the origin that makes optimization bumpier. GELU (Gaussian Error Linear Unit) is a smooth gate instead: it multiplies the input by the probability that a standard-normal draw falls below it,</p>
+
+<div class="math block">GELU(x) = x · Φ(x) &nbsp;≈&nbsp; 0.5 · x · (1 + tanh[ √(2/π) · (x + 0.044715 · x³) ])</div>
+
+<p>where <span class="math">Φ</span> is the standard-normal CDF. (GPT-2 was trained with exactly this tanh approximation, so we match it.) The payoff is a curve that is smooth everywhere and, crucially, has a <em>small nonzero gradient for almost all negative inputs</em> — it only fully zeroes out near <span class="math">x ≈ −0.75</span>. So a neuron nudged negative can still recover and contribute, and the smooth shape gives the optimizer cleaner slopes to follow. It is one of the small, quiet changes that make deep transformers train more reliably than they would with ReLU.</p>
+
+<div class="callout"><div class="label">The MLP is where the model remembers</div>Count the weights. Attention's four projections (<span class="math">W<sub>q</sub>, W<sub>k</sub>, W<sub>v</sub>, W<sub>o</sub></span>), each <span class="math">d×d</span>, total <span class="math">4d²</span>. The MLP's two matrices are <span class="math">d×4d</span> and <span class="math">4d×d</span>, totalling <span class="math">8d²</span> — <em>twice</em> attention, about two-thirds of every block. Attention is the cheap router that decides what to read; the fat MLP is where most of the block's learned knowledge actually lives — a large per-position lookup that turns "here is my blended context" into "here is what I now am." When people say a transformer stores facts in its feed-forward layers, this <span class="math">8d²</span> is what they mean.</div>
+
+<h2>2 · Depth breaks two ways</h2>
+
+<p>Now try to make the network deep — which we must, since one block is far too shallow to model language. Two independent failures appear, and each has its own fix.</p>
+
+<h3>Failure A: activations drift → LayerNorm</h3>
+<p>Every sublayer transforms its input, and the statistics of the output almost never match the input. Feed a layer a batch of vectors with some mean and variance and its outputs land at a different mean and variance; the next layer shifts them again. Over a dozen layers the scale can snowball toward huge values or collapse toward zero, and softmax, GELU, and the gradients all misbehave outside their healthy range. The training dynamics become unstable and the loss struggles to fall.</p>
+
+<p>The fix is <strong>LayerNorm</strong>: before a sublayer acts, standardize each token vector <em>across its own feature dimension</em> so it has mean 0 and variance 1, then re-scale and shift it with two learned vectors <span class="math">γ</span> (scale) and <span class="math">β</span> (shift):</p>
+
+<div class="math block">LN(x) = γ ⊙ (x − μ) / √(σ² + ε) + β &nbsp;&nbsp;&nbsp; μ, σ² computed over the d features of that one token</div>
+
+<pre><code>class LayerNorm:
+    gamma = ones(d)                          # learned scale
+    beta  = zeros(d)                         # learned shift
+    eps   = 1e-5                             # keeps the denom finite
+    forward(x):
+        mu  = mean(x, axis=features)         # per-token, over the d dims
+        var = var(x,  axis=features)         # biased (÷ n), GPT-2 style
+        return gamma * (x - mu)/sqrt(var+eps) + beta</code></pre>
+
+<p>Three details earn their place. Normalization is over the <em>feature</em> axis (each token independently), <strong>not</strong> the batch axis — so it behaves identically whether the batch has 1 sequence or 1,000, which is exactly what a language model needs. The <span class="math">ε</span> guards against dividing by zero when a vector is nearly constant. And <span class="math">γ, β</span> restore expressive freedom: forcing every vector to unit variance would be too rigid, so the model is allowed to learn the scale and offset that actually help — including, if it wants, to partly undo the normalization. (We use the biased variance, dividing by <span class="math">n</span> rather than <span class="math">n−1</span>, to match GPT-2's implementation so pretrained weights drop in cleanly later.)</p>
+
+<h3>Failure B: gradients vanish → residual shortcuts</h3>
+<p>The second failure is about the backward pass. In a plain deep stack, the gradient reaching layer <span class="math">ℓ</span> is a long product of the per-layer Jacobians above it. If those factors are even slightly below 1 on average, their product shrinks geometrically, and by the time the signal reaches the first few layers it is effectively zero — the <em>vanishing gradient problem</em>. The book makes this vivid with a five-layer toy net: without shortcuts the mean gradient at the input layer is about <span class="math">0.0002</span>, four orders of magnitude smaller than at the top; the early layers simply do not learn.</p>
+
+<p>The fix is the <strong>residual (shortcut / skip) connection</strong>: instead of replacing the input with the sublayer's output, <em>add</em> the sublayer's output to the input.</p>
+
+<div class="math block">x<sub>out</sub> = x + f(x) &nbsp;&nbsp;&nbsp;(instead of&nbsp; x<sub>out</sub> = f(x))</div>
+
+<p>Each sublayer now computes only a <em>correction</em> to the running vector — the "residual stream" that flows straight up the network. The backward consequence is the whole point: differentiating <span class="math">x + f(x)</span> gives <span class="math">1 + f'(x)</span>, so there is always a clean <strong>+1</strong> term — an identity highway — through which gradient flows to the bottom undiminished, no matter how small <span class="math">f'</span> becomes. Add shortcuts to that same toy net and the input-layer gradient jumps from <span class="math">0.0002</span> to around <span class="math">0.22</span>: the early layers come alive. Residual connections are what make depth trainable at all.</p>
+
+<div class="callout warn"><div class="label">The trap</div>The shortcut only works if the correction has the <em>same shape</em> as the vector it is added to — which is exactly why the MLP must contract back from <span class="math">4d</span> to <span class="math">d</span>, and why every sublayer in the block preserves the width <span class="math">d</span>. Break the shape and you cannot add the residual; keep it and the identity path is free.</div>
+
+<h2>3 · Where the norm goes: pre-norm vs post-norm</h2>
+
+<p>LayerNorm and the residual can be wired in two orders, and the choice matters more than it looks. The original 2017 transformer put the norm <em>after</em> the sublayer and the addition — <strong>post-norm</strong>: <span class="math">x = LN(x + f(x))</span>. GPT-2 and essentially every modern LLM put the norm <em>inside</em> the branch, before the sublayer, leaving the residual addition un-normalized — <strong>pre-norm</strong>:</p>
+
+<div class="math block">post-norm: &nbsp; x = LN( x + f(x) ) &nbsp;&nbsp;&nbsp;&nbsp; pre-norm: &nbsp; x = x + f( LN(x) )</div>
+
+<p>The difference is what sits on the residual highway. In pre-norm the raw <span class="math">x</span> passes to the next layer completely untouched — the identity path is truly clean, so the <strong>+1</strong> gradient term survives all the way down. In post-norm every addition is immediately squashed by a LayerNorm, which repeatedly rescales the residual stream and re-introduces the shrinking-product problem the shortcut was meant to solve. The practical result: post-norm transformers need a careful learning-rate <em>warmup</em> and are finicky to train deep, while pre-norm transformers train stably from step one without warmup. That is why we normalize inside the branch. Everything below uses pre-norm.</p>
+
+<h2>4 · The full block</h2>
+
+<p>Assemble the pieces. A transformer block is <strong>two pre-norm residual sublayers</strong> stacked in series: first causal multi-head attention (the cross-position mixer from 06), then the feed-forward MLP (the per-position processor from §1). A dropout sits on each branch for regularization. Each sublayer follows the identical template <span class="math">x = x + dropout(sublayer(LN(x)))</span>:</p>
+
+<pre><code>class TransformerBlock:
+    attn  = CausalMultiHeadAttention(d, heads, ...)   # from lesson 06
+    ff    = FeedForward(d)                             # from section 1
+    norm1 = LayerNorm(d);  norm2 = LayerNorm(d)
+    drop  = Dropout(p)
+
+    forward(x):                       # x : (B, T, d)
+        x = x + drop(attn(norm1(x)))  # sublayer 1: mix across positions
+        x = x + drop(ff(  norm2(x)))  # sublayer 2: transform per position
+        return x                      # -> (B, T, d), same shape</code></pre>
+
+<svg class="diagram block-svg" viewBox="0 0 380 430" role="img" aria-label="Transformer block: input flows through a LayerNorm-attention-add residual sublayer, then a LayerNorm-feedforward-add residual sublayer; two skip connections carry the input around each sublayer.">
+  <!-- residual stream backbone -->
+  <line class="flow" x1="120" y1="410" x2="120" y2="30" marker-end="url(#ah)"/>
+  <defs>
+    <marker id="ah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--text-dim)"/></marker>
+    <marker id="ahs" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="var(--ok)"/></marker>
+  </defs>
+
+  <!-- input -->
+  <text x="120" y="422" text-anchor="middle" class="lbl">x  (B, T, d)  — input embeddings</text>
+
+  <!-- sublayer 1: attention -->
+  <rect class="box norm" x="60" y="352" width="120" height="26" rx="5"/>
+  <text x="120" y="369" text-anchor="middle">LayerNorm 1</text>
+  <rect class="box attn" x="45" y="312" width="150" height="30" rx="5"/>
+  <text x="120" y="331" text-anchor="middle">Masked multi-head attn</text>
+  <rect class="box add" x="95" y="276" width="50" height="24" rx="12"/>
+  <text x="120" y="292" text-anchor="middle">+</text>
+  <!-- skip 1 -->
+  <path class="flow skip" d="M120,398 C210,398 235,320 235,288 C235,288 160,288 148,288" marker-end="url(#ahs)"/>
+  <text x="246" y="345" class="lbl" transform="rotate(90 246 345)">shortcut</text>
+
+  <!-- sublayer 2: feed-forward -->
+  <rect class="box norm" x="60" y="212" width="120" height="26" rx="5"/>
+  <text x="120" y="229" text-anchor="middle">LayerNorm 2</text>
+  <rect class="box ff" x="45" y="164" width="150" height="38" rx="5"/>
+  <text x="120" y="180" text-anchor="middle">Feed forward</text>
+  <text x="120" y="194" text-anchor="middle" class="lbl">d→4d · GELU · 4d→d</text>
+  <rect class="box add" x="95" y="128" width="50" height="24" rx="12"/>
+  <text x="120" y="144" text-anchor="middle">+</text>
+  <!-- skip 2 -->
+  <path class="flow skip" d="M120,258 C210,258 235,172 235,140 C235,140 160,140 148,140" marker-end="url(#ahs)"/>
+  <text x="246" y="200" class="lbl" transform="rotate(90 246 200)">shortcut</text>
+
+  <!-- output -->
+  <text x="120" y="20" text-anchor="middle" class="lbl">→ (B, T, d)  — same shape, stackable</text>
+</svg>
+
+<p>The signature is the headline: <strong><span class="math">(B, T, d) → (B, T, d)</span></strong>. The block re-encodes each token's vector to fold in context and per-position computation, but it does not change the sequence length or the width. That invariance is exactly what makes the block a <em>Lego brick</em> — because the output is shape-compatible with the input, you can feed a block's output straight into another block, and another, with nothing to adjust between them. GPT-2 small stacks this block 12 times; the 1.5-billion-parameter GPT-2 stacks the same brick 48 times. Building the block right is building the whole model minus its two end-caps, which is precisely lesson 08's job.</p>
+
+<h2>5 · Watch depth live or die</h2>
+
+<p>The widget runs a deterministic deep stack of <span class="math">L</span> toy layers and tracks two numbers as the signal moves up: the <strong>activation magnitude</strong> at each layer (forward pass) and a proxy for the <strong>gradient reaching layer 0</strong> (backward pass). Each toy layer multiplies by a fixed factor slightly off from 1 and adds a fixed nonlinearity — no randomness, just the geometric-product effect that real depth suffers. Toggle <strong>residual</strong> and <strong>LayerNorm</strong> independently. With <em>neither</em>, watch the activation curve explode or vanish and the layer-0 gradient collapse to ~0 (the stack is dead). Turn on <em>LayerNorm</em> and the forward curve flattens; turn on <em>residual</em> and the gradient reaches the bottom. With <em>both</em> — the real block — the stack stays healthy at any depth. The bar underneath shows the per-block parameter split: attention <span class="math">4d²</span> versus MLP <span class="math">8d²</span>.</p>
+
+<div class="widget" id="stab-widget">
+  <div class="title">Block stability lab</div>
+  <div class="hint">Proves that LayerNorm + residual are what make depth <em>trainable</em>: remove them and a deep stack's activations blow up or vanish and no gradient reaches layer 0. Add them and the stack stays flat at any depth. The bar shows why the MLP (<span class="math">8d²</span>) holds two-thirds of a block's parameters.</div>
+
+  <div class="controls">
+    <button type="button" id="stab-res" class="primary toggle-on">Residual : ON</button>
+    <button type="button" id="stab-ln" class="primary toggle-on">LayerNorm : ON</button>
+    <label class="inline">depth L: <input type="range" id="stab-L" min="1" max="48" step="1" value="24"> <span class="val" id="stab-L-v">24</span></label>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">activation norm @ layer L</div><div class="v" id="stab-kpi-act">—</div></div>
+    <div class="kpi"><div class="k">gradient reaching layer 0</div><div class="v" id="stab-kpi-grad">—</div></div>
+    <div class="kpi"><div class="k">trainable?</div><div class="v" id="stab-kpi-ok">—</div></div>
+    <div class="kpi"><div class="k">params / block (d=768)</div><div class="v" id="stab-kpi-par">—</div></div>
+  </div>
+
+  <canvas id="stab-canvas"></canvas>
+  <canvas id="split-canvas"></canvas>
+</div>
+
+<h2>Failure modes &amp; checklist</h2>
+
+<div class="lesson-grid">
+  <div class="lesson-card"><h3>Failure modes</h3><ul>
+    <li><strong>No residual connections.</strong> Gradient to early layers vanishes geometrically; the bottom of the stack never learns. <em>Signal:</em> deeper models train no better — or worse — than shallow ones, and layer-0 gradients are ~0.</li>
+    <li><strong>No normalization.</strong> Activation scale drifts up or down layer by layer until softmax/GELU saturate; loss is unstable or stuck. </li>
+    <li><strong>Post-norm without warmup.</strong> Normalizing after the addition squashes the residual highway and destabilizes deep training; pre-norm avoids it.</li>
+    <li><strong>MLP that doesn't contract to <span class="math">d</span>.</strong> The residual add fails (shape mismatch) and the block can't be stacked.</li>
+    <li><strong>Normalizing over the batch axis.</strong> LayerNorm must reduce over features per token, or behavior changes with batch size.</li>
+  </ul></div>
+  <div class="lesson-card"><h3>Checklist</h3><ul>
+    <li>FeedForward is <span class="math">d → 4d →</span> GELU <span class="math">→ d</span> (expand, nonlinearity, contract).</li>
+    <li>LayerNorm reduces over the <em>feature</em> dim, with learned <span class="math">γ, β</span> and an <span class="math">ε</span>.</li>
+    <li>Every sublayer is wrapped as <span class="math">x = x + sublayer(LN(x))</span> (pre-norm residual).</li>
+    <li>Two sublayers per block: causal MHA first, then the MLP.</li>
+    <li>Output shape equals input shape, <span class="math">(B,T,d)</span> — the block stacks unchanged.</li>
+  </ul></div>
+</div>
+
+<h2>Checkpoint</h2>
+<div class="callout"><div class="label">Try it</div>Set depth <span class="math">L</span> to 48 (GPT-2 XL's depth) and turn <strong>both</strong> toggles OFF. Watch the activation-norm curve run away (or crash) and the "gradient reaching layer 0" read essentially 0 — the stack is untrainable. Now turn <strong>LayerNorm ON</strong> only: the forward curve flattens, but the layer-0 gradient is still tiny. Turn <strong>residual ON</strong> too: the gradient climbs back to a healthy value and "trainable?" flips to yes. You have just isolated the two independent failures of depth and seen that each fix cures exactly one. Which of the two — norm or residual — is the one that repairs the <em>backward</em> pass?</div>
+
+<h2>Where this points next</h2>
+
+<p>You now hold the transformer block: a self-contained unit that mixes context (attention), transforms each position (the GELU MLP), and — thanks to LayerNorm and residual shortcuts wired pre-norm — stays stable and trainable no matter how deep the stack. But a single block is shallow, and its output is still a tensor of <span class="math">d</span>-dimensional vectors, not a next-token prediction. Two things are missing: <strong>depth</strong> (stack <span class="math">L</span> blocks) and <strong>a way back to words</strong> (a final norm and a linear head that maps each vector to <span class="math">V</span> logits over the vocabulary). Add those and run the autoregressive loop from lesson 00 for real. That is lesson 08, <a href="08_gpt_and_generation.html">Assembling GPT &amp; generating text</a>, where the brick becomes a model.</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>A transformer block wraps attention into a stackable unit by adding what attention lacks. A feed-forward MLP (<span class="math">d → 4d →</span> GELU <span class="math">→ d</span>) does the per-position nonlinear work attention's weighted averages cannot, and it holds ~two-thirds of the block's parameters (<span class="math">8d²</span> vs attention's <span class="math">4d²</span>) — the model's main store of knowledge. Depth then breaks two independent ways and each has one fix: activations drift, cured by <strong>LayerNorm</strong> (standardize each token's features to mean 0/var 1, then learned <span class="math">γ, β</span>); gradients vanish, cured by <strong>residual shortcuts</strong> (<span class="math">x = x + f(x)</span>, whose <strong>+1</strong> derivative is a clean gradient highway). Wire the norm <em>inside</em> the branch — pre-norm, <span class="math">x = x + sublayer(LN(x))</span> — so the residual path stays clean and the model trains without warmup. The finished block is two such sublayers (causal MHA, then MLP) and maps <span class="math">(B,T,d) → (B,T,d)</span>, so it stacks.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+  <li>What can the feed-forward MLP do that attention cannot, and where do most of a block's parameters live? <em>(§1 — the MLP does nonlinear, per-position work (attention only takes linear weighted averages across positions), and it holds the bulk of the weights — <span class="math">8d²</span> vs attention's <span class="math">4d²</span> — acting as the block's memory while attention is the cheaper router.)</em></li>
+  <li>Why does the MLP expand to <span class="math">4d</span> and then contract? <em>(§1 — the wide hidden space gives the nonlinearity room to represent richer per-position functions; the contraction restores width <span class="math">d</span> so the residual add and stacking work.)</em></li>
+  <li>Why GELU instead of ReLU? <em>(§1 — GELU is smooth and keeps a small nonzero gradient for almost all negative inputs, so neurons don't "die"; GPT-2 used its tanh approximation.)</em></li>
+  <li>Name the two ways depth breaks and the fix for each. <em>(§2 — activations drift in scale → LayerNorm; gradients vanish backward → residual shortcuts. Each cures one failure.)</em></li>
+  <li>How does a residual connection help the backward pass? <em>(§2 — <span class="math">x + f(x)</span> differentiates to <span class="math">1 + f'(x)</span>; the constant <strong>+1</strong> is an identity path that carries gradient to early layers regardless of <span class="math">f'</span>.)</em></li>
+  <li>What is pre-norm vs post-norm, and why prefer pre-norm? <em>(§3 — pre-norm normalizes inside the branch (<span class="math">x + f(LN(x))</span>) leaving a clean residual highway that trains stably without warmup; post-norm (<span class="math">LN(x+f(x))</span>) squashes the highway and is finicky at depth.)</em></li>
+  <li>What is the input/output shape of a block and why does it matter? <em>(§4 — <span class="math">(B,T,d) → (B,T,d)</span>; shape invariance is what lets identical blocks stack with nothing to adjust between them.)</em></li>
+</ul>
+
+<footer class="lesson-nav">
+  <a href="06_causal_multihead.html"><span class="dir">← Back</span><span class="ttl">06 · Causal &amp; multi-head attention</span></a>
+  <a class="next" href="08_gpt_and_generation.html"><span class="dir">Next →</span><span class="ttl">08 · Assembling GPT &amp; generating text</span></a>
+</footer>
+
+<p style="font-size:13px; color:var(--text-mute); margin-top:18px;">Companion reads: <a href="../../cs336/lessons/02_transformer.html">cs336 · 02 The Transformer</a> derives pre-norm and counts the block's parameters and FLOPs in detail; <a href="../../gpt_mini/lessons/01_architecture.html">gpt_mini · 01 Architecture</a> shows this exact block as runnable code.</p>
+
+</main>
+
+<script>
+(function(){
+  var cv = document.getElementById('stab-canvas');
+  var sp = document.getElementById('split-canvas');
+  if (!cv || !sp) return;
+  var ctx = cv.getContext('2d');
+  var sctx = sp.getContext('2d');
+
+  function cssv(name, fb){ try { var v = getComputedStyle(document.documentElement).getPropertyValue(name); return (v && v.trim()) || fb; } catch(e){ return fb; } }
+  var C = {
+    accent: cssv('--accent','#2563eb'), accent2: cssv('--accent-2','#d97706'),
+    ok: cssv('--ok','#16a34a'), bad: cssv('--bad','#dc2626'), purple: cssv('--purple','#7c3aed'),
+    mute: cssv('--text-mute','#5b6573'), dim: cssv('--text-dim','#94a3b8'), text: cssv('--text','#1f2430'),
+    border: cssv('--border','#dde2ea')
+  };
+
+  var resOn = true, lnOn = true;
+
+  // deterministic toy stack: fixed factors only, no RNG and no clock reads
+  // Each layer applies a fixed transform. Without residual/LN, activations
+  // follow a geometric drift (factor != 1) and the backward gradient is a
+  // product of per-layer factors -> vanishes. Residual injects a +1 identity
+  // path (gradient stays ~1); LayerNorm re-standardizes activations to ~1.
+  var GROW = 1.18;   // per-layer forward gain when unnormalized (>1 => explode)
+  var GJAC = 0.62;   // per-layer backward Jacobian factor (<1 => vanish)
+
+  function simulate(L){
+    var act = [], grad = [], a = 1.0, i;
+    // forward: activation magnitude per layer
+    for (i=1;i<=L;i++){
+      if (lnOn){
+        // LayerNorm forces each token vector back to ~unit scale every layer;
+        // a small residual bump keeps it just above 1 when residual is on.
+        a = resOn ? 1.06 : 1.0;
+      } else if (resOn){
+        // residual accumulates corrections: linear-ish growth, not explosive
+        a = a + (GROW - 1.0) * 0.55;
+      } else {
+        // raw stack: geometric explosion
+        a = a * GROW;
+      }
+      act.push(a);
+    }
+    // backward: gradient magnitude reaching layer 0 (product from top down)
+    // residual => each factor is (1 + small) ~ identity highway => stays ~1
+    // no residual => each factor ~ GJAC (or GLN with norm) => geometric vanish
+    var g = 1.0, per = resOn ? 0.995 : (lnOn ? 0.90 : GJAC);
+    for (i=0;i<L;i++){ grad.push(g); g = g * per; }
+    grad.push(g); // value that "reaches" layer 0
+    return { act: act, gradSeries: grad.slice(0,L), grad0: g };
+  }
+
+  function fmt(x){
+    if (x === 0) return '0';
+    var ax = Math.abs(x);
+    if (ax >= 1e4 || ax < 1e-3) return x.toExponential(1);
+    if (ax >= 100) return x.toFixed(0);
+    if (ax >= 1) return x.toFixed(2);
+    return x.toFixed(3);
+  }
+
+  function drawStack(){
+    var L = +document.getElementById('stab-L').value;
+    var res = simulate(L);
+
+    var dpr = window.devicePixelRatio || 1;
+    var r = cv.getBoundingClientRect();
+    cv.width = Math.max(1,r.width)*dpr; cv.height = Math.max(1,r.height)*dpr;
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    var W = r.width, H = r.height;
+    ctx.clearRect(0,0,W,H);
+
+    var padL = 46, padR = 16, padT = 26, padB = 34;
+    var plotW = W - padL - padR, plotH = H - padT - padB;
+
+    // log-scale y for activation (can span many orders); clamp for display
+    var acts = res.act;
+    var maxA = 1, minA = 1, i;
+    for (i=0;i<acts.length;i++){ if (acts[i] > maxA) maxA = acts[i]; if (acts[i] < minA) minA = acts[i]; }
+    var loHi = Math.max(maxA, 1/Math.max(minA,1e-9), 4);
+    function yAct(v){
+      // symmetric log around 1: map log10(v) in [-e, +e] to plot
+      var e = Math.log(loHi)/Math.LN10;
+      var lv = Math.log(Math.max(v,1e-9))/Math.LN10;
+      var t = 0.5 - (lv/(2*e)); // v=1 -> center
+      return padT + Math.max(0,Math.min(1,t))*plotH;
+    }
+    function xAt(idx){ return padL + (L<=1?0.5:idx/(L-1))*plotW; }
+
+    // gridlines + labels
+    ctx.strokeStyle = C.border; ctx.lineWidth = 1; ctx.fillStyle = C.dim;
+    ctx.font = '10px ' + cssv('--mono','monospace');
+    var mid = padT + plotH*0.5;
+    ctx.beginPath(); ctx.moveTo(padL, mid); ctx.lineTo(W-padR, mid); ctx.stroke();
+    ctx.textAlign = 'right';
+    ctx.fillText('1', padL-6, mid+3);
+    ctx.fillText('big', padL-6, padT+8);
+    ctx.fillText('~0', padL-6, padT+plotH+2);
+    ctx.textAlign = 'left';
+
+    // title row
+    ctx.fillStyle = C.mute; ctx.font = '11px ' + cssv('--mono','monospace');
+    ctx.fillText('forward: activation magnitude', padL, 14);
+    ctx.fillStyle = C.ok;
+    ctx.fillText('backward: gradient depth', W - padR - 150, 14);
+
+    // activation curve (accent)
+    ctx.strokeStyle = C.accent; ctx.lineWidth = 2; ctx.beginPath();
+    for (i=0;i<acts.length;i++){ var x=xAt(i), y=yAct(acts[i]); if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y); }
+    ctx.stroke();
+    // dot at final layer
+    var lx = xAt(acts.length-1), ly = yAct(acts[acts.length-1]);
+    ctx.fillStyle = C.accent; ctx.beginPath(); ctx.arc(lx,ly,3.5,0,Math.PI*2); ctx.fill();
+
+    // gradient curve (ok green) — map [0,1] onto lower half from center down
+    var gs = res.gradSeries;
+    ctx.strokeStyle = C.ok; ctx.lineWidth = 2; ctx.beginPath();
+    for (i=0;i<gs.length;i++){
+      var gx = xAt(i);
+      var gy = mid + (1 - Math.max(0,Math.min(1,gs[i]))) * (plotH*0.5 - 4);
+      if (i===0) ctx.moveTo(gx,gy); else ctx.lineTo(gx,gy);
+    }
+    ctx.stroke();
+
+    // x axis label
+    ctx.fillStyle = C.dim; ctx.font = '10px ' + cssv('--mono','monospace'); ctx.textAlign='center';
+    ctx.fillText('layer 0 (input)', padL+30, H-8);
+    ctx.fillText('layer L (output)', W-padR-40, H-8);
+    ctx.textAlign='left';
+
+    // KPIs
+    document.getElementById('stab-kpi-act').textContent = fmt(acts[acts.length-1]);
+    var g0 = res.grad0;
+    document.getElementById('stab-kpi-grad').textContent = fmt(g0);
+    var actBad = (acts[acts.length-1] > 20 || acts[acts.length-1] < 0.05);
+    var gradBad = (g0 < 0.02);
+    var ok = !actBad && !gradBad;
+    var el = document.getElementById('stab-kpi-ok');
+    el.textContent = ok ? 'yes — healthy' : (gradBad ? 'no — gradient dead' : 'no — activations drift');
+    el.style.color = ok ? C.ok : C.bad;
+  }
+
+  function drawSplit(){
+    var dpr = window.devicePixelRatio || 1;
+    var r = sp.getBoundingClientRect();
+    sp.width = Math.max(1,r.width)*dpr; sp.height = Math.max(1,r.height)*dpr;
+    sctx.setTransform(dpr,0,0,dpr,0,0);
+    var W = r.width, H = r.height;
+    sctx.clearRect(0,0,W,H);
+
+    // attn = 4d^2, mlp = 8d^2 => total 12d^2; split 1/3 vs 2/3
+    var padX = 12, barY = 40, barH = 26, barW = W - padX*2;
+    var attnFrac = 4/12, mlpFrac = 8/12;
+
+    sctx.fillStyle = C.mute; sctx.font = '11px ' + cssv('--mono','monospace');
+    sctx.fillText('parameters per block', padX, 18);
+
+    // attn segment
+    var aw = barW * attnFrac;
+    sctx.fillStyle = C.purple; sctx.fillRect(padX, barY, aw, barH);
+    // mlp segment
+    sctx.fillStyle = C.accent2; sctx.fillRect(padX + aw, barY, barW * mlpFrac, barH);
+    // border
+    sctx.strokeStyle = C.border; sctx.lineWidth = 1; sctx.strokeRect(padX, barY, barW, barH);
+
+    // labels inside
+    sctx.fillStyle = '#ffffff'; sctx.font = '600 11px ' + cssv('--mono','monospace'); sctx.textAlign='center';
+    sctx.fillText('attn  4d²  (1/3)', padX + aw/2, barY + barH/2 + 4);
+    sctx.fillText('MLP  8d²  (2/3)', padX + aw + barW*mlpFrac/2, barY + barH/2 + 4);
+    sctx.textAlign='left';
+
+    // numbers for d=768: attn 4*768^2, mlp 8*768^2
+    var d = 768;
+    var attnP = 4*d*d, mlpP = 8*d*d, tot = attnP + mlpP;
+    document.getElementById('stab-kpi-par').textContent = (tot/1e6).toFixed(1) + 'M (attn ' + (attnP/1e6).toFixed(1) + ' · mlp ' + (mlpP/1e6).toFixed(1) + ')';
+  }
+
+  function draw(){ drawStack(); drawSplit(); }
+
+  document.getElementById('stab-res').addEventListener('click', function(){
+    resOn = !resOn;
+    this.textContent = 'Residual : ' + (resOn ? 'ON' : 'OFF');
+    this.classList.toggle('toggle-on', resOn);
+    if (resOn) this.classList.add('primary'); else this.classList.remove('primary');
+    draw();
+  });
+  document.getElementById('stab-ln').addEventListener('click', function(){
+    lnOn = !lnOn;
+    this.textContent = 'LayerNorm : ' + (lnOn ? 'ON' : 'OFF');
+    this.classList.toggle('toggle-on', lnOn);
+    if (lnOn) this.classList.add('primary'); else this.classList.remove('primary');
+    draw();
+  });
+  document.getElementById('stab-L').addEventListener('input', function(){
+    document.getElementById('stab-L-v').textContent = this.value;
+    draw();
+  });
+  window.addEventListener('resize', draw);
+  draw();
+})();
+</script>
+
+<!-- reviewed:v1 -->
+</body>
+</html>
