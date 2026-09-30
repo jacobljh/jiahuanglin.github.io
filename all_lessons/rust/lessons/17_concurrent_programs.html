@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>17 · Concurrent programs | Rust from the Contract Up</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">Rust</a><span class="crumb">/</span><span class="crumb">17 · Concurrent programs</span><span class="step-pill">lesson 18 / 23</span></div></header>
+<main>
+
+<h1>Concurrent programs — channels, locks, scopes</h1>
+<p class="subtitle">Lesson 16 told the compiler which values may cross, or be shared between, threads, and <code>thread::spawn</code>'s bounds turned a data race into a compile error. But the first program most people write — a worker thread reading a log the main thread owns — is rejected. This lesson derives what to write instead: data a second thread touches is <em>moved</em> to it, <em>shared</em> under a lock that makes exclusive access take turns, or <em>lent</em> for a region that provably ends first — a channel, a <code>Mutex</code>, a scoped thread, and one atomic counter. Then it checks those claims on every interleaving and lists what the promise still lets go wrong, deadlock first.</p>
+
+<div class="callout source-note"><div class="label">The thesis, here</div>Concurrency is where the law earns the most, because the second name belongs to a thread whose timing nobody controls. Rust adds no concurrency model; it gives each regime the law allows a type, so the compiler can check that every place two threads reach is in one. What no type can check is progress, and this lesson marks where that line runs.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> <span class="baton" data-seam="S16-17">Send and Sync tell the compiler which values may cross, or be shared between, threads. Given those safe building blocks, how do we structure real concurrent programs — sharing, messaging, borrowing from a parent — and what does the promise still not cover?</span><br><strong>New idea:</strong> for each piece of data a second thread touches, choose who may reach it while the threads run: <strong>move it (a channel), share it with exclusion in time (a lock), or lend it for a region the owner provably outlives (a scope)</strong>. The promise covers memory, not progress: deadlock, lost updates without a data race, leaks and poisoned locks remain.<br><strong>Forces next:</strong> <span class="baton" data-seam="S17-18">Every thread costs a stack and a scheduler slot; ten thousand idle connections would need ten thousand threads. How can many tasks wait at once without a thread each, and without the language shipping a runtime?</span></div>
+
+<div class="callout"><div class="label">The plan</div>
+Seven moves. (1) The refused program, and the three answers the law leaves. (2) Move: a channel. (3) Share: a lock, with the data inside it. (4) Lend: a scope that joins before it returns. (5) Every claim, checked on every interleaving. (6) One atomic counter, and globals. (7) What the promise does not cover.</div>
+
+<h2>1 · One log, one worker, and the three answers</h2>
+
+<p>The smallest concurrent program worth writing: <code>main</code> holds a log, a worker thread counts its error lines, and <code>main</code> prints the count beside the log's length.</p>
+
+<pre id="s-spawn" data-rs="E0373"><code>use std::thread;
+
+fn main() {
+    let lines = vec!["ok", "error: disk", "error: net"];
+    let worker = thread::spawn(|| {        // borrows `lines`
+        lines.iter().filter(|l| l.starts_with("error")).count()
+    });
+    println!("{} of {} lines", worker.join().unwrap(), lines.len());
+}</code></pre>
+
+<pre class="diag" data-for="s-spawn"><code>error[E0373]: closure may outlive the current function, but it borrows `lines`, which is owned by the current function
+ --&gt; src/main.rs:5:32
+  |
+5 |     let worker = thread::spawn(|| {        // borrows `lines`
+  |                                ^^ may outlive borrowed value `lines`
+6 |         lines.iter().filter(|l| l.starts_with("error")).count()
+  |         ----- `lines` is borrowed here
+  |
+note: function requires argument type to outlive `'static`
+help: to force the closure to take ownership of `lines` (and any other referenced variables), use the `move` keyword</code></pre>
+
+<p>This program joins the worker before <code>lines</code> ends, but <code>spawn</code>'s signature does not promise it: dropping a <code>JoinHandle</code> detaches the thread, and the process ends when <code>main</code> returns, whatever other threads are doing. Accept the borrow, and the same program with one early <code>return</code> — or one panic before the <code>join</code> — drops the log while the worker may still read it: a use-after-free whose second name lives on another thread. Hence <code>spawn</code>'s bound <code>F: Send + 'static</code> (<a href="16_send_sync.html">Lesson 16</a>): a thread that may outlive its spawner may hold only what nothing else will end. C++ accepts the shape, race included:</p>
+
+<pre data-rs="skip" data-lang="c++"><code>std::vector&lt;std::string&gt; lines = load_log();
+int errors = 0;
+std::thread worker([&amp;] { errors += count_errors(lines); });  // captures by reference
+errors += 1;          // the same int, meanwhile: a data race, undefined
+worker.detach();      // nobody waits now: lines may die first</code></pre>
+
+<div class="callout"><div class="label">Reading the error</div>E0373 names the borrowed variable and the frame the closure might outlive; the note says why — <code>spawn</code> wants <code>'static</code>, <a href="08_lifetimes_signatures.html">Lesson 08</a>'s "holds no borrow of anything that ends". What the message cannot know is whether <code>main</code> still needs <code>lines</code>. If not, <code>move</code> is the right design: the worker becomes the owner. Here it does, so the suggested edit yields a second error, whose help is to clone the whole log:
+<pre id="s-move" data-rs="E0382"><code>use std::thread;
+
+fn main() {
+    let lines = vec!["ok", "error: disk", "error: net"];
+    let worker = thread::spawn(move || {   // the suggested fix
+        lines.iter().filter(|l| l.starts_with("error")).count()
+    });
+    println!("{} of {} lines", worker.join().unwrap(), lines.len());
+}</code></pre>
+<pre class="diag" data-for="s-move"><code>error[E0382]: borrow of moved value: `lines`
+help: consider cloning the value before moving it into the closure</code></pre>
+Each suggestion makes one line type-check; neither asks the design question — who should reach the log while the worker runs: the worker alone (§2), both through a shared owner (§3), or <code>main</code>, lending it (§4)?</div>
+
+<p>Why those three? <a href="07_borrow_checker_liveness.html">Lesson 07</a>'s checker compares regions by walking one function in order. A second thread's steps happen when the scheduler says, so there is no order to walk, and the compiler can accept only arrangements safe in <em>every</em> order. Lesson 00's second question — who else can reach it, and for how long? — has three such answers under the law (many readers or one writer, never both):</p>
+
+<table>
+<thead><tr><th>While the threads run, the data is reached by…</th><th>Regime</th><th>Rust's tool</th><th>Checked</th><th>Price</th></tr></thead>
+<tbody>
+<tr><td>one thread at a time; the sender loses its name</td><td>no alias at all</td><td>a channel (§2)</td><td>compile time: the move rule</td><td>a queue operation per message</td></tr>
+<tr><td>several threads, some writing</td><td>exclusive, taking turns</td><td><code>Arc&lt;Mutex&lt;T&gt;&gt;</code> (§3)</td><td>run time: the lock</td><td>lock, unlock, and waiting</td></tr>
+<tr><td>threads that end before the owner's region does</td><td>ordinary borrows</td><td><code>thread::scope</code> (§4)</td><td>compile time: regions</td><td>the parent waits for them</td></tr>
+</tbody>
+</table>
+
+<p>Read-only sharing needs none of them: many readers is the law's first regime, and an <code>Arc&lt;T&gt;</code> with <code>T: Send + Sync</code> (<a href="15_smart_pointers_interior_mutability.html">Lessons 15</a>–16) suffices. The first row is the cheapest proof — a value with one name is in nobody's way — so start there: we need to hand values to another thread, one after another, and lose them.</p>
+
+<h2>2 · Move: a channel is the move rule across threads</h2>
+
+<p>A <strong>channel</strong> is a queue with two ends: <code>mpsc::channel()</code> returns a <code>Sender</code>, which can be cloned so several threads produce, and a <code>Receiver</code>, which cannot; messages arrive in order and <code>send</code> never waits for space. The signature carries the proof: <code>send(&amp;self, t: T)</code> takes the message <em>by value</em>, so the sender's name is dead afterwards — <a href="04_move_semantics.html">Lesson 04</a>'s rule, across threads. Were the last line below accepted, the receiver could be changing or dropping the <code>String</code> while the sender prints it:</p>
+
+<pre data-rs="E0382"><code>use std::sync::mpsc;
+
+fn main() {
+    let (tx, _rx) = mpsc::channel();
+    let report = String::from("error: disk");
+    tx.send(report).unwrap();            // ownership moves into the channel
+    println!("sent {report}");           // ...so this name is dead
+}</code></pre>
+
+<p>The log program as a pipeline: each worker owns half the log, and each error line — the <code>String</code> itself — moves from worker to channel to <code>main</code>:</p>
+
+<pre id="s-chan" data-rs="ok" data-out="[&quot;error: disk&quot;, &quot;error: net&quot;]"><code>use std::sync::mpsc;
+use std::thread;
+
+fn main() {
+    let mut front: Vec&lt;String&gt; = ["ok", "error: disk", "error: net", "ok"].map(String::from).into();
+    let back = front.split_off(2);              // two owners now; no String was copied
+    let (tx, rx) = mpsc::channel();
+    for chunk in [front, back] {
+        let tx = tx.clone();                    // each worker gets its own Sender
+        thread::spawn(move || {                 // ...and owns its chunk outright
+            for line in chunk {
+                if line.starts_with("error") {
+                    tx.send(line).unwrap();     // the String itself moves on
+                }
+            }
+        });                                     // the worker's Sender is dropped here
+    }
+    drop(tx);                                   // and main's own, or the loop never ends
+    let mut got: Vec&lt;String&gt; = rx.iter().collect();
+    got.sort();
+    println!("{got:?}");
+}</code></pre>
+<pre class="out" data-for="s-chan"><code>["error: disk", "error: net"]</code></pre>
+
+<p>No <code>String</code> ever has names on two threads, so the law has nothing to forbid; the compiler checks only that messages are <code>Send</code> (a <code>Sender</code> of <code>Rc</code>s moved into a thread is E0277). The loop ends when <code>recv</code> fails, once every <code>Sender</code> is dropped and the queue is empty — hence <code>drop(tx)</code>: without it <code>main</code>'s own <code>Sender</code> keeps the channel open and <code>main</code> waits forever, a hang the compiler cannot see (§7).</p>
+
+<p>The <a href="../../go/lessons/09_channels_csp.html">Go track's Lesson 09</a> teaches the same slogan — share memory by communicating, which the Rust Book credits to Go — and notes that ownership there is by convention: send a pointer and you can still race. Here it is a proof, priced at a queue operation per message; a <code>String</code> moves its header (Lesson 04), not its buffer. The shape stops fitting when every thread must update the <em>same</em> tally.</p>
+
+<h2>3 · Share: a lock makes exclusive access take turns</h2>
+
+<p>The law still allows one writer at a time, so writers must take turns. <code>Arc</code> supplies the shared owners (Lesson 15), <code>Mutex</code> the exclusion: <code>lock()</code> waits until no other thread holds the mutex, then returns a <strong>guard</strong>, <code>MutexGuard&lt;T&gt;</code> (inside a <code>Result</code>, for a reason §7 gives), which is the one exclusive name for the data while it lives, derefs to <code>T</code>, and unlocks when dropped — Lesson 15's <code>RefCell</code> guard, waiting where that one panics.</p>
+
+<pre id="s-lock" data-rs="ok" data-out="[&quot;error: disk&quot;, &quot;error: net&quot;]"><code>use std::sync::{Arc, Mutex};
+use std::thread;
+
+fn main() {
+    let found = Arc::new(Mutex::new(Vec::new()));    // one Vec, reachable only through the lock
+    let mut workers = Vec::new();
+    for chunk in [["ok", "error: disk"], ["error: net", "ok"]] {
+        let found = Arc::clone(&amp;found);               // one more owner of the same Mutex
+        workers.push(thread::spawn(move || {
+            for line in chunk {
+                if line.starts_with("error") {
+                    found.lock().unwrap().push(line); // lock, push, unlock at the semicolon
+                }
+            }
+        }));
+    }
+    for w in workers { w.join().unwrap(); }
+    let mut all = found.lock().unwrap().clone();
+    all.sort();
+    println!("{all:?}");
+}</code></pre>
+<pre class="out" data-for="s-lock"><code>["error: disk", "error: net"]</code></pre>
+
+<p>The decisive choice is where the data lives: <em>inside</em> the mutex. No path to it skips <code>lock()</code>, so forgetting to lock is not a bug you can write:</p>
+
+<pre data-rs="E0614"><code>use std::sync::Mutex;
+
+fn main() {
+    let total = Mutex::new(0);
+    *total += 1;               // no lock taken: is there a path to the number?
+}</code></pre>
+
+<p>In C++ a <code>std::mutex</code> sits <em>beside</em> what it guards, paired by a comment (<a href="../../cpp/lessons/17_concurrency_threads.html">C++ 17</a>); Go pairs lock and fields "by convention and comment" (<a href="../../go/lessons/11_sharing_memory.html">Go 11</a>). Rust makes the comment the type, and Lesson 16's rules keep it honest: <code>Mutex&lt;T&gt;</code> is <code>Sync</code> when <code>T: Send</code>, while <code>MutexGuard</code> is not <code>Send</code>, so the thread that locks is the one that unlocks. <code>RwLock</code> is the law itself at run time — many readers or one writer — and also needs <code>T: Sync</code>, since its readers really share.</p>
+
+<p>The price: a lock and an unlock per access, and waiting — a lock works by <em>removing</em> interleavings, which §5 counts. Both shapes cut the data loose from <code>main</code>'s frame. But the log already lives in <code>main</code>, and the worker only needs to look at it for a while. Why can a thread not borrow it?</p>
+
+<h2>4 · Lend: a scope that joins before it returns</h2>
+
+<p><a href="06_lifetimes_regions.html">Lesson 06</a>: a borrow is sound if its region — its lifetime, in the source's word — fits inside the owner's. <code>spawn</code> cannot say where a thread's region ends; that is all its <code>'static</code> means. So change the API until it can: <code>thread::scope</code> (stable since Rust 1.63) calls your closure with a scope handle and, before returning, joins every thread spawned through it that you did not join yourself. Its <code>spawn</code> asks only for <code>'scope</code>, and what the threads borrow must outlive the <code>scope</code> call, so every borrow fits inside its owner's region. The borrows are ordinary, and so is the law: two scoped threads adding to one counter — a data race, if accepted — are rejected with the <code>E0499</code> of two <code>&amp;mut</code> borrows (<a href="01_the_promise.html">Lesson 01</a> compiled exactly that). Give each thread its own slot, and no <code>Arc</code>, lock or copy of the log is needed:</p>
+
+<pre id="s-scope" data-rs="ok" data-out="[1, 1] of 4 lines"><code>use std::thread;
+
+fn main() {
+    let lines = vec!["ok", "error: disk", "error: net", "ok"];
+    let mut counts = [0; 2];                          // one slot per worker
+    thread::scope(|s| {
+        for (chunk, slot) in lines.chunks(2).zip(counts.iter_mut()) {
+            // chunk: &amp;[&amp;str], shared;  slot: &amp;mut usize, this thread's alone
+            s.spawn(move || *slot = chunk.iter().filter(|l| l.starts_with("error")).count());
+        }
+    });                                               // every thread is joined here
+    println!("{counts:?} of {} lines", lines.len());  // both are main's again
+}</code></pre>
+<pre class="out" data-for="s-scope"><code>[1, 1] of 4 lines</code></pre>
+
+<p>(<code>move</code> moves the two <em>references</em> in, not the data.) If a scoped thread panics, <code>scope</code> joins the others and then panics itself. The price: the parent waits at the closing brace, where it wanted the counts anyway.</p>
+
+<div class="callout road"><div class="label">Road not taken · a guard whose destructor joins</div>The obvious API returns a guard that joins the thread when dropped — RAII, as C++ would write it. <a href="03_ownership_drop.html">Lesson 03</a>'s "leaks are safe" makes it unsound: <code>mem::forget(guard)</code> is safe and skips the destructor, so the join never happens, the parent returns and drops its locals, and the thread reads freed memory, from safe code. The standard library once had exactly this shape, <code>thread::scoped</code>, and removed it for this reason, as the Nomicon records. <code>thread::scope</code> puts the join in its own body, after your closure returns: control flow, which no leaked value can skip.</div>
+
+<p>Three claims so far: a lock makes the steps inside it indivisible; a channel hands each value to one receiver; a consistent lock order prevents deadlock. Each is a claim about every order in which steps can run — for a small program, a finite set.</p>
+
+<h2>5 · Every interleaving, counted</h2>
+
+<p>So count it. An <strong>interleaving</strong> (or schedule) is one order in which the threads' steps can happen. The explorer runs every schedule of a tiny program of indivisible steps; a thread waiting for a held lock or an empty channel cannot move. A schedule ends when nobody can: with final values if every thread finished, in a <strong>deadlock</strong> if not. Identical states share futures, so the search remembers each. The model is one global order of steps — for atomics, what <code>SeqCst</code> promises (§6).</p>
+
+<div class="widget" id="w17">
+  <div class="title">All interleavings</div>
+  <div class="hint">Steps, separated by <code>;</code>: <code>load x</code> · <code>store x</code> (writes the loaded value + 1) · <code>fetch_add x</code> · <code>lock A</code> · <code>unlock A</code> · <code>send c</code> · <code>recv c s</code> (s += the value). Pick a preset or edit the threads (T3 is optional). Green: the answer of running the threads one after another; amber: any other; red: deadlock. The lanes replay one witness.</div>
+  <div class="controls">
+    <label class="inline">iterations per thread: <input type="range" id="w17-n" min="1" max="4" step="1" value="1"> <span class="val" id="w17-n-v">1</span></label>
+    <label class="inline">preset: <select id="w17-preset"><option value="a">(a) load + store</option><option value="b">(b) fetch_add</option><option value="c">(c) under a Mutex</option><option value="d">(d) two locks, opposite order</option><option value="e">(e) two locks, one order</option><option value="f">(f) producer → consumer</option><option value="g">(g) recv under a lock</option></select></label>
+    <button type="button" id="w17-next">next witness</button>
+    <label class="inline">T1 <input type="text" id="w17-t1" value="load x; store x" size="40"></label>
+    <label class="inline">T2 <input type="text" id="w17-t2" value="load x; store x" size="40"></label>
+    <label class="inline">T3 <input type="text" id="w17-t3" value="" size="40"></label>
+    <button type="button" id="w17-run" class="primary">run</button>
+  </div>
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">interleavings</div><div class="v" id="w17-k1">—</div></div>
+    <div class="kpi"><div class="k">distinct states</div><div class="v" id="w17-k2">—</div></div>
+    <div class="kpi"><div class="k">different answers</div><div class="v" id="w17-k3">—</div></div>
+    <div class="kpi"><div class="k">deadlock</div><div class="v" id="w17-k4">—</div></div>
+  </div>
+  <canvas id="w17-canvas" class="rs-canvas tall"></canvas>
+  <div class="readout" id="w17-read"></div>
+  <details><summary>Show the core JS</summary>
+<pre data-rs="skip" data-lang="JavaScript"><code>// Every schedule from state s: which endings it reaches, and in how many ways.
+function visit(s) {
+  var k = key(s), hit = memo.get(k);
+  if (hit) return hit;                              // same state, same future
+  if (memo.size &gt;= LIMIT_STATES) { truncated = true; return { c: {}, first: {}, dd: Infinity, dt: -1 }; }
+  var node = { c: {}, first: {}, dd: Infinity, dt: -1 }, moved = false, done = true;
+  for (var t = 0; t &lt; T; t++) {
+    if (s.pc[t] &lt; p.threads[t].length) done = false;
+    if (!enabled(p, s, t)) continue;                // waiting for a held lock or an empty channel
+    moved = true;
+    var sub = visit(step(p, s, t));                   // every enabled thread may go next
+    for (var o in sub.c) {
+      node.c[o] = (node.c[o] || 0) + sub.c[o];        // schedules through this child
+      if (!(o in node.first)) node.first[o] = t;      // lexicographically first witness
+    }
+    if (sub.dd + 1 &lt; node.dd) { node.dd = sub.dd + 1; node.dt = t; }
+  }
+  if (!moved) {                                       // nobody can move: the schedule ends
+    var out = done ? outcomeKey(p, s) : DEAD;
+    node.c[out] = 1;
+    if (!done) node.dd = 0;                           // unfinished threads, all blocked
+  }
+  memo.set(k, node);
+  return node;
+}</code></pre>
+  </details>
+</div>
+
+<p><strong>What to try.</strong> (a) at one iteration: 6 interleavings, 4 ending with <code>x = 1</code> — the lost update is the common case. At four: 12,870 interleavings, only 70 reach <code>x = 8</code>, and the answers run down to <code>x = 2</code>. (c), the same steps inside a lock: 70 interleavings at four, all ending at 8 — (b)'s count, because only the order of the critical sections is left. (d) at one iteration: 2 of 6 interleavings deadlock, the shortest in 2 steps (T1 locks A, T2 locks B); at four, 1,256 of 2,932. (e) flips one lock order and the red bar is gone. (f): 1, 2, 5 and 14 interleavings for one to four messages, one answer each. (g): in one of its 2 interleavings T1 takes <code>m</code>, then waits for a message T2 cannot send until it gets <code>m</code>.</p>
+
+<p>Testing samples schedules; this enumerates them. Compiled as real Rust, preset (a) at four iterations printed 8 in all 2,000 runs; with a <code>thread::yield_now()</code> between load and store, 1,191 of 2,000 runs lost updates (one trial; the count varies), every value one the explorer lists (<code>tools/rust_verify/17_interleave.js</code>, which also checks the explorer against an independent one; Apple M5, rustc 1.98.1 <code>-C opt-level=3</code>, 2026-09).</p>
+
+<div class="callout limit"><div class="label">What the explorer does not model</div>Orderings weaker than <code>SeqCst</code>, which do not promise one global order (§6); how <em>likely</em> a schedule is — hardware may never pick most of them, as the 2,000 runs show; bounded channels; and programs past a few dozen steps, where the count explodes. Presets (a) and (b) are real operations, and §6 prices them.</div>
+
+<h2>6 · Atomics, one counter's worth</h2>
+
+<p>For one integer a lock is more machinery than the job needs. <code>AtomicUsize::fetch_add</code> does the read, the add and the write as one indivisible step — preset (b) — so four threads adding a hundred thousand each always make four hundred thousand:</p>
+
+<pre id="s-atomic" data-rs="ok" data-out="400000"><code>use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::thread;
+
+fn main() {
+    let hits = AtomicUsize::new(0);
+    thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| for _ in 0..100_000 {
+                hits.fetch_add(1, SeqCst);            // read, add, write: one indivisible step
+            });
+        }
+    });
+    println!("{}", hits.load(SeqCst));
+}</code></pre>
+<pre class="out" data-for="s-atomic"><code>400000</code></pre>
+
+<p>Split the step in two, as preset (a) does. Every access is still atomic, so there is no data race — the Nomicon's definition needs an unsynchronized access — and the compiler accepts it:</p>
+
+<pre data-rs="ok"><code>use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::thread;
+
+fn main() {
+    let hits = AtomicUsize::new(0);
+    thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| for _ in 0..100_000 {
+                let seen = hits.load(SeqCst);         // step 1: an atomic read
+                hits.store(seen + 1, SeqCst);         // step 2: an atomic write, perhaps of a stale value
+            });
+        }
+    });
+    println!("{}", hits.load(SeqCst));
+}</code></pre>
+
+<p>On one machine (Apple M5, macOS 26.5, rustc 1.98.1 <code>-C opt-level=3</code>, 2026-09), 21 runs printed from 100,000 to 137,988, median 105,816; the <code>fetch_add</code> version printed 400,000 in each of 5 runs. This is a <strong>race condition</strong>: the result depends on the interleaving; every step is defined, and the answer is wrong. Safe Rust rules out data races, not race conditions; the Nomicon calls preventing those impossible without control of the scheduler. Each operation being atomic says nothing about the <em>pair</em>.</p>
+
+<p><code>SeqCst</code> is a memory ordering, and this lesson needs one sentence about it: a data-race-free program that uses only <code>SeqCst</code> atomics has a single global order of operations every thread agrees on — the explorer's model. The weaker orderings (<code>Relaxed</code>, <code>Acquire</code>, <code>Release</code>, <code>AcqRel</code>) follow C++20's rules and are out of scope; <a href="../../cpp/lessons/18_concurrency_atomics.html">the C++ track's Lesson 18</a> covers them.</p>
+
+<p>Globals are the last case. A <code>static</code> is the purest alias there is: every function on every thread can name it without being handed it. If a <code>static Cell</code> were allowed, two threads calling <code>record</code> at once would race on it, so the type of a non-<code>mut</code> static must be <code>Sync</code>:</p>
+
+<pre id="s-static" data-rs="E0277"><code>use std::cell::Cell;
+
+static HITS: Cell&lt;u32&gt; = Cell::new(0);     // a global every thread can name
+
+pub fn record() {
+    HITS.set(HITS.get() + 1);
+}</code></pre>
+<pre class="diag" data-for="s-static"><code>error[E0277]: `Cell&lt;u32&gt;` cannot be shared between threads safely
+  = note: shared static variables must have a type that implements `Sync`</code></pre>
+
+<p>Mutable global state therefore goes through interior mutability that is <code>Sync</code> — a static <code>AtomicU32</code>, a static <code>Mutex</code>, or a <code>OnceLock</code> for a value written once, all accepted. <code>static mut</code> needs <code>unsafe</code> to touch, and in edition 2024 even a reference to one is denied by default — <a href="19_unsafe_obligations.html">Lesson 19</a>'s ground. Every tool so far removes data races. None made the load-then-store counter right, and none can make a thread finish.</p>
+
+<h2>7 · What the promise does not cover</h2>
+
+<p>The promise is exactly "no undefined behavior". The Reference's list of behavior <em>not</em> considered unsafe names deadlocks, leaks of memory and other resources, exiting without running destructors, integer overflow and logic errors. Data races are undefined, so they are excluded; all of the following is defined, so it is allowed:</p>
+
+<table>
+<thead><tr><th>Still possible in safe Rust</th><th>Smallest example, and what helps</th></tr></thead>
+<tbody>
+<tr><td><strong>Deadlock</strong></td><td>preset (d), and the program below, which compiles; so does locking a mutex your own thread holds, a call that will not return. Helps: one global lock order (e), one lock at a time, no waiting on a channel under a lock (g).</td></tr>
+<tr><td><strong>Race condition</strong></td><td>§6's load-then-store counter. Helps: make the whole update one step.</td></tr>
+<tr><td><strong>Leaks and hangs</strong></td><td>an <code>Rc</code> cycle (Lesson 15), <code>mem::forget</code>, a live <code>Sender</code> that keeps <code>recv</code> waiting (§2).</td></tr>
+<tr><td><strong>Poisoning</strong></td><td>a thread panics while holding a lock (below).</td></tr>
+<tr><td><strong>Starvation</strong></td><td><code>RwLock</code> leaves priority between waiting readers and writers to the OS.</td></tr>
+<tr><td><strong>Overflow, exhaustion</strong></td><td>overflow is defined, not prevented; <code>spawn</code> panics if the OS cannot make a thread, where <code>Builder::spawn</code> returns an error.</td></tr>
+</tbody>
+</table>
+
+<pre data-rs="ok"><code>use std::sync::Mutex;
+use std::thread;
+
+fn transfer(from: &amp;Mutex&lt;i32&gt;, to: &amp;Mutex&lt;i32&gt;, amount: i32) {
+    let mut f = from.lock().unwrap();            // lock the source first...
+    let mut t = to.lock().unwrap();              // ...then the destination
+    *f -= amount;
+    *t += amount;
+}
+
+fn main() {
+    let (a, b) = (Mutex::new(100), Mutex::new(100));
+    thread::scope(|s| {
+        s.spawn(|| transfer(&amp;a, &amp;b, 10));        // locks A, then B
+        s.spawn(|| transfer(&amp;b, &amp;a, 10));        // locks B, then A
+    });
+}</code></pre>
+
+<p>It compiles because nothing in it is undefined; preset (d) is this program, and the explorer finds the 2-step schedule that stops it forever. Note where the bug is: <code>transfer</code> is fine alone, and so is each call site. A lock order is a property of the whole program, so no rule local to one function — the only kind the checker applies — can see it. The C++ track's cure (lock ordering, <code>std::scoped_lock</code>) and the Go track's (no channel send while holding a lock, Go 11) carry over unchanged. <strong>Poisoning</strong> answers a different failure — a thread that dies halfway through a change:</p>
+
+<pre id="s-poison" data-rs="ok" data-out="worker ok: false poisoned; balance is 70"><code>use std::sync::{Arc, Mutex};
+use std::thread;
+
+fn main() {
+    let balance = Arc::new(Mutex::new(100));
+    let b = Arc::clone(&amp;balance);
+    let result = thread::spawn(move || {
+        let mut g = b.lock().unwrap();
+        *g -= 30;                        // the first half of a transfer...
+        panic!("network down");          // ...and the thread dies holding the guard
+    }).join();
+    println!("worker ok: {}", result.is_ok());
+    match balance.lock() {
+        Ok(g) =&gt; println!("balance {}", *g),
+        Err(poisoned) =&gt; println!("poisoned; balance is {}", *poisoned.into_inner()),
+    }
+}</code></pre>
+<pre class="out" data-for="s-poison"><code>worker ok: false
+poisoned; balance is 70</code></pre>
+
+<p>Unwinding dropped the guard, so the lock is free, but the mutex is <strong>poisoned</strong>: later calls to <code>lock()</code> return <code>Err</code> — the <code>Result</code> every <code>.unwrap()</code> above was opening. The error is advisory, since <code>into_inner</code> hands over the data anyway: only the program knows whether 70 is a balance or half a transfer. Detection is imperfect, so <code>unsafe</code> code must not rely on it for soundness; an <code>RwLock</code> is poisoned only by a panicking writer.</p>
+
+<p>One classic deadlock the language did remove, in edition 2024: the temporaries of an <code>if let</code> test — here a <code>MutexGuard</code> — are dropped before the <code>else</code> block runs.</p>
+
+<pre id="s-iflet" data-rs="ok" data-out="miss; lock free: true"><code>use std::sync::Mutex;
+
+fn main() {
+    let cache: Mutex&lt;Option&lt;u32&gt;&gt; = Mutex::new(None);
+    if let Some(hit) = *cache.lock().unwrap() {     // the test creates a guard...
+        println!("hit {hit}");
+    } else {
+        // ...which edition 2024 drops before this block runs
+        println!("miss; lock free: {}", cache.try_lock().is_ok());
+    };
+}</code></pre>
+<pre class="out" data-for="s-iflet"><code>miss; lock free: true</code></pre>
+
+<p>Compiled with <code>--edition 2021</code>, the same program prints <code>miss; lock free: false</code>: the guard lives to the end of the whole <code>if let</code>, so a cache that filled itself with <code>cache.lock()</code> in the <code>else</code> block would be locking a mutex its own thread holds.</p>
+
+<h2>Common mistakes / failure modes</h2>
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">"Fearless concurrency means no deadlocks and no races"</div><div class="v">Safe Rust rules out <em>data races</em>, which are undefined. Deadlocks and race conditions are defined, so they stay: preset (d) deadlocks in 2 steps; the load-then-store counter loses most of its updates (§5–§7).</div></div>
+  <div class="topic-card"><div class="k">"Atomics make the program correct"</div><div class="v">Each atomic operation is indivisible; a sequence is not. <code>load</code> then <code>store</code> leaves room for another thread between. Use one read-modify-write, or one critical section (§6).</div></div>
+  <div class="topic-card"><div class="k">"Channels avoid all sharing problems"</div><div class="v">A moved message cannot race, but a thread can still wait forever: for a message only a lock-holder can send (preset g), or on a <code>recv</code> a forgotten <code>Sender</code> keeps open (§2).</div></div>
+  <div class="topic-card"><div class="k">"A <code>Mutex</code> protects the code between lock and unlock"</div><div class="v">It protects the <em>data it wraps</em>, by type: the only path to the value is the guard, whose lifetime is the critical section (§3). Other data touched there is not protected.</div></div>
+  <div class="topic-card"><div class="k">"A poisoned mutex is broken"</div><div class="v">It is a message: a holder panicked mid-update. <code>into_inner</code> still returns the data; whether the invariant survived is yours to decide (§7).</div></div>
+  <div class="topic-card"><div class="k">"Sharing with threads needs <code>Arc</code>"</div><div class="v">Only with threads that may outlive you. Scoped threads borrow, shared or exclusive, because <code>thread::scope</code> joins them before it returns (§4).</div></div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>In the widget, at one iteration, type three transfers over three accounts: T1 <code>lock A; lock B; fetch_add x; unlock B; unlock A</code>, T2 the same with B then C, T3 with C then A. Before pressing run, predict whether a deadlock is reachable and how many steps the shortest deadlocking schedule takes. Then change T3 to take A before C — every thread now locks in the order A, B, C — and predict again. Finally, write one sentence saying why a global order makes a cycle of waiting impossible. (Check: the cycle deadlocks in 6 of 234 interleavings, shortest 3 steps; the ordered version has 236 interleavings and none.)</div>
+
+<h2>Where this points next</h2>
+<p>Every tool here is built on one unit: a thread, which the standard library maps one-to-one onto an operating-system thread, each with its own stack — by default 2 MiB for a spawned thread on Tier-1 platforms as of 2026-09, a figure the documentation calls subject to change. Two workers counting a log never notice. A server holding ten thousand idle connections, one thread each, would ask for 20,000 MiB of stack (10,000 × 2 MiB) and give the operating system ten thousand threads to schedule, nearly all only waiting. Go's answer is a scheduler inside its runtime (<a href="../../go/lessons/08_goroutines_scheduler.html">the Go track's Lesson 08</a>); Rust's budget forbids one. So: can waiting be made cheap, without a thread per waiter — and without the language shipping a runtime to do it?</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+With a second thread the checker cannot compare regions in program order, so it accepts only arrangements safe in every order, and the law leaves three: <strong>move</strong> the data (a channel — <code>send</code> takes it by value), <strong>share it with exclusion in time</strong> (<code>Arc&lt;Mutex&lt;T&gt;&gt;</code> — the data lives inside the lock), or <strong>lend it</strong> to threads that provably end first (<code>thread::scope</code>, whose join is control flow, since a joining guard could be leaked). One counter needs only <code>fetch_add</code>; a <code>static</code> must be <code>Sync</code>. Counting every interleaving shows the boundary: a lock or <code>fetch_add</code> leaves one answer, but load-then-store loses updates with no data race, opposite lock orders deadlock, and leaks, hangs, poisoning and starvation remain — all defined. Safe Rust promises memory, not progress.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+<li>Why does <code>thread::spawn</code> require <code>'static</code>, and what are the three ways to give a thread data? <em>(§1 — a detached thread may outlive its spawner; so move the data in, share it through an owner with a lock, or lend it to threads a scope joins.)</em></li>
+<li>Message passing versus shared state: what does each prove? <em>(§2–§3 — <code>send</code> takes the value by move, so one thread at a time reaches it; a <code>Mutex</code> admits several, one guard-holder at a time.)</em></li>
+<li>Dissect <code>Arc&lt;Mutex&lt;T&gt;&gt;</code>. <em>(§3 — <code>Arc</code>: shared ownership; <code>Mutex</code>: exclusion, the data inside so nothing skips <code>lock()</code>; the guard derefs to <code>T</code>, unlocks on drop, is not <code>Send</code>.)</em></li>
+<li>How does a scoped thread borrow a local, and why is the API a closure, not a join guard? <em>(§4 — <code>scope</code> joins every thread before returning; a guard could be leaked by safe <code>mem::forget</code>, skipping the join — why <code>thread::scoped</code> was removed.)</em></li>
+<li>Data race versus race condition: write a safe program with the second. <em>(§6 — a data race is an unsynchronized conflicting access, undefined and rejected; a race condition is an order-dependent wrong answer, defined and accepted: atomic <code>load</code> then <code>store</code>.)</em></li>
+<li>Does Rust prevent deadlock? How do you avoid one? <em>(§5, §7 — no: it is defined behavior, and lock order is a whole-program property; keep one global order, hold one lock at a time, never wait on a channel under a lock.)</em></li>
+<li>What is mutex poisoning, and can you rely on it? <em>(§7 — after a holder panics, <code>lock()</code> returns <code>Err</code>; advisory, since <code>into_inner</code> yields the data, and imperfect, so <code>unsafe</code> code must not depend on it.)</em></li>
+<li>When is an atomic enough? <em>(§6 — when the update is one read-modify-write on one value, like <code>fetch_add</code>; two steps or two values need one critical section.)</em></li>
+</ul>
+
+<footer class="lesson-nav"><a href="16_send_sync.html"><span class="dir">Previous</span><span class="ttl">16 · Send and Sync — the law across threads</span></a><a class="next" href="18_async_state_machines.html"><span class="dir">Next</span><span class="ttl">18 · Async — futures as state machines</span></a></footer>
+
+<p style="font-size:13px; color:var(--text-mute); margin-top:18px;">Companion reads: <a href="../../go/lessons/09_channels_csp.html">Go · 09 Channels and CSP</a>, <a href="../../go/lessons/10_select_context.html">Go · 10 select and context</a>, <a href="../../go/lessons/11_sharing_memory.html">Go · 11 When to share memory</a>, <a href="../../cpp/lessons/17_concurrency_threads.html">C++ · 17 Threads and races</a>, and <a href="../../cpp/lessons/18_concurrency_atomics.html">C++ · 18 Atomics</a> (the orderings left out here).</p>
+
+</main>
+
+<script src="interleave.js"></script>
+<script>
+(function () {
+  var cv = document.getElementById('w17-canvas');
+  if (!cv || !window.Interleave) return;
+  var IL = window.Interleave, ctx = cv.getContext('2d');
+  function cssv(n, fb) { try { var v = getComputedStyle(document.documentElement).getPropertyValue(n); return (v && v.trim()) || fb; } catch (e) { return fb; } }
+  var C = { good: cssv('--good', '#16a34a'), err: cssv('--err', '#dc2626'), shared: cssv('--shared', '#2563eb'), excl: cssv('--excl', '#d97706'),
+            live: cssv('--live', '#7c3aed'), own: cssv('--own', '#334155'), mute: cssv('--text-mute', '#5b6573'), dim: cssv('--text-dim', '#94a3b8'),
+            text: cssv('--text', '#1f2430'), border: cssv('--border', '#dde2ea'), mono: cssv('--mono', 'monospace') };
+  function $(id) { return document.getElementById(id); }
+  var slider = $('w17-n'), preset = $('w17-preset'), inputs = [$('w17-t1'), $('w17-t2'), $('w17-t3')], KP = ['w17-k1', 'w17-k2', 'w17-k3', 'w17-k4'];
+  var SHORT = { load: 'ld', store: 'st', fetch_add: '+1', lock: 'L', unlock: 'U', send: 'snd', recv: 'rcv' };
+  var HUE = { load: 'shared', store: 'excl', fetch_add: 'excl', lock: 'live', unlock: 'live', send: 'own', recv: 'own' };
+  var st = { prog: null, res: null, err: '', list: [], wi: 0 };
+
+  function loadPreset(id) {
+    var p = IL.PRESETS.filter(function (q) { return q.id === id; })[0] || IL.PRESETS[0];
+    inputs.forEach(function (inp, i) { inp.value = p.threads[i] || ''; });
+    run();
+  }
+  function run() {
+    var n = Math.max(1, Math.min(4, +slider.value || 1));
+    $('w17-n-v').textContent = String(n);
+    st.res = null; st.list = []; st.wi = 0;
+    try { st.prog = IL.parse(inputs.map(function (x) { return x.value; }), n); st.res = IL.explore(st.prog); var e = IL.endings(st.res); st.list = e.list; st.wi = e.start; }
+    catch (e) { st.err = e.message; }
+    draw();
+  }
+  function text(s, x, y, color, align) { ctx.fillStyle = color; ctx.textAlign = align || 'left'; ctx.fillText(s, x, y); }
+
+  function draw() {
+    var dpr = window.devicePixelRatio || 1, rc = cv.getBoundingClientRect(), W = Math.max(320, rc.width), H = Math.max(300, rc.height), rd = $('w17-read');
+    cv.width = W * dpr; cv.height = H * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, W, H);
+    ctx.font = '11px ' + C.mono; ctx.textBaseline = 'middle';
+    if (!st.res) {
+      text('cannot run this program — see the readout', 12, 24, C.err);
+      KP.forEach(function (id) { $(id).textContent = '—'; }); rd.textContent = st.err; rd.className = 'readout err'; return;
+    }
+    var r = st.res, p = st.prog, T = p.threads.length, sel = st.list[st.wi], rep = IL.report(p, r, sel), rp = rep.replay;
+    // histogram: how each interleaving ends (answers left to right, the deadlock last)
+    var bars = st.list.filter(function (w) { return !w.dead; }).concat(st.list.filter(function (w) { return w.dead; }));
+    var top = 26, base = Math.round(H * 0.47), max = 1, bw = Math.min(72, (W - 20) / Math.max(1, bars.length)), x0 = (W - bw * bars.length) / 2;
+    bars.forEach(function (b) { max = Math.max(max, b.count); });
+    text('how each of the ' + IL.fmt(r.schedules) + ' interleavings ends', 10, 11, C.mute);
+    bars.forEach(function (b, i) {
+      var h = Math.max(2, (base - top - 18) * b.count / max), x = x0 + i * bw + 8, w = bw - 16;
+      ctx.fillStyle = b.dead ? C.err : b.seq ? C.good : C.excl; ctx.fillRect(x, base - h, w, h);
+      if (b === sel) { ctx.strokeStyle = C.text; ctx.lineWidth = 2; ctx.strokeRect(x - 3, base - h - 3, w + 6, h + 6); }
+      text(IL.fmt(b.count), x + w / 2, base - h - 11, C.text, 'center');
+      b.label.split(' ').forEach(function (part, j) { text(part, x + w / 2, base + 11 + 13 * j, C.mute, 'center'); });
+    });
+    // lanes: the selected witness schedule, one lane per thread
+    var n = rp.steps.length, LW = 34, ly = base + 30 + 13 * Math.max(0, p.vars.length - 1);
+    var lh = Math.min(30, (H - ly - 22) / T), cw = Math.min(46, (W - LW - 12) / Math.max(1, n + (sel.dead ? 4 : 0)));
+    text('witness ' + (st.wi + 1) + '/' + st.list.length + ': ' + (sel.dead ? 'the shortest schedule into a deadlock' : 'one schedule ending in ' + sel.label) + ' (' + n + ' steps)', 10, ly - 12, C.mute);
+    for (var t = 0; t < T; t++) {
+      var y = ly + t * lh + lh / 2;
+      text('T' + (t + 1), 8, y, C.text);
+      ctx.strokeStyle = C.border; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(LW, y); ctx.lineTo(W - 8, y); ctx.stroke();
+    }
+    rp.steps.forEach(function (s, i) {
+      var w = s.text.split(' '), x = LW + i * cw, y = ly + s.t * lh;
+      ctx.fillStyle = C[HUE[w[0]]]; ctx.fillRect(x + 1, y + 3, cw - 2, lh - 6);
+      if (cw >= 24) text(SHORT[w[0]] + ' ' + w[1], x + cw / 2, y + lh / 2, '#fff', 'center');
+    });
+    if (sel.dead) rp.blocked.forEach(function (b) { text('✕ ' + b.text, Math.min(LW + n * cw + 6, W - 250), ly + b.t * lh + lh / 2, C.err); });
+    text('ld/st load/store  +1 fetch_add  L/U lock/unlock  snd/rcv channel', W - 8, H - 9, C.dim, 'right');
+    KP.forEach(function (id, i) { $(id).textContent = rep.kpis[i]; });
+    rd.textContent = rep.text; rd.className = 'readout ' + (rep.bad ? 'err' : 'ok');
+  }
+
+  slider.addEventListener('input', run);
+  preset.addEventListener('change', function () { loadPreset(preset.value); });
+  inputs.forEach(function (inp) { inp.addEventListener('change', run); });
+  $('w17-run').addEventListener('click', run);
+  $('w17-next').addEventListener('click', function () { if (st.list.length) { st.wi = (st.wi + 1) % st.list.length; draw(); } });
+  window.addEventListener('resize', draw);
+  loadPreset('a');
+})();
+</script>
+<!-- reviewed:v1 -->
+</body>
+</html>

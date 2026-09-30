@@ -1,0 +1,488 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>18 · Async — futures as state machines | Rust from the Contract Up</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topnav"><div class="inner"><a class="crumb-link" href="../../index.html">all_lessons</a><span class="crumb">/</span><a class="crumb-link" href="index.html">Rust</a><span class="crumb">/</span><span class="crumb">18 · Async</span><span class="step-pill">lesson 19 / 23</span></div></header>
+<main>
+
+<h1>Async — futures as state machines</h1>
+<p class="subtitle">Lesson 17 left one cost standing: every thread owns a stack and a place in the operating system's scheduler, so a server with ten thousand idle connections pays for ten thousand of them just to wait. This lesson compiles the pause into the code instead. An <code>async fn</code> becomes a state machine — a value that records which <code>.await</code> it stopped at and holds the locals still live there — and an ordinary library function drives such values on one thread. One new rule, pinning, makes the machine sound, because a paused function may hold references into itself. What it buys is waiting that costs bytes instead of threads, with no run-time system in the language; what it costs is a second dialect of Rust.</p>
+
+<div class="callout source-note"><div class="label">The thesis, here</div>Waiting is not work; it is state. A thread keeps that state implicitly, on a stack sized for the worst case. A future keeps it explicitly, in a value whose type the compiler derives from the liveness analysis Lesson 07 already runs — one state per <code>.await</code>, holding what is live there. Once the pause is a value, running it is a library's job, and the only new question is what may happen to a value that points into itself.</div>
+
+<div class="callout"><div class="label">Linear position</div><strong>Forced by:</strong> <span class="baton" data-seam="S17-18">Every thread costs a stack and a scheduler slot; ten thousand idle connections would need ten thousand threads. How can many tasks wait at once without a thread each, and without the language shipping a runtime?</span><br><strong>New idea:</strong> compile each pause into the code. <strong>An <code>async fn</code> compiles to a state machine that stores the locals live across each <code>.await</code>; <code>Pin</code> makes its self-references sound; the executor that runs it is ordinary library code.</strong> The price is a second dialect.<br><strong>Forces next:</strong> <span class="baton" data-seam="S18-19">Since Rc and RefCell we have leaned on library types — Mutex, Vec, Pin — whose insides the checker cannot verify. What is inside them, what exactly is the compiler taking on trust, and who checks it?</span></div>
+
+<div class="callout"><div class="label">The plan</div>
+Seven moves. (1) Price waiting with threads, and weigh three ways to pause without one. (2) Derive the state machine by hand from liveness, then measure the compiler's. (3) Read the <code>Future</code> trait: <code>poll</code>, <code>Pending</code>, and the waker. (4) Build state machines in the widget and watch rustc's layout, byte for byte. (5) Write the executor — a dozen lines of library code. (6) Derive why a started future must not move, and what <code>Pin</code> promises. (7) Price the dialect: colouring, <code>Send</code>, blocking, cancellation.</div>
+
+<h2>1 · The cost of waiting with threads</h2>
+
+<p>Picture a chat server with ten thousand open connections, of which perhaps a dozen have a message at any moment; the rest wait for their client to type. The simplest design is Lesson 17's: a thread per connection, looping <em>read, handle, write</em> and blocking in <em>read</em>. The code is straight-line and the borrow checker is content. The bill is in the threads.</p>
+
+<p><a href="17_concurrent_programs.html">Lesson 17</a> priced that unit: a standard-library thread is one operating-system thread with its own stack, 2 MiB by default for a spawned thread on Tier-1 platforms (the docs call the figure subject to change). Ten thousand connections ask for 20,000 MiB of stack (10,000 × 2 MiB) and ten thousand entries in the scheduler, almost all of them doing nothing. A stack is sized for the deepest call the thread might ever make; a waiting connection needs only the few values it will use when its data arrives.</p>
+
+<p>So the goal is sharper than "fewer threads". We want <strong>a computation that can pause</strong>: stop in the middle of a function, give the thread back, and later continue from the same point with the same locals, on whatever thread is free. There are three ways to build one.</p>
+
+<div class="callout road"><div class="label">Road not taken · callbacks</div>Split the handler at every wait and register the rest as a closure to run when the data arrives. No stack per connection — but the straight-line function is gone: control is inverted, and every local that crosses a wait must be captured by the closure that continues. In Rust each capture is an ownership decision (<a href="14_closures_iterators.html">Lesson 14</a>): a callback that runs later must own what it captures, so shared state tends to end up in <code>Rc&lt;RefCell&lt;…&gt;&gt;</code>, where <a href="15_smart_pointers_interior_mutability.html">Lesson 15</a> checks the law at run time.</div>
+
+<div class="callout road"><div class="label">Road not taken · cheap threads and a scheduler</div>Keep straight-line code and make threads cheap instead: small stacks that grow on demand, switched by a scheduler in the language's run-time system. That is the road <a href="../../go/lessons/08_goroutines_scheduler.html">Go · 08</a> derives, and under Go's budget it is a good one. Under Rust's it is excluded: a run-time system is what <a href="00_orientation.html">Lesson 00</a>'s budget rules out.</div>
+
+<p>The third road is to <strong>compile the pause into the code</strong>: the compiler rewrites the function into a value that remembers where it stopped and which locals it still needs, and resuming it is a method call. No stack per task, no scheduler in the language; whoever holds the value decides when to resume it. So now we need to know exactly what that value must contain.</p>
+
+<h2>2 · Derive the state machine by hand</h2>
+
+<p>Take the smallest handler with two waits. It creates a 64-byte buffer for a request header, waits for the header, parses it, then creates a 1,024-byte buffer for the body, waits again, and reads the body. To pause at a wait the function must return to its caller; to resume, it must jump back to the statement after that wait with every local it will still use. Which locals are those? The ones <em>live</em> at the wait — used later on some path — the backward liveness <a href="07_borrow_checker_liveness.html">Lesson 07</a> computes for borrows, now asked at the waits. At the first wait <code>header</code> is live; at the second only <code>body</code> is, because the header was last used before it.</p>
+
+<p>So the paused function is a value with a <strong>tag</strong> — the number of the wait it is stopped at — and, for each wait, just the locals live there: an enum with one variant per wait, plus one for "not started" (<a href="09_enums_option_match.html">Lesson 09</a>). Written by hand, with std's two-case enum <code>Poll</code> (<code>Ready(value)</code> or <code>Pending</code>) as the result:</p>
+
+<pre data-rs="ok" id="hand" data-out="suspended suspended size_of::&lt;Handler&gt;() = 1025"><code>use std::task::Poll;
+struct Buf&lt;const N: usize&gt; { bytes: [u8; N] }
+
+enum Handler {                          // one variant per point where the body can stop
+    Start,
+    AtHeader { header: Buf&lt;64&gt; },       // stopped at wait 1: header is still needed
+    AtBody { body: Buf&lt;1024&gt; },         // stopped at wait 2: only body is
+}
+impl Handler {
+    fn resume(&amp;mut self) -&gt; Poll&lt;u8&gt; {  // run to the next wait; keep only what is live
+        match self {
+            Handler::Start =&gt; *self = Handler::AtHeader { header: Buf { bytes: [1; 64] } },
+            Handler::AtHeader { header } =&gt; {
+                let _kind = header.bytes[0];            // the last use of header
+                *self = Handler::AtBody { body: Buf { bytes: [2; 1024] } };
+            }
+            Handler::AtBody { body } =&gt; return Poll::Ready(body.bytes[0]),
+        }
+        Poll::Pending
+    }
+}
+fn main() {
+    let mut h = Handler::Start;
+    while h.resume().is_pending() { println!("suspended"); }
+    println!("size_of::&lt;Handler&gt;() = {}", std::mem::size_of::&lt;Handler&gt;());
+}</code></pre>
+<pre class="out" data-for="hand">suspended
+suspended
+size_of::&lt;Handler&gt;() = 1025</pre>
+
+<p>Each call to <code>resume</code> runs from where the last one stopped to the next wait, stores what the rest of the function needs in the next variant, and returns <code>Pending</code>; when the body finishes it returns <code>Ready</code>. The machine is 1,025 bytes: one byte of tag plus the largest variant. The header and the body are never stored at the same time, so they share bytes.</p>
+
+<p>Rust's syntax for writing the handler straight-line is <code>async fn</code>, with <code>.await</code> marking each point where it may pause; the compiler derives the enum. Calling an <code>async fn</code> runs none of its body — it returns the machine as a value — so <code>size_of_val</code> can weigh it. Below, <code>tick()</code> stands in for any operation that may have to wait (§3 writes a real one), and <code>read</code> for parsing:</p>
+
+<pre data-rs="ok" id="sizes" data-out="handler: 1026 bytes both: 1090 bytes"><code>struct Buf&lt;const N: usize&gt; { bytes: [u8; N] }
+fn read(_byte: u8) {}
+fn tick() -&gt; std::future::Ready&lt;()&gt; { std::future::ready(()) }
+
+async fn handler() {                  // header, then body
+    let header = Buf { bytes: [1; 64] };
+    tick().await;                     // live here: header
+    read(header.bytes[0]);
+    drop(header);                     // header's storage ends
+    let body = Buf { bytes: [2; 1024] };
+    tick().await;                     // live here: body
+    read(body.bytes[0]);
+}
+async fn both() {                     // both needed across the same await
+    let header = Buf { bytes: [1; 64] };
+    let body = Buf { bytes: [2; 1024] };
+    tick().await;                     // live here: header and body
+    read(header.bytes[0]);
+    read(body.bytes[0]);
+}
+fn main() {
+    println!("handler: {} bytes", std::mem::size_of_val(&amp;handler()));
+    println!("both:    {} bytes", std::mem::size_of_val(&amp;both()));
+}</code></pre>
+<pre class="out" data-for="sizes">handler: 1026 bytes
+both:    1090 bytes</pre>
+
+<p>The compiler's machine is 1,026 bytes: the tag plus the larger state — the 1,024-byte body and one byte more, because a state also holds the future it is waiting on (<code>tick()</code>'s one-byte future). When both buffers are live across one wait, that state holds both: 1,090 = 1 + 64 + 1,024 + 1. The size tracks the largest set of locals held across one wait, not the number of locals, and it is fixed at compile time: a future is an ordinary value that can sit in a queue with ten thousand others. One line in <code>handler</code> matters more than it looks, <code>drop(header)</code>; §4 shows why.</p>
+
+<p>Holding the future it awaits has one more consequence: a function that awaits <em>itself</em> would contain itself, a value of infinite size (<a href="03_ownership_drop.html">Lesson 03</a>'s recursive type without a <code>Box</code>), so rustc rejects a directly recursive <code>async fn</code> with <code>E0733</code> until the recursive call is boxed with <code>Box::pin</code> (§6 explains the "pin").</p>
+
+<p>We have the value. Now we need the method every executor can call on every such value — what the hand-written <code>resume</code> becomes when it must work for machines nobody wrote by hand.</p>
+
+<h2>3 · The Future trait: poll, Pending, and the waker</h2>
+
+<p>Three requirements turn <code>resume</code> into the standard library's <strong><code>Future</code></strong> trait. It must never block: if the awaited event has not happened, it returns at once so the thread can run something else — hence <code>Poll::Pending</code>. It must tell whoever runs it when trying again is worthwhile, or an executor would poll everything forever — hence a <code>Context</code> carrying a <strong>waker</strong>. And it must be called on a machine that will not move, for a reason §6 derives — hence <code>self: Pin&lt;&amp;mut Self&gt;</code>. Here is std's definition, copied:</p>
+
+<pre data-rs="ok"><code>use std::pin::Pin;
+use std::task::{Context, Poll};
+
+pub trait Future {                     // std's definition, copied
+    type Output;
+    fn poll(self: Pin&lt;&amp;mut Self&gt;, cx: &amp;mut Context&lt;'_&gt;) -&gt; Poll&lt;Self::Output&gt;;
+}</code></pre>
+
+<p>The contract, as the std docs state it: <code>poll</code> tries to finish without blocking; if it cannot, it returns <code>Pending</code> after arranging a wake-up — it keeps a clone of the <code>Waker</code> from the <code>Context</code> and calls <code>wake</code> when its event happens, and the executor then polls it again. The <code>Waker</code> is how a future reaches whatever runs it: <em>poll me again, something changed</em>.</p>
+
+<p><code>.await</code> is a <code>poll</code> in a loop. In the Reference's description: pin the operand and poll it with the current task's context; on <code>Ready(v)</code> the expression's value is <code>v</code>; on <code>Pending</code> the enclosing future itself returns <code>Pending</code>, and when it is polled again it resumes at this same <code>.await</code>. So <code>Pending</code> travels outward to the executor, resumption travels back inward, and nothing runs until someone polls. Here is a real <code>Tick</code> and a handler, polled by hand:</p>
+
+<pre data-rs="ok" id="lazy" data-out="created body: start poll returned Pending body: resumed poll returned Ready"><code>use std::pin::{Pin, pin};
+use std::task::{Context, Poll, Waker};
+struct Tick(bool);                               // not ready once, then ready
+impl Future for Tick {
+    type Output = ();
+    fn poll(mut self: Pin&lt;&amp;mut Self&gt;, cx: &amp;mut Context&lt;'_&gt;) -&gt; Poll&lt;()&gt; {
+        if self.0 { return Poll::Ready(()); }
+        self.0 = true;
+        cx.waker().wake_by_ref();                // "poll me again"
+        Poll::Pending
+    }
+}
+async fn handler() {
+    println!("  body: start");
+    Tick(false).await;
+    println!("  body: resumed");
+}
+fn main() {
+    let mut fut = pin!(handler());               // creating it prints nothing
+    println!("created");
+    let mut cx = Context::from_waker(Waker::noop());
+    while fut.as_mut().poll(&amp;mut cx).is_pending() { println!("poll returned Pending"); }
+    println!("poll returned Ready");
+}</code></pre>
+<pre class="out" data-for="lazy">created
+  body: start
+poll returned Pending
+  body: resumed
+poll returned Ready</pre>
+
+<p>Creating the future printed nothing: futures are lazy, and the compiler warns about one you create and never use. The body started at the first <code>poll</code>, and the <code>Tick</code> that was not ready made the whole handler return <code>Pending</code>, to resume exactly there on the next poll. <code>Waker::noop()</code> is a waker that does nothing, acceptable only because this loop polls regardless; <code>pin!</code> fixes the future in place (§6). Everything so far is two hand-picked bodies. The claim of §2, that a state holds what is live at its wait, should hold for any body, so we need a way to try bodies and compare with rustc.</p>
+
+<h2>4 · Build the state machine</h2>
+
+<p>The widget takes the body of an <code>async fn</code> in five kinds of statement, runs Lesson 07's backward liveness at every <code>.await</code> to find what each state saves, and lays those values out the way rustc 1.98.1 does. Every program it accepts is real Rust, given §2's <code>Buf</code>, <code>read</code> and <code>tick</code> and any function <code>look</code> that takes a <code>&amp;Buf&lt;N&gt;</code>:</p>
+
+<table>
+<thead><tr><th>Widget</th><th>Rust</th><th>What it does to the value</th></tr></thead>
+<tbody>
+<tr><td><code>let x: Buf&lt;64&gt;;</code></td><td><code>let x = Buf { bytes: [0; 64] };</code></td><td>a 64-byte buffer (not <code>Copy</code>); its storage begins</td></tr>
+<tr><td><code>use x;</code></td><td><code>read(x.bytes[0]);</code></td><td>reads one byte by value: no borrow, no move</td></tr>
+<tr><td><code>borrow x;</code></td><td><code>look(&amp;x);</code></td><td>a shared borrow that ends at once</td></tr>
+<tr><td><code>drop x;</code></td><td><code>drop(x);</code></td><td>moves <code>x</code> out; its storage ends</td></tr>
+<tr><td><code>await;</code></td><td><code>tick().await;</code></td><td>a suspension point, awaiting a one-byte future</td></tr>
+</tbody>
+</table>
+
+<div class="widget" id="w18">
+  <div class="title">Build the state machine</div>
+  <div class="hint">Left: the body, one row per statement. Per buffer: its storage (thin line), its live range (thick bar, Lesson 07's liveness), a dashed line once it has been borrowed, a red ✕ where it is dropped, and a mark at each <code>await</code> that saves it: a dot if it is live there (dark if stored in the prefix), a ring if kept only because it was borrowed. Right: the future's bytes as rustc 1.98.1 lays them out: the state byte <code>#</code> and the shared prefix, then each state's own bytes, overlapping. The slider adds statements one at a time; the text box is editable.</div>
+  <div class="controls">
+    <label class="inline">statements: <input type="range" id="w18-n" min="1" max="7" step="1" value="7"> <span class="val" id="w18-n-v">7</span></label>
+    <label class="inline">program: <select id="w18-preset">
+      <option value="0">handler: header, then body</option>
+      <option value="1">the same, header never dropped</option>
+      <option value="2">both live across one await</option>
+      <option value="3">one buffer across two awaits</option>
+      <option value="4">borrowed, then dropped</option>
+      <option value="5">three stages (checkpoint)</option>
+    </select></label>
+  </div>
+  <textarea id="w18-src" rows="6" spellcheck="false" aria-label="async fn body" style="width:100%; font:12.5px/1.45 var(--mono); background:var(--code-bg); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 8px; margin-bottom:8px;"></textarea>
+  <div class="kpi-grid">
+    <div class="kpi"><div class="k">states (awaits)</div><div class="v" id="w18-k1">—</div></div>
+    <div class="kpi"><div class="k">largest live set</div><div class="v" id="w18-k2">—</div></div>
+    <div class="kpi"><div class="k">size_of_val, predicted</div><div class="v" id="w18-k3">—</div></div>
+    <div class="kpi"><div class="k">lower bound</div><div class="v" id="w18-k4">—</div></div>
+  </div>
+  <canvas id="w18-canvas" class="rs-canvas tall"></canvas>
+  <div class="readout" id="w18-read"></div>
+  <details><summary>Show the core JS</summary>
+<pre data-rs="skip" data-lang="JavaScript"><code>names.forEach(function (v) { var x = L[v]; x.end = (x.drop &gt;= 0 &amp;&amp; x.borrow &lt; 0) ? x.drop : n; });
+// Saved across await k: storage still live, and used after k (liveness) or borrowed before k (rule 3).
+function savedAt(x, k) { return x.def &lt; k &amp;&amp; k &lt; x.end &amp;&amp; (x.last &gt; k || (x.borrow &gt;= 0 &amp;&amp; x.borrow &lt; k)); }
+// …
+// Rule 1: saved in two or more states -&gt; the prefix every state shares.
+items.forEach(function (it) { it.home = null; it.why = ''; });
+states.forEach(function (st, j) {
+  st.fields.forEach(function (it) {
+    if (it.home === null) it.home = j;
+    else if (it.home !== 'prefix') { it.home = 'prefix'; it.why = 'saved in two or more states'; }
+  });
+});
+// …
+// Rule 2: two values of different states whose storage overlaps cannot share bytes; rustc moves
+// the one whose storage overlaps more values (on a tie, the later one) to the prefix.
+function overlap(a, b) { return a.lo &lt;= b.hi &amp;&amp; b.lo &lt;= a.hi; }
+function degree(a) { return items.filter(function (b) { return overlap(a, b); }).length; }
+items.forEach(function (a) {
+  if (a.home === 'prefix') return;
+  items.forEach(function (b) {
+    if (!overlap(a, b) || b.home === 'prefix' || a.home === b.home) return;
+    var loser = degree(a) &gt; degree(b) ? a : b, other = loser === a ? b : a;
+    if (loser.home !== 'prefix') { loser.home = 'prefix'; loser.why = 'storage overlaps ' + other.name + ', in another state'; }
+  });
+});</code></pre>
+  </details>
+</div>
+
+<p><strong>What to try.</strong> The first preset is §2's <code>handler</code>, statement for statement. Drag the slider up from 1. The first <code>await</code> makes a state, but <code>header</code> is saved only once <code>use header</code> arrives (a value is saved at a wait if something after the wait uses it), so the size goes 1, 2, 66, and at seven statements 1,026: the <em>lower bound</em>, the state byte plus the largest state, as if every state overlapped perfectly. "The same, header never dropped" has the same live values, yet its size is 1,090: <code>header</code>'s storage runs to the closing brace while <code>body</code> exists, so they cannot share bytes and <code>header</code> moves to the prefix. "One buffer across two awaits" puts <code>session</code> in the prefix (a value needed in two states keeps one address): 290 bytes. "Borrowed, then dropped" is 1,090 although the header is dropped before the second wait; delete <code>borrow header;</code> and it falls to 1,026.</p>
+
+<div class="callout limit"><div class="label">What rustc actually does (1.98.1, measured)</div>The Reference leaves a future's layout unspecified (roughly an enum with one variant per await point). For bodies in the widget's five statements, three rules reproduce <code>size_of_val</code> exactly. (1) A value saved in two or more states goes into a prefix every state shares. (2) A value saved in one state gets bytes of its own there, and different states' own bytes overlap — unless its storage (from its <code>let</code> to its move, or to the closing brace) overlaps the storage of a value that lives in another state; then rustc moves one of the two to the prefix: the one whose storage overlaps more values, on a tie the later one. (3) A value that was ever borrowed keeps its storage to the closing brace, whatever moves it, and counts as saved at every later <code>.await</code>: rustc assumes a borrowed value may still be in use. Size = one state byte + prefix + the largest state's own bytes. <code>tools/rust_verify/18_asyncsm.js</code> compiled 644 such bodies (each preset at every slider position, the two variants the prose mentions, 600 random ones) and matched every size. It is an observation of one release, not a promise: rustc's tracking issue for coroutine memory still lists rule 3 (issue #59087) as unfinished work as of 2026-09, beside a related cost — an argument used across an await is stored twice, measured on rustc 1.98.1 as a 16,387-byte future for one 8,192-byte argument.</div>
+
+<p>In practice: to keep a future small, end big values before the next <code>.await</code>, and give them a block to do it, since a move does not end the storage of a value that was ever borrowed. What the widget cannot show is who calls <code>poll</code>, and how that caller knows when.</p>
+
+<h2>5 · The executor is a library</h2>
+
+<p>Something has to call <code>poll</code>. In §3 it was a loop in <code>main</code> polling flat out; a real executor must sleep while nothing can make progress and wake exactly when a waker is called. The standard library's <code>Wake</code> trait turns any <code>Arc&lt;W&gt;</code> with a <code>wake</code> method into a <code>Waker</code>, and thread parking supplies the sleep. That is the whole executor:</p>
+
+<pre data-rs="ok" id="exec" data-out="executor: Pending, parking task finished: 1024"><code>use std::pin::{Pin, pin};
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread::{self, Thread};
+
+struct Unpark(Thread);                            // to wake = to unpark the executor's thread
+impl Wake for Unpark { fn wake(self: Arc&lt;Self&gt;) { self.0.unpark(); } }
+
+fn block_on&lt;F: Future&gt;(fut: F) -&gt; F::Output {     // the whole executor: a library function
+    let mut fut = pin!(fut);
+    let waker = Waker::from(Arc::new(Unpark(thread::current())));
+    let mut cx = Context::from_waker(&amp;waker);
+    loop {
+        if let Poll::Ready(out) = fut.as_mut().poll(&amp;mut cx) { return out; }
+        println!("executor: Pending, parking");
+        thread::park();                           // sleep until some waker unparks us
+    }
+}
+
+struct Tick(bool);                                // Pending once; the wake comes from elsewhere
+impl Future for Tick {
+    type Output = ();
+    fn poll(mut self: Pin&lt;&amp;mut Self&gt;, cx: &amp;mut Context&lt;'_&gt;) -&gt; Poll&lt;()&gt; {
+        if self.0 { return Poll::Ready(()); }
+        self.0 = true;
+        let waker = cx.waker().clone();
+        thread::spawn(move || waker.wake());      // another thread says "try again"
+        Poll::Pending
+    }
+}
+fn main() {
+    let n = block_on(async { Tick(false).await; 1024 });
+    println!("task finished: {n}");
+}</code></pre>
+<pre class="out" data-for="exec">executor: Pending, parking
+task finished: 1024</pre>
+
+<p><code>block_on</code> pins the future, builds a waker whose <code>wake</code> unparks the executor's thread, and loops: poll; on <code>Pending</code>, park until woken; on <code>Ready</code>, return. The helper thread in <code>Tick</code> stands in for whatever eventually reports that the data is there; the point is that <em>someone else</em> calls <code>wake</code>, possibly from another thread, which is why <code>Waker</code> is <code>Send</code> and <code>Sync</code>. The standard library provides the trait, the waker machinery, <code>pin!</code> and the syntax, but no executor. That is why <code>async fn main</code> is rejected (<code>E0752</code>) unless a runtime's macro rewrites it into an ordinary <code>main</code>. As the Book puts it, Rust does not bundle an async runtime: you choose one, and runtimes such as Tokio are ordinary crates.</p>
+
+<p>From one future to ten thousand is the same loop with a ready queue. A multi-task executor holds many futures, called <strong>tasks</strong>; a task's waker, when called, puts that task on the queue; the loop takes a ready task, polls it once, and parks when the queue is empty. Ten thousand idle connections are then ten thousand suspended state machines — each a state byte plus its largest state, 1,026 bytes for §2's toy handler — and one thread asleep until a waker fires. That answers the question we inherited: many tasks wait without a thread each, and the language ships no runtime, because the runtime is whichever library you called. But <code>block_on</code> did one thing without comment: it pinned the future before polling it.</p>
+
+<h2>6 · Why Pin</h2>
+
+<p>Borrowing across an <code>.await</code> is ordinary code: read into a buffer, keep a reference into it, wait for more. Here is the smallest version, and the obvious way to get the <code>Pin&lt;&amp;mut _&gt;</code> that <code>poll</code> demands:</p>
+
+<pre data-rs="E0277" id="pin-new"><code>use std::pin::Pin;
+
+async fn tick() {}
+
+async fn parse() -&gt; u8 {
+    let buf = [7u8; 16];
+    let cursor = &amp;buf;                // a reference to another local of this future...
+    tick().await;                     // ...held across an await
+    cursor[0]
+}
+
+fn main() {
+    let mut fut = parse();
+    let pinned = Pin::new(&amp;mut fut);  // Pin::new is only for Unpin types
+}</code></pre>
+
+<pre class="diag" data-for="pin-new"><code>error[E0277]: `{async fn body of parse()}` cannot be unpinned
+  --&gt; src/main.rs:14:27
+   |
+14 |     let pinned = Pin::new(&amp;mut fut);  // Pin::new is only for Unpin types
+   |                  -------- ^^^^^^^^ within `impl Future&lt;Output = u8&gt;`, the trait `Unpin` is not implemented for `{async fn body of parse()}`
+   |                  |
+   |                  required by a bound introduced by this call
+   |
+   = note: consider using the `pin!` macro
+           consider using `Box::pin` if you need to access the pinned value outside of the current scope</code></pre>
+
+<p>Why refuse? At that <code>.await</code>, <code>buf</code> and <code>cursor</code> are both live, so both are fields of the same state — and <code>cursor</code>'s value is the address of <code>buf</code>, a field of the very same value. The future points into itself. <a href="08_lifetimes_signatures.html">Lesson 08</a>'s side box built such a struct by hand and found it could be used where it was built but never moved, because a move copies bytes and changes the address the reference assumed. Here the compiler writes the struct for you, and a future must move at least once (the function that creates it returns it), so "never move" is too strong. If a started future could move — swapped, or pushed into a <code>Vec</code> that reallocates — <code>cursor</code> would keep the old address. In C++, where the default copy copies the pointer and not what it meant:</p>
+
+<pre data-rs="skip" data-lang="c++"><code>struct Parser {
+    char buf[16] = "GET /";
+    char* cursor = buf;              // points into this very object
+};
+std::vector&lt;Parser&gt; v(1);
+v.push_back(Parser{});               // may reallocate: v[0] moves to a new buffer...
+*v[0].cursor = 'P';                  // ...but its cursor still points at the old one</code></pre>
+
+<p>What could the language do? Forbid borrows across <code>.await</code>, and <code>parse</code> above stops compiling. Put every borrowed-across local on the heap, and each such wait costs a hidden allocation, against the budget. Fix the pointers when the value moves, as a C++ move constructor could — but a Rust move is a plain copy of bytes that runs no code (<a href="04_move_semantics.html">Lesson 04</a>). Track it in lifetimes — but the borrow's region, which the source calls its lifetime, now reaches past a suspension into a value that can move, and no lifetime names "the address of my own field". What is left is a promise: <em>once a future has been polled, it will not move again until it is dropped.</em> Before the first poll it holds no self-references, so moving it is fine.</p>
+
+<p><strong><code>Pin</code></strong> is that promise attached to a pointer. In the std docs' terms, a <code>Pin&lt;&amp;mut T&gt;</code> or <code>Pin&lt;Box&lt;T&gt;&gt;</code> guarantees that the pointee will not be moved or otherwise invalidated until it is dropped — provided <code>T</code> is not <code>Unpin</code>. It is not compiler magic: it withholds safe access to <code>&amp;mut T</code>, which is all <code>mem::swap</code> would need to move the value, and since <code>poll</code> takes <code>self: Pin&lt;&amp;mut Self&gt;</code>, nobody polls a future without having made the promise. <strong><code>Unpin</code></strong> is an auto trait for types that do not care where they live — almost every type — and the compiler marks every future made from <code>async</code> code as not <code>Unpin</code>, because it may hold references into itself. That is the error above: <code>Pin::new</code> makes no promise, so it takes only <code>Unpin</code> types. The note names two ways that do — pin on the heap, or in the current frame:</p>
+
+<pre data-rs="ok"><code>use std::pin::{Pin, pin};
+async fn tick() {}
+async fn parse() -&gt; u8 { let buf = [7u8; 16]; let cursor = &amp;buf; tick().await; cursor[0] }
+
+fn main() {
+    let on_heap: Pin&lt;Box&lt;_&gt;&gt; = Box::pin(parse());   // pinned on the heap
+    let on_stack = pin!(parse());                   // pinned in this frame
+    let mut count = 0;
+    let ordinary = Pin::new(&amp;mut count);            // fine: i32 is Unpin
+}</code></pre>
+
+<p>Either way the <em>pointee</em> stays put while the pointer — the <code>Box</code>, or the pinned handle — moves freely; for an <code>Unpin</code> type such as <code>i32</code>, <code>Pin</code> is a plain wrapper. The mechanism is now complete: a state machine, a loop that polls it, and a promise that it stays put. What is left is the bill.</p>
+
+<h2>7 · What async costs</h2>
+
+<p><strong>Two colours of function.</strong> An <code>async fn</code> can be awaited only from async code; ordinary code can call it, but gets back an inert value that something must poll. Nystrom's 2015 essay <em>What Color is Your Function?</em> named the split: every function has a colour, a red (async) function can be called only from a red one, and async/await makes the calls easier but still divides the world in two. In Rust the first symptom is a compile error:</p>
+
+<pre data-rs="E0728"><code>async fn tick() {}
+
+fn handler() {
+    tick().await;                     // an ordinary fn cannot pause
+}</code></pre>
+
+<p>The bridge from sync to async is an executor (<code>block_on</code>, §5).</p>
+
+<p><strong><code>Send</code> is decided by the saved state.</strong> An executor that may move tasks between threads demands <code>F: Send</code>, and <a href="16_send_sync.html">Lesson 16</a>'s structural rule applies to the state machine's fields: a future is <code>Send</code> only if everything it holds across an <code>.await</code> is — exactly the saved values the widget draws. Hold an <code>Rc</code> across a wait and the whole future is not <code>Send</code>:</p>
+
+<pre data-rs="error" id="not-send"><code>use std::rc::Rc;
+
+fn spawn&lt;F: Future + Send + 'static&gt;(_task: F) {}   // an executor that may move tasks between threads
+async fn tick() {}
+
+fn main() {
+    spawn(async {
+        let visits = Rc::new(0);          // Rc is not Send
+        tick().await;                     // ...and it is held across this await
+        println!("{visits}");
+    });
+}</code></pre>
+
+<pre class="diag" data-for="not-send"><code>error: future cannot be sent between threads safely
+note: future is not `Send` as this value is used across an await
+  --&gt; src/main.rs:9:16
+   |
+ 8 |         let visits = Rc::new(0);          // Rc is not Send
+   |             ------ has type `Rc&lt;i32&gt;` which is not `Send`
+ 9 |         tick().await;                     // ...and it is held across this await
+   |                ^^^^^ await occurs here, with `visits` maybe used later
+note: required by a bound in `spawn`</code></pre>
+
+<div class="callout"><div class="label">Reading the error</div>On rustc 1.98.1 this diagnostic carries no error code. Read it bottom-up: the last note names the bound that asked (<code>Send</code>, on <code>spawn</code>); the note above it names the culprit, the value (<code>visits</code>, an <code>Rc&lt;i32&gt;</code>) and the <code>.await</code> it is held across. "Maybe used later" is Lesson 16's check run on one field of a state, and its conservative rule in three words: the compiler keeps what it cannot prove dead. What the message cannot know is which change you mean — end <code>visits</code> before the wait, or switch to a type that is <code>Send</code>, such as <code>Arc</code> (<a href="15_smart_pointers_interior_mutability.html">Lesson 15</a>).</div>
+
+<p>The obvious local edit — <code>drop(visits)</code> after the <code>println!</code> and before the wait — is still rejected on this compiler. It is §4's rule 3 again: <code>println!</code> borrowed <code>visits</code>, and a value that was ever borrowed stays in the future until its scope ends, whatever you drop. A block ends the scope:</p>
+
+<pre data-rs="ok"><code>use std::rc::Rc;
+
+fn spawn&lt;F: Future + Send + 'static&gt;(_task: F) {}
+async fn tick() {}
+
+fn main() {
+    spawn(async {
+        {
+            let visits = Rc::new(0);
+            println!("{visits}");
+        }                                 // visits' scope ends before the await
+        tick().await;
+    });
+}</code></pre>
+
+<p><strong>Blocking stalls everyone.</strong> An executor thread runs one task's <code>poll</code> at a time, and nothing preempts it: a task that blocks inside <code>poll</code> — a synchronous file read, <code>thread::sleep</code>, a long computation — blocks every other task on that thread. The std docs ask that <code>poll</code> return quickly and send long work to a thread pool; a rule of thumb from a blog post by Ryhl is roughly 10 to 100 microseconds between <code>.await</code>s. Async saves the memory and the thread switches of <em>waiting</em>; it does not make work faster.</p>
+
+<p><strong>Cancellation is drop.</strong> A future does nothing unless polled, so to cancel one you stop polling it and drop it. Dropping a suspended state machine drops the values saved in its current state, at that <code>.await</code>, and the code after it never runs:</p>
+
+<pre data-rs="ok" id="cancel" data-out="cancel drop conn"><code>use std::future::pending;
+use std::task::{Context, Waker};
+
+struct Conn(&amp;'static str);                        // says when it is dropped
+impl Drop for Conn { fn drop(&amp;mut self) { println!("drop {}", self.0); } }
+async fn handler() {
+    let _conn = Conn("conn");
+    pending::&lt;()&gt;().await;                        // suspended here, for good...
+    println!("never printed");
+}
+fn main() {
+    let mut fut = Box::pin(handler());
+    let _ = fut.as_mut().poll(&amp;mut Context::from_waker(Waker::noop()));
+    println!("cancel");
+    drop(fut);                                    // ...and dropped: conn's drop runs now
+}</code></pre>
+<pre class="out" data-for="cancel">cancel
+drop conn</pre>
+
+<p>That is clean — the future simply stops being polled, and destructors run (<a href="../../cpp/lessons/05_raii.html">RAII</a> at work) — and it is a new failure mode: every <code>.await</code> is a point where your function may silently stop. Code that must finish two steps together, such as writing a record and then its index, cannot assume the second step runs.</p>
+
+<p><strong>"Zero-cost", precisely.</strong> The state machine needs no allocation, no thread and no run-time system you did not choose, and its size is a compile-time constant. That is all zero-cost means here. The concepts are not free (colouring, pinning, <code>Send</code> bounds, cancellation points), and the layout is not optimal (§4's rules, the doubled arguments).</p>
+
+<h2>Common mistakes / failure modes</h2>
+<div class="topic-grid">
+  <div class="topic-card"><div class="k">"Calling an async fn starts the work"</div><div class="v">It builds the state machine and returns it; the body runs at the first <code>poll</code> (§3 printed "created" before any line of the body), and a future you create and ignore draws the unused-future warning.</div></div>
+  <div class="topic-card"><div class="k">"<code>.await</code> blocks the thread until the result is ready"</div><div class="v">If the inner future is not ready, <code>.await</code> makes its own future return <code>Pending</code> to the poller; the thread moves on to other tasks and only this task waits (§3, §5).</div></div>
+  <div class="topic-card"><div class="k">"async is threads — or a runtime built into Rust"</div><div class="v">It is syntax plus a trait. The executor is library code you choose (§5 wrote one in a dozen lines); one thread can drive many tasks, and std ships no executor.</div></div>
+  <div class="topic-card"><div class="k">"<code>Pin</code> freezes memory" / "a future can move any time"</div><div class="v">A future moves freely until its first poll. After that, <code>Pin</code> promises only that a pointee that is not <code>Unpin</code> keeps its address until dropped; the <code>Box</code> or handle holding it still moves (§6).</div></div>
+  <div class="topic-card"><div class="k">"async is just cheaper threads"</div><div class="v">It saves the stack and the thread switch of each <em>waiting</em> task, not the work: CPU-bound code has no waiting to save. A blocking call inside <code>poll</code> stalls every task on that executor thread, because nothing preempts it, so keep the time between <code>.await</code>s short and move blocking work elsewhere (§7).</div></div>
+</div>
+
+<h2>Checkpoint exercise</h2>
+<div class="callout"><div class="label">Try it</div>In the widget, choose "three stages (checkpoint)". Before looking at the numbers, write down which buffers each of the three states saves, and the lower bound (the state byte plus the largest state). Then read rustc's size: it is 602, not your lower bound of 402, and the readout says <code>row</code> went to the prefix. Explain why from rule 2 — which two storages overlap, and why the 400-byte buffer is the one moved. Now bring the future down to its lower bound by <em>moving one line</em>, without changing what the function computes; the widget confirms it when <code>size_of_val</code> reads 402. Finally, write the three-stage body as a real <code>async fn</code> using the table in §4, and print <code>size_of_val</code> before and after your change.</div>
+
+<h2>Where this points next</h2>
+<p>We answered with a value instead of a thread: a future is a compiler-built state machine, an executor is a library loop, and ten thousand futures wait on one sleeping thread. But count what we trusted. <code>.await</code> pins its operand with <code>Pin::new_unchecked</code>, an <code>unsafe</code> function (the Reference's description): a promise the checker does not verify. A <code>Waker</code> can be built from raw pointers and a hand-written table of functions. And long before this lesson, <code>Rc</code>, <code>RefCell</code>, <code>Mutex</code> and <code>Vec</code> counted owners, handed out exclusive access through a shared handle and reallocated buffers, none of it visible to the borrow checker. Each is a library type whose soundness someone asserted and the checker did not prove. So what is inside those types, what exactly is the compiler taking on trust, and who checks it?</p>
+
+<div class="callout ok"><div class="label">Takeaway</div>
+Waiting is state, not work. An <code>async fn</code> compiles to a <strong>state machine</strong>: a tag for the <code>.await</code> it stopped at plus the values live there — Lesson 07's liveness asked at suspension points — so a future is its largest state plus a byte (1,026 bytes for the handler, 1,090 when both buffers survive one wait). Values share bytes only once their storage has ended; a borrowed value is kept to its closing brace. <code>poll</code> returns <code>Ready</code> or <code>Pending</code>; the <code>Waker</code> says when to poll again. The <strong>executor is a library</strong>: std ships the trait and the syntax, not a runtime. A started future may point into itself, so <strong><code>Pin</code></strong> promises it will not move until dropped. The price is a second dialect: two colours of function, <code>Send</code> decided at each <code>.await</code>, blocking that stalls everyone, and cancellation at any <code>.await</code>.</div>
+
+<h2>Interview prompts</h2>
+<ul class="prompt-list">
+<li>What does an <code>async fn</code> compile to, and how big is it? <em>(§2 — an anonymous state machine: a tag for the <code>.await</code> it is stopped at, plus the locals live there and the future it awaits; its size, fixed at compile time, is the largest state plus the tag.)</em></li>
+<li>Why is a future lazy, and what does <code>.await</code> do? <em>(§3 — nothing runs until something calls <code>poll</code>; <code>.await</code> polls the inner future and, on <code>Pending</code>, makes the enclosing future return <code>Pending</code>, resuming at the same point next time.)</em></li>
+<li>What is a <code>Waker</code> for? <em>(§3, §5 — a <code>Pending</code> future keeps a clone and calls <code>wake</code> when its event happens, so the executor re-polls that task instead of everything; it is <code>Send</code> and <code>Sync</code> because the wake may come from any thread.)</em></li>
+<li>Does Rust have a built-in async runtime? <em>(§5 — no: std provides the trait, the waker types, <code>pin!</code> and the syntax; executors are library code, runtimes like Tokio are crates, and <code>async fn main</code> is rejected without one.)</em></li>
+<li>What does <code>Pin</code> guarantee, and why do futures need it? <em>(§6 — that a pointee which is not <code>Unpin</code> is not moved until dropped; a started future may hold a reference into its own state, and a Rust move cannot run fix-up code.)</em></li>
+<li>When is a future <code>Send</code>, and how do you fix "future cannot be sent between threads safely"? <em>(§7 — when everything it holds across an <code>.await</code> is <code>Send</code>; end the value's scope with a block before the await — a <code>drop</code> after a borrow does not count — or use a <code>Send</code> type.)</em></li>
+<li>Why is blocking inside async code a bug, and is async faster than threads? <em>(§7 — a blocked <code>poll</code> stalls every task on its executor thread; async saves the stack and switch of waiting tasks, not the work.)</em></li>
+<li>How do you cancel a future, and what runs? <em>(§7 — drop it: the values saved in its current state are dropped at that <code>.await</code> and the rest never runs, so every <code>.await</code> is a possible exit.)</em></li>
+</ul>
+
+<footer class="lesson-nav"><a href="17_concurrent_programs.html"><span class="dir">Previous</span><span class="ttl">17 · Concurrent programs</span></a><a class="next" href="19_unsafe_obligations.html"><span class="dir">Next</span><span class="ttl">19 · unsafe — taking the proof back</span></a></footer>
+
+<p style="font-size:13px; color:var(--text-mute); margin-top:18px;">Companion reads: <a href="../../go/lessons/08_goroutines_scheduler.html">Go · 08 Goroutines and the scheduler</a> (the road with a run-time system), <a href="../../go/lessons/10_select_context.html">Go · 10 select and context</a> (cancellation made explicit), <a href="../../cpp/lessons/17_concurrency_threads.html">C++ · 17 Threads</a> (OS threads, each with its own stack: the baseline), and <a href="../../functional_programming/lessons/13_laziness_streams_concurrency.html">FP · 13 Laziness and streams</a> (work described as a value until forced).</p>
+
+</main>
+
+<script src="asyncsm.js"></script>
+<script>
+(function () {
+  var cv = document.getElementById('w18-canvas');
+  if (!cv || !window.AsyncSM) return;
+  var SM = window.AsyncSM;
+  var sel = document.getElementById('w18-preset'), rng = document.getElementById('w18-n'), src = document.getElementById('w18-src');
+  var prog = { stmts: [], errors: [] };
+  function put(id, t) { var e = document.getElementById(id); if (e) e.textContent = t; }
+
+  function draw() {
+    var v = SM.draw(cv, prog, +rng.value), a = v.a, rep = SM.report(prog, a), rd = document.getElementById('w18-read');
+    put('w18-n-v', v.n + ' / ' + prog.stmts.length);
+    put('w18-k1', String(a.states.length)); put('w18-k2', a.largestLive + ' B');
+    put('w18-k3', a.size + ' B'); put('w18-k4', a.lower + ' B');
+    rd.textContent = rep.text; rd.className = 'readout ' + (rep.ok ? 'ok' : 'err');
+  }
+  function reparse(toEnd) {
+    prog = SM.parse(src.value);
+    var m = Math.max(1, prog.stmts.length);
+    rng.max = String(m);
+    if (toEnd || +rng.value > m) rng.value = String(m);
+    draw();
+  }
+  function load(i) { src.value = (SM.PRESETS[i] || SM.PRESETS[0]).text; reparse(true); }
+
+  sel.addEventListener('change', function () { load(+sel.value || 0); });
+  rng.addEventListener('input', draw);
+  src.addEventListener('input', function () { reparse(false); });
+  window.addEventListener('resize', draw);
+  load(0);
+})();
+</script>
+<!-- reviewed:v1 -->
+</body>
+</html>
