@@ -1,6 +1,6 @@
 /* ============================================================================
    Widget engine. One renderer per lesson, keyed by canvas[data-demo="KEY"].
-   Wiring contract (identical to ../world_models/visuals.js):
+   Wiring contract (shared by the three training tracks):
      controls   <input type=range data-role="X" data-suffix="%">  |  <select data-role="X">
      echoes     <span class="val" data-value="X">
      readouts   <div class="v" data-metric="Y">
