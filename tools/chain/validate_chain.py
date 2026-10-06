@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate a "forced chain" lesson series: 3D Vision (computer_vision_3d), World Models (world_models) and Training a Robot Model (robot_model_training).
+"""Validate a "forced chain" lesson series: 3D Vision (computer_vision_3d), World Models (world_models), Training a Robot Model (robot_model_training) and Synthetic Vision Data (synthetic_vision).
 
 What it checks, cheapest first
   structure  tag balance, unescaped & / <, step-pill == "lesson N / TOTAL", exactly one widget + one canvas,
@@ -43,6 +43,8 @@ SERIES = {
     "wm": dict(json="batons_wm.json", dirname="world_models", engines=["courtyard.js"],
                next_last="../robot_model_training/01_the_policy_contract.html"),
     "rob": dict(json="batons_rob.json", dirname="robot_model_training", engines=["bench.js"],
+                next_last="index.html"),
+    "syn": dict(json="batons_syn.json", dirname="synthetic_vision", engines=["street.js"],
                 next_last="index.html"),
 }
 
@@ -404,7 +406,7 @@ def check_structure(S: Series, files: list[Path], final: bool) -> tuple[list[str
 def alt_exists(target: Path) -> bool:
     """During the rewrite the two series live in *_new directories; a link into the other series is fine if either exists."""
     s = str(target)
-    for name in ("computer_vision_3d", "world_models", "robot_model_training"):
+    for name in ("computer_vision_3d", "world_models", "robot_model_training", "synthetic_vision"):
         tag = f"/{name}/"
         if tag in s and Path(s.replace(tag, f"/{name}_new/")).exists():
             return True

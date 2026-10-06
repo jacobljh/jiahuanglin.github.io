@@ -24,7 +24,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 LESSON_ROOT = ROOT / "all_lessons"
 SERIES = {"3d": ("batons_3d.json", "computer_vision_3d"), "wm": ("batons_wm.json", "world_models"),
-          "rob": ("batons_rob.json", "robot_model_training")}
+          "rob": ("batons_rob.json", "robot_model_training"), "syn": ("batons_syn.json", "synthetic_vision")}
 ROMAN = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII"]
 
 
