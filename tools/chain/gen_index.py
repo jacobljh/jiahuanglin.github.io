@@ -24,7 +24,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 LESSON_ROOT = ROOT / "all_lessons"
 SERIES = {"3d": ("batons_3d.json", "computer_vision_3d"), "wm": ("batons_wm.json", "world_models"),
-          "rob": ("batons_rob.json", "robot_model_training"), "dat": ("batons_dat.json", "embodied_training_data")}
+          "rob": ("batons_rob.json", "robot_model_training")}
 ROMAN = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII"]
 
 
@@ -65,10 +65,16 @@ def build(key: str) -> int:
         rows.append(f'<tr class="part"><td colspan="4">Part {ROMAN[pi]} · {esc(part["name"])}</td></tr>')
         for n in range(a, b + 1):
             L = lessons[n]
+            if L.get("legacy"):          # a lesson kept in the layout it was written in: no baton sentences, so no derivation row
+                continue
             sin = f"S{n - 1:02d}-{n:02d}"
             sout = f"S{n:02d}-{n + 1:02d}" if n < total else f"S{n:02d}-x"
             rows.append(f'<tr data-lesson="{n:02d}"><td>{n:02d}</td><td>{esc(batons[sin])}</td>'
                         f'<td><a href="{L["slug"]}.html">{esc(L["title"])}</a>: {esc(L["move"])}</td><td>{esc(batons[sout])}</td></tr>')
+        old = [n for n in range(a, b + 1) if lessons[n].get("legacy")]
+        if old:
+            rows.append(f'<tr class="legacy"><td colspan="4">Lessons {old[0]}–{old[-1]} keep the layout they were written in: each opens with a box that says what forced it and closes with a hand-off, '
+                        f'but those sentences are not diffed against this table and their numbers are not re-derived by script.</td></tr>')
 
     def swap(text: str, name: str, body: str) -> str:
         pat = re.compile(rf"(<!-- GEN:{name} -->)(.*?)(<!-- /GEN:{name} -->)", re.S)
@@ -79,7 +85,7 @@ def build(key: str) -> int:
     raw = swap(raw, "TOC", "\n".join(toc))
     raw = swap(raw, "DERIVE", "\n".join(rows))
     idx.write_text(raw, encoding="utf-8")
-    print(f"wrote {idx.relative_to(ROOT)}: {total} cards, {total} derivation rows")
+    print(f"wrote {idx.relative_to(ROOT)}: {total} cards, {sum(1 for r in rows if r.startswith('<tr data-lesson'))} derivation rows")
     return 0
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate a "forced chain" lesson series: 3D Vision (computer_vision_3d) and World Models (world_models).
+"""Validate a "forced chain" lesson series: 3D Vision (computer_vision_3d), World Models (world_models) and Training a Robot Model (robot_model_training).
 
 What it checks, cheapest first
   structure  tag balance, unescaped & / <, step-pill == "lesson N / TOTAL", exactly one widget + one canvas,
@@ -41,10 +41,8 @@ SERIES = {
     "3d": dict(json="batons_3d.json", dirname="computer_vision_3d", engines=["flatland.js"],
                next_last="../world_models/01_what_is_a_world_model.html"),
     "wm": dict(json="batons_wm.json", dirname="world_models", engines=["courtyard.js"],
-               next_last="../world_model_training/00_two_seats_one_tuple.html"),
+               next_last="../robot_model_training/01_the_policy_contract.html"),
     "rob": dict(json="batons_rob.json", dirname="robot_model_training", engines=["bench.js"],
-                next_last="../embodied_training_data/01_exchange_rates.html"),
-    "dat": dict(json="batons_dat.json", dirname="embodied_training_data", engines=["bench.js", "ledger.js"],
                 next_last="index.html"),
 }
 
@@ -213,6 +211,36 @@ class Series:
 
 
 # ───────────────────────────── structure ─────────────────────────────
+def check_legacy(S: Series, f: Path, n: int) -> list[str]:
+    """A lesson kept in the layout it was written in (batons file entry with "legacy": true): it has no baton spans, no oracle and no
+    widget contract, so only its place in the series is checked: tag balance, step pill, title, navigation and links."""
+    errs: list[str] = []
+    raw = f.read_text(encoding="utf-8")
+    page = parse(f)
+    errs += page.errors
+    want_pill = f"lesson {n} / {S.total}"
+    if page.step_pill.strip() != want_pill:
+        errs.append(f"{f.name}: step-pill is {page.step_pill.strip()!r}, want {want_pill!r}")
+    if not page.title.startswith(f"{n:02d} ·") or not page.title.endswith("| " + S.title):
+        errs.append(f"{f.name}: <title> should be 'NN · … | {S.title}' (got {page.title!r})")
+    nav = re.search(r'<footer class="lesson-nav">(.*?)</footer>', raw, re.S)
+    if not nav:
+        errs.append(f"{f.name}: missing footer.lesson-nav")
+    else:
+        hrefs = re.findall(r'href="([^"]+)"', nav.group(1))
+        prev_want = "index.html" if n == 1 else S.slug[n - 1]
+        next_want = S.cfg["next_last"] if n == S.total else S.slug[n + 1]
+        if len(hrefs) != 2 or hrefs[0] != prev_want or hrefs[1] != next_want:
+            errs.append(f"{f.name}: nav footer hrefs {hrefs} != [{prev_want}, {next_want}]")
+    for h in page.hrefs:
+        if re.match(r"^(https?:|mailto:|#)", h):
+            continue
+        base = h.split("#")[0]
+        if base and not ((f.parent / base).resolve().exists() or alt_exists((f.parent / base).resolve())):
+            errs.append(f"{f.name}: dangling href {h}")
+    return errs
+
+
 def check_structure(S: Series, files: list[Path], final: bool) -> tuple[list[str], dict]:
     errs: list[str] = []
     info: dict[int, dict] = {}
@@ -228,6 +256,9 @@ def check_structure(S: Series, files: list[Path], final: bool) -> tuple[list[str
             continue
         if f.name != S.slug[n]:
             errs.append(f"{f.name}: the plan calls lesson {n:02d} {S.slug[n]!r}")
+        if S.lessons[n].get("legacy"):
+            errs += check_legacy(S, f, n)
+            continue
         raw = f.read_text(encoding="utf-8")
         page = parse(f)
         errs += page.errors
@@ -373,7 +404,7 @@ def check_structure(S: Series, files: list[Path], final: bool) -> tuple[list[str
 def alt_exists(target: Path) -> bool:
     """During the rewrite the two series live in *_new directories; a link into the other series is fine if either exists."""
     s = str(target)
-    for name in ("computer_vision_3d", "world_models", "robot_model_training", "embodied_training_data"):
+    for name in ("computer_vision_3d", "world_models", "robot_model_training"):
         tag = f"/{name}/"
         if tag in s and Path(s.replace(tag, f"/{name}_new/")).exists():
             return True
@@ -403,7 +434,7 @@ def check_batons(S: Series, info: dict, strict_index: bool) -> list[str]:
             tds = [strip_tags(x) for x in re.findall(r"<td[^>]*>(.*?)</td>", body, re.S)]
             if len(tds) >= 4:
                 cells[int(num)] = (tds, body)
-        for n in range(1, S.total + 1):
+        for n in sorted(k for k in S.lessons if not S.lessons[k].get("legacy")):
             if n not in cells:
                 errs.append(f"index derivation table lacks a row for lesson {n:02d}")
                 continue
@@ -428,19 +459,16 @@ def check_cross_series(sers: dict[str, Series]) -> list[str]:
         a, b = sers["3d"].batons["S14-x"], sers["wm"].batons["S00-01"]
         if a != b:
             errs.append(f"cross-series baton: 3D S14-x != World Models S00-01\n      {a!r}\n      {b!r}")
-    wmt = LESSON_ROOT / "world_model_training" / "00_two_seats_one_tuple.html"
+    # the last World Models lessons (17-31) are older lessons without baton spans; their two ends are still tied to the batons
+    wmt = LESSON_ROOT / "world_models" / "17_two_seats_one_tuple.html"
     if "wm" in sers and wmt.exists():
         raw = wmt.read_text(encoding="utf-8")
-        if sers["wm"].batons["S16-x"] not in strip_tags(raw):
-            errs.append("world_model_training/00_two_seats_one_tuple.html does not open with the World Models closing baton (S16-x)")
-    if "rob" in sers and "dat" in sers:
-        a, b = sers["rob"].batons["S15-x"], sers["dat"].batons["S00-01"]
-        if a != b:
-            errs.append(f"cross-series baton: Robot Model S15-x != Embodied Data S00-01\n      {a!r}\n      {b!r}")
-    wmt14 = LESSON_ROOT / "world_model_training" / "14_capstone_recipe.html"
+        if sers["wm"].batons["S16-17"] not in strip_tags(raw):
+            errs.append("world_models/17_two_seats_one_tuple.html does not open with lesson 16's closing baton (S16-17)")
+    wmt14 = LESSON_ROOT / "world_models" / "31_capstone_recipe.html"
     if "rob" in sers and wmt14.exists():
         if sers["rob"].batons["S00-01"] not in strip_tags(wmt14.read_text(encoding="utf-8")):
-            errs.append("world_model_training/14_capstone_recipe.html does not end on the Robot Model opening baton (S00-01)")
+            errs.append("world_models/31_capstone_recipe.html does not end on the Robot Model opening baton (S00-01)")
     return errs
 
 

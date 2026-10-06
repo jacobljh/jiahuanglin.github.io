@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 'use strict';
 /* merge_relevance.js — copies lesson 4's measured shelf-life table into the ledger:  LG.TABLE.relevance = SL.table()
- *   node tools/chain/verify/engine/merge_relevance.js          (rewrites the TABLE block of all_lessons/embodied_training_data_new/ledger.js)
+ *   node tools/chain/verify/engine/merge_relevance.js          (rewrites the TABLE block of all_lessons/robot_model_training/ledger.js)
  * shelf_lab.js holds the measurements (built by build_shelf.js); the ledger only carries the small summary the later lessons read.
  * build_ledger.js keeps an existing `relevance` block when it rebuilds the rest of the table. */
 const fs = require('fs'), path = require('path');
 const LESS = path.resolve(__dirname, '../../../../all_lessons');
-const DD = fs.existsSync(path.join(LESS, 'embodied_training_data_new')) ? 'embodied_training_data_new' : 'embodied_training_data';
+const DD = fs.existsSync(path.join(LESS, 'robot_model_training_new')) ? 'robot_model_training_new' : 'robot_model_training';
 const LEDGER = path.join(LESS, DD, 'ledger.js'), SHELF = path.join(LESS, DD, 'shelf_lab.js');
 const BEGIN = '/*TABLE:BEGIN*/', END = '/*TABLE:END*/';
 const LG = require(LEDGER), SL = require(SHELF), rel = SL.table();

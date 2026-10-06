@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/* build_shelf.js — measures lesson 4's table on the Bench and writes it into all_lessons/embodied_training_data_new/shelf_lab.js
+/* build_shelf.js — measures lesson 19's table on the Bench and writes it into all_lessons/robot_model_training/shelf_lab.js
  *
  *   node tools/chain/verify/engine/build_shelf.js            (runs every measurement with shelf_lab.js's own constants, one process per lineage, and rewrites the TABLE block)
  *   node tools/chain/verify/engine/build_shelf.js --check    (recomputes the cheap cells live and compares them with the stored table)
@@ -17,7 +17,7 @@
 'use strict';
 const fs = require('fs'), path = require('path'), cp = require('child_process');
 const ROOT = path.resolve(__dirname, '../../../..');
-const DD = path.join(ROOT, 'all_lessons', fs.existsSync(path.join(ROOT, 'all_lessons', 'embodied_training_data_new')) ? 'embodied_training_data_new' : 'embodied_training_data');
+const DD = path.join(ROOT, 'all_lessons', fs.existsSync(path.join(ROOT, 'all_lessons', 'robot_model_training_new')) ? 'robot_model_training_new' : 'robot_model_training');
 const SHELF = path.join(DD, 'shelf_lab.js');
 const SL = require(SHELF), DL = require(path.join(DD, 'dagger_lab.js'));
 const LG = require(path.join(DD, 'ledger.js'));

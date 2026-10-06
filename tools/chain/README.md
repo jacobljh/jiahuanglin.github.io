@@ -2,12 +2,12 @@
 
 Machinery for lesson tracks written as a *forced chain*: every lesson is the single move that resolves the problem the
 previous lesson created, and hands the next problem on in a verbatim sentence (the **baton**). Used by
-`computer_vision_3d` (3D Vision), `world_models` (World Models), `robot_model_training` and `embodied_training_data`
-(and, with its own copy of the idea, `rust`).
+`computer_vision_3d` (3D Vision), `world_models` (World Models: 16 chain lessons, then 15 older ones) and `robot_model_training` (Training a Robot Model, 24 lessons: the
+policy, then the price of the data it eats), and, with its own copy of the idea, `rust`.
 
 | file | job |
 |---|---|
-| `batons_<s>.json` | the series plan: lessons, parts, and every baton sentence `S<n>-<n+1>` (series keys `3d`, `wm`, `rob`, `dat`) |
+| `batons_<s>.json` | the series plan: lessons, parts, and every baton sentence `S<n>-<n+1>` (series keys `3d`, `wm`, `rob`). A lesson entry with `"legacy": true` (World Models 17-31) keeps the layout it was written in: only its place in the series (pill, title, nav, links, tag balance) is checked, it has no oracle, and the index lists it without a derivation row |
 | `validate_chain.py` | structure, batons (end of lesson *n* = start of *n+1* = index table), page budget 20–48 KB, widgets, oracles, release gate |
 | `dom_probe.js` | runs every widget script of a page under a DOM stub (deterministic: `Math.random`/`Date` are poisoned) |
 | `verify/<s>_NN_*.js` | one **oracle** per lesson: re-derives every quoted number independently and drives the page; prints `{"facts":{…}}` last |
@@ -24,7 +24,7 @@ python3 tools/chain/qa_layout.py --series wm --index                            
 python3 tools/chain/gen_index.py --series wm                                        # refresh the index tables
 ```
 
-`--all` means *every* series that has a batons file (3d and wm; rob and dat once their plans exist), not "all checks" — name the series you mean.
+`--all` means *every* series that has a batons file (3d, wm and rob), not "all checks" — name the series you mean.
 The release gate (`--final`) additionally wants `<!-- reviewed:v1 -->` before `</body>` in every lesson, an oracle for every
 lesson and a valid index. Oracles take 5 s–3 min each (WM 08, 15 and 16 are the slow ones).
 
@@ -39,7 +39,7 @@ External facts (papers, systems, dates) come only from the series' fact list, ar
 
 One `.widget`, one `<canvas>`, the first `input[type=range]` is the main experiment, the layout switches on
 `cv.style.height` for narrow screens, and the "Show the core JS" listing must be lines that exist in the page script or the
-private engine (≥ 6 lines). Engines: `flatland.js`/`geom3.js` (3D), `courtyard.js` (World Models), `bench.js` (robot/data);
+private engine (≥ 6 lines). Engines: `flatland.js`/`geom3.js` (3D), `courtyard.js` (World Models), `bench.js` (robot, with `ledger.js` on top of it for lessons 16-24);
 a lesson may add a private engine `lNN_*.js`.
 
 ## Writing a series (what worked)
@@ -51,4 +51,6 @@ a lesson may add a private engine `lNN_*.js`.
    run the release gate, then swap the directories and fix inbound links (`grep -r "<old dir>/"` over `all_lessons/`,
    the master `all_lessons/index.html` cards, and `tools/epub/volumes.py`, which is keyed by directory name).
 4. Do the cross-series seams last: the closing baton of one series is the opening of the next (3D `S14-x` = WM `S00-01`; WM
-   `S16-x` opens `world_model_training/00`; robot `S15-x` = data `S00-01`).
+   `S16-17` opens `world_models/17`; the robot series' `S00-01` closes `world_models/31`; the old data series was folded into the robot
+   series as lessons 16-24, so its seam is the interior baton `S15-16`, and the old `world_model_training` track was folded into World
+   Models as lessons 17-31).

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/* build_ledger.js — measures the data track's table on the Bench and writes it into all_lessons/embodied_training_data_new/ledger.js
+/* build_ledger.js — measures the data track's table on the Bench and writes it into all_lessons/robot_model_training/ledger.js
  *
  *   node tools/chain/verify/engine/build_ledger.js            (rewrites the TABLE block of ledger.js between the two markers)
  *   node tools/chain/verify/engine/build_ledger.js --check    (recomputes a sample of cells live and compares them with the stored table)
@@ -9,7 +9,7 @@
  *            footage of a person, and simulators whose arm model is off by a gap; own demonstrations are the baseline.
  *   recover  lesson 3's engine (dagger_lab.js): the five-post course; own calm demonstrations, demonstrations recorded under a gust, corrections.
  *   contact  lesson 10's engine (insertion_lab.js): a peg in a hole with a millimetre of clearance; demonstrations with and without the force channels.
- * Hours are motion hours: attempted demonstrations x 9.3 s (the expert's time on five posts) / 3600; the supervisor's and the operator's other time is priced in lesson 2.
+ * Hours are motion hours: attempted demonstrations x 9.3 s (the expert's time on five posts) / 3600; the supervisor's and the operator's other time is priced in lesson 17.
  * Every cell is a function of fixed seeds; the file has no Math.random and no Date.
  */
 'use strict';
@@ -17,7 +17,7 @@ const fs = require('fs'), path = require('path');
 const ROOT = path.resolve(__dirname, '../../../..');
 const LESS = path.join(ROOT, 'all_lessons');
 const RD = fs.existsSync(path.join(LESS, 'robot_model_training_new')) ? 'robot_model_training_new' : 'robot_model_training';
-const DD = fs.existsSync(path.join(LESS, 'embodied_training_data_new')) ? 'embodied_training_data_new' : 'embodied_training_data';
+const DD = RD;                                           // the data lessons (16-24) live in the same directory as the robot lessons
 const BN = require(path.join(LESS, RD, 'bench.js'));
 const BL = require(path.join(LESS, RD, 'bodies_lab.js'));
 const DL = require(path.join(LESS, RD, 'dagger_lab.js'));

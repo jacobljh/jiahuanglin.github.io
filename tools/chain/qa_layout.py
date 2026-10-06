@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 CHROME = os.environ.get("CHROME", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
-DIRS = {"3d": "computer_vision_3d", "wm": "world_models", "rob": "robot_model_training", "dat": "embodied_training_data"}
+DIRS = {"3d": "computer_vision_3d", "wm": "world_models", "rob": "robot_model_training"}
 
 
 class Quiet(http.server.SimpleHTTPRequestHandler):
