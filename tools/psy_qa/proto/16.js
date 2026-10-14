@@ -1,102 +1,92 @@
-// proto/16.js — lesson 16 widget maths: cutting a continuous scale into "types" (a labelled DEMO model, not data).
-// run: node tools/psy_qa/proto/16.js
+// proto/11.js — lesson 11 widget maths: "how hard is a developmental window?  wall, soft band or steady slide?"
+// (受已发表数字启发的示意模型 — a labelled demo model. The anchor points are published (FACTS_T3b §11 D/E); the curves are 示意.)
+// run: node tools/psy_qa/proto/11.js       (the same functions are ported verbatim into 11_development.html; RNG-free, fully deterministic)
 //
-// Setting. A trait is measured twice. X, Y are the two standardised scores of one person, jointly normal, corr(X, Y) = r
-// (r is a KNOB: the two sittings may be days or years apart; the gap can be measurement noise or real change).
-// A "type letter" = which side of the population median (z = 0) the score falls on, at each sitting.
-// P(flip) = P(the two letters differ).
+// A window = a curve p(t) in [0,1]: "how much can experience that starts at age t still change?"  (1 = fully open, 0 = closed).
+//   soft band(m, W): p = 1 up to u = m − W/2, falls linearly to 0 at v = m + W/2, 0 afterwards.   W = 0 is a WALL at m (p = 1 for t <= m).
+//   steady slide: the same ramp laid over the whole age axis (m = middle, W = whole axis): no window, just "harder and harder".
+// Each published number is an AGE INTERVAL [a,b] with a value y in [0,1]; the model's prediction for it is the AVERAGE of p over [a,b]
+//   (a = b for a point).  Fit = for every width W (K+1 values from 0 to the whole axis) the position m with the smallest
+//   SSE = sum (y − prediction)²  (grid search over m, step = axis/400; no randomness).
+//   SSE is NOT weighted by sample size (FACTS gives no group sizes for the cut-off groups) → a descriptive distance, not a test.
+// "fits about as well" tolerance: SSE <= min + 0.01 + 0.25·min   (a demo convention, 示意).
 //
-// Derivation (re-done here, not copied):
-//   Given X = x, Y ~ N(r x, 1 - r^2).   So P(Y > 0 | x) = Phi(r x / s),  s = sqrt(1 - r^2).
-//   P(X > 0, Y > 0) = ∫_0^∞ phi(x) Phi(r x / s) dx = 1/4 + arcsin(r) / (2π)        (orthant probability; checked numerically below)
-//   P(same side)    = 2 P(X > 0, Y > 0) = 1/2 + arcsin(r)/π     →     P(flip) = 1/2 − arcsin(r)/π = arccos(r)/π.
-//   Who flips: given the first score x, P(flip | x) = Phi(− r |x| / s)  (50% at the cut, falling with distance).
-//   K independent scales (MBTI has four): P(no letter changes) = (1 − P(flip))^K.
-//
-// Simulation used by the widget (deterministic): N = 4000 people, K = 4 independent scales; for scale s and person i
-//   draw T, E1, E2 ~ N(0,1) once (seeded); X = √r·T + √(1−r)·E1, Y = √r·T + √(1−r)·E2  →  Var = 1, Cov = r.
-//   The same base draws are reused for every r, so the dots move smoothly when r changes.
-function mulberry32(seed) { var a = seed >>> 0; return function () { a = (a + 0x6D2B79F5) >>> 0; var t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
-function gauss(r) { var u = r() || 1e-12, v = r(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
-function erfAS(x) { var s = x < 0 ? -1 : 1; x = Math.abs(x); var t = 1 / (1 + 0.3275911 * x); var y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x); return s * y; }
-function phiAS(z) { return 0.5 * (1 + erfAS(z / Math.SQRT2)); }                 // = PSY.phi
-// a high-precision Phi for the independent check (series for the erf, |z| < 8)
-function phiExact(z) { var x = z / Math.SQRT2, s = x, term = x, n; for (n = 1; n < 200; n++) { term *= -x * x / n; s += term / (2 * n + 1); if (Math.abs(term) < 1e-17) break; } var erf = 2 / Math.sqrt(Math.PI) * s; if (Math.abs(z) > 5) return phiAS(z); return 0.5 * (1 + erf); }
-function pdf(x) { return Math.exp(-x * x / 2) / Math.sqrt(2 * Math.PI); }
+// ANCHORS (all ages as published; the y rules are the page's own, 示意)
+//  Bucharest (Smyke et al. 2010, Table 5 as given in FACTS_T3b W6): share securely attached at 42 months among foster-care children placed
+//     BEFORE / AFTER a cut-off (months): 18: 53.8/46.8; 20: 58.8/44.2; 22: 63.6/39.5; 24: 69.0/29.0; 26: 66.7/25.9; 28: 60.0/25.0.
+//     Care-as-usual 17.5%, never-institutionalised 64.7%  =>  y = (share − 17.5) / (64.7 − 17.5).  Placement ages assumed uniform on 6–31
+//     months (BEIP baseline range: King 2023 6–31, Fox 2011 5–31)  =>  "before c" = [6, c], "after c" = [c, 31].  Popular wall: 24 months.
+//  Kitten (Hubel & Wiesel 1970, FACTS_T3a C5): "remains high until some time between the sixth and eighth weeks", "disappearing finally
+//     around the end of the third month"  =>  coded y(6 wk) = 1, y(13 wk) = 0 (bounds from words → hollow dots).  Popular wall: 8 weeks.
+//  Hearing (Sharma, Dorman & Spahr 2002): age-appropriate P1 latency within 6 months if deprivation <= about 3.5 y; abnormal latencies
+//     after 7+ years  =>  coded y(3.5) = 1, y(7) = 0 (hollow dots).  Wall: 3.5 y (the authors' "sensitive period of about 3.5 years").
+//  Amblyopia (Scheiman et al. 2005, PEDIG): responders treated vs glasses alone: ages 7–12 53% vs 25%; ages 13–17 25% vs 23%; 13–17 never
+//     treated before 47% vs 20%.  Benefit = difference / 28 (the 7–12 benefit, assumed full strength): [7,13) = 1; [13,18) = 2/28 = 0.07
+//     (all teens) or 27/28 = 0.96 (never treated).  Popular wall: age 8 ("no treatment after 7–8", which FACTS calls wrong).
+//  Absolute pitch (Baharloo et al. 1998, self-report): began training at <= 4 y: 40%; at >= 9 y: 3%  =>  y(4) = 1, y(9) = 0.  No popular age.
+var K = 40;                                              // number of W steps; W_j = axis · j / K
+var FLOOR = 17.5, CEIL = 64.7, P_LO = 6, P_HI = 31;
+var CUTS = [[18, 53.8, 46.8], [20, 58.8, 44.2], [22, 63.6, 39.5], [24, 69.0, 29.0], [26, 66.7, 25.9], [28, 60.0, 25.0]];
+function by(s) { return (s - FLOOR) / (CEIL - FLOOR); }
+var BUC = [], i, E = 53 - 25;
+for (i = 0; i < CUTS.length; i++) { BUC.push({ a: P_LO, b: CUTS[i][0], y: by(CUTS[i][1]), g: 0 }); BUC.push({ a: CUTS[i][0], b: P_HI, y: by(CUTS[i][2]), g: 1 }); }
+var DOMS = [
+  { key: 'buc', unit: '个月', lo: 0, hi: 40, pop: 24, an: BUC },
+  { key: 'kit', unit: '周', lo: 0, hi: 20, pop: 8, an: [{ a: 6, b: 6, y: 1 }, { a: 13, b: 13, y: 0 }] },
+  { key: 'ear', unit: '岁', lo: 0, hi: 20, pop: 3.5, an: [{ a: 3.5, b: 3.5, y: 1 }, { a: 7, b: 7, y: 0 }] },
+  { key: 'ambAll', unit: '岁', lo: 0, hi: 20, pop: 8, an: [{ a: 7, b: 13, y: 1 }, { a: 13, b: 18, y: (25 - 23) / E }] },
+  { key: 'ambUn', unit: '岁', lo: 0, hi: 20, pop: 8, an: [{ a: 7, b: 13, y: 1 }, { a: 13, b: 18, y: (47 - 20) / E }] },
+  { key: 'pit', unit: '岁', lo: 0, hi: 20, pop: null, an: [{ a: 4, b: 4, y: 1 }, { a: 9, b: 9, y: 0 }] }
+];
 
-function flipFormula(r) { return Math.acos(r) / Math.PI; }
-function flipGiven(x, r) { return phiAS(-r * Math.abs(x) / Math.sqrt(1 - r * r)); }
-function allSame(r, K) { return Math.pow(1 - flipFormula(r), K); }
-
-// ───────── 1. independent checks of arccos(r)/π ─────────
-function orthantNumeric(r) { var s = Math.sqrt(1 - r * r), h = 0.0005, x, acc = 0; for (x = h / 2; x < 9; x += h) acc += pdf(x) * phiExact(r * x / s) * h; return acc; }
-function flipNumeric(r) { var s = Math.sqrt(1 - r * r), h = 0.0005, x, acc = 0; for (x = -9 + h / 2; x < 9; x += h) acc += pdf(x) * phiExact(-r * Math.abs(x) / s) * h; return acc; }
-function flipMC(r, n, seed) { var rng = mulberry32(seed), a = Math.sqrt(r), b = Math.sqrt(1 - r), i, f = 0, t, x, y; for (i = 0; i < n; i++) { t = gauss(rng); x = a * t + b * gauss(rng); y = a * t + b * gauss(rng); if ((x > 0) !== (y > 0)) f++; } return f / n; }
-
-// ───────── 2. the widget's simulation ─────────
-var N = 4000, K = 4, NB = 400;      // people, scales, dots drawn in the scatter
-function makeBase(seed) { var base = [], s, i, rng; for (s = 0; s < K; s++) { rng = mulberry32(seed * 100 + s + 1); var T = [], E1 = [], E2 = []; for (i = 0; i < N; i++) { T.push(gauss(rng)); E1.push(gauss(rng)); E2.push(gauss(rng)); } base.push({ T: T, E1: E1, E2: E2 }); } return base; }
-var BINS = 24, BW = 0.25, XMIN = -3;   // who-flips histogram: 24 bins of 0.25 SD over [-3, 3)
-function simulate(base, r) {
-  var a = Math.sqrt(r), b = Math.sqrt(1 - r), s, i, x, y, flips = 0, noFlipPerson = [], bins = [], binFlip = [], k, nNear = 0, fNear = 0;
-  for (k = 0; k < BINS; k++) { bins.push(0); binFlip.push(0); }
-  for (i = 0; i < N; i++) noFlipPerson.push(1);
-  for (s = 0; s < K; s++) for (i = 0; i < N; i++) {
-    x = a * base[s].T[i] + b * base[s].E1[i]; y = a * base[s].T[i] + b * base[s].E2[i];
-    var fl = (x > 0) !== (y > 0);
-    if (fl) { flips++; noFlipPerson[i] = 0; }
-    k = Math.floor((x - XMIN) / BW); if (k >= 0 && k < BINS) { bins[k]++; if (fl) binFlip[k]++; }
-    if (Math.abs(x) < 0.25) { nNear++; if (fl) fNear++; }
-  }
-  var none = 0; for (i = 0; i < N; i++) none += noFlipPerson[i];
-  return { flipSim: flips / (N * K), noneSim: none / N, bins: bins, binFlip: binFlip, nearShareSim: nNear / (N * K), nearFlipSim: nNear ? fNear / nNear : 0 };
+// ∫ p dt measured from the ramp's start u (negative left of u): G(b) − G(a) = ∫_a^b p
+function G(t, m, W) {
+  if (W <= 0) return Math.min(t, m);
+  var u = m - W / 2, v = m + W / 2;
+  if (t <= u) return t - u;
+  if (t < v) return (W * W - (v - t) * (v - t)) / (2 * W);
+  return W / 2;
 }
-// share of people with |x| < c, and their flip rate (formula, trapezoid)
-function nearFormula(r, c) { var h = 0.0005, x, num = 0, den = 0, w; for (x = -c + h / 2; x < c; x += h) { w = pdf(x) * h; den += w; num += w * flipGiven(x, r); } return { share: den, flip: num / den }; }
-// among those who flip: share whose first score is within |x| < c
-function flippersWithin(r, c) { var h = 0.0005, x, num = 0, den = 0, w; for (x = -9 + h / 2; x < 9; x += h) { w = pdf(x) * flipGiven(x, r) * h; den += w; if (Math.abs(x) < c) num += w; } return num / den; }
+function pAt(t, m, W) { if (W <= 0) return t <= m ? 1 : 0; var u = m - W / 2, v = m + W / 2; return t <= u ? 1 : t >= v ? 0 : (v - t) / W; }
+function avgP(a, b, m, W) { return b - a < 1e-9 ? pAt(a, m, W) : (G(b, m, W) - G(a, m, W)) / (b - a); }
+function sse(an, m, W) { var s = 0, j, d; for (j = 0; j < an.length; j++) { d = an[j].y - avgP(an[j].a, an[j].b, m, W); s += d * d; } return s; }
+function bestM(d, W) {
+  var step = (d.hi - d.lo) / 400, idx, m, s, bm = d.lo, bs = 1e9;
+  for (idx = 0; idx <= 600; idx++) { m = d.lo + idx * step; s = sse(d.an, m, W); if (s < bs - 1e-12) { bs = s; bm = m; } }
+  return { m: bm, s: bs };
+}
+function summary(d) {
+  var span = d.hi - d.lo, pr = [], j, r, jm = 0, mn = 1e9, idx, m, s;
+  for (j = 0; j <= K; j++) { r = bestM(d, span * j / K); pr.push({ W: span * j / K, m: r.m, s: r.s }); if (r.s < mn - 1e-12) { mn = r.s; jm = j; } }
+  var tol = mn + 0.01 + 0.25 * mn, jl = jm, jh = jm, wlo = null, whi = null, step = span / 400;
+  while (jl > 0 && pr[jl - 1].s <= tol) jl--;
+  while (jh < K && pr[jh + 1].s <= tol) jh++;
+  for (idx = 0; idx <= 600; idx++) { m = d.lo + idx * step; s = sse(d.an, m, 0); if (s <= tol) { if (wlo === null) wlo = m; whi = m; } }
+  return { pr: pr, min: mn, jMin: jm, tol: tol, jLo: jl, jHi: jh, jDef: Math.round((jl + jh) / 2), wLo: wlo, wHi: whi,
+    steady: sse(d.an, (d.lo + d.hi) / 2, span), forced: d.pop === null ? null : sse(d.an, d.pop, 0) };
+}
+function f1(x) { return x.toFixed(1); }
+function lowT(x) { return (Math.floor(x * 10 + 1e-6) / 10).toFixed(1); }       // a range's lower edge, widened to the tenth
+function upT(x) { return (Math.ceil(x * 10 - 1e-6) / 10).toFixed(1); }          // its upper edge (grid points sit one step inside the boundary)
+module.exports = { DOMS: DOMS, summary: summary, sse: sse, avgP: avgP, pAt: pAt, K: K, by: by, lowT: lowT, upT: upT };
 
-function pc(x, d) { return (100 * x).toFixed(d === undefined ? 1 : d) + '%'; }
 if (require.main === module) {
-  console.log('--- 1. arccos(r)/π vs numerical integration vs seeded Monte-Carlo (400,000 draws) ---');
-  console.log('r     formula   orthant-int  flip-int    MC       |MC-formula|');
-  [0.31, 0.50, 0.54, 0.64, 0.74, 0.80, 0.86, 0.90, 0.95].forEach(function (r) {
-    var f = flipFormula(r), o = 1 - 2 * orthantNumeric(r) * 1, fi = flipNumeric(r), mc = flipMC(r, 400000, 7);
-    console.log(r.toFixed(2), pc(f, 3).padStart(9), pc(1 - 2 * orthantNumeric(r), 3).padStart(11), pc(fi, 3).padStart(11), pc(mc, 3).padStart(9), (Math.abs(mc - f) * 100).toFixed(3).padStart(8) + ' pp');
+  function f(x, n) { return x === null ? '—' : x.toFixed(n === undefined ? 3 : n); }
+  DOMS.forEach(function (d) {
+    var r = summary(d), span = d.hi - d.lo, w = function (j) { return f(span * j / K, 1); };
+    console.log('== ' + d.key + '  n anchors ' + d.an.length + '  axis [' + d.lo + ',' + d.hi + '] ' + d.unit);
+    console.log('   k1 wall positions that fit as well: ' + lowT(r.wLo) + '–' + upT(r.wHi) + '   k2 wall SSE ' + f(r.pr[0].s) + ' (best m ' + f1(r.pr[0].m) + ')');
+    console.log('   k3 min SSE ' + f(r.min) + ' at W = ' + w(r.jMin) + ' (m ' + f1(r.pr[r.jMin].m) + '); W range ' + w(r.jLo) + '–' + w(r.jHi) + ' (tol ' + f(r.tol) + '); default j ' + r.jDef + ' → W ' + w(r.jDef) + ', m ' + f1(r.pr[r.jDef].m) + ', SSE ' + f(r.pr[r.jDef].s));
+    console.log('   k4 steady slide SSE ' + f(r.steady) + '   k5 forced wall at ' + d.pop + ': SSE ' + f(r.forced) + (r.forced !== null && r.pr[0].s > 0.005 ? '  ratio ' + f(r.forced / r.pr[0].s, 2) : ''));
+    var mx = 0; r.pr.forEach(function (p) { mx = Math.max(mx, p.s); });
+    console.log('   profile max ' + f(mx) + ';  profile: ' + r.pr.filter(function (p, j) { return j % 5 === 0; }).map(function (p) { return f(p.s, 3); }).join(' '));
   });
-  console.log('(orthant identity: P(X>0,Y>0) = 1/4 + asin(r)/(2π):', [0.64, 0.9].map(function (r) { return orthantNumeric(r).toFixed(5) + ' vs ' + (0.25 + Math.asin(r) / (2 * Math.PI)).toFixed(5); }).join(' ; '), ')');
-
-  console.log('\n--- 2. table: r → P(flip per letter), P(all four unchanged) = (1-P)^4, P(>=1 letter changed) ---');
-  [0.31, 0.50, 0.54, 0.60, 0.64, 0.70, 0.71, 0.74, 0.80, 0.86, 0.90, 0.95].forEach(function (r) {
-    var P = flipFormula(r);
-    console.log('r', r.toFixed(2), ' flip', pc(P), ' per-letter unchanged', pc(1 - P), ' all four unchanged', pc(allSame(r, 4)), ' >=1 changed', pc(1 - allSame(r, 4)));
+  var b = DOMS[0], r0 = summary(b);
+  console.log('\nBucharest anchors (y): ' + b.an.map(function (x) { return '[' + x.a + ',' + x.b + ']' + x.y.toFixed(2); }).join(' '));
+  console.log('RMS per anchor at best: ' + Math.sqrt(r0.min / 12).toFixed(3) + ' (≈ ' + (Math.sqrt(r0.min / 12) * (CEIL - FLOOR)).toFixed(1) + ' percentage points of secure share); wall ' + Math.sqrt(r0.pr[0].s / 12).toFixed(3));
+  console.log('wall at best m predicts (published share → wall → soft default → wall@24):');
+  b.an.forEach(function (x) {
+    var sh = function (y) { return (FLOOR + y * (CEIL - FLOOR)).toFixed(1); };
+    console.log('   [' + x.a + ',' + x.b + '] ' + sh(x.y) + ' → ' + sh(avgP(x.a, x.b, r0.pr[0].m, 0)) + ' ; ' + sh(avgP(x.a, x.b, r0.pr[r0.jDef].m, r0.pr[r0.jDef].W)) + ' ; ' + sh(avgP(x.a, x.b, 24, 0)));
   });
-
-  console.log('\n--- 3. calibration against the second-hand "about 83% / 75% of letters unchanged" figures ---');
-  [0.83, 0.75].forEach(function (u) { var r = Math.cos(Math.PI * (1 - u)); console.log('per-letter unchanged', pc(u, 0), '→ r =', r.toFixed(3), '→ all four unchanged', pc(Math.pow(u, 4)), '(model at that r:', pc(allSame(r, 4)), ')'); });
-  console.log('r = .86:', 'flip', pc(flipFormula(0.86)), 'unchanged', pc(1 - flipFormula(0.86)), 'all four', pc(allSame(0.86, 4)));
-  console.log('r = .71:', 'flip', pc(flipFormula(0.71)), 'unchanged', pc(1 - flipFormula(0.71)), 'all four', pc(allSame(0.71, 4)));
-
-  console.log('\n--- 4. who flips: P(flip | x) = Phi(-r|x|/sqrt(1-r^2)) ---');
-  [0.64, 0.80, 0.90].forEach(function (r) { console.log('r', r, [0, 0.25, 0.5, 1, 1.5, 2].map(function (x) { return 'x=' + x + ':' + pc(flipGiven(x, r)); }).join('  ')); });
-  [0.54, 0.64, 0.74, 0.80, 0.90, 0.95].forEach(function (r) {
-    var n25 = nearFormula(r, 0.25), n5 = nearFormula(r, 0.5);
-    console.log('r', r.toFixed(2), '| within ±0.25 SD: share', pc(n25.share), 'flip rate', pc(n25.flip), '| within ±0.5 SD: share', pc(n5.share), 'flip rate', pc(n5.flip), '| flippers within ±0.5 SD:', pc(flippersWithin(r, 0.5), 0), 'within ±1 SD:', pc(flippersWithin(r, 1), 0));
-  });
-
-  console.log('\n--- 5. the widget simulation (N=4000 people × K=4 scales, seed 1) ---');
-  var base = makeBase(1);
-  [0.54, 0.64, 0.74, 0.86, 0.90, 0.95].forEach(function (r) {
-    var o = simulate(base, r);
-    console.log('r', r.toFixed(2), 'formula', pc(flipFormula(r)), 'sim', pc(o.flipSim), '| all-four-unchanged formula', pc(allSame(r, 4)), 'sim', pc(o.noneSim), '| near ±0.25: sim share', pc(o.nearShareSim), 'sim flip', pc(o.nearFlipSim));
-  });
-  var o64 = simulate(base, 0.64), tot = 0, totF = 0;
-  console.log('bin share of all (r .64):', o64.bins.map(function (n, k) { tot += n; totF += o64.binFlip[k]; return (100 * n / (N * K)).toFixed(1); }).join(' '));
-  console.log('bin flipped share      :', o64.binFlip.map(function (n) { return (100 * n / (N * K)).toFixed(1); }).join(' '));
-  console.log('max bin share', Math.max.apply(null, o64.bins) / (N * K), ' expected centre-bin share', (pdf(0.125) * 0.25).toFixed(4));
-  // seeds: how much do the simulated KPIs wobble?
-  var d = [], sd2 = [];
-  for (var sd = 1; sd <= 8; sd++) { var o = simulate(makeBase(sd), 0.64); d.push(pc(o.flipSim)); sd2.push(pc(o.noneSim)); }
-  console.log('r .64, seeds 1..8: flip sim', d.join(' '), '| all-four-unchanged sim', sd2.join(' '));
 }
-if (typeof module !== 'undefined') module.exports = { flipFormula: flipFormula, flipGiven: flipGiven, allSame: allSame, makeBase: makeBase, simulate: simulate, nearFormula: nearFormula, flippersWithin: flippersWithin };

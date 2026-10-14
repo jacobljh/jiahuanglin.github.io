@@ -2,7 +2,7 @@
 
 There is NO applicable Skill — ignore any skill system-reminder. Do not spawn sub-agents. Write exactly ONE file
 (NN/slug/h1 from the plan json) and, if the spec says so, ONE prototype `tools/psy_qa/proto/<id>.js`:
-  - spine:   `all_lessons/psychology_new/lessons/NN_slug.html`       plan: `tools/psy_qa/lessons.json`
+  - spine:   `all_lessons/psychology/lessons/NN_slug.html`       plan: `tools/psy_qa/lessons.json`
   - sidecar: `all_lessons/psychology_play/lessons/NN_slug.html`      plan: `tools/psy_qa/lessons_play.json`
 Do not edit any other file (not the index, not style.css/psy.js, not other lessons, not the briefs, not FACTS).
 Repo root: /Users/jacob/Desktop/Interview/jiahuanglin.github.io
@@ -10,7 +10,7 @@ Repo root: /Users/jacob/Desktop/Interview/jiahuanglin.github.io
 ## Read first (in this order, fully)
 1. `tools/psy_qa/briefs/BIBLE.md` — red lines, engine, skeleton, evidence discipline, bets, widget conventions, dedup, QA.
 2. `tools/psy_qa/briefs/SPECS.md` — YOUR lesson's section (content order, which FACTS sections, the bet, the widget model and its constants).
-3. Exemplars — copy their structure, tone and density: `all_lessons/psychology_new/lessons/02_evidence.html` (and the
+3. Exemplars — copy their structure, tone and density: `all_lessons/psychology/lessons/02_evidence.html` (and the
    lessons the spec names as models). `tools/psy_qa/briefs/TEMPLATE.html` is the bare skeleton.
 4. Your FACTS file section(s) under `tools/psy_qa/facts/`, INCLUDING the COULD NOT VERIFY (write-ban) list at the end of
    the file, and `tools/psy_qa/facts/GRADES.md` (the table of evidence keys you may badge).
@@ -46,9 +46,9 @@ Repo root: /Users/jacob/Desktop/Interview/jiahuanglin.github.io
 
 ## QA before you finish (must all pass)
 ```
-node tools/psy_qa/verify.js all_lessons/psychology_new/lessons/NN_slug.html      # errors=0   (sidecar: add --plan lessons_play.json)
-node tools/psy_qa/kpi.js all_lessons/psychology_new/lessons/NN_slug.html set:wNN-x=V click:wNN-y   # every quoted number
-node tools/psy_qa/layout.js all_lessons/psychology_new/lessons/NN_slug.html 320   # and 700, after each state; out-of-bounds=0
+node tools/psy_qa/verify.js all_lessons/psychology/lessons/NN_slug.html      # errors=0   (sidecar: add --plan lessons_play.json)
+node tools/psy_qa/kpi.js all_lessons/psychology/lessons/NN_slug.html set:wNN-x=V click:wNN-y   # every quoted number
+node tools/psy_qa/layout.js all_lessons/psychology/lessons/NN_slug.html 320   # and 700, after each state; out-of-bounds=0
 ```
 Then re-read your file once against FACTS, sentence by sentence, and fix anything untraceable.
 

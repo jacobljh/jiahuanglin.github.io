@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""ledger.py — (re)build the evidence-ledger block of lesson 19 from the badges that are actually on the pages of lessons 00–18.
+"""ledger.py — (re)build the evidence-ledger block of the finale lesson (27_looking_back) from the badges that are actually on the pages of all earlier lessons.
 
     python3 tools/psy_qa/ledger.py            # print the block and the totals
-    python3 tools/psy_qa/ledger.py --write    # replace what sits between <!--LEDGER:begin--> and <!--LEDGER:end--> in 19_looking_back.html
+    python3 tools/psy_qa/ledger.py --write    # replace what sits between <!--LEDGER:begin--> and <!--LEDGER:end--> in 27_looking_back.html
     python3 tools/psy_qa/ledger.py --dir all_lessons/psychology/lessons --write      # after the swap
 
 Counts every <span class="ev ev-X" data-k="…"> in the page body (scripts excluded), except the legend examples (keys starting 'legend-').
-Run it again after any edit to lessons 00–18 (reviewer waves change badge counts), then re-run verify.js on 19.
+Run it again after any edit to lessons 00–26 (reviewer waves change badge counts), then re-run verify.js on 19.
 """
 import json, re, sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 args = sys.argv[1:]
-DIR = ROOT / (args[args.index('--dir') + 1] if '--dir' in args else 'all_lessons/psychology_new/lessons')
+DIR = ROOT / (args[args.index('--dir') + 1] if '--dir' in args else 'all_lessons/psychology/lessons')
 PLAN = json.load(open(ROOT / 'tools/psy_qa/lessons.json', encoding='utf-8'))
+FINAL = len(PLAN['lessons']) - 1          # the finale lesson (27 after the 28-lesson insertion) holds the ledger
 COL = {'A': '#15803d', 'B': '#2563eb', 'C': '#b45309', 'D': '#b91c1c'}
 
 
@@ -36,7 +37,7 @@ def main():
     rows, tot = [], {'A': 0, 'B': 0, 'C': 0, 'D': 0}
     for l in PLAN['lessons']:
         n = l['n']
-        if n > 18:
+        if n >= FINAL:
             continue
         p = DIR / (l['slug'] + '.html')
         if not p.exists():
@@ -57,7 +58,7 @@ def main():
     block = '\n'.join(out)
     print(f'lessons counted: {len(rows)} | totals {tot} = {allN} | max per lesson {mx}')
     if '--write' in args:
-        f = DIR / '19_looking_back.html'
+        f = DIR / (PLAN['lessons'][FINAL]['slug'] + '.html')
         t = f.read_text(encoding='utf-8')
         a, b = '<!--LEDGER:begin-->', '<!--LEDGER:end-->'
         if a not in t or b not in t:

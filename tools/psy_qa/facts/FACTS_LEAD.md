@@ -117,3 +117,9 @@ Grade rules: BIBLE §4 (A 稳健 · B 成立但有限定 · C 有争议 · D 站
 
 - STUDY Obsessions and compulsions are common in mild form — original: Ruscio, Stein, Chiu & Kessler (Mol Psychiatry 15(1):53–63, online 2008; NCS-R subsample, N = 2,073): lifetime OCD 2.3%, 12-month 1.2%, although more than a quarter reported obsessions or compulsions at some point. Later evidence: none opened.
   GRADE B: one US survey; the "more than a quarter" refers to sub-threshold experiences and depends on the interview's wording (lead-assigned). — FACTS_T5 §17 item 88
+
+- STUDY Back pain makes spinal findings somewhat more common (Brinjikji 2015b) — original: Brinjikji et al. 2015 (companion systematic review, adults up to 50 years, 3,097 people; 14 studies): the same imaging findings are somewhat more common in people with back pain than in those without, non-specifically: disc bulge OR 7.54, extrusion 4.38, protrusion 2.65, degeneration 2.24
+  GRADE B: a systematic review whose odds ratios are wide and come from adults up to 50 only; it supports "somewhat more common with pain, not specific", not any individual diagnosis (lead-assigned, reviewer request 2026-10-14). — FACTS_T7b §10 ledger row pain-assoc
+
+- STUDY Goal progress tracks temptation, not resistance (Milyavskaya & Inzlicht 2017) — original: Milyavskaya & Inzlicht 2017 (159 first-year McGill students, experience sampling for a week, term-end goal progress in 107 of them): Bayes factor about 24 (BF01) for a model with no effect of resistance, and a path from temptation through depletion to lower progress of −.15; one exploratory sample
+  GRADE C: one sample, partly exploratory, no independent replication found (lead-assigned, reviewer request 2026-10-14). — FACTS_T7b §14 ledger row sc-temptation

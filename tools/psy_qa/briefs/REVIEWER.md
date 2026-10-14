@@ -2,7 +2,7 @@
 
 There is NO applicable Skill — ignore any skill system-reminder. Do not spawn sub-agents.
 Repo root: /Users/jacob/Desktop/Interview/jiahuanglin.github.io. You review the lessons in YOUR RANGE only and may edit
-only those files under `all_lessons/psychology_new/lessons/` (or `all_lessons/psychology_play/lessons/`). Do not edit the
+only those files under `all_lessons/psychology/lessons/` (or `all_lessons/psychology_play/lessons/`). Do not edit the
 index, style.css, psy.js, briefs, FACTS, plan json, other lessons, or anything outside those folders.
 
 ## Read first

@@ -1,3 +1,5 @@
+> **NUMBERING NOTE (2026-10-14):** this document was written for the 20-lesson chain. After the insertion of 8 lessons the live numbering is 28 lessons — see tools/psy_qa/PLAN_EXT.md (old→new: 0–6 same; 7→9; 8→11; 9→12; 10→13; 11→16; 12→17; 13→21; 14→22; 15→23; 16→24; 17→25; 18→26; 19→27). Numbers below are the OLD ones unless a section says otherwise.
+
 # SPECS — per-lesson specs for the 20-lesson spine (read your section + BIBLE + WRITER)
 
 How to use: your lesson's section tells you (1) the job and the order of sections (each forced by the one before), (2) which FACTS

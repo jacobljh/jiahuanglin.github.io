@@ -9,7 +9,7 @@
    No Math.random / Date anywhere (house rule: widgets are deterministic). */
 (function (root) {
   'use strict';
-  var KEY = 'psy.bets.v1';
+  var KEY = 'psy.bets.v2';
   var mem = {};
 
   function readAll() {

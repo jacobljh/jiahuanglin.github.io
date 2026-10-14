@@ -1,32 +1,43 @@
-// proto/12.js — lesson 12 widget maths: other people's unanimous answers as EVIDENCE (a lens inspired by Asch 1955; a toy, not the authors' model).
-// All quantities in units of the SD of your own percept. The correct line is A. Your percept x ~ N(+d', 1); LLR_self(x) = 2 d' x (equal-variance Gaussians).
-// k others all say B (wrong). Two hypotheses about them: H_ind — each saw the lines as well as you did and errs independently with probability eps;
-//   H_col — their answers were fixed in advance (carry no information about the lines), prior π.
-//   P(all say B | B correct) = (1-π)(1-eps)^k + π ;  P(all say B | A correct) = (1-π) eps^k + π ;  L(k) = ln of their ratio.
-// A truthful partner (honest, independent, says A) multiplies the first by eps and the second by (1-eps) in the H_ind and H_col branches alike (the partner is not part of the bloc).
-// You say B iff L > LLR_self(x), i.e. x < L/(2 d')  →  P(conform) = Φ(L/(2 d') − d').
-var ASCH = [[1, 3.6], [2, 13.6], [3, 31.8], [4, 35.1], [6, 35.2], [7, 37.1], [9, 35.1], [15, 31.2]];   // Asch 1955 caption, % of critical trials echoing the wrong majority
-function erf(x) { var s = x < 0 ? -1 : 1; x = Math.abs(x); var t = 1 / (1 + 0.3275911 * x); var y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x); return s * y; }
-function phi(z) { return 0.5 * (1 + erf(z / Math.SQRT2)); }
-function L(k, eps, pi, partner) {
-  var n = (1 - pi) * Math.pow(1 - eps, k) + pi, d = (1 - pi) * Math.pow(eps, k) + pi;
-  if (partner) { n = (1 - pi) * Math.pow(1 - eps, k) * eps + pi * eps; d = (1 - pi) * Math.pow(eps, k) * (1 - eps) + pi * (1 - eps); }
-  return Math.log(n / d);
+// proto/09.js — lesson 09 learning: Rescorla–Wagner, three-phase experiment (A+ ; AX+ ; A- ).
+// Rule (Rescorla & Wagner 1972; as in Sutton & Barto 2018 §14.2.2 / Rescorla 2008): for every cue present on a trial
+//   ΔV_i = αβ (λ − ΣV),   ΣV = sum of V over the cues present,  λ = asymptote the outcome supports (1 present, 0 absent;
+//   scaled up for a stronger outcome).  αβ is fitted per experiment — NO standard value exists in the sources read, so
+//   the widget uses αβ = 0.2 as a labelled DEMO value (cap 0.5 so that two cues present stay monotone: 2·αβ ≤ 1).
+// Everything printed here is a MODEL OUTPUT (associative strength V and error δ), not data.
+function rw(o) {
+  var ab = o.ab, n1 = o.n1, n2 = o.n2, n3 = o.n3, l2 = o.l2;
+  var VA = 0, VX = 0, t = [], i, d;
+  for (i = 0; i < n1; i++) { d = 1 - VA; VA += ab * d; t.push({ ph: 1, d: d, VA: VA, VX: VX, lam: 1 }); }
+  for (i = 0; i < n2; i++) { d = l2 - (VA + VX); VA += ab * d; VX += ab * d; t.push({ ph: 2, d: d, VA: VA, VX: VX, lam: l2 }); }
+  for (i = 0; i < n3; i++) { d = 0 - VA; VA += ab * d; t.push({ ph: 3, d: d, VA: VA, VX: VX, lam: 0 }); }
+  return t;
 }
-function pConform(k, dp, eps, pi, partner) { return k === 0 ? phi(-dp) : phi(L(k, eps, pi, partner) / (2 * dp) - dp); }
-function rmse(dp, eps, pi) { var s = 0; ASCH.forEach(function (r) { var e = 100 * pConform(r[0], dp, eps, pi, false) - r[1]; s += e * e; }); return Math.sqrt(s / ASCH.length); }
+function end(t, ph) { var r = null, i; for (i = 0; i < t.length; i++) if (t[i].ph === ph) r = t[i]; return r; }
+function first(t, ph) { var i; for (i = 0; i < t.length; i++) if (t[i].ph === ph) return t[i]; return null; }
+function f(x, k) { return x.toFixed(k === undefined ? 3 : k); }
 if (require.main === module) {
-  var best = { r: 1e9 }, dp, eps, lp, i;
-  for (dp = 2.34; dp <= 3.4; dp += 0.02) for (eps = 0.002; eps <= 0.06; eps *= 1.06) for (lp = -9; lp <= -1.5; lp += 0.1) { var r = rmse(dp, eps, Math.pow(10, lp)); if (r < best.r) best = { r: r, dp: dp, eps: eps, lp: lp }; }
-  console.log('best fit (d>=2.34 so that error alone < 1%):', JSON.stringify(best));
-  var b = best;
-  console.log('k   model%   Asch%');
-  ASCH.forEach(function (r) { console.log(String(r[0]).padStart(2), (100 * pConform(r[0], b.dp, b.eps, Math.pow(10, b.lp), false)).toFixed(1).padStart(7), String(r[1]).padStart(7)); });
-  console.log('alone: model', (100 * pConform(0, b.dp)).toFixed(2), '% (Asch: < 1%)');
-  console.log('partner (honest A):'); [3, 6, 9, 15].forEach(function (k) { console.log('  k', k, 'model', (100 * pConform(k, b.dp, b.eps, Math.pow(10, b.lp), true)).toFixed(1), '% vs without partner', (100 * pConform(k, b.dp, b.eps, Math.pow(10, b.lp), false)).toFixed(1), '%  ratio', (pConform(k, b.dp, b.eps, Math.pow(10, b.lp), true) / pConform(k, b.dp, b.eps, Math.pow(10, b.lp), false)).toFixed(2)); });
-  console.log('pure-independent (π=1e-9): k=1..15'); [1, 2, 3, 4, 6, 9, 15].forEach(function (k) { console.log('  k', k, (100 * pConform(k, b.dp, b.eps, 1e-9, false)).toFixed(1)); });
-  console.log('fit landscape: rmse by log10 π at best d,eps'); for (lp = -8; lp <= -2; lp += 1) console.log('  logπ', lp, rmse(b.dp, b.eps, Math.pow(10, lp)).toFixed(2));
-  console.log('rmse by d at best eps,π:'); [2.4, 2.6, 2.8, 3.0, 3.2].forEach(function (d) { console.log('  d', d, rmse(d, b.eps, Math.pow(10, b.lp)).toFixed(2)); });
-  console.log('demo default candidates:'); [[2.6, 0.015, -5], [2.6, 0.012, -5], [2.7, 0.01, -5], [2.5, 0.015, -5]].forEach(function (p) { console.log('  d', p[0], 'eps', p[1], 'logπ', p[2], 'rmse', rmse(p[0], p[1], Math.pow(10, p[2])).toFixed(2), 'curve', ASCH.map(function (r) { return (100 * pConform(r[0], p[0], p[1], Math.pow(10, p[2]), false)).toFixed(0); }).join(' ')); });
+  console.log('--- single cue V_n = 1-(1-ab)^n (FACTS DERIVED: ab .2 -> .200 .360 .672 .893 after 1,2,5,10)');
+  [0.1, 0.2, 0.3, 0.5].forEach(function (ab) {
+    var out = [], thr = { 50: 0, 90: 0, 95: 0, 99: 0 }, V = 0, n = 0, k;
+    var t = rw({ ab: ab, n1: 60, n2: 0, n3: 0, l2: 1 });
+    for (k in thr) { for (n = 0; n < t.length; n++) if (t[n].VA >= k / 100) { thr[k] = n + 1; break; } }
+    console.log('ab', ab, 'V1,2,5,10', [1, 2, 5, 10].map(function (i) { return f(t[i - 1].VA); }).join(' '), 'trials to 50/90/95/99%', thr[50], thr[90], thr[95], thr[99]);
+  });
+  console.log('--- blocking: V_X at end of phase 2 (8 AX+ trials, lam 1) after n1 earlier A+ trials; FACTS: ab .2 -> .492 .082 .014 .002; ab .1 -> .416 .179 .077 .033');
+  [0.2, 0.1].forEach(function (ab) {
+    console.log('ab', ab, [0, 8, 16, 24].map(function (n1) { var t = rw({ ab: ab, n1: n1, n2: 8, n3: 0, l2: 1 }); return f(end(t, 2).VX); }).join(' '));
+  });
+  console.log('--- unblocking (ab .2, n1 16, n2 8): V_X for lam2 = 1, 2, 4  (FACTS: .014 .505 1.489)');
+  [1, 2, 4].forEach(function (l2) { var t = rw({ ab: 0.2, n1: 16, n2: 8, n3: 0, l2: l2 }); console.log('lam2', l2, 'V_X', f(end(t, 2).VX), 'first AX error', f(first(t, 2).d)); });
+  console.log('--- widget default: ab .2, n1 16, n2 8, lam2 1, n3 4');
+  var t = rw({ ab: 0.2, n1: 16, n2: 8, n3: 4, l2: 1 });
+  console.log('first outcome error', f(first(t, 1).d), ' V_A end ph1', f(end(t, 1).VA), ' first AX error', f(first(t, 2).d), ' V_X end ph2', f(end(t, 2).VX), ' V_A end ph2', f(end(t, 2).VA), ' first omission error', f(first(t, 3).d), ' V_A end ph3', f(end(t, 3).VA));
+  console.log('--- presets');
+  var P = { control: { ab: 0.2, n1: 0, n2: 8, n3: 4, l2: 1 }, unblock4: { ab: 0.2, n1: 16, n2: 8, n3: 4, l2: 4 }, unblock2: { ab: 0.2, n1: 16, n2: 8, n3: 4, l2: 2 }, slow: { ab: 0.05, n1: 16, n2: 8, n3: 4, l2: 1 }, nofx: { ab: 0.2, n1: 16, n2: 8, n3: 0, l2: 1 } };
+  Object.keys(P).forEach(function (k) {
+    var t = rw(P[k]);
+    console.log(k, 'V_A ph1', f(end(t, 1) ? end(t, 1).VA : 0), 'first AX err', f(first(t, 2).d), 'V_X ph2', f(end(t, 2).VX), 'V_A ph2', f(end(t, 2).VA), 'omission err', first(t, 3) ? f(first(t, 3).d) : '-', 'V_A ph3', end(t, 3) ? f(end(t, 3).VA) : '-');
+  });
+  console.log('--- stability: 2 cues at ab .5: error factor (1-2ab) =', 1 - 2 * 0.5);
 }
-if (typeof module !== 'undefined') module.exports = { pConform: pConform, L: L, rmse: rmse, ASCH: ASCH, phi: phi };
+if (typeof module !== 'undefined') module.exports = { rw: rw };

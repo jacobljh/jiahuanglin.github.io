@@ -1,69 +1,89 @@
-// proto/14.js — lesson 14 widget maths: who you sample decides what you conclude (a labelled DEMO model, not data).
+// proto/14.js — lesson 14 widget maths: 「一天里的诱惑」 — two simulated people, same resisting rule, different inputs (a labelled TOY, not data).
 // run: node tools/psy_qa/proto/14.js
-// World: S = 120 societies. Society s has an "industrialisation / market-integration" index m_s ~ U(0,1) and a trait mean
-//   mu_s = BASE + gap*sigma*(m_s - 0.5) + tau*eps_s     (BASE .40, tau .04, eps_s ~ N(0,1); gap = how many individual SDs the trait moves between m=0 and m=1; gap=0 → no variation with m).
-//   The estimand T = mean over all 120 societies (each society counts once).  Individuals within a society: N(mu_s, sigma^2), sigma .12.
-// A study picks k societies WITHOUT replacement with probability ∝ exp(kappa*m_s)  (kappa 0 = random, kappa 20 ≈ only the most industrialised slice),
-//   measures n people in each, estimate = mean of the k society sample means.  Interval 'by number of people' = ±1.96*sigma/sqrt(k*n)
-//   (sigma known; counts only person-to-person spread, ignores society-to-society spread).
-// Repeat the study R = 300 times (seeds 1..R) to get bias, spread, coverage.  Deterministic (PSY.rng = mulberry32, PSY.gauss).
-function mulberry32(seed) { var a = seed >>> 0; return function () { a = (a + 0x6D2B79F5) >>> 0; var t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
-function gauss(r) { var u = r() || 1e-12, v = r(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
-var S = 120, BASE = 0.40, TAU = 0.04, SIGMA = 0.12, R = 300;
-var rw = mulberry32(2026), M = [], EPS = [], i;
-for (i = 0; i < S; i++) { M.push(rw()); EPS.push(gauss(rw)); }
-function means(gap) { var out = [], s, beta = gap * SIGMA; for (s = 0; s < S; s++) out.push(BASE + beta * (M[s] - 0.5) + TAU * EPS[s]); return out; }
-function pick(rng, k, kappa) {
-  var avail = [], w = [], j, s, out = [];
-  for (s = 0; s < S; s++) { avail.push(s); w.push(Math.exp(kappa * (M[s] - 1))); }
-  for (j = 0; j < k; j++) {
-    var tot = 0, t; for (t = 0; t < avail.length; t++) tot += w[avail[t]];
-    var u = rng() * tot, acc = 0, ix = avail.length - 1;
-    for (t = 0; t < avail.length; t++) { acc += w[avail[t]]; if (u <= acc) { ix = t; break; } }
-    out.push(avail[ix]); avail.splice(ix, 1);
+// Anchors (Hofmann, Baumeister, Förster & Vohs 2012, JPSP 102(6):1318–1335; N = 205, 7 days x 7 random beeps, FACTS_T7b 14-A):
+//   a current desire on 49.9% of responded beeps; mean strength 4.08 on 0-7, 6.3% rated 7 ("irresistible");
+//   conflict with a goal (0-4): 53.2 / 14.7 / 12.4 / 10.9 / 8.8 %  (mean 1.08);
+//   a desire was actively resisted in 42% of desire occasions; enactment 69.6% if not resisted, 17.4% if resisted;
+//   among RESISTED desires enactment rises from 10.8% (strength 1) to 25.8% (strength 7); among unresisted ones strength does not matter;
+//   strength and conflict unrelated (r ~ 0); resisting rises with conflict (log-odds B = 0.49 per conflict point).
+//   high vs low trait self-control (+1 SD vs -1 SD): strength 3.88 vs 4.20 (gap 0.32); conflict gap about 0.19 (DERIVED from B = -0.16, SD 0.59);
+//   desire FREQUENCY unrelated to trait self-control (|r| ~ .04).
+// NOT published (labelled 示意 in the widget): the SD of strength (derived below from "6.3% rate 7"), the per-hour slot structure (14 slots/day: each hour
+//   treated like one beep), the intercept of the resisting curve (calibrated to the published 42%), the "lapse" definition, the exposure cut.
+// Model per slot (hour), common random numbers for both people:
+//   desire if u1 < PD * (1 - cut);  strength s = clip(mu + SD*z, 0, 7);  conflict c ~ pmf(tilt);
+//   resisted if u3 < sigmoid(A + 0.49*c + o);   enacted if u4 < (resisted ? 0.108 + 0.150*(s-1)/6 : 0.696)
+//   lapse = a desire with conflict >= 1 that was enacted.
+var PSY = require('./_psy.js');
+
+var DAYS = 1000, SLOTS = 14, SEED = 2014;
+var PD = 0.499, PC0 = [0.532, 0.147, 0.124, 0.109, 0.088], SLOPE = 0.49;
+var MU_TARGET = 4.08, SD_S = 1.58;       // SD: P(strength >= 6.5) = 6.3%  ->  z = 1.53  ->  SD = (6.5 - 4.08) / 1.53
+var DSTR = 0.32, DCON = 0.19;             // high-vs-low trait self-control gap (published / derived)
+var ENR0 = 0.108, ENR7 = 0.258, ENN = 0.696;
+
+function sig(x) { return 1 / (1 + Math.exp(-x)); }
+function clip(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function meanOf(p) { var m = 0, i; for (i = 0; i < p.length; i++) m += i * p[i]; return m; }
+function tilt(lam) { var p = [], t = 0, i; for (i = 0; i < 5; i++) { p.push(PC0[i] * Math.exp(-lam * i)); t += p[i]; } for (i = 0; i < 5; i++) p[i] /= t; return p; }
+function pmfWithMean(target) {            // exponential tilt of the published pmf so that its mean equals target
+  var lo = -3, hi = 6, i, m;
+  for (i = 0; i < 60; i++) { m = (lo + hi) / 2; if (meanOf(tilt(m)) > target) lo = m; else hi = m; }
+  return tilt((lo + hi) / 2);
+}
+var BASEMEAN = meanOf(PC0);
+// intercept A: base pmf, offset 0  ->  42% of desires resisted
+function calA() { var lo = -4, hi = 2, i, m, r, c; for (i = 0; i < 60; i++) { m = (lo + hi) / 2; r = 0; for (c = 0; c < 5; c++) r += PC0[c] * sig(m + SLOPE * c); if (r > 0.42) hi = m; else lo = m; } return (lo + hi) / 2; }
+var A = calA();
+// mu0 such that the CLIPPED strength has mean 4.08 (estimated on the shared z stream)
+var rr = PSY.rng(SEED), U = [], d, k;
+for (d = 0; d < DAYS * SLOTS; d++) U.push({ u1: rr(), z: PSY.gauss(rr), u2: rr(), u3: rr(), u4: rr() });
+function clippedMean(mu) { var s = 0, i; for (i = 0; i < U.length; i++) s += clip(mu + SD_S * U[i].z, 0, 7); return s / U.length; }
+var MU0 = (function () { var lo = 2, hi = 6, i, m; for (i = 0; i < 50; i++) { m = (lo + hi) / 2; if (clippedMean(m) < MU_TARGET) lo = m; else hi = m; } return (lo + hi) / 2; })();
+
+// person: { x: arrangement (0..2, 1 = the published high-vs-low gap), cut: exposure cut 0..0.6, o: resisting tendency offset (log-odds) }
+function run(p) {
+  var pmf = pmfWithMean(BASEMEAN - DCON * p.x), cdf = [], t = 0, i, c, s, r = { des: 0, con: 0, res: 0, enact: 0, lapse: 0, str: 0, sres: 0 };
+  for (c = 0; c < 5; c++) { t += pmf[c]; cdf.push(t); }
+  var mu = MU0 - DSTR * p.x, pd = PD * (1 - p.cut);
+  for (i = 0; i < U.length; i++) {
+    var u = U[i];
+    if (!(u.u1 < pd)) continue;
+    c = 0; while (c < 4 && u.u2 >= cdf[c]) c++;
+    s = clip(mu + SD_S * u.z, 0, 7);
+    var res = u.u3 < sig(A + SLOPE * c + p.o);
+    var pe = res ? ENR0 + (ENR7 - ENR0) * (s - 1) / 6 : ENN;
+    var en = u.u4 < pe;
+    r.des++; r.str += s; if (c >= 1) r.con++; if (res) r.res++; if (en) r.enact++; if (en && c >= 1) r.lapse++;
   }
-  return out;
+  var n = DAYS;
+  return { des: r.des / n, con: r.con / n, res: r.res / n, enact: r.enact / n, lapse: r.lapse / n, strMean: r.des ? r.str / r.des : 0, resShare: r.des ? r.res / r.des : 0, enactShare: r.des ? r.enact / r.des : 0 };
 }
-function study(o, rep) {          // o: k, n, kappa, gap
-  var mu = means(o.gap), rng = mulberry32(1000 + rep), ids = pick(rng, o.k, o.kappa), xs = [], t, sum = 0, mbar = 0;
-  for (t = 0; t < ids.length; t++) { xs.push(mu[ids[t]] + SIGMA / Math.sqrt(o.n) * gauss(rng)); sum += xs[t]; mbar += M[ids[t]]; }
-  var est = sum / o.k;
-  var se = SIGMA / Math.sqrt(o.k * o.n);      // interval "by number of people": only person-to-person spread, as if all k*n people were one random sample of one population
-  return { ids: ids, est: est, se: se, mbar: mbar / o.k, xs: xs };
+// the resisting offset the hard-resister needs to match a target number of lapses (CRN => lapses is monotone non-increasing in o)
+function matchO(pA, targetLapse) {
+  var lo = 0, hi = 8, i, m, q = { x: pA.x, cut: pA.cut, o: hi };
+  if (run(q).lapse > targetLapse) return null;
+  for (i = 0; i < 40; i++) { m = (lo + hi) / 2; q.o = m; if (run(q).lapse > targetLapse) lo = m; else hi = m; }
+  q.o = hi; return { o: hi, r: run(q) };
 }
-function run(o) {
-  var mu = means(o.gap), T = 0, s; for (s = 0; s < S; s++) T += mu[s]; T /= S;
-  var ests = [], cov = 0, r, st, sum = 0, mb = 0;
-  for (r = 1; r <= R; r++) { st = study(o, r); ests.push(st.est); sum += st.est; mb += st.mbar; if (Math.abs(st.est - T) <= 1.96 * st.se) cov++; }
-  var mean = sum / R, v = 0; for (r = 0; r < R; r++) v += (ests[r] - mean) * (ests[r] - mean); v /= (R - 1);
-  var bias = mean - T, partVar = SIGMA * SIGMA / (o.k * o.n), betw = Math.max(0, v - partVar);
-  // true between-society SD (all societies) and mean SD seen in a study
-  var sdAll = 0; for (s = 0; s < S; s++) sdAll += (mu[s] - T) * (mu[s] - T); sdAll = Math.sqrt(sdAll / (S - 1));
-  return { T: T, mean: mean, bias: bias, sd: Math.sqrt(v), partSD: Math.sqrt(partVar), betwSD: Math.sqrt(betw), rmse: Math.sqrt(bias * bias + v), cover: cov / R, mbar: mb / R, sdAll: sdAll, ests: ests };
+function f(v, d) { return v.toFixed(d === undefined ? 2 : d); }
+function show(name, pA, pB) {
+  var a = run(pA), b = run(pB), m = matchO(pA, b.lapse);
+  console.log(name);
+  console.log('   A 硬扛型  des', f(a.des), 'conf', f(a.con), 'resist', f(a.res), 'lapse', f(a.lapse), 'enact', f(a.enact), '| str', f(a.strMean), 'resShare', f(a.resShare, 3), 'enactShare', f(a.enactShare, 3));
+  console.log('   B 安排型  des', f(b.des), 'conf', f(b.con), 'resist', f(b.res), 'lapse', f(b.lapse), 'enact', f(b.enact), '| str', f(b.strMean), 'resShare', f(b.resShare, 3), 'enactShare', f(b.enactShare, 3));
+  console.log('   match: ', m ? 'o_A = ' + f(m.o) + ' -> A resist ' + f(m.r.res) + ' lapse ' + f(m.r.lapse) + ' (B resist ' + f(b.res) + ')' : '追不平');
+  return { a: a, b: b, m: m };
 }
-function f(x, d) { return x.toFixed(d === undefined ? 3 : d); }
 if (require.main === module) {
-  var cases = [
-    ['default: k1 n100 kappa20 gap1.0', { k: 1, n: 100, kappa: 20, gap: 1.0 }],
-    ['n 5000', { k: 1, n: 5000, kappa: 20, gap: 1.0 }],
-    ['k8 kappa10 n100', { k: 8, n: 100, kappa: 10, gap: 1.0 }],
-    ['k20 kappa20 n100', { k: 20, n: 100, kappa: 20, gap: 1.0 }],
-    ['k30 kappa20 n5000', { k: 30, n: 5000, kappa: 20, gap: 1.0 }],
-    ['k8 kappa0 n100', { k: 8, n: 100, kappa: 0, gap: 1.0 }],
-    ['k20 kappa0 n100', { k: 20, n: 100, kappa: 0, gap: 1.0 }],
-    ['k20 kappa0 n1000', { k: 20, n: 1000, kappa: 0, gap: 1.0 }],
-    ['k1 kappa0 n100 (one random society)', { k: 1, n: 100, kappa: 0, gap: 1.0 }],
-    ['gap 0 k1 kappa20', { k: 1, n: 100, kappa: 20, gap: 0 }],
-    ['gap 0 k20 kappa0', { k: 20, n: 100, kappa: 0, gap: 0 }],
-    ['gap .3 k1 kappa20', { k: 1, n: 100, kappa: 20, gap: 0.3 }],
-    ['gap .3 k1 kappa20 n5000', { k: 1, n: 5000, kappa: 20, gap: 0.3 }],
-    ['gap 2 k1 kappa20', { k: 1, n: 100, kappa: 20, gap: 2 }],
-    ['k4 kappa20 n100', { k: 4, n: 100, kappa: 20, gap: 1.0 }],
-    ['k12 kappa5 n100', { k: 12, n: 100, kappa: 5, gap: 1.0 }]
-  ];
-  console.log('T(gap 1) and true between-society SD:', f(run(cases[0][1]).T), f(run(cases[0][1]).sdAll));
-  cases.forEach(function (c) { var r = run(c[1]); console.log(c[0].padEnd(46), 'T', f(r.T), 'E[est]', f(r.mean), 'bias', f(r.bias), '(' + f(r.bias / SIGMA, 2) + ' sd)', '| SD part', f(r.partSD), 'betw', f(r.betwSD), 'RMSE', f(r.rmse), '| cover', f(100 * r.cover, 0) + '%', ' mbar', f(r.mbar, 2)); });
-  console.log('--- single study #1 for default:', JSON.stringify((function () { var s = study(cases[0][1], 1); return { ids: s.ids, est: f(s.est), se: f(s.se), mbar: f(s.mbar, 2) }; })()));
-  var mm = 0; for (i = 0; i < S; i++) mm += M[i]; console.log('mean m over societies', f(mm / S), 'top-10% cut m>=', f(M.slice().sort(function (a, b) { return b - a; })[11], 2));
+  console.log('A (intercept) =', f(A, 4), ' MU0 =', f(MU0, 4), ' base conflict mean =', f(BASEMEAN, 4), ' clipped mean at MU0 =', f(clippedMean(MU0), 3));
+  console.log('P(resist | c) =', [0, 1, 2, 3, 4].map(function (c) { return f(sig(A + SLOPE * c), 3); }).join(' '));
+  show('sanity: identical persons (x=0,cut=0,o=0)', { x: 0, cut: 0, o: 0 }, { x: 0, cut: 0, o: 0 });
+  show('default: o_A=0, x=1, cut=0', { x: 0, cut: 0, o: 0 }, { x: 1, cut: 0, o: 0 });
+  show('x=2', { x: 0, cut: 0, o: 0 }, { x: 2, cut: 0, o: 0 });
+  show('A resist +1.5 vs B x=1', { x: 0, cut: 0, o: 1.5 }, { x: 1, cut: 0, o: 0 });
+  show('A resist +3 vs B x=1', { x: 0, cut: 0, o: 3 }, { x: 1, cut: 0, o: 0 });
+  show('cut 30% only (x=0)', { x: 0, cut: 0, o: 0 }, { x: 0, cut: 0.3, o: 0 });
+  show('x=1 + cut 30%', { x: 0, cut: 0, o: 0 }, { x: 1, cut: 0.3, o: 0 });
 }
-if (typeof module !== 'undefined') module.exports = { run: run, study: study, M: M, EPS: EPS, S: S };
+if (typeof module !== 'undefined') module.exports = { run: run, matchO: matchO };
