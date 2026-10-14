@@ -1,0 +1,22 @@
+// usage: node tools/psy_qa/kpi.js FILE [actions...] : run widget headless, apply actions, print KPI texts
+// action: "time:MS" (advance the mock performance.now clock) | "click:ID" | "set:ID=VALUE" | "chk:ID" (toggle a checkbox) | "tick:N" (run N queued setTimeout callbacks, FIFO) | "clickxy:ID@x,y" (click with coordinates) | "js:CODE" (run JS in the page context, e.g. js:PSY.save({...}) to seed bets) ; prints all #w..-ids text after each action
+const fs=require('fs'),vm=require('vm');
+const file=process.argv[2], acts=process.argv.slice(3);
+const html=fs.readFileSync(file,'utf8');
+const path=require('path');
+// psy_qa variant: local <script src="psy.js"> files run first (kpi.js/layout.js in cooking_qa skip src scripts)
+const srcs=[...html.matchAll(/<script[^>]*\bsrc="([^"]+)"[^>]*><\/script>/g)].map(m=>m[1]).filter(u=>!/^(https?:)?\/\//.test(u));
+const pre=srcs.map(u=>{try{return fs.readFileSync(path.resolve(path.dirname(file),u),'utf8')}catch(e){return ''}});
+const scripts=pre.concat([...html.matchAll(/<script(?![^>]*src=)[^>]*>([\s\S]*?)<\/script>/g)].map(m=>m[1]));
+const attrsById={};
+for(const m of html.matchAll(/<(\w+)((?:\s+[\w:-]+(?:="[^"]*")?)*)\s*\/?>/g)){const a={};for(const x of m[2].matchAll(/([\w:-]+)(?:="([^"]*)")?/g))a[x[1]]=x[2]===undefined?'':x[2];if(a.id)attrsById[a.id]={tag:m[1],a};}
+const H=[];const els={};const TQ=[];let PERF=0;
+function ctx2d(){return new Proxy({},{get(o,k){if(k in o)return o[k];if(k==='measureText')return s=>({width:String(s).length*7});if(/Gradient|Pattern/.test(k))return()=>({addColorStop(){}});if(k==='createImageData'||k==='getImageData')return(w,h)=>({width:w|0,height:h|0,data:new Uint8ClampedArray(Math.max(1,(w|0)*(h|0)*4))});if(typeof k==='symbol')return undefined;return()=>{}},set(o,k,v){o[k]=v;return true}})}
+function mk(id){const info=attrsById[id]||{tag:'div',a:{}};const a=info.a;const cls=new Set((a.class||'').split(/\s+/).filter(Boolean));let _c=null,_t='';const el={id,tagName:info.tag.toUpperCase(),value:a.value||'',min:a.min,max:a.max,checked:'checked' in a,style:{},dataset:{},clientWidth:680,clientHeight:330,width:0,height:0,classList:{add:c=>cls.add(c),remove:c=>cls.delete(c),toggle:(c,f)=>{const on=f===undefined?!cls.has(c):!!f;on?cls.add(c):cls.delete(c);return on},contains:c=>cls.has(c)},getAttribute:k=>a[k]??null,setAttribute(){},addEventListener:(e,fn)=>H.push({el,e,fn}),getContext:()=>_c||(_c=ctx2d()),getBoundingClientRect:()=>({left:0,top:0,width:680,height:330}),appendChild:c=>c,querySelectorAll:()=>[],children:[]};Object.defineProperty(el,'textContent',{get:()=>_t,set:v=>{_t=String(v)}});Object.defineProperty(el,'innerHTML',{get:()=>_t,set:v=>{_t=String(v).replace(/<[^>]+>/g,'')}});return el}
+const document={getElementById:id=>els[id]||(els[id]=mk(id)),querySelectorAll:()=>[],createElement:()=>mk('x'),addEventListener(){}};
+const win={performance:{now:()=>PERF},devicePixelRatio:2,addEventListener(){},requestAnimationFrame:()=>0,setTimeout:fn=>{if(typeof fn==='function')TQ.push(fn);return TQ.length},clearTimeout(){},setInterval:()=>0,clearInterval(){},cancelAnimationFrame(){},getComputedStyle:()=>({getPropertyValue:()=>''}),Math,console,document};
+win.window=win;const c=vm.createContext(win);
+for(const s of scripts)vm.runInContext(s,c,{timeout:20000});
+function dump(label){const out=Object.keys(els).filter(k=>els[k].textContent&&!/canvas/.test(k)).map(k=>k.replace(/^w\d\d-/,'')+'='+els[k].textContent).join(' | ');console.log('['+label+'] '+out)}
+dump('init');
+for(const a of acts){if(a.startsWith('click:')){const id=a.slice(6);H.filter(h=>h.el.id===id&&h.e==='click').forEach(h=>h.fn({target:h.el}))}else if(a.startsWith('chk:')){const id=a.slice(4);const el=document.getElementById(id);el.checked=!el.checked;H.filter(h=>h.el.id===id&&(h.e==='change'||h.e==='input'||h.e==='click')).forEach(h=>h.fn({target:el}))}else if(a.startsWith('tick:')){const n=parseInt(a.slice(5),10)||1;for(let i=0;i<n&&TQ.length;i++)TQ.shift()()}else if(a.startsWith('clickxy:')){const [id,xy]=a.slice(8).split('@');const [x,y]=xy.split(',').map(Number);H.filter(h=>h.el.id===id&&h.e==='click').forEach(h=>h.fn({target:h.el,clientX:x,clientY:y,offsetX:x,offsetY:y,preventDefault(){}}))}else if(a.startsWith('time:')){PERF+=parseFloat(a.slice(5))||0}else if(a.startsWith('js:')){vm.runInContext(a.slice(3),c,{timeout:5000})}else if(a.startsWith('set:')){const [id,v]=a.slice(4).split('=');const el=document.getElementById(id);el.value=v;H.filter(h=>h.el.id===id&&(h.e==='input'||h.e==='change')).forEach(h=>h.fn({target:el}))}dump(a)}
